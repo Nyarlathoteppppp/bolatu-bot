@@ -643,7 +643,7 @@ def _format_message(msg: ChatMessage) -> str:
 
 def _format_decision_message(msg: ChatMessage) -> str:
     if msg.is_bot:
-        return f"张风雪之前发言（只判断互动状态，禁止复用措辞）: {msg.text}"
+        return f"机器人之前发言（只判断互动状态，禁止复用措辞）: {msg.text}"
     return _format_message(msg)
 
 

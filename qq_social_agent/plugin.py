@@ -639,7 +639,7 @@ async def _handle_group_message_locked(
             reply_candidates = (
                 PendingApprovalCandidate(
                     1,
-                    "人在。你把问题说清楚，本城主再给你一刀。",
+                    "我是个美少女人家不知道呢。",
                     "reply",
                     "空回复兜底，要求对方补清楚",
                 ),
@@ -767,7 +767,7 @@ async def handle_private_message(bot: Bot, event: PrivateMessageEvent) -> None:
         logger.warning(f"qq_social_agent private reply generation failed: user={user_id} error={exc}")
         reply = "我在。刚才模型没接上，你再发一遍重点。"
     if not reply:
-        reply = "我在。别给本城主发空包，直接说事。"
+        reply = "我是个美少女人家不知道呢。"
         logger.info(f"qq_social_agent fallback private reply: user={user_id} reason=empty_model_reply")
     reply, guarded = sanitize_political_output(reply)
     if guarded:

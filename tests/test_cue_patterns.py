@@ -44,7 +44,7 @@ def test_tracker_only_counts_addressed_messages() -> None:
     third = tracker.record(
         group_id=1,
         user_id=2,
-        text="锐评一下张雪峰",
+        text="锐评一下某个博主",
         addressed=True,
         now=103,
     )
