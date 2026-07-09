@@ -107,7 +107,8 @@ APPROVAL_RULES_MESSAGE = """张风雪群发审批规则：
 4. 回 不准奏1原因/不准奏2原因/不准奏3原因：xxx：取消并批评指定候选。
 5. 回 开启/关闭：恢复或暂停群聊进入决策，并重发本规则。
 6. 回 token用量：查看近 24 小时 token 明细；也可回 token用量 1h/7d/all。
-7. 回 审批规则详情：展开完整说明。"""
+7. 回 token用量 2026-07-10：查看指定日期。
+8. 回 审批规则详情：展开完整说明。"""
 APPROVAL_RULES_DETAIL_MESSAGE = """张风雪群发审批规则详情：
 一、候选规则
 1. 机器人想发群时，会先把候选回复私聊发给审批人，不会直接发群。
@@ -138,8 +139,9 @@ APPROVAL_RULES_DETAIL_MESSAGE = """张风雪群发审批规则详情：
 2. 回复“审批规则详情”或“详细规则”：展开这份完整说明。
 3. 回复“token用量”：查看近 24 小时 token 明细。
 4. 回复“token用量 1h/7d/all”：查看指定窗口 token 明细；也可用 /bot tokens 24h。
-5. 回复其他内容：取消上一条候选，不写反馈。
-6. 黑话命令：/黑话：咱妈 指代：中国；/黑话列表；/删黑话：咱妈。"""
+5. 回复“token用量 2026-07-10”：查看本机时区这一天 00:00 到次日 00:00 的用量；也支持 2026/07/10。
+6. 回复其他内容：取消上一条候选，不写反馈。
+7. 黑话命令：/黑话：咱妈 指代：中国；/黑话列表；/删黑话：咱妈。"""
 TOKEN_REPORT_DEFAULT_WINDOW_SECONDS = 24 * 60 * 60
 TOKEN_REPORT_MAX_RECENT_EVENTS = 8
 
@@ -173,6 +175,13 @@ class PendingGroupApproval:
     candidates: tuple[PendingApprovalCandidate, ...]
     mention_targets: dict[int, str]
     created_at: float
+
+
+@dataclass(frozen=True)
+class TokenReportWindow:
+    start_at: float | None
+    end_at: float | None
+    label: str
 
 
 @get_driver().on_startup
@@ -817,40 +826,59 @@ async def handle_bot_command(event: Event, matcher: Matcher, args: Message = Com
             f"utility_model={app_config.deepseek.utility_model}"
         )
     if action in {"tokens", "token", "usage"}:
-        since_seconds, label = _parse_token_report_window(parts[1] if len(parts) >= 2 else "")
+        window = _parse_token_report_window(parts[1] if len(parts) >= 2 else "")
         await matcher.finish(
-            _format_token_usage_report(
-                summaries=memory.llm_usage_summary(since_seconds=since_seconds),
-                recent_events=memory.recent_llm_usage_events(
-                    since_seconds=since_seconds,
-                    limit=TOKEN_REPORT_MAX_RECENT_EVENTS,
-                ),
-                label=label,
-            )
+            _token_usage_report_for_window(window)
         )
 
-    await matcher.finish("用法：/bot status|tokens 24h|pause|resume|reset|quiet 10m|persona <id>")
+    await matcher.finish("用法：/bot status|tokens 24h|tokens 2026-07-10|pause|resume|reset|quiet 10m|persona <id>")
 
 
-def _parse_token_report_window(raw: str) -> tuple[int | None, str]:
+def _parse_token_report_window(raw: str) -> TokenReportWindow:
     text = raw.strip().lower()
-    if not text or text in {"24h", "day", "today"}:
-        return TOKEN_REPORT_DEFAULT_WINDOW_SECONDS, "近 24 小时"
+    if not text or text in {"24h", "day"}:
+        return _relative_token_report_window(TOKEN_REPORT_DEFAULT_WINDOW_SECONDS, "近 24 小时")
+    if text in {"today", "今天", "今日"}:
+        return _date_token_report_window(time.localtime().tm_year, time.localtime().tm_mon, time.localtime().tm_mday)
+    if text in {"yesterday", "昨天", "昨日"}:
+        local_now = time.localtime(time.time() - 24 * 60 * 60)
+        return _date_token_report_window(local_now.tm_year, local_now.tm_mon, local_now.tm_mday)
     if text in {"all", "全部", "total"}:
-        return None, "全部"
+        return TokenReportWindow(None, None, "全部")
+    date_match = re.fullmatch(r"(\d{4})[-/](\d{1,2})[-/](\d{1,2})", text)
+    if date_match is not None:
+        return _date_token_report_window(
+            int(date_match.group(1)),
+            int(date_match.group(2)),
+            int(date_match.group(3)),
+        )
     match = re.fullmatch(r"(\d+)([hdw天周]?)", text)
     if match is None:
-        return TOKEN_REPORT_DEFAULT_WINDOW_SECONDS, "近 24 小时"
+        return _relative_token_report_window(TOKEN_REPORT_DEFAULT_WINDOW_SECONDS, "近 24 小时")
     value = max(1, int(match.group(1)))
     unit = match.group(2)
     if unit in {"h", ""}:
-        return value * 60 * 60, f"近 {value} 小时"
+        return _relative_token_report_window(value * 60 * 60, f"近 {value} 小时")
     if unit in {"d", "天"}:
-        return value * 24 * 60 * 60, f"近 {value} 天"
-    return value * 7 * 24 * 60 * 60, f"近 {value} 周"
+        return _relative_token_report_window(value * 24 * 60 * 60, f"近 {value} 天")
+    return _relative_token_report_window(value * 7 * 24 * 60 * 60, f"近 {value} 周")
 
 
-def _parse_approval_token_report_command(text: str) -> tuple[int | None, str] | None:
+def _relative_token_report_window(seconds: int, label: str) -> TokenReportWindow:
+    return TokenReportWindow(time.time() - seconds, None, label)
+
+
+def _date_token_report_window(year: int, month: int, day: int) -> TokenReportWindow:
+    try:
+        start_struct = time.strptime(f"{year:04d}-{month:02d}-{day:02d}", "%Y-%m-%d")
+    except ValueError:
+        return _relative_token_report_window(TOKEN_REPORT_DEFAULT_WINDOW_SECONDS, "近 24 小时")
+    start_at = time.mktime(start_struct)
+    end_at = start_at + 24 * 60 * 60
+    return TokenReportWindow(start_at, end_at, f"{year:04d}-{month:02d}-{day:02d}")
+
+
+def _parse_approval_token_report_command(text: str) -> TokenReportWindow | None:
     compact = text.strip()
     if not compact:
         return None
@@ -863,6 +891,18 @@ def _parse_approval_token_report_command(text: str) -> tuple[int | None, str] | 
             raw_window = compact[len(alias) :].strip(" ：:")
             return _parse_token_report_window(raw_window)
     return None
+
+
+def _token_usage_report_for_window(window: TokenReportWindow) -> str:
+    return _format_token_usage_report(
+        summaries=memory.llm_usage_summary(start_at=window.start_at, end_at=window.end_at),
+        recent_events=memory.recent_llm_usage_events(
+            start_at=window.start_at,
+            end_at=window.end_at,
+            limit=TOKEN_REPORT_MAX_RECENT_EVENTS,
+        ),
+        label=window.label,
+    )
 
 
 def _format_token_usage_report(
@@ -1614,18 +1654,10 @@ async def _handle_group_approval_private(bot: Bot, user_id: int, text: str) -> b
         return True
     token_report_window = _parse_approval_token_report_command(compact_text)
     if token_report_window is not None:
-        since_seconds, label = token_report_window
         await _send_private_text(
             bot,
             user_id,
-            _format_token_usage_report(
-                summaries=memory.llm_usage_summary(since_seconds=since_seconds),
-                recent_events=memory.recent_llm_usage_events(
-                    since_seconds=since_seconds,
-                    limit=TOKEN_REPORT_MAX_RECENT_EVENTS,
-                ),
-                label=label,
-            ),
+            _token_usage_report_for_window(token_report_window),
         )
         return True
     if compact_text in {"开启", "打开", "恢复"}:

@@ -1,4 +1,5 @@
 import asyncio
+import time
 
 import nonebot
 
@@ -104,6 +105,21 @@ def test_approval_help_commands() -> None:
     assert "详细规则" in APPROVAL_DETAIL_COMMANDS
     assert "token用量" in plugin.APPROVAL_RULES_MESSAGE
     assert "token用量 1h/7d/all" in plugin.APPROVAL_RULES_DETAIL_MESSAGE
+    assert "token用量 2026-07-10" in plugin.APPROVAL_RULES_DETAIL_MESSAGE
+
+
+def test_parse_token_report_date_window() -> None:
+    window = plugin._parse_token_report_window("2026-07-10")
+
+    assert window.label == "2026-07-10"
+    assert window.start_at == time.mktime(time.strptime("2026-07-10", "%Y-%m-%d"))
+    assert window.end_at == window.start_at + 24 * 60 * 60
+
+
+def test_parse_token_report_slash_date_window() -> None:
+    window = plugin._parse_token_report_window("2026/7/10")
+
+    assert window.label == "2026-07-10"
 
 
 def test_jargon_command_regexes() -> None:
@@ -330,6 +346,38 @@ def test_approval_token_report_command_does_not_consume_pending(monkeypatch, tmp
     assert plugin.pending_group_approvals[approval.group_id] == approval
     assert "Token 用量报告（全部）" in bot.private_messages[-1][1]
     assert "decision / deepseek-v4-flash" in bot.private_messages[-1][1]
+
+
+def test_approval_token_report_date_command(monkeypatch, tmp_path) -> None:
+    store = _use_temp_plugin_memory(monkeypatch, tmp_path)
+    target_start = time.mktime(time.strptime("2026-07-10", "%Y-%m-%d"))
+    store.add_llm_usage(
+        task="old",
+        model="deepseek-v4-flash",
+        prompt_tokens=9000,
+        completion_tokens=900,
+        total_tokens=9900,
+        created_at=target_start - 1,
+    )
+    store.add_llm_usage(
+        task="decision",
+        model="deepseek-v4-flash",
+        prompt_tokens=1000,
+        completion_tokens=100,
+        total_tokens=1100,
+        created_at=target_start + 60,
+    )
+    approval = _pending_approval()
+    plugin.pending_group_approvals[approval.group_id] = approval
+    bot = FakeApprovalBot()
+
+    handled = asyncio.run(plugin._handle_group_approval_private(bot, 3370998238, "token用量 2026-07-10"))
+
+    assert handled
+    assert plugin.pending_group_approvals[approval.group_id] == approval
+    assert "Token 用量报告（2026-07-10）" in bot.private_messages[-1][1]
+    assert "decision / deepseek-v4-flash" in bot.private_messages[-1][1]
+    assert "old / deepseek-v4-flash" not in bot.private_messages[-1][1]
 
 
 def test_approval_close_clears_pending_and_resends_rules(monkeypatch, tmp_path) -> None:

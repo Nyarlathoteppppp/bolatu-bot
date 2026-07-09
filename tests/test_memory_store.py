@@ -212,3 +212,37 @@ def test_llm_usage_summary_and_recent_events(tmp_path, monkeypatch) -> None:
         ("decision", "deepseek-v4-flash", 1, 230),
     ]
     assert [event.task for event in recent] == ["reply_candidates", "decision"]
+
+
+def test_llm_usage_summary_accepts_absolute_time_range(tmp_path) -> None:
+    memory = MemoryStore(tmp_path / "bot.sqlite3")
+    memory.add_llm_usage(
+        task="before",
+        model="deepseek-v4-flash",
+        prompt_tokens=100,
+        completion_tokens=10,
+        total_tokens=110,
+        created_at=99.0,
+    )
+    memory.add_llm_usage(
+        task="inside",
+        model="deepseek-v4-flash",
+        prompt_tokens=200,
+        completion_tokens=20,
+        total_tokens=220,
+        created_at=100.0,
+    )
+    memory.add_llm_usage(
+        task="after",
+        model="deepseek-v4-flash",
+        prompt_tokens=300,
+        completion_tokens=30,
+        total_tokens=330,
+        created_at=200.0,
+    )
+
+    summaries = memory.llm_usage_summary(start_at=100.0, end_at=200.0)
+    recent = memory.recent_llm_usage_events(start_at=100.0, end_at=200.0, limit=5)
+
+    assert [(item.task, item.total_tokens) for item in summaries] == [("inside", 220)]
+    assert [event.task for event in recent] == ["inside"]

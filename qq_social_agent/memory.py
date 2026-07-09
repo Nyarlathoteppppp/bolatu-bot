@@ -878,12 +878,18 @@ class MemoryStore:
         )
         self.conn.commit()
 
-    def llm_usage_summary(self, *, since_seconds: int | None = None) -> list[LLMUsageSummary]:
-        where = ""
-        params: tuple[float, ...] = ()
-        if since_seconds is not None:
-            where = "where created_at >= ?"
-            params = (time.time() - since_seconds,)
+    def llm_usage_summary(
+        self,
+        *,
+        since_seconds: int | None = None,
+        start_at: float | None = None,
+        end_at: float | None = None,
+    ) -> list[LLMUsageSummary]:
+        where, params = _usage_time_where(
+            since_seconds=since_seconds,
+            start_at=start_at,
+            end_at=end_at,
+        )
         rows = self.conn.execute(
             f"""
             select
@@ -908,13 +914,16 @@ class MemoryStore:
         self,
         *,
         since_seconds: int | None = None,
+        start_at: float | None = None,
+        end_at: float | None = None,
         limit: int = 8,
     ) -> list[LLMUsageEvent]:
-        where = ""
-        params: tuple[object, ...] = (limit,)
-        if since_seconds is not None:
-            where = "where created_at >= ?"
-            params = (time.time() - since_seconds, limit)
+        where, time_params = _usage_time_where(
+            since_seconds=since_seconds,
+            start_at=start_at,
+            end_at=end_at,
+        )
+        params: tuple[object, ...] = (*time_params, limit)
         rows = self.conn.execute(
             f"""
             select task, model, prompt_tokens, completion_tokens, total_tokens, created_at
@@ -1087,6 +1096,27 @@ def _custom_jargon_from_row(row: sqlite3.Row) -> CustomJargonEntry:
         created_by=int(row["created_by"]),
         created_at=float(row["created_at"]),
     )
+
+
+def _usage_time_where(
+    *,
+    since_seconds: int | None,
+    start_at: float | None,
+    end_at: float | None,
+) -> tuple[str, tuple[float, ...]]:
+    clauses: list[str] = []
+    params: list[float] = []
+    if start_at is None and since_seconds is not None:
+        start_at = time.time() - since_seconds
+    if start_at is not None:
+        clauses.append("created_at >= ?")
+        params.append(start_at)
+    if end_at is not None:
+        clauses.append("created_at < ?")
+        params.append(end_at)
+    if not clauses:
+        return "", ()
+    return "where " + " and ".join(clauses), tuple(params)
 
 
 def _llm_usage_summary_from_row(row: sqlite3.Row) -> LLMUsageSummary:
