@@ -246,3 +246,30 @@ def test_llm_usage_summary_accepts_absolute_time_range(tmp_path) -> None:
 
     assert [(item.task, item.total_tokens) for item in summaries] == [("inside", 220)]
     assert [event.task for event in recent] == ["inside"]
+
+
+def test_llm_usage_source_key_deduplicates(tmp_path) -> None:
+    memory = MemoryStore(tmp_path / "bot.sqlite3")
+
+    assert memory.add_llm_usage(
+        task="decision",
+        model="deepseek-v4-flash",
+        prompt_tokens=100,
+        completion_tokens=20,
+        total_tokens=120,
+        created_at=1000.0,
+        source_key="log:1",
+    )
+    assert not memory.add_llm_usage(
+        task="decision",
+        model="deepseek-v4-flash",
+        prompt_tokens=100,
+        completion_tokens=20,
+        total_tokens=120,
+        created_at=1000.0,
+        source_key="log:1",
+    )
+
+    summaries = memory.llm_usage_summary()
+    assert len(summaries) == 1
+    assert summaries[0].call_count == 1

@@ -268,7 +268,8 @@ class MemoryStore:
               prompt_tokens integer,
               completion_tokens integer,
               total_tokens integer,
-              created_at real not null
+              created_at real not null,
+              source_key text
             );
 
             create index if not exists idx_llm_usage_events_time
@@ -276,8 +277,24 @@ class MemoryStore:
 
             """
         )
+        self._ensure_llm_usage_source_key()
         self._backfill_member_profiles()
         self.conn.commit()
+
+    def _ensure_llm_usage_source_key(self) -> None:
+        columns = {
+            str(row["name"])
+            for row in self.conn.execute("pragma table_info(llm_usage_events)").fetchall()
+        }
+        if "source_key" not in columns:
+            self.conn.execute("alter table llm_usage_events add column source_key text")
+        self.conn.execute(
+            """
+            create unique index if not exists idx_llm_usage_events_source_key
+              on llm_usage_events(source_key)
+              where source_key is not null
+            """
+        )
 
     def _backfill_member_profiles(self) -> None:
         existing = self.conn.execute("select 1 from member_profiles limit 1").fetchone()
@@ -857,15 +874,16 @@ class MemoryStore:
         completion_tokens: int | None,
         total_tokens: int | None,
         created_at: float | None = None,
-    ) -> None:
+        source_key: str | None = None,
+    ) -> bool:
         if prompt_tokens is None and completion_tokens is None and total_tokens is None:
-            return
-        self.conn.execute(
+            return False
+        cursor = self.conn.execute(
             """
-            insert into llm_usage_events(
-              task, model, prompt_tokens, completion_tokens, total_tokens, created_at
+            insert or ignore into llm_usage_events(
+              task, model, prompt_tokens, completion_tokens, total_tokens, created_at, source_key
             )
-            values (?, ?, ?, ?, ?, ?)
+            values (?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 task.strip() or "unknown",
@@ -874,9 +892,11 @@ class MemoryStore:
                 completion_tokens,
                 total_tokens,
                 created_at or time.time(),
+                source_key.strip()[:240] if source_key else None,
             ),
         )
         self.conn.commit()
+        return cursor.rowcount > 0
 
     def llm_usage_summary(
         self,

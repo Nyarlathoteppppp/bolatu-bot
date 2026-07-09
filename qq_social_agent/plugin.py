@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import re
 import time
 from dataclasses import dataclass
@@ -97,6 +98,14 @@ APPROVAL_CHOICE_RE = re.compile(r"^([1-3])([!！])?$")
 JARGON_ADD_RE = re.compile(r"^/黑话\s*[:：]?\s*(?P<term>.+?)\s+指代\s*[:：]\s*(?P<meaning>.+)$")
 JARGON_DELETE_RE = re.compile(r"^/删黑话\s*[:：]?\s*(?P<term>.+)$")
 JARGON_LIST_RE = re.compile(r"^/黑话列表\s*$")
+LLM_USAGE_LOG_RE = re.compile(
+    r"^(?P<month>\d{2})-(?P<day>\d{2}) "
+    r"(?P<hms>\d{2}:\d{2}:\d{2}).*qq_social_agent llm usage: "
+    r"task=(?P<task>\S+) model=(?P<model>\S+) "
+    r"prompt_tokens=(?P<prompt>\d+|None) "
+    r"completion_tokens=(?P<completion>\d+|None) "
+    r"total_tokens=(?P<total>\d+|None)"
+)
 APPROVAL_HELP_COMMANDS = {"审批规则", "规则", "帮助"}
 APPROVAL_DETAIL_COMMANDS = {"审批规则详情", "详细规则", "规则详情", "详细解释"}
 TOKEN_REPORT_COMMAND_ALIASES = {"token用量", "tokens", "token", "usage", "用量", "消耗", "费用"}
@@ -144,6 +153,10 @@ APPROVAL_RULES_DETAIL_MESSAGE = """张风雪群发审批规则详情：
 7. 黑话命令：/黑话：咱妈 指代：中国；/黑话列表；/删黑话：咱妈。"""
 TOKEN_REPORT_DEFAULT_WINDOW_SECONDS = 24 * 60 * 60
 TOKEN_REPORT_MAX_RECENT_EVENTS = 8
+TOKEN_USAGE_LOG_BACKFILL_FILES = (
+    Path(__file__).resolve().parent.parent / "logs" / "bot-runtime.log",
+    Path(__file__).resolve().parent.parent / "logs" / "bot.log",
+)
 
 
 @dataclass(frozen=True)
@@ -894,6 +907,9 @@ def _parse_approval_token_report_command(text: str) -> TokenReportWindow | None:
 
 
 def _token_usage_report_for_window(window: TokenReportWindow) -> str:
+    imported = _backfill_llm_usage_from_logs()
+    if imported:
+        logger.info(f"qq_social_agent imported llm usage from logs: rows={imported}")
     return _format_token_usage_report(
         summaries=memory.llm_usage_summary(start_at=window.start_at, end_at=window.end_at),
         recent_events=memory.recent_llm_usage_events(
@@ -903,6 +919,68 @@ def _token_usage_report_for_window(window: TokenReportWindow) -> str:
         ),
         label=window.label,
     )
+
+
+def _backfill_llm_usage_from_logs() -> int:
+    imported = 0
+    current_year = time.localtime().tm_year
+    for path in TOKEN_USAGE_LOG_BACKFILL_FILES:
+        if not path.exists():
+            continue
+        try:
+            with path.open("r", encoding="utf-8", errors="ignore") as f:
+                for line_no, line in enumerate(f, start=1):
+                    parsed = _parse_llm_usage_log_line(line, year=current_year)
+                    if parsed is None:
+                        continue
+                    task, model, prompt_tokens, completion_tokens, total_tokens, created_at = parsed
+                    digest = hashlib.sha1(line.strip().encode("utf-8")).hexdigest()[:16]
+                    source_key = f"log:{path.name}:{line_no}:{digest}"
+                    if memory.add_llm_usage(
+                        task=task,
+                        model=model,
+                        prompt_tokens=prompt_tokens,
+                        completion_tokens=completion_tokens,
+                        total_tokens=total_tokens,
+                        created_at=created_at,
+                        source_key=source_key,
+                    ):
+                        imported += 1
+        except OSError as exc:
+            logger.warning(f"qq_social_agent failed reading llm usage log: path={path} error={exc}")
+    return imported
+
+
+def _parse_llm_usage_log_line(
+    line: str,
+    *,
+    year: int,
+) -> tuple[str, str, int | None, int | None, int | None, float] | None:
+    match = LLM_USAGE_LOG_RE.match(line.strip())
+    if match is None:
+        return None
+    timestamp_text = (
+        f"{year:04d}-{match.group('month')}-{match.group('day')} "
+        f"{match.group('hms')}"
+    )
+    try:
+        created_at = time.mktime(time.strptime(timestamp_text, "%Y-%m-%d %H:%M:%S"))
+    except ValueError:
+        return None
+    return (
+        match.group("task"),
+        match.group("model"),
+        _optional_usage_int(match.group("prompt")),
+        _optional_usage_int(match.group("completion")),
+        _optional_usage_int(match.group("total")),
+        created_at,
+    )
+
+
+def _optional_usage_int(value: str) -> int | None:
+    if value == "None":
+        return None
+    return int(value)
 
 
 def _format_token_usage_report(

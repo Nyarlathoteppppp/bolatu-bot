@@ -122,6 +122,45 @@ def test_parse_token_report_slash_date_window() -> None:
     assert window.label == "2026-07-10"
 
 
+def test_parse_llm_usage_log_line() -> None:
+    parsed = plugin._parse_llm_usage_log_line(
+        "07-10 00:36:48 [INFO] qq_social_agent | qq_social_agent llm usage: "
+        "task=decision model=deepseek-v4-flash prompt_tokens=3823 "
+        "completion_tokens=88 total_tokens=3911",
+        year=2026,
+    )
+
+    assert parsed is not None
+    task, model, prompt_tokens, completion_tokens, total_tokens, created_at = parsed
+    assert task == "decision"
+    assert model == "deepseek-v4-flash"
+    assert prompt_tokens == 3823
+    assert completion_tokens == 88
+    assert total_tokens == 3911
+    assert created_at == time.mktime(time.strptime("2026-07-10 00:36:48", "%Y-%m-%d %H:%M:%S"))
+
+
+def test_backfill_llm_usage_from_logs_deduplicates(monkeypatch, tmp_path) -> None:
+    store = _use_temp_plugin_memory(monkeypatch, tmp_path)
+    log_path = tmp_path / "bot-runtime.log"
+    log_path.write_text(
+        "07-10 00:36:48 [INFO] qq_social_agent | qq_social_agent llm usage: "
+        "task=decision model=deepseek-v4-flash prompt_tokens=3823 "
+        "completion_tokens=88 total_tokens=3911\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(plugin, "TOKEN_USAGE_LOG_BACKFILL_FILES", (log_path,))
+    monkeypatch.setattr(plugin.time, "localtime", lambda *args: time.struct_time((2026, 7, 10, 0, 0, 0, 4, 191, 0)))
+
+    assert plugin._backfill_llm_usage_from_logs() == 1
+    assert plugin._backfill_llm_usage_from_logs() == 0
+
+    summaries = store.llm_usage_summary()
+    assert len(summaries) == 1
+    assert summaries[0].task == "decision"
+    assert summaries[0].total_tokens == 3911
+
+
 def test_jargon_command_regexes() -> None:
     add = JARGON_ADD_RE.match("/黑话：咱妈 指代：中国")
     assert add is not None
