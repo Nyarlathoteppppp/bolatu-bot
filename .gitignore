@@ -1,0 +1,14 @@
+.venv/
+.env
+.env.*
+!.env.example
+logs/
+*.log
+*.pid
+*.egg-info/
+__pycache__/
+.pytest_cache/
+*.pyc
+data/*.sqlite3-shm
+data/*.sqlite3-wal
+.DS_Store

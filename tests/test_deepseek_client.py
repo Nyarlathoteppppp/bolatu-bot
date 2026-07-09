@@ -1,0 +1,191 @@
+from types import SimpleNamespace
+
+from qq_social_agent.deepseek_client import (
+    _log_llm_usage,
+    _parse_jargon_terms,
+    _parse_reply_decision,
+    _sanitize_reply,
+    _usage_value,
+    set_usage_recorder,
+)
+
+
+def test_sanitize_empty_string_markers() -> None:
+    assert _sanitize_reply("空字符串", 120) == ""
+    assert _sanitize_reply("（空字符串）", 120) == ""
+    assert _sanitize_reply('"（空字符串）"', 120) == ""
+
+
+def test_sanitize_keeps_normal_reply() -> None:
+    assert _sanitize_reply("人在，直接说事。", 120) == "人在，直接说事。"
+
+
+def test_sanitize_trims_to_sentence_boundary() -> None:
+    text = "第一句完整。第二句也完整。第三句会被截断在这里后面还有很多很多很多内容。"
+    reply = _sanitize_reply(text, 14)
+    assert reply == "第一句完整。第二句也完整。"
+    assert reply.endswith("。")
+
+
+def test_parse_reply_decision() -> None:
+    decision = _parse_reply_decision(
+        '{"should_reply": true, "confidence": 0.82, "action": "tease", "mode": "natural", "reason": "有梗"}'
+    )
+    assert decision.should_reply
+    assert decision.confidence == 0.82
+    assert decision.action == "tease"
+    assert decision.mode == "natural"
+    assert decision.reason == "有梗"
+
+
+def test_parse_reply_decision_maps_legacy_mode_to_action() -> None:
+    decision = _parse_reply_decision(
+        '{"should_reply": true, "confidence": 0.7, "mode": "natural", "reason": "普通接话"}'
+    )
+
+    assert decision.should_reply
+    assert decision.action == "reply"
+
+
+def test_parse_reply_decision_action_market_sets_tool() -> None:
+    decision = _parse_reply_decision(
+        '{"should_reply": true, "confidence": 0.8, "action": "market_check", "reason": "行情"}'
+    )
+
+    assert decision.should_reply
+    assert decision.action == "market_check"
+    assert decision.need_tool
+    assert decision.tool == "market"
+
+
+def test_parse_reply_decision_action_fresh_sets_context() -> None:
+    decision = _parse_reply_decision(
+        '{"should_reply": true, "confidence": 0.8, "action": "fresh_context", "fresh_query": "世界杯 比分", "reason": "赛果"}'
+    )
+
+    assert decision.should_reply
+    assert decision.action == "fresh_context"
+    assert decision.need_fresh_context
+
+
+def test_parse_reply_decision_action_agree() -> None:
+    decision = _parse_reply_decision(
+        '{"should_reply": true, "confidence": 0.74, "action": "agree", "reason": "观点说到点子上"}'
+    )
+
+    assert decision.should_reply
+    assert decision.action == "agree"
+
+
+def test_parse_reply_decision_action_answer() -> None:
+    decision = _parse_reply_decision(
+        '{"should_reply": true, "confidence": 0.72, "action": "answer", "reason": "正常提问"}'
+    )
+
+    assert decision.should_reply
+    assert decision.action == "answer"
+
+
+def test_parse_reply_decision_action_answer_chinese_alias() -> None:
+    decision = _parse_reply_decision(
+        '{"should_reply": true, "confidence": 0.72, "action": "正常回答", "reason": "正常交流"}'
+    )
+
+    assert decision.should_reply
+    assert decision.action == "answer"
+
+
+def test_parse_reply_decision_extracts_json_block() -> None:
+    decision = _parse_reply_decision(
+        '```json\n{"should_reply": true, "confidence": 0.66, "action": "agree", "reason": "能补判断"}\n```'
+    )
+
+    assert decision.should_reply
+    assert decision.action == "agree"
+
+
+def test_parse_reply_decision_with_market_tool() -> None:
+    decision = _parse_reply_decision(
+        """
+        {
+          "should_reply": true,
+          "confidence": 0.9,
+          "mode": "market",
+          "need_tool": true,
+          "tool": "market",
+          "symbols": [{"kind": "crypto", "symbol": "bitcoin", "display": "BTC"}],
+          "comment_after_tool": true,
+          "reason": "需要查行情"
+        }
+        """
+    )
+
+    assert decision.should_reply
+    assert decision.need_tool
+    assert decision.tool == "market"
+    assert decision.comment_after_tool
+    assert len(decision.symbols) == 1
+    assert decision.symbols[0].kind == "crypto"
+    assert decision.symbols[0].symbol == "bitcoin"
+    assert decision.symbols[0].display == "BTC"
+
+
+def test_parse_reply_decision_with_fresh_context() -> None:
+    decision = _parse_reply_decision(
+        """
+        {
+          "should_reply": true,
+          "confidence": 0.76,
+          "mode": "chat",
+          "need_fresh_context": true,
+          "fresh_query": "美国 伊朗 冲突 最新消息",
+          "fresh_kind": "news",
+          "reason": "涉及实时国际冲突"
+        }
+        """
+    )
+
+    assert decision.should_reply
+    assert decision.need_fresh_context
+    assert decision.fresh_query == "美国 伊朗 冲突 最新消息"
+    assert decision.fresh_kind == "news"
+
+
+def test_parse_reply_decision_invalid_json() -> None:
+    decision = _parse_reply_decision("不是 json")
+    assert not decision.should_reply
+    assert decision.confidence == 0.0
+    assert decision.reason == "invalid_json"
+
+
+def test_parse_jargon_terms() -> None:
+    terms = _parse_jargon_terms('{"terms":["柏拉图","zbzy","柏拉图"],"reason":"命中"}')
+
+    assert terms == ("柏拉图", "zbzy")
+
+
+def test_parse_jargon_terms_extracts_json_block() -> None:
+    terms = _parse_jargon_terms('```json\n{"terms":["霓虹"]}\n```')
+
+    assert terms == ("霓虹",)
+
+
+def test_usage_value_reads_dict_and_object() -> None:
+    assert _usage_value({"prompt_tokens": 12}, "prompt_tokens") == 12
+    assert _usage_value(SimpleNamespace(total_tokens="34"), "total_tokens") == 34
+    assert _usage_value(SimpleNamespace(total_tokens=None), "total_tokens") is None
+
+
+def test_log_llm_usage_calls_recorder() -> None:
+    events = []
+    set_usage_recorder(lambda *args: events.append(args))
+    try:
+        _log_llm_usage(
+            "decision",
+            SimpleNamespace(usage={"prompt_tokens": 12, "completion_tokens": 3, "total_tokens": 15}),
+            model="deepseek-v4-flash",
+        )
+    finally:
+        set_usage_recorder(None)
+
+    assert events == [("decision", "deepseek-v4-flash", 12, 3, 15)]

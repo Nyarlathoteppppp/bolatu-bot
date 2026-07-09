@@ -1,0 +1,41 @@
+bot:
+  default_persona: zhangxuefeng
+  data_path: data/bot.sqlite3
+  context_limit: 30
+  active_reply_on_mention: true
+
+access_control:
+  allowed_groups:
+    - 1026813421
+  allowed_private_users:
+    - 2776760548
+    - 3115344487
+
+deepseek:
+  base_url: https://api.deepseek.com
+  model: deepseek-v4-pro
+  decision_model: deepseek-v4-flash
+  reply_model: deepseek-v4-flash
+  utility_model: deepseek-v4-flash
+  thinking: disabled
+  reasoning_effort: high
+  temperature: 0.72
+  max_tokens: 260
+  timeout_seconds: 30
+
+rate_control:
+  min_interval_seconds: 3
+  hard_mention_interval_seconds: 1
+  max_replies_per_10min: 40
+  max_replies_per_hour: 180
+  max_consecutive_replies: 4
+  user_reply_cooldowns: {}
+  quiet_hours:
+    enabled: false
+    start: "01:00"
+    end: "08:00"
+
+groups:
+  default:
+    enabled: true
+    persona: zhangxuefeng
