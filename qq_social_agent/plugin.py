@@ -99,13 +99,15 @@ JARGON_DELETE_RE = re.compile(r"^/删黑话\s*[:：]?\s*(?P<term>.+)$")
 JARGON_LIST_RE = re.compile(r"^/黑话列表\s*$")
 APPROVAL_HELP_COMMANDS = {"审批规则", "规则", "帮助"}
 APPROVAL_DETAIL_COMMANDS = {"审批规则详情", "详细规则", "规则详情", "详细解释"}
+TOKEN_REPORT_COMMAND_ALIASES = {"token用量", "tokens", "token", "usage", "用量", "消耗", "费用"}
 APPROVAL_RULES_MESSAGE = """张风雪群发审批规则：
 1. AI 默认把最想发的候选放在 1；准奏=发 1。
 2. 回 1/2/3：发送对应候选；回 1!/2!/3!：发送并标记优质。
 3. 回 不准奏原因：xxx：取消并默认批评第 1 条。
 4. 回 不准奏1原因/不准奏2原因/不准奏3原因：xxx：取消并批评指定候选。
 5. 回 开启/关闭：恢复或暂停群聊进入决策，并重发本规则。
-6. 回 审批规则详情：展开完整说明。"""
+6. 回 token用量：查看近 24 小时 token 明细；也可回 token用量 1h/7d/all。
+7. 回 审批规则详情：展开完整说明。"""
 APPROVAL_RULES_DETAIL_MESSAGE = """张风雪群发审批规则详情：
 一、候选规则
 1. 机器人想发群时，会先把候选回复私聊发给审批人，不会直接发群。
@@ -134,8 +136,10 @@ APPROVAL_RULES_DETAIL_MESSAGE = """张风雪群发审批规则详情：
 五、其他
 1. 回复“审批规则”：查看简版规则。
 2. 回复“审批规则详情”或“详细规则”：展开这份完整说明。
-3. 回复其他内容：取消上一条候选，不写反馈。
-4. 黑话命令：/黑话：咱妈 指代：中国；/黑话列表；/删黑话：咱妈。"""
+3. 回复“token用量”：查看近 24 小时 token 明细。
+4. 回复“token用量 1h/7d/all”：查看指定窗口 token 明细；也可用 /bot tokens 24h。
+5. 回复其他内容：取消上一条候选，不写反馈。
+6. 黑话命令：/黑话：咱妈 指代：中国；/黑话列表；/删黑话：咱妈。"""
 TOKEN_REPORT_DEFAULT_WINDOW_SECONDS = 24 * 60 * 60
 TOKEN_REPORT_MAX_RECENT_EVENTS = 8
 
@@ -844,6 +848,21 @@ def _parse_token_report_window(raw: str) -> tuple[int | None, str]:
     if unit in {"d", "天"}:
         return value * 24 * 60 * 60, f"近 {value} 天"
     return value * 7 * 24 * 60 * 60, f"近 {value} 周"
+
+
+def _parse_approval_token_report_command(text: str) -> tuple[int | None, str] | None:
+    compact = text.strip()
+    if not compact:
+        return None
+    parts = compact.split(maxsplit=1)
+    head = parts[0].casefold()
+    if head in TOKEN_REPORT_COMMAND_ALIASES:
+        return _parse_token_report_window(parts[1] if len(parts) >= 2 else "")
+    for alias in TOKEN_REPORT_COMMAND_ALIASES:
+        if compact.casefold().startswith(alias.casefold()):
+            raw_window = compact[len(alias) :].strip(" ：:")
+            return _parse_token_report_window(raw_window)
+    return None
 
 
 def _format_token_usage_report(
@@ -1593,6 +1612,22 @@ async def _handle_group_approval_private(bot: Bot, user_id: int, text: str) -> b
     if compact_text in APPROVAL_DETAIL_COMMANDS:
         await _send_private_text(bot, user_id, APPROVAL_RULES_DETAIL_MESSAGE)
         return True
+    token_report_window = _parse_approval_token_report_command(compact_text)
+    if token_report_window is not None:
+        since_seconds, label = token_report_window
+        await _send_private_text(
+            bot,
+            user_id,
+            _format_token_usage_report(
+                summaries=memory.llm_usage_summary(since_seconds=since_seconds),
+                recent_events=memory.recent_llm_usage_events(
+                    since_seconds=since_seconds,
+                    limit=TOKEN_REPORT_MAX_RECENT_EVENTS,
+                ),
+                label=label,
+            ),
+        )
+        return True
     if compact_text in {"开启", "打开", "恢复"}:
         await _set_approval_group_decision_enabled(bot, user_id, True)
         return True
@@ -2041,7 +2076,7 @@ def _command_chat_id(event: Event) -> int | None:
         return group_id
     if isinstance(event, PrivateMessageEvent):
         user_id = int(event.user_id)
-        if not app_config.private_user_allowed(user_id):
+        if not app_config.private_user_allowed(user_id) and user_id not in GROUP_APPROVAL_USER_IDS:
             return None
         return _private_chat_id(user_id)
     return None

@@ -102,6 +102,8 @@ def test_approval_help_commands() -> None:
     assert "审批规则" in APPROVAL_HELP_COMMANDS
     assert "审批规则详情" in APPROVAL_DETAIL_COMMANDS
     assert "详细规则" in APPROVAL_DETAIL_COMMANDS
+    assert "token用量" in plugin.APPROVAL_RULES_MESSAGE
+    assert "token用量 1h/7d/all" in plugin.APPROVAL_RULES_DETAIL_MESSAGE
 
 
 def test_jargon_command_regexes() -> None:
@@ -306,6 +308,28 @@ def test_approval_detail_command_does_not_consume_pending(monkeypatch, tmp_path)
     assert handled
     assert plugin.pending_group_approvals[approval.group_id] == approval
     assert "张风雪群发审批规则详情" in bot.private_messages[-1][1]
+
+
+def test_approval_token_report_command_does_not_consume_pending(monkeypatch, tmp_path) -> None:
+    store = _use_temp_plugin_memory(monkeypatch, tmp_path)
+    store.add_llm_usage(
+        task="decision",
+        model="deepseek-v4-flash",
+        prompt_tokens=1000,
+        completion_tokens=100,
+        total_tokens=1100,
+        created_at=1000.0,
+    )
+    approval = _pending_approval()
+    plugin.pending_group_approvals[approval.group_id] = approval
+    bot = FakeApprovalBot()
+
+    handled = asyncio.run(plugin._handle_group_approval_private(bot, 3370998238, "token用量 all"))
+
+    assert handled
+    assert plugin.pending_group_approvals[approval.group_id] == approval
+    assert "Token 用量报告（全部）" in bot.private_messages[-1][1]
+    assert "decision / deepseek-v4-flash" in bot.private_messages[-1][1]
 
 
 def test_approval_close_clears_pending_and_resends_rules(monkeypatch, tmp_path) -> None:
