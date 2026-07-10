@@ -27,6 +27,7 @@ from .approval_rules import (
     BOT_TOOL_FULL_MESSAGE,
     BOT_TOOL_INDEX_MESSAGE,
     BOT_TOOL_SECTION_MESSAGES,
+    BOT_TOOL_SHORTCUT_COMMANDS,
     JARGON_ADD_RE,
     JARGON_DELETE_RE,
     JARGON_LIST_RE,
@@ -159,25 +160,35 @@ TOKEN_USAGE_LOG_BACKFILL_FILES = (
     Path(__file__).resolve().parent.parent / "logs" / "bot-runtime.log",
     Path(__file__).resolve().parent.parent / "logs" / "bot.log",
 )
-APPROVAL_CANCEL_COMMANDS = {"取消", "取消发送", "不发", "别发"}
-APPROVAL_TOOL_COMMANDS = {"bot工具", "工具", "工具单", "审批工具", "机器人工具", "bot 工具"}
+APPROVAL_CANCEL_COMMANDS = {"取消", "取消发送", "不发", "别发", "D", "d", "X", "x"}
+BASIC_APPROVAL_DENIED_MESSAGE = "你只有基础审批权限：A/B/C/D/X/1/2/3/取消 处理审批单。"
+APPROVAL_TOOL_COMMANDS = {"bot工具", "工具", "工具单", "审批工具", "机器人工具", "bot 工具", "T", "t"}
 BOT_TOOL_COMMAND_RE = re.compile(r"^(?:bot\s*工具|工具|工具单|审批工具|机器人工具)\s*(?P<section>.*)$", re.IGNORECASE)
 BOT_TOOL_SECTION_ALIASES = {
     "": "index",
     "目录": "index",
     "帮助": "index",
+    "t": "index",
+    "a": "view",
     "审批": "approval",
     "审核": "approval",
+    "e": "approval",
     "查看": "view",
     "查询": "view",
+    "f": "jargon",
     "黑话": "jargon",
+    "d": "switch",
     "开关": "switch",
+    "h": "approver",
     "审批人": "approver",
+    "g": "private",
     "私聊": "private",
     "私人聊天": "private",
     "白名单": "private",
+    "c": "model",
     "模型": "model",
     "model": "model",
+    "b": "learning",
     "学习": "learning",
     "记忆": "learning",
     "回想": "learning",
@@ -187,6 +198,8 @@ BOT_TOOL_SECTION_ALIASES = {
     "learning": "learning",
     "prompt": "prompt",
     "提示词": "prompt",
+    "p": "prompt",
+    "z": "full",
     "全部": "full",
     "全量": "full",
 }
@@ -252,10 +265,10 @@ CHANGELOG_NOTICE_MESSAGE = """张风雪后端更新记录：
 4. 群聊风格学习默认改为 siliconflow/MiniMaxAI/MiniMax-M2.5。
 5. 可切换模型目录新增 siliconflow/Pro/moonshotai/Kimi-K2.6。
 6. 模型状态会显示可切换部分、当前模型、fallback、API key 来源和可切换模型清单。
-7. 切工具模型 <模型> 保留为兼容批量命令，会同时切黑话/记忆/风格。
+7. 切工具模型 <模型> 保留为兼容批量命令，会同时切黑话/记忆/风格/画像。
 
 审批提醒：
-- 审批：1/2/3 发送；取消 不发。
+- 审批：A/B/C 或 1/2/3 发送；D/X/取消 不发。
 - 工具：回 bot工具 或 审批规则详情；回 模型状态 查看模型清单。
 """
 
@@ -585,6 +598,14 @@ def _bot_tool_message(text: str) -> str | None:
     compact = text.strip()
     if compact in APPROVAL_DETAIL_COMMANDS or compact in APPROVAL_TOOL_COMMANDS:
         return BOT_TOOL_INDEX_MESSAGE
+    direct_key = re.sub(r"\s+", "", compact).casefold()
+    if direct_key in BOT_TOOL_SECTION_ALIASES:
+        key = BOT_TOOL_SECTION_ALIASES.get(direct_key)
+        if key == "index":
+            return BOT_TOOL_INDEX_MESSAGE
+        if key == "full":
+            return BOT_TOOL_FULL_MESSAGE
+        return BOT_TOOL_SECTION_MESSAGES.get(key, BOT_TOOL_INDEX_MESSAGE)
     match = BOT_TOOL_COMMAND_RE.match(compact)
     if match is None:
         return None
@@ -597,6 +618,11 @@ def _bot_tool_message(text: str) -> str | None:
     if key == "full":
         return BOT_TOOL_FULL_MESSAGE
     return BOT_TOOL_SECTION_MESSAGES.get(key, BOT_TOOL_INDEX_MESSAGE)
+
+
+def _bot_tool_shortcut_command(text: str) -> str | None:
+    key = re.sub(r"[\s.。:：_-]+", "", text.strip()).casefold()
+    return BOT_TOOL_SHORTCUT_COMMANDS.get(key)
 
 
 def _runtime_private_whitelist() -> set[int]:
@@ -869,14 +895,14 @@ def _format_model_route_status() -> str:
         lines.append(f"  当前：{active} {suffix}")
         lines.append(f"  config：{configured}")
         lines.append(f"  fallback：{fallback}")
-    lines.append("兼容命令：切工具模型 <模型> = 同时切黑话/记忆/风格。")
+    lines.append("兼容命令：切工具模型 <模型> = 同时切黑话/记忆/风格/画像。")
     lines.append("")
     lines.append("可切换模型：")
     for route in app_config.deepseek.model_catalog:
         provider = app_config.deepseek.providers[route.provider]
         lines.append(f"- {route.label}（{_provider_key_source(provider.name)} / {provider.api_key_env}）")
     lines.append("")
-    lines.append("命令示例：切回复模型 siliconflow/MiniMaxAI/MiniMax-M2.5；切风格模型 siliconflow/MiniMaxAI/MiniMax-M2.5；切决策模型 deepseek/deepseek-v4-pro；清模型覆盖。")
+    lines.append("命令示例：切回复模型 siliconflow/MiniMaxAI/MiniMax-M2.5；切画像模型 siliconflow/MiniMaxAI/MiniMax-M2.5；切决策模型 deepseek/deepseek-v4-pro；清模型覆盖。")
     return "\n".join(lines)
 
 
@@ -1824,7 +1850,7 @@ async def handle_bot_command(event: Event, matcher: Matcher, args: Message = Com
         "拦截",
     }
     if action in admin_actions and not _is_tool_admin_user(user_id):
-        await matcher.finish("没权限。基础审批人只能用 1/2/3/取消 处理审批单。")
+        await matcher.finish("没权限。基础审批人只能用 A/B/C/D/X/1/2/3/取消 处理审批单。")
 
     if action == "pause":
         memory.set_group_enabled(chat_id, False)
@@ -2980,7 +3006,7 @@ async def _request_group_approval(bot: Bot, approval: PendingGroupApproval) -> N
         f"触发人：{_member_label(approval.trigger_user_id, approval.trigger_nickname)}\n"
         f"触发消息：{approval.trigger_text}\n\n"
         f"候选：\n{preview}\n\n"
-        "回复：1/2/3 发送；取消 不发。"
+        "回复：A/B/C 或 1/2/3 发送；D/X/取消 不发；T 工具单。"
     )
     delivered = 0
     approval_user_ids = _approval_user_ids()
@@ -3020,6 +3046,21 @@ def _approval_candidate_by_index(
         if candidate.index == index:
             return candidate
     return None
+
+
+def _approval_choice_index(raw: str | None, *, default: int = 1) -> int:
+    if raw is None:
+        return default
+    key = raw.strip().casefold()
+    mapping = {
+        "1": 1,
+        "a": 1,
+        "2": 2,
+        "b": 2,
+        "3": 3,
+        "c": 3,
+    }
+    return mapping.get(key, default)
 
 
 def _latest_group_approval() -> PendingGroupApproval | None:
@@ -3074,7 +3115,8 @@ def _is_approval_control_text(text: str) -> bool:
 
 
 def _is_basic_approval_control_text(text: str) -> bool:
-    return text in {"1", "2", "3", *APPROVAL_CANCEL_COMMANDS}
+    choice_match = APPROVAL_CHOICE_RE.match(text)
+    return (choice_match is not None and not choice_match.group(2)) or text in APPROVAL_CANCEL_COMMANDS
 
 
 def _is_private_tool_text(text: str) -> bool:
@@ -3216,9 +3258,14 @@ async def _handle_group_approval_private(bot: Bot, user_id: int, text: str) -> b
         return False
     compact_text = text.strip()
     is_admin = _is_tool_admin_user(user_id) or _is_owner_user(user_id)
+    pending_approval_control = _latest_group_approval() is not None and _is_approval_control_text(compact_text)
+    if not pending_approval_control:
+        shortcut_command = _bot_tool_shortcut_command(compact_text)
+        if shortcut_command is not None:
+            compact_text = shortcut_command
     if _is_jargon_command_text(compact_text):
         if not is_admin:
-            await _send_private_text(bot, user_id, "你只有基础审批权限：1/2/3 发送，取消 不发。")
+            await _send_private_text(bot, user_id, BASIC_APPROVAL_DENIED_MESSAGE)
             return True
         await _send_private_text(
             bot,
@@ -3230,17 +3277,18 @@ async def _handle_group_approval_private(bot: Bot, user_id: int, text: str) -> b
             ),
         )
         return True
-    if compact_text in APPROVAL_HELP_COMMANDS:
+    if not pending_approval_control and compact_text in APPROVAL_HELP_COMMANDS:
         await _send_private_text(bot, user_id, APPROVAL_RULES_MESSAGE)
         return True
-    bot_tool_message = _bot_tool_message(compact_text)
-    if bot_tool_message is not None or compact_text in APPROVAL_DETAIL_COMMANDS:
-        await _send_private_text(bot, user_id, bot_tool_message or APPROVAL_RULES_DETAIL_MESSAGE)
-        return True
+    if not pending_approval_control:
+        bot_tool_message = _bot_tool_message(compact_text)
+        if bot_tool_message is not None or compact_text in APPROVAL_DETAIL_COMMANDS:
+            await _send_private_text(bot, user_id, bot_tool_message or APPROVAL_RULES_DETAIL_MESSAGE)
+            return True
     if await _handle_approver_management_command(bot, user_id, compact_text):
         return True
-    if _is_private_tool_text(compact_text) and not is_admin:
-        await _send_private_text(bot, user_id, "你只有基础审批权限：1/2/3 发送，取消 不发。")
+    if not pending_approval_control and _is_private_tool_text(compact_text) and not is_admin:
+        await _send_private_text(bot, user_id, BASIC_APPROVAL_DENIED_MESSAGE)
         return True
     if await _handle_private_whitelist_command(bot, user_id, compact_text):
         return True
@@ -3273,7 +3321,7 @@ async def _handle_group_approval_private(bot: Bot, user_id: int, text: str) -> b
     token_report_window = _parse_approval_token_report_command(compact_text)
     if token_report_window is not None:
         if not is_admin:
-            await _send_private_text(bot, user_id, "你只有基础审批权限：1/2/3 发送，取消 不发。")
+            await _send_private_text(bot, user_id, BASIC_APPROVAL_DENIED_MESSAGE)
             return True
         await _send_private_text(
             bot,
@@ -3284,47 +3332,47 @@ async def _handle_group_approval_private(bot: Bot, user_id: int, text: str) -> b
     suppression_report_limit = _parse_approval_suppression_report_command(compact_text)
     if suppression_report_limit is not None:
         if not is_admin:
-            await _send_private_text(bot, user_id, "你只有基础审批权限：1/2/3 发送，取消 不发。")
+            await _send_private_text(bot, user_id, BASIC_APPROVAL_DENIED_MESSAGE)
             return True
         await _send_private_text(bot, user_id, _format_suppression_report(suppression_report_limit))
         return True
     if compact_text in APPROVAL_REVIEW_STATUS_COMMANDS:
         if not is_admin:
-            await _send_private_text(bot, user_id, "你只有基础审批权限：1/2/3 发送，取消 不发。")
+            await _send_private_text(bot, user_id, BASIC_APPROVAL_DENIED_MESSAGE)
             return True
         await _send_private_text(bot, user_id, _format_approval_review_status())
         return True
     if compact_text in APPROVAL_REVIEW_ON_COMMANDS:
         if not is_admin:
-            await _send_private_text(bot, user_id, "你只有基础审批权限：1/2/3 发送，取消 不发。")
+            await _send_private_text(bot, user_id, BASIC_APPROVAL_DENIED_MESSAGE)
             return True
         await _set_approval_review_enabled(bot, user_id, True)
         return True
     if compact_text in APPROVAL_REVIEW_OFF_COMMANDS:
         if not is_admin:
-            await _send_private_text(bot, user_id, "你只有基础审批权限：1/2/3 发送，取消 不发。")
+            await _send_private_text(bot, user_id, BASIC_APPROVAL_DENIED_MESSAGE)
             return True
         await _set_approval_review_enabled(bot, user_id, False)
         return True
     if compact_text in {"开启", "打开", "恢复"}:
         if not is_admin:
-            await _send_private_text(bot, user_id, "你只有基础审批权限：1/2/3 发送，取消 不发。")
+            await _send_private_text(bot, user_id, BASIC_APPROVAL_DENIED_MESSAGE)
             return True
         await _set_approval_group_decision_enabled(bot, user_id, True)
         return True
     if compact_text in {"关闭", "关掉", "暂停"}:
         if not is_admin:
-            await _send_private_text(bot, user_id, "你只有基础审批权限：1/2/3 发送，取消 不发。")
+            await _send_private_text(bot, user_id, BASIC_APPROVAL_DENIED_MESSAGE)
             return True
         await _set_approval_group_decision_enabled(bot, user_id, False)
         return True
     if not _is_approval_control_text(compact_text):
         if _is_private_tool_text(compact_text) and not is_admin:
-            await _send_private_text(bot, user_id, "你只有基础审批权限：1/2/3 发送，取消 不发。")
+            await _send_private_text(bot, user_id, BASIC_APPROVAL_DENIED_MESSAGE)
             return True
         return False
     if _is_basic_approval_user(user_id) and not _is_basic_approval_control_text(compact_text):
-        await _send_private_text(bot, user_id, "你只有基础审批权限：1/2/3 发送，取消 不发。")
+        await _send_private_text(bot, user_id, BASIC_APPROVAL_DENIED_MESSAGE)
         return True
     cooldown_until = approval_choice_cooldowns.get(user_id, 0.0)
     if time.time() < cooldown_until and _is_approval_control_text(compact_text):
@@ -3342,7 +3390,7 @@ async def _handle_group_approval_private(bot: Bot, user_id: int, text: str) -> b
         high_quality = False
         choice_match = APPROVAL_CHOICE_RE.match(compact_text)
         if choice_match is not None:
-            candidate = _approval_candidate_by_index(approval, int(choice_match.group(1)))
+            candidate = _approval_candidate_by_index(approval, _approval_choice_index(choice_match.group(1)))
             high_quality = bool(choice_match.group(2))
             if high_quality and not is_admin:
                 await _send_private_text(bot, user_id, "你只有基础审批权限，不能标优。")
@@ -3353,7 +3401,7 @@ async def _handle_group_approval_private(bot: Bot, user_id: int, text: str) -> b
             reason_match = APPROVAL_REJECT_REASON_RE.match(compact_text)
             if reason_match is not None and is_admin:
                 owner_reason = reason_match.group("reason").strip()
-                reject_index = int(reason_match.group("index") or "1")
+                reject_index = _approval_choice_index(reason_match.group("index"), default=1)
                 rejected_candidate = _approval_candidate_by_index(approval, reject_index)
                 if owner_reason:
                     _save_approval_rejection_feedback(

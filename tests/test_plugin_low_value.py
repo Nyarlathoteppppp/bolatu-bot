@@ -213,6 +213,9 @@ def test_approval_choice_regex() -> None:
     assert APPROVAL_CHOICE_RE.match("1")
     assert APPROVAL_CHOICE_RE.match("2!")
     assert APPROVAL_CHOICE_RE.match("3！")
+    assert APPROVAL_CHOICE_RE.match("A")
+    assert APPROVAL_CHOICE_RE.match("b!")
+    assert APPROVAL_CHOICE_RE.match("C！")
     assert not APPROVAL_CHOICE_RE.match("4")
 
 
@@ -220,18 +223,24 @@ def test_approval_help_commands() -> None:
     assert "审批规则" in APPROVAL_HELP_COMMANDS
     assert "审批规则详情" in APPROVAL_DETAIL_COMMANDS
     assert "详细规则" in APPROVAL_DETAIL_COMMANDS
-    assert "1/2/3" in plugin.APPROVAL_RULES_MESSAGE
-    assert "bot工具" in plugin.APPROVAL_RULES_MESSAGE
+    assert "A/1" in plugin.APPROVAL_RULES_MESSAGE
+    assert "T 打开工具单" in plugin.APPROVAL_RULES_MESSAGE
     assert "bot工具目录" in plugin.APPROVAL_RULES_DETAIL_MESSAGE
     assert "bot工具 私聊" in plugin.APPROVAL_RULES_DETAIL_MESSAGE
     assert "bot工具 学习" in plugin.APPROVAL_RULES_DETAIL_MESSAGE
+    assert "A1拦截" in plugin.APPROVAL_RULES_DETAIL_MESSAGE
+    assert "B3群友画像" in plugin.APPROVAL_RULES_DETAIL_MESSAGE
     assert "/黑话：咱妈 指代：中国" in plugin._bot_tool_message("bot工具 黑话")
+    assert "张风雪 bot工具目录" in plugin._bot_tool_message("T")
+    assert "bot工具 查看" in plugin._bot_tool_message("A")
+    assert "bot工具 学习" in plugin._bot_tool_message("B")
+    assert "bot工具 模型" in plugin._bot_tool_message("C")
     assert "拦截 20" in plugin._bot_tool_message("bot工具 查看")
     assert "记忆 8" in plugin._bot_tool_message("bot工具 学习")
     assert "风格学习 20" in plugin._bot_tool_message("bot工具 风格")
     assert "群友画像 20" in plugin._bot_tool_message("bot工具 学习")
     assert "加审批" in plugin._bot_tool_message("bot工具 审批人")
-    assert "回 1/2/3" in plugin._bot_tool_message("bot 工具 审批")
+    assert "回 A/B/C" in plugin._bot_tool_message("bot 工具 审批")
     assert "关闭审查" in plugin.APPROVAL_RULES_MESSAGE
     assert "开启审查" in plugin._bot_tool_message("bot工具 开关")
     assert "切回复模型" in plugin._bot_tool_message("bot工具 模型")
@@ -239,6 +248,8 @@ def test_approval_help_commands() -> None:
     assert "可切换部分" in plugin._bot_tool_message("bot工具 模型")
     assert "模型状态" in plugin._bot_tool_message("bot工具 模型")
     assert "flows.decision" in plugin._bot_tool_message("bot工具 prompt")
+    assert plugin._bot_tool_shortcut_command("B3") == "群友画像 20"
+    assert plugin._bot_tool_shortcut_command("A 1") == "拦截 20"
 
 
 def test_parse_token_report_date_window() -> None:
@@ -706,6 +717,53 @@ def test_approval_detail_command_does_not_consume_pending(monkeypatch, tmp_path)
     assert "张风雪 bot工具目录" in bot.private_messages[-1][1]
 
 
+def test_approval_letter_choice_takes_priority_over_tool_menu(monkeypatch, tmp_path) -> None:
+    _use_temp_plugin_memory(monkeypatch, tmp_path)
+    approval = _pending_approval()
+    plugin.pending_group_approvals[approval.group_id] = approval
+    bot = FakeApprovalBot()
+
+    handled = asyncio.run(plugin._handle_group_approval_private(bot, 3370998238, "A"))
+
+    assert handled
+    assert bot.group_messages == [(1026813421, "第一条回复")]
+    assert not bot.private_messages or "bot工具 查看" not in bot.private_messages[-1][1]
+
+
+def test_approval_letter_cancel_takes_priority_over_tool_menu(monkeypatch, tmp_path) -> None:
+    _use_temp_plugin_memory(monkeypatch, tmp_path)
+    approval = _pending_approval()
+    plugin.pending_group_approvals[approval.group_id] = approval
+    bot = FakeApprovalBot()
+
+    handled = asyncio.run(plugin._handle_group_approval_private(bot, 3370998238, "D"))
+
+    assert handled
+    assert not bot.group_messages
+    assert bot.private_messages[-1] == (3370998238, "已取消。")
+    assert approval.group_id not in plugin.pending_group_approvals
+
+
+def test_tool_letter_menu_when_no_pending_approval(monkeypatch, tmp_path) -> None:
+    _use_temp_plugin_memory(monkeypatch, tmp_path)
+    bot = FakeApprovalBot()
+
+    handled = asyncio.run(plugin._handle_group_approval_private(bot, 3370998238, "A"))
+
+    assert handled
+    assert "bot工具 查看" in bot.private_messages[-1][1]
+
+
+def test_tool_shortcut_member_profile_report(monkeypatch, tmp_path) -> None:
+    _use_temp_plugin_memory(monkeypatch, tmp_path)
+    bot = FakeApprovalBot()
+
+    handled = asyncio.run(plugin._handle_group_approval_private(bot, 1535071184, "B3"))
+
+    assert handled
+    assert "群友画像：group=1026813421 limit=20" in bot.private_messages[-1][1]
+
+
 def test_approval_token_report_command_does_not_consume_pending(monkeypatch, tmp_path) -> None:
     store = _use_temp_plugin_memory(monkeypatch, tmp_path)
     store.add_llm_usage(
@@ -737,7 +795,7 @@ def test_basic_approver_cannot_use_token_tool(monkeypatch, tmp_path) -> None:
 
     assert handled
     assert plugin.pending_group_approvals[approval.group_id] == approval
-    assert bot.private_messages[-1] == (3370998238, "你只有基础审批权限：1/2/3 发送，取消 不发。")
+    assert bot.private_messages[-1] == (3370998238, "你只有基础审批权限：A/B/C/D/X/1/2/3/取消 处理审批单。")
 
 
 def test_owner_can_query_recent_memory_and_style(monkeypatch, tmp_path) -> None:
@@ -783,7 +841,7 @@ def test_basic_approver_cannot_query_recent_memory(monkeypatch, tmp_path) -> Non
 
     assert handled
     assert plugin.pending_group_approvals[approval.group_id] == approval
-    assert bot.private_messages[-1] == (3370998238, "你只有基础审批权限：1/2/3 发送，取消 不发。")
+    assert bot.private_messages[-1] == (3370998238, "你只有基础审批权限：A/B/C/D/X/1/2/3/取消 处理审批单。")
 
 
 def test_approval_token_report_date_command(monkeypatch, tmp_path) -> None:
@@ -895,7 +953,7 @@ def test_basic_approver_cannot_disable_review(monkeypatch, tmp_path) -> None:
 
     assert handled
     assert plugin._approval_review_enabled()
-    assert bot.private_messages[-1] == (3370998238, "你只有基础审批权限：1/2/3 发送，取消 不发。")
+    assert bot.private_messages[-1] == (3370998238, "你只有基础审批权限：A/B/C/D/X/1/2/3/取消 处理审批单。")
 
 
 def test_owner_can_query_model_status(monkeypatch, tmp_path) -> None:
@@ -1040,7 +1098,7 @@ def test_basic_approver_cannot_switch_model(monkeypatch, tmp_path) -> None:
     )
 
     assert handled
-    assert bot.private_messages[-1] == (3370998238, "你只有基础审批权限：1/2/3 发送，取消 不发。")
+    assert bot.private_messages[-1] == (3370998238, "你只有基础审批权限：A/B/C/D/X/1/2/3/取消 处理审批单。")
 
 
 def test_request_group_approval_auto_sends_first_candidate_when_review_disabled(monkeypatch, tmp_path) -> None:
@@ -1220,7 +1278,7 @@ def test_basic_approver_cannot_manage_private_whitelist(monkeypatch, tmp_path) -
     handled = asyncio.run(plugin._handle_group_approval_private(bot, 3370998238, "加私聊 123456789"))
 
     assert handled
-    assert bot.private_messages[-1] == (3370998238, "你只有基础审批权限：1/2/3 发送，取消 不发。")
+    assert bot.private_messages[-1] == (3370998238, "你只有基础审批权限：A/B/C/D/X/1/2/3/取消 处理审批单。")
     assert not plugin._private_user_allowed(123456789)
 
 
@@ -1247,13 +1305,13 @@ def test_approval_high_quality_choice_sends_and_records_positive(monkeypatch, tm
     plugin.pending_group_approvals[approval.group_id] = approval
     bot = FakeApprovalBot()
 
-    handled = asyncio.run(plugin._handle_group_approval_private(bot, 1535071184, "1!"))
+    handled = asyncio.run(plugin._handle_group_approval_private(bot, 1535071184, "B!"))
 
     assert handled
-    assert bot.group_messages == [(1026813421, "第一条回复")]
+    assert bot.group_messages == [(1026813421, "第二条回复")]
     approved = store.recent_approved_reply_feedback(1026813421, 3)
     assert len(approved) == 1
-    assert approved[0].candidate_text == "第一条回复"
+    assert approved[0].candidate_text == "第二条回复"
     assert approved[0].operator_id == 1535071184
 
 
