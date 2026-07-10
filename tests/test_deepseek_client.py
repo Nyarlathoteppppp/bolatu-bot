@@ -7,6 +7,7 @@ from qq_social_agent.deepseek_client import (
     DeepSeekClient,
     _log_llm_usage,
     _parse_jargon_terms,
+    _parse_member_profile_draft,
     _parse_reply_candidates,
     _parse_reply_decision,
     _sanitize_reply,
@@ -82,6 +83,24 @@ def test_parse_reply_decision_action_agree() -> None:
 
     assert decision.should_reply
     assert decision.action == "agree"
+
+
+def test_parse_reply_decision_action_care() -> None:
+    decision = _parse_reply_decision(
+        '{"should_reply": true, "confidence": 0.81, "action": "care", "reason": "压力很大"}'
+    )
+
+    assert decision.should_reply
+    assert decision.action == "care"
+
+
+def test_parse_reply_decision_action_care_chinese_alias() -> None:
+    decision = _parse_reply_decision(
+        '{"should_reply": true, "confidence": 0.81, "action": "关心", "reason": "明显低落"}'
+    )
+
+    assert decision.should_reply
+    assert decision.action == "care"
 
 
 def test_parse_reply_decision_action_answer() -> None:
@@ -213,6 +232,8 @@ def test_client_methods_use_expected_model_routes() -> None:
         "jargon": '{"terms":["柏拉图"]}',
         "reply": "一句话",
         "reply_candidates": '{"candidates":[{"text":"候选一句话","style":"自然","action":"reply"}]}',
+        "daily_review": "今天群里聊得挺热闹，我也算接上了几句。",
+        "member_profile": '{"summary":"爱聊行情和代码","interests":["股票","代码"],"speaking_style":"短句吐槽","representative_texts":["股票又亏了"]}',
         "mid_memory": '{"summary":"按人：A[#11111]说了事","recall_cues":["A[#11111]"]}',
         "style_learning": '{"rules":[{"situation":"聊亏钱","style":"短句吐槽","source_id":1}]}',
     }
@@ -276,6 +297,16 @@ def test_client_methods_use_expected_model_routes() -> None:
             current_nickname="A",
             mentioned=False,
         )
+        await client.daily_review(
+            persona=persona,
+            messages=messages,
+            chat_label="QQ 群聊",
+            today_label="2026-07-10",
+        )
+        await client.summarize_member_profile(
+            messages=messages,
+            member_label="A[#11111]",
+        )
         await client.summarize_mid_memory(messages=messages)
         await client.learn_style_rules(messages=messages)
 
@@ -286,9 +317,23 @@ def test_client_methods_use_expected_model_routes() -> None:
         ("jargon", "jargon"),
         ("reply", "reply"),
         ("reply_candidates", "reply"),
+        ("daily_review", "reply"),
+        ("member_profile", "memory"),
         ("mid_memory", "memory"),
         ("style_learning", "style"),
     ]
+
+
+def test_parse_member_profile_draft() -> None:
+    draft = _parse_member_profile_draft(
+        '{"summary":"爱聊行情和代码","interests":["股票","代码","股票"],'
+        '"speaking_style":"短句吐槽","representative_texts":["股票又亏了"]}'
+    )
+
+    assert draft.summary == "爱聊行情和代码"
+    assert draft.interests == ("股票", "代码")
+    assert draft.speaking_style == "短句吐槽"
+    assert draft.representative_texts == ("股票又亏了",)
 
 
 def test_parse_reply_candidates_logs_diagnostic_when_short(monkeypatch) -> None:

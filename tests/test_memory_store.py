@@ -85,6 +85,38 @@ def test_relevant_style_rules_match_current_text(tmp_path) -> None:
     assert rules[0].situation == "聊亏钱"
 
 
+def test_relevant_raw_corpus_examples_include_original_and_neighbors(tmp_path) -> None:
+    memory = MemoryStore(tmp_path / "bot.sqlite3")
+    memory.add_message(1, 100, "A", "今天午饭吃什么", created_at=100)
+    memory.add_message(1, 101, "B", "股票又亏麻了，真的顶不住", created_at=101)
+    memory.add_message(1, 102, "C", "这就是资本市场教育费", created_at=102)
+    memory.add_message(1, 999, "bot", "机器人旧回复", is_bot=True, created_at=103)
+
+    examples = memory.relevant_raw_corpus_examples(1, "股票亏了怎么接", limit=2, context_radius=1)
+
+    assert len(examples) == 1
+    assert examples[0].message.text == "股票又亏麻了，真的顶不住"
+    assert "倒霉" in examples[0].tags
+    assert [message.text for message in examples[0].before] == ["今天午饭吃什么"]
+    assert [message.text for message in examples[0].after] == ["这就是资本市场教育费"]
+
+
+def test_relevant_raw_corpus_examples_excludes_current_message(tmp_path) -> None:
+    memory = MemoryStore(tmp_path / "bot.sqlite3")
+    memory.add_message(1, 100, "A", "没人理我", created_at=100)
+    memory.add_message(1, 101, "B", "没人理我", created_at=101)
+
+    examples = memory.relevant_raw_corpus_examples(
+        1,
+        "没人理我",
+        limit=3,
+        exclude_user_id=101,
+        exclude_text="没人理我",
+    )
+
+    assert [example.message.user_id for example in examples] == [100]
+
+
 def test_member_profiles_track_aliases_by_user_id(tmp_path) -> None:
     memory = MemoryStore(tmp_path / "bot.sqlite3")
 
@@ -131,6 +163,44 @@ def test_member_profiles_backfill_from_existing_messages(tmp_path) -> None:
     assert len(profiles) == 1
     assert profiles[0].display_name == "🦕"
     assert profiles[0].aliases == ("🦕", "乌木")
+
+
+def test_member_impressions_track_tags_keywords_and_ai_summary(tmp_path) -> None:
+    memory = MemoryStore(tmp_path / "bot.sqlite3")
+
+    memory.add_message(1, 3370998238, "乌木", "股票又亏麻了，代码也炸了", created_at=100)
+    memory.add_message(1, 3370998238, "乌木", "比特币跌得有点顶不住", created_at=200)
+    memory.add_member_profile_summary(
+        group_id=1,
+        user_id=3370998238,
+        profile_summary="经常聊行情和代码，遇到亏钱会直接破防。",
+        interests=["股票", "比特币", "代码"],
+        speaking_style="短句吐槽，情绪比较直接。",
+        representative_texts=["股票又亏麻了，代码也炸了"],
+        start_at=100,
+        end_at=200,
+        message_count=2,
+    )
+
+    impressions = memory.member_impressions_for_context(1, [3370998238], limit=8)
+
+    assert len(impressions) == 1
+    impression = impressions[0]
+    assert impression.message_count == 2
+    assert impression.ai_summary == "经常聊行情和代码，遇到亏钱会直接破防。"
+    assert impression.ai_interests == ("股票", "比特币", "代码")
+    assert "行情" in [tag for tag, _ in impression.top_tags]
+    assert impression.ai_representative_texts == ("股票又亏麻了，代码也炸了",)
+
+
+def test_active_member_ids_since_respects_min_messages(tmp_path) -> None:
+    memory = MemoryStore(tmp_path / "bot.sqlite3")
+
+    memory.add_message(1, 100, "A", "第一句有内容", created_at=100)
+    memory.add_message(1, 100, "A", "第二句有内容", created_at=110)
+    memory.add_message(1, 200, "B", "只有一句", created_at=120)
+
+    assert memory.active_member_ids_since(1, since_at=90, limit=10, min_messages=2) == [100]
 
 
 def test_bot_sent_message_and_recalled_feedback_round_trip(tmp_path) -> None:

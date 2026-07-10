@@ -52,6 +52,14 @@ class StyleRuleDraft:
 
 
 @dataclass(frozen=True)
+class MemberProfileDraft:
+    summary: str
+    interests: tuple[str, ...]
+    speaking_style: str
+    representative_texts: tuple[str, ...]
+
+
+@dataclass(frozen=True)
 class ReplyCandidateDraft:
     text: str
     action: str
@@ -63,6 +71,7 @@ SOCIAL_ACTIONS = {
     "reply",
     "answer",
     "agree",
+    "care",
     "tease",
     "ask_back",
     "mock_repeated_question",
@@ -179,6 +188,7 @@ class DeepSeekClient:
         chat_label: str = "QQ 群聊",
         memory_context: str = "",
         style_context: str = "",
+        raw_corpus_context: str = "",
         jargon_context: str = "",
         member_context: str = "",
         fresh_context_hint: str = "",
@@ -289,6 +299,7 @@ class DeepSeekClient:
         fresh_context: str = "",
         memory_context: str = "",
         style_context: str = "",
+        raw_corpus_context: str = "",
         jargon_context: str = "",
         member_context: str = "",
         recall_feedback_context: str = "",
@@ -341,6 +352,7 @@ class DeepSeekClient:
             member_context_section=_optional_section("当前相关群友", member_context),
             recall_feedback_context_section=_optional_section("主人撤回反馈", recall_feedback_context),
             style_context_section=_optional_section("群聊表达风格参考", style_context),
+            raw_corpus_context_section=_optional_section("群友原文语料参考", raw_corpus_context),
             jargon_context_section=_optional_section("群内黑话词典", jargon_context),
             mention_targets_section=_optional_section("可艾特目标", mention_targets),
             priority_context_section=_optional_section("私聊优先级", priority_context),
@@ -365,6 +377,45 @@ class DeepSeekClient:
         content = response.choices[0].message.content or ""
         return _sanitize_reply(content, persona.max_reply_chars)
 
+    async def summarize_member_profile(
+        self,
+        *,
+        messages: list[ChatMessage],
+        member_label: str,
+        chat_label: str = "QQ 群聊",
+    ) -> MemberProfileDraft:
+        context = "\n".join(_format_message(msg) for msg in messages[-120:])
+        if not context:
+            return MemberProfileDraft("", (), "", ())
+        system = (
+            "你只做群友画像摘要。只根据给出的这个人的原始发言判断，"
+            "不要编造身份、现实信息、政治立场或关系。输出严格 JSON。"
+        )
+        user = (
+            f"聊天场景：{chat_label}\n"
+            f"画像对象：{member_label}\n"
+            "任务：总结这个群友的发言印象、兴趣话题、说话方式，并挑选少量代表性原话。\n"
+            "要求：短、具体、可用于以后回复这个人；代表性原话必须来自原文，不要改写。\n"
+            "JSON 格式："
+            "{\"summary\":\"...\",\"interests\":[\"...\"],"
+            "\"speaking_style\":\"...\",\"representative_texts\":[\"...\"]}\n\n"
+            f"该群友最近发言：\n{context}"
+        )
+        response = await self._chat_completion(
+            task="member_profile",
+            route_name="memory",
+            request={
+                "temperature": 0.2,
+                "max_tokens": 420,
+                "response_format": {"type": "json_object"},
+                "messages": [
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user},
+                ],
+            },
+        )
+        return _parse_member_profile_draft(response.choices[0].message.content or "")
+
     async def reply_candidates(
         self,
         *,
@@ -381,6 +432,7 @@ class DeepSeekClient:
         fresh_context: str = "",
         memory_context: str = "",
         style_context: str = "",
+        raw_corpus_context: str = "",
         jargon_context: str = "",
         member_context: str = "",
         recall_feedback_context: str = "",
@@ -431,6 +483,7 @@ class DeepSeekClient:
             recall_feedback_context_section=_optional_section("主人撤回/不准奏反馈", recall_feedback_context),
             positive_feedback_context_section=_optional_section("审批人标记过的优质发言方向", positive_feedback_context),
             style_context_section=_optional_section("群聊表达风格参考", style_context),
+            raw_corpus_context_section=_optional_section("群友原文语料参考", raw_corpus_context),
             jargon_context_section=_optional_section("群内黑话词典", jargon_context),
             mention_targets_section=_optional_section("可艾特目标", mention_targets),
             market_section=market_section,
@@ -460,6 +513,48 @@ class DeepSeekClient:
             fallback_action=normalized_action,
             limit=candidate_count,
         )
+
+    async def daily_review(
+        self,
+        *,
+        persona: Persona,
+        messages: list[ChatMessage],
+        chat_label: str,
+        today_label: str,
+        max_chars: int = 520,
+    ) -> str:
+        context_messages = messages[-140:]
+        context = "\n".join(_format_message(msg) for msg in context_messages)
+        if not context:
+            context = "（今天还没有可复盘的聊天记录）"
+        system = self.prompts.render(
+            "daily_review",
+            "system",
+            persona_prompt=persona.prompt,
+            max_reply_chars=max_chars,
+        )
+        user = self.prompts.render(
+            "daily_review",
+            "user",
+            chat_label=chat_label,
+            today_label=today_label,
+            context=context,
+        )
+        request = {
+            "max_tokens": max(self.config.max_tokens, 700),
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+        }
+        if self.config.thinking == "enabled":
+            request["reasoning_effort"] = self.config.reasoning_effort
+        else:
+            request["temperature"] = min(0.85, max(0.5, self.config.temperature))
+
+        response = await self._chat_completion(task="daily_review", route_name="reply", request=request)
+        content = response.choices[0].message.content or ""
+        return _sanitize_reply(content, max_chars)
 
     async def summarize_mid_memory(
         self,
@@ -669,6 +764,12 @@ def _normalize_action(value: str, *, should_reply: bool) -> str:
         "approve": "agree",
         "认可": "agree",
         "同意": "agree",
+        "care": "care",
+        "comfort": "care",
+        "empathy": "care",
+        "关心": "care",
+        "安慰": "care",
+        "承接": "care",
         "market": "market_check",
         "tool": "market_check",
         "search": "fresh_context",
@@ -706,6 +807,42 @@ def _parse_mid_memory(content: str) -> MidMemoryDraft:
         raw_cues = []
     cues = tuple(str(cue).strip() for cue in raw_cues if str(cue).strip())[:5]
     return MidMemoryDraft(summary, cues)
+
+
+def _parse_member_profile_draft(content: str) -> MemberProfileDraft:
+    try:
+        raw = _loads_json_object(content)
+    except json.JSONDecodeError:
+        return MemberProfileDraft("", (), "", ())
+    summary = str(raw.get("summary", "")).strip()
+    speaking_style = str(raw.get("speaking_style", "")).strip()
+    interests = _parse_string_list(raw.get("interests", []), limit=8, item_limit=32)
+    representative_texts = _parse_string_list(raw.get("representative_texts", []), limit=5, item_limit=140)
+    return MemberProfileDraft(
+        summary[:420],
+        tuple(interests),
+        speaking_style[:260],
+        tuple(representative_texts),
+    )
+
+
+def _parse_string_list(value: object, *, limit: int, item_limit: int) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    result: list[str] = []
+    seen: set[str] = set()
+    for item in value:
+        text = re.sub(r"\s+", " ", str(item)).strip()
+        if not text:
+            continue
+        key = text.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(text[:item_limit])
+        if len(result) >= limit:
+            break
+    return result
 
 
 def _parse_style_rules(

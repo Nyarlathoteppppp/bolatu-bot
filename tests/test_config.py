@@ -147,6 +147,7 @@ def test_prompt_registry_loads_central_prompt_file() -> None:
     )
     assert "群聊三候选生成" in prompts.raw["flows"]["reply_candidates"]["flow"]
     assert "普通接话" in prompts.action_guide("reply")
+    assert "关心/承接" in prompts.action_guide("care")
 
 
 def test_central_prompt_file_contains_all_runtime_flows() -> None:
@@ -156,6 +157,7 @@ def test_central_prompt_file_contains_all_runtime_flows() -> None:
         "jargon_select",
         "reply",
         "reply_candidates",
+        "daily_review",
         "mid_memory",
         "style_learning",
     }
@@ -163,7 +165,14 @@ def test_central_prompt_file_contains_all_runtime_flows() -> None:
     assert required_flows <= set(prompts.flows)
     for flow in required_flows:
         assert prompts.raw["flows"][flow]["flow"]
-        assert prompts.render(flow, "system", persona_name="张风雪", persona_decision_prompt="人格", persona_prompt="人格")
+        assert prompts.render(
+            flow,
+            "system",
+            persona_name="张风雪",
+            persona_decision_prompt="人格",
+            persona_prompt="人格",
+            max_reply_chars=520,
+        )
 
 
 def test_persona_registry_loads_persona_from_central_prompt_file() -> None:
@@ -171,5 +180,6 @@ def test_persona_registry_loads_persona_from_central_prompt_file() -> None:
     persona = registry.get("zhangxuefeng")
 
     assert persona.name == "张风雪"
-    assert "毒舌美少女" in persona.prompt
-    assert "QQ 群里的毒舌美少女" in persona.decision_prompt
+    assert "温柔美少女妹妹" in persona.prompt
+    assert "QQ 群里的温柔美少女妹妹" in persona.decision_prompt
+    assert "棘手的大问题" in persona.decision_prompt

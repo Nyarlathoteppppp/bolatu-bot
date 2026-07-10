@@ -41,7 +41,7 @@ from .decision_gate import (
     is_low_value_group_text as _is_low_value_group_text,
     pre_decision_gate as _pre_decision_gate,
 )
-from .deepseek_client import DeepSeekClient, ReplyDecision, set_usage_recorder
+from .deepseek_client import DeepSeekClient, MemberProfileDraft, ReplyDecision, set_usage_recorder
 from .group_jargon import (
     GroupJargonEntry,
     detect_group_jargon_terms,
@@ -54,9 +54,12 @@ from .memory import (
     CustomJargonEntry,
     LLMUsageEvent,
     LLMUsageSummary,
+    MemberImpression,
     MemberProfile,
+    MemberProfileSummary,
     MemoryStore,
     MemorySummary,
+    RawCorpusExample,
     RecalledReplyFeedback,
     StyleRule,
 )
@@ -97,6 +100,7 @@ group_passive_retry_tasks: dict[int, asyncio.Task[None]] = {}
 group_passive_decision_state: dict[int, "PassiveDecisionState"] = {}
 pending_group_approvals: dict[int, "PendingGroupApproval"] = {}
 recent_suppression_events: list["SuppressionEvent"] = []
+daily_review_tasks: dict[str, asyncio.Task[None]] = {}
 approval_processing_lock = asyncio.Lock()
 approval_choice_cooldowns: dict[int, float] = {}
 
@@ -108,6 +112,15 @@ STYLE_LEARN_INTERVAL_SECONDS = 60 * 60
 STYLE_LEARN_MESSAGE_LIMIT = 40
 STYLE_LEARN_MIN_MESSAGES = 12
 STYLE_RULE_CONTEXT_LIMIT = 12
+MEMBER_PROFILE_SUMMARY_INTERVAL_SECONDS = 24 * 60 * 60
+MEMBER_PROFILE_SUMMARY_LOOKBACK_SECONDS = 7 * 24 * 60 * 60
+MEMBER_PROFILE_SUMMARY_ACTIVE_LIMIT = 20
+MEMBER_PROFILE_SUMMARY_MIN_MESSAGES = 5
+MEMBER_PROFILE_SUMMARY_MESSAGE_LIMIT = 120
+MEMBER_IMPRESSION_CONTEXT_LIMIT = 8
+RAW_CORPUS_CONTEXT_LIMIT = 6
+RAW_CORPUS_CANDIDATE_LIMIT = 240
+RAW_CORPUS_CONTEXT_RADIUS = 2
 JARGON_CONTEXT_LOOKBACK = 4
 CUSTOM_JARGON_CONTEXT_LIMIT = 10
 GROUP_BUFFER_SECONDS = 6.0
@@ -115,6 +128,9 @@ GROUP_INFLIGHT_BUFFER_RETRY_SECONDS = 1.0
 GROUP_PASSIVE_DECISION_GAP_SECONDS = 30
 GROUP_PASSIVE_DECISION_EVERY_MESSAGES = 3
 SUPPRESSION_EVENTS_LIMIT = 80
+DAILY_REVIEW_HOUR = 0
+DAILY_REVIEW_MINUTE = 0
+DAILY_REVIEW_MESSAGE_LIMIT = 140
 ADDRESS_REPEAT_WINDOW_SECONDS = 10 * 60
 MENTION_TARGET_LIMIT = 8
 REPEAT_MENTION_SUPPRESS_SECONDS = 10 * 60
@@ -166,6 +182,8 @@ BOT_TOOL_SECTION_ALIASES = {
     "记忆": "learning",
     "回想": "learning",
     "风格": "learning",
+    "画像": "learning",
+    "印象": "learning",
     "learning": "learning",
     "prompt": "prompt",
     "提示词": "prompt",
@@ -193,6 +211,19 @@ MODEL_ROUTE_COMMAND_RE = re.compile(
 )
 MEMORY_REPORT_COMMAND_RE = re.compile(r"^(?:/)?(?:记忆|近期记忆|查看记忆|回想|聊天回想|memory)\s*(?P<limit>\d{0,2})$")
 STYLE_REPORT_COMMAND_RE = re.compile(r"^(?:/)?(?:风格|近期风格|查看风格|风格学习|学习风格|style)\s*(?P<limit>\d{0,2})$")
+MEMBER_IMPRESSION_REPORT_COMMAND_RE = re.compile(
+    r"^(?:/)?(?:群友画像|成员画像|画像|印象|member(?:s)?|profile)\s*(?P<limit>\d{0,2})$",
+    re.IGNORECASE,
+)
+PRIVATE_CONTEXT_RESET_COMMANDS = {
+    "清空上下文",
+    "清空背景",
+    "重置上下文",
+    "重新开始",
+    "清空私聊",
+    "/清空上下文",
+    "/reset",
+}
 MODEL_ROUTE_INFOS = (
     ("decision", "决策", "群聊是否插嘴、action、是否需要联网搜索"),
     ("reply", "回复", "私聊回复、群聊审批三候选生成"),
@@ -304,6 +335,14 @@ def _record_llm_usage(
 async def _send_approval_rules_on_connect(bot: Bot) -> None:
     await _send_approval_rules_to_approvers(bot, reason="bot_connect")
     await _send_changelog_notice_to_approvers(bot)
+    _ensure_daily_review_task(bot)
+
+
+@get_driver().on_shutdown
+async def _cancel_daily_review_tasks() -> None:
+    for task in daily_review_tasks.values():
+        task.cancel()
+    daily_review_tasks.clear()
 
 
 async def _send_approval_rules_to_approvers(bot: Bot, *, reason: str) -> None:
@@ -350,6 +389,178 @@ def _mark_changelog_notice_sent(marker_key: str, approver_id: int) -> None:
 
 def _changelog_notice_marker(marker_key: str, approver_id: int) -> str:
     return f"{marker_key}:{approver_id}"
+
+
+def _ensure_daily_review_task(bot: Bot) -> None:
+    bot_key = str(getattr(bot, "self_id", "default"))
+    task = daily_review_tasks.get(bot_key)
+    if task is not None and not task.done():
+        return
+    daily_review_tasks[bot_key] = asyncio.create_task(_run_daily_review_scheduler(bot, bot_key))
+    logger.info(f"qq_social_agent daily review scheduler started: bot={bot_key}")
+
+
+async def _run_daily_review_scheduler(bot: Bot, bot_key: str) -> None:
+    try:
+        while True:
+            await asyncio.sleep(_seconds_until_next_daily_review())
+            await _send_due_daily_reviews(bot)
+            await asyncio.sleep(120)
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        logger.warning(f"qq_social_agent daily review scheduler stopped: bot={bot_key} error={exc}")
+    finally:
+        if daily_review_tasks.get(bot_key) is asyncio.current_task():
+            daily_review_tasks.pop(bot_key, None)
+
+
+def _seconds_until_next_daily_review(now: float | None = None) -> float:
+    current = time.time() if now is None else now
+    target = _local_timestamp_for_today(DAILY_REVIEW_HOUR, DAILY_REVIEW_MINUTE, now=current)
+    if current <= target:
+        return max(1.0, target - current)
+    if current - target <= 90:
+        return 1.0
+    return max(1.0, target + 24 * 60 * 60 - current)
+
+
+async def _send_due_daily_reviews(bot: Bot) -> None:
+    if deepseek_client is None:
+        logger.warning("qq_social_agent daily review skipped: deepseek_client_not_ready")
+        return
+    target_groups = _daily_review_target_groups()
+    if not target_groups:
+        logger.info("qq_social_agent daily review skipped: no_target_groups")
+        return
+    now = time.time()
+    start_at, end_at, review_label = _daily_review_window(now)
+    for group_id in target_groups:
+        if not _daily_review_group_enabled(group_id, now=now):
+            logger.info(f"qq_social_agent daily review skipped: group={group_id} disabled_or_muted")
+            continue
+        sent_key = _daily_review_sent_key(group_id, review_label)
+        if memory.app_kv_get(sent_key) == "sent":
+            logger.info(f"qq_social_agent daily review skipped: group={group_id} already_sent date={review_label}")
+            continue
+        await _send_daily_review_for_group(
+            bot,
+            group_id=group_id,
+            start_at=start_at,
+            end_at=end_at,
+            review_label=review_label,
+            sent_key=sent_key,
+        )
+
+
+async def _send_daily_review_for_group(
+    bot: Bot,
+    *,
+    group_id: int,
+    start_at: float,
+    end_at: float,
+    review_label: str,
+    sent_key: str,
+) -> None:
+    persona_id = str(memory.group_state(group_id)["persona"] or app_config.group_config(group_id).get("persona") or app_config.default_persona)
+    persona = personas.get(persona_id)
+    messages = memory.messages_between(
+        group_id,
+        start_at=start_at,
+        end_at=end_at,
+        limit=DAILY_REVIEW_MESSAGE_LIMIT,
+    )
+    try:
+        review = await deepseek_client.daily_review(
+            persona=persona,
+            messages=messages,
+            chat_label=f"QQ 群 {group_id}",
+            today_label=review_label,
+        ) if deepseek_client is not None else ""
+    except Exception as exc:
+        logger.warning(f"qq_social_agent daily review generation failed: group={group_id} error={exc}")
+        return
+    if not review:
+        review = "今天群里没怎么留给我发挥，我先记一笔：大家还是挺能聊的。"
+    review, guarded = sanitize_political_output(review)
+    review = _sanitize_generated_text(review)
+    if guarded:
+        logger.info(f"qq_social_agent political guard daily review output: group={group_id}")
+    parts = split_reply_messages(review, max_messages=3)
+    if not parts:
+        return
+    for index, part in enumerate(parts):
+        try:
+            message_id = await _send_group_message(bot, group_id, Message(part))
+            _record_bot_sent_message(
+                group_id=group_id,
+                message_id=message_id,
+                bot_reply=part,
+                trigger_user_id=0,
+                trigger_nickname="每日复盘",
+                trigger_text=f"{review_label} 午夜复盘",
+                action="daily_review",
+            )
+            memory.add_message(group_id, int(getattr(bot, "self_id", 0) or 0), persona.name, part, is_bot=True)
+        except ActionFailed as exc:
+            logger.warning(
+                "qq_social_agent failed sending daily review: "
+                f"group={group_id} {_action_failed_summary(exc)}"
+            )
+            return
+        if index < len(parts) - 1:
+            await asyncio.sleep(0.9)
+    memory.app_kv_set(sent_key, "sent")
+    logger.info(
+        "qq_social_agent daily review sent: "
+        f"group={group_id} date={review_label} messages={len(messages)} parts={len(parts)}"
+    )
+
+
+def _daily_review_target_groups() -> tuple[int, ...]:
+    if app_config.allowed_groups:
+        return tuple(sorted(app_config.allowed_groups))
+    group_ids: list[int] = []
+    for raw_group_id in app_config.groups:
+        if str(raw_group_id).isdigit():
+            group_ids.append(int(raw_group_id))
+    return tuple(sorted(set(group_ids)))
+
+
+def _daily_review_group_enabled(group_id: int, *, now: float) -> bool:
+    if not app_config.group_allowed(group_id):
+        return False
+    group_cfg = app_config.group_config(group_id)
+    state = memory.group_state(group_id)
+    if not bool(group_cfg.get("enabled", True)) or not bool(state["enabled"]):
+        return False
+    return float(state["muted_until"]) <= now
+
+
+def _daily_review_sent_key(group_id: int, today_label: str) -> str:
+    return f"daily_review_sent:{group_id}:{today_label}"
+
+
+def _daily_review_window(now: float) -> tuple[float, float, str]:
+    end_at = _local_timestamp_for_today(DAILY_REVIEW_HOUR, DAILY_REVIEW_MINUTE, now=now)
+    if now < end_at:
+        end_at -= 24 * 60 * 60
+    start_at = end_at - 24 * 60 * 60
+    local_end = time.localtime(end_at - 1)
+    label = f"{local_end.tm_year:04d}-{local_end.tm_mon:02d}-{local_end.tm_mday:02d}"
+    return start_at, end_at, label
+
+
+def _local_day_start_and_label(now: float) -> tuple[float, str]:
+    local = time.localtime(now)
+    start = time.mktime((local.tm_year, local.tm_mon, local.tm_mday, 0, 0, 0, -1, -1, -1))
+    label = f"{local.tm_year:04d}-{local.tm_mon:02d}-{local.tm_mday:02d}"
+    return start, label
+
+
+def _local_timestamp_for_today(hour: int, minute: int, *, now: float) -> float:
+    local = time.localtime(now)
+    return time.mktime((local.tm_year, local.tm_mon, local.tm_mday, hour, minute, 0, -1, -1, -1))
 
 
 def _is_owner_user(user_id: int) -> bool:
@@ -603,6 +814,38 @@ def _format_recent_style_report(group_id: int | None, limit: int) -> str:
         lines.append(f"{index}. 当{rule.situation}时，可以{rule.style}")
         lines.append(f"   来源：{source}")
         lines.append(f"   生成：{created_at}")
+    return "\n".join(lines)
+
+
+def _format_member_impression_report(group_id: int | None, limit: int) -> str:
+    if group_id is None:
+        return "群友画像：当前配置了多个群或没有群，暂不支持默认查询。"
+    impressions = memory.recent_member_impressions(group_id, limit)
+    lines = [f"群友画像：group={group_id} limit={limit}"]
+    if not impressions:
+        lines.append("暂无群友画像。")
+        return "\n".join(lines)
+    for index, impression in enumerate(impressions, start=1):
+        label = _member_label(impression.user_id, impression.display_name)
+        tags = "、".join(f"{tag}x{count}" for tag, count in impression.top_tags[:4]) or "无"
+        keywords = "、".join(term for term, _ in impression.top_keywords[:6]) or "无"
+        lines.append(f"{index}. {label}，记录发言 {impression.message_count} 条")
+        if impression.aliases:
+            aliases = "、".join(alias for alias in impression.aliases if alias != impression.display_name) or "无"
+            lines.append(f"   曾用名：{aliases}")
+        if impression.ai_summary:
+            lines.append(f"   长期印象：{_short_notice_text(impression.ai_summary, 120)}")
+        if impression.ai_interests:
+            lines.append(f"   兴趣/常聊：{'、'.join(impression.ai_interests[:6])}")
+        if impression.ai_speaking_style:
+            lines.append(f"   说话方式：{_short_notice_text(impression.ai_speaking_style, 100)}")
+        lines.append(f"   后端标签：{tags}")
+        lines.append(f"   高频词：{keywords}")
+        sample_texts = impression.ai_representative_texts or impression.recent_texts
+        if sample_texts:
+            lines.append(f"   原话样本：{_short_notice_text(' / '.join(sample_texts[:2]), 120)}")
+        if impression.ai_summary_at:
+            lines.append(f"   AI 摘要：{_format_local_time(impression.ai_summary_at)}")
     return "\n".join(lines)
 
 
@@ -953,6 +1196,7 @@ async def _handle_group_message_locked(
     positive_feedback_context = ""
     member_context = ""
     style_context = ""
+    raw_corpus_context = ""
     jargon_context = ""
     context_query = _context_query_text(text, nickname, context_recent)
 
@@ -994,10 +1238,10 @@ async def _handle_group_message_locked(
             )
         )
         member_context = _format_member_context(
-            memory.member_profiles_for_context(
+            memory.member_impressions_for_context(
                 group_id,
                 _related_member_user_ids(context_recent, current_user_id=user_id),
-                limit=8,
+                limit=MEMBER_IMPRESSION_CONTEXT_LIMIT,
             )
         )
         style_context = _format_style_context(
@@ -1129,10 +1373,10 @@ async def _handle_group_message_locked(
         )
     if not member_context:
         member_context = _format_member_context(
-            memory.member_profiles_for_context(
+            memory.member_impressions_for_context(
                 group_id,
                 _related_member_user_ids(context_recent, current_user_id=user_id),
-                limit=8,
+                limit=MEMBER_IMPRESSION_CONTEXT_LIMIT,
             )
         )
     if not style_context:
@@ -1143,6 +1387,17 @@ async def _handle_group_message_locked(
                 limit=STYLE_RULE_CONTEXT_LIMIT,
             )
         )
+    raw_corpus_context = _format_raw_corpus_context(
+        memory.relevant_raw_corpus_examples(
+            group_id,
+            context_query,
+            limit=RAW_CORPUS_CONTEXT_LIMIT,
+            candidate_limit=RAW_CORPUS_CANDIDATE_LIMIT,
+            context_radius=RAW_CORPUS_CONTEXT_RADIUS,
+            exclude_user_id=user_id,
+            exclude_text=text,
+        )
+    )
     if not jargon_context:
         jargon_context = await _selected_group_jargon_context(
             group_id,
@@ -1226,6 +1481,7 @@ async def _handle_group_message_locked(
             fresh_context=fresh_context,
             memory_context=memory_context,
             style_context=style_context,
+            raw_corpus_context=raw_corpus_context,
             jargon_context=jargon_context,
             member_context=member_context,
             recall_feedback_context=recall_feedback_context,
@@ -1265,10 +1521,11 @@ async def _handle_group_message_locked(
 
     approval_candidates: list[PendingApprovalCandidate] = []
     for index, draft in enumerate(reply_candidates, start=1):
-        candidate_text = draft.text
+        candidate_text = _sanitize_generated_text(draft.text)
         if market_report:
             candidate_text = f"{market_report}\n{candidate_text}".strip()
         candidate_text, guarded = sanitize_political_output(candidate_text)
+        candidate_text = _sanitize_generated_text(candidate_text)
         if guarded:
             logger.info(f"qq_social_agent political guard output: group={group_id} candidate={index}")
         if not candidate_text:
@@ -1324,6 +1581,13 @@ async def handle_private_message(bot: Bot, event: PrivateMessageEvent) -> None:
 
     if not _private_user_can_chat(user_id):
         logger.info(f"qq_social_agent ignored private: user={user_id} not_allowed")
+        return
+
+    if text in PRIVATE_CONTEXT_RESET_COMMANDS:
+        chat_id = _private_chat_id(user_id)
+        memory.reset_group_messages(chat_id)
+        await bot.send_private_msg(user_id=user_id, message=Message("私聊上下文已清空，重新开始。"))
+        logger.info(f"qq_social_agent private context reset: user={user_id}")
         return
 
     logger.info(f"qq_social_agent private start: user={user_id} text={text!r}")
@@ -1389,6 +1653,7 @@ async def handle_private_message(bot: Bot, event: PrivateMessageEvent) -> None:
         reply = "我是个美少女人家不知道呢。"
         logger.info(f"qq_social_agent fallback private reply: user={user_id} reason=empty_model_reply")
     reply, guarded = sanitize_political_output(reply)
+    reply = _sanitize_generated_text(reply)
     if guarded:
         logger.info(f"qq_social_agent political guard private output: user={user_id}")
 
@@ -2200,6 +2465,8 @@ async def _maintain_group_learning(group_id: int) -> None:
     if deepseek_client is None:
         return
 
+    await _maintain_member_profile_summaries(group_id)
+
     mid_messages = memory.messages_for_mid_summary(
         group_id,
         keep_recent=app_config.context_limit,
@@ -2272,6 +2539,64 @@ async def _maintain_group_learning(group_id: int) -> None:
         logger.warning(f"qq_social_agent style learning skipped: group={group_id} error={exc}")
 
 
+async def _maintain_member_profile_summaries(group_id: int) -> None:
+    if deepseek_client is None:
+        return
+    now = time.time()
+    start_at = now - MEMBER_PROFILE_SUMMARY_LOOKBACK_SECONDS
+    active_user_ids = memory.active_member_ids_since(
+        group_id,
+        since_at=start_at,
+        limit=MEMBER_PROFILE_SUMMARY_ACTIVE_LIMIT,
+        min_messages=MEMBER_PROFILE_SUMMARY_MIN_MESSAGES,
+    )
+    if not active_user_ids:
+        return
+    for user_id in active_user_ids:
+        last_summary_at = memory.last_member_profile_summary_at(group_id, user_id)
+        if now - last_summary_at < MEMBER_PROFILE_SUMMARY_INTERVAL_SECONDS:
+            continue
+        messages = memory.member_messages_between(
+            group_id,
+            user_id,
+            start_at=start_at,
+            end_at=now + 1,
+            limit=MEMBER_PROFILE_SUMMARY_MESSAGE_LIMIT,
+        )
+        if len(messages) < MEMBER_PROFILE_SUMMARY_MIN_MESSAGES:
+            continue
+        label = _member_label(user_id, messages[-1].nickname)
+        try:
+            draft = await deepseek_client.summarize_member_profile(
+                messages=messages,
+                member_label=label,
+                chat_label="QQ 群聊",
+            )
+        except Exception as exc:
+            logger.warning(
+                "qq_social_agent member profile summary skipped: "
+                f"group={group_id} user={user_id} error={exc}"
+            )
+            continue
+        if not draft.summary:
+            continue
+        memory.add_member_profile_summary(
+            group_id=group_id,
+            user_id=user_id,
+            profile_summary=draft.summary,
+            interests=list(draft.interests),
+            speaking_style=draft.speaking_style,
+            representative_texts=list(draft.representative_texts),
+            start_at=messages[0].created_at,
+            end_at=messages[-1].created_at,
+            message_count=len(messages),
+        )
+        logger.info(
+            "qq_social_agent member profile summarized: "
+            f"group={group_id} user={user_id} messages={len(messages)}"
+        )
+
+
 def _format_memory_context(summaries: list[MemorySummary]) -> str:
     if not summaries:
         return ""
@@ -2331,6 +2656,40 @@ def _format_style_context(rules: list[StyleRule]) -> str:
     return "\n".join(lines)
 
 
+def _format_raw_corpus_context(examples: list[RawCorpusExample]) -> str:
+    if not examples:
+        return ""
+    lines = [
+        "以下是群友原文语料和少量前后文，只参考语气、节奏、黑话和接话方式；"
+        "禁止复制完整原句，禁止把旧语料当作当前事实。"
+    ]
+    for index, example in enumerate(examples, start=1):
+        tags = "、".join(example.tags) if example.tags else "未标注"
+        speaker = _member_label(example.message.user_id, example.message.nickname)
+        lines.append(
+            f"{index}. 标签：{tags}；说话人：{speaker}；原话：“{_trim_inline(example.message.text, 72)}”"
+        )
+        context = _format_raw_corpus_neighbors(example)
+        if context:
+            lines.append(f"   前后文：{context}")
+    return "\n".join(lines)
+
+
+def _format_raw_corpus_neighbors(example: RawCorpusExample) -> str:
+    items: list[str] = []
+    for message in (*example.before[-2:], *example.after[:2]):
+        speaker = "机器人" if message.is_bot else _member_label(message.user_id, message.nickname)
+        items.append(f"{speaker}: {_trim_inline(message.text, 32)}")
+    return " / ".join(items)
+
+
+def _trim_inline(text: str, limit: int) -> str:
+    compact = re.sub(r"\s+", " ", text).strip()
+    if len(compact) <= limit:
+        return compact
+    return compact[: max(0, limit - 1)].rstrip() + "…"
+
+
 def _related_member_user_ids(
     recent_messages: list[ChatMessage],
     *,
@@ -2346,7 +2705,7 @@ def _related_member_user_ids(
     return user_ids
 
 
-def _format_member_context(profiles: list[MemberProfile]) -> str:
+def _format_member_context(profiles: list[MemberProfile | MemberImpression]) -> str:
     if not profiles:
         return ""
     lines: list[str] = []
@@ -2357,10 +2716,33 @@ def _format_member_context(profiles: list[MemberProfile]) -> str:
             for alias in profile.aliases
             if alias and alias != profile.display_name
         ][:3]
+        prefix = f"- {label}"
         if aliases:
-            lines.append(f"- {label}，曾用名/历史名：{'、'.join(aliases)}")
+            prefix = f"{prefix}，曾用名/历史名：{'、'.join(aliases)}"
+        details: list[str] = []
+        if isinstance(profile, MemberImpression):
+            if profile.ai_summary:
+                details.append(f"长期印象：{_trim_inline(profile.ai_summary, 88)}")
+            if profile.ai_interests:
+                details.append(f"兴趣/常聊：{'、'.join(profile.ai_interests[:5])}")
+            if profile.ai_speaking_style:
+                details.append(f"说话方式：{_trim_inline(profile.ai_speaking_style, 72)}")
+            if profile.top_tags:
+                details.append(
+                    "后端标签：" + "、".join(f"{tag}x{count}" for tag, count in profile.top_tags[:4])
+                )
+            if profile.top_keywords:
+                details.append("高频词：" + "、".join(term for term, _ in profile.top_keywords[:5]))
+            sample_texts = profile.ai_representative_texts or profile.recent_texts
+            if sample_texts:
+                samples = " / ".join(f"“{_trim_inline(text, 34)}”" for text in sample_texts[:2])
+                details.append(f"代表性原话：{samples}")
+            if profile.message_count:
+                details.append(f"已记录发言约 {profile.message_count} 条")
+        if details:
+            lines.append(f"{prefix}；" + "；".join(details))
         else:
-            lines.append(f"- {label}")
+            lines.append(prefix)
     return "\n".join(lines)
 
 
@@ -2589,6 +2971,7 @@ def _is_private_tool_text(text: str) -> bool:
         or MODEL_ROUTE_COMMAND_RE.match(text) is not None
         or MEMORY_REPORT_COMMAND_RE.match(text) is not None
         or STYLE_REPORT_COMMAND_RE.match(text) is not None
+        or MEMBER_IMPRESSION_REPORT_COMMAND_RE.match(text) is not None
         or APPROVER_ADD_RE.match(text) is not None
         or APPROVER_DELETE_RE.match(text) is not None
         or _parse_approval_token_report_command(text) is not None
@@ -2757,6 +3140,14 @@ async def _handle_group_approval_private(bot: Bot, user_id: int, text: str) -> b
             bot,
             user_id,
             _format_recent_style_report(_private_jargon_group_id(), style_report_limit),
+        )
+        return True
+    member_report_limit = _parse_memory_report_limit(compact_text, MEMBER_IMPRESSION_REPORT_COMMAND_RE)
+    if member_report_limit is not None:
+        await _send_private_text(
+            bot,
+            user_id,
+            _format_member_impression_report(_private_jargon_group_id(), member_report_limit),
         )
         return True
     token_report_window = _parse_approval_token_report_command(compact_text)
@@ -3148,6 +3539,32 @@ def _looks_like_literal_style_rule(style: str) -> bool:
         return True
     quote_count = compact.count("“") + compact.count("”") + compact.count("\"")
     return quote_count > 0 and len(compact) <= 28
+
+
+EMOJI_RE = re.compile(
+    "["
+    "\U0001f1e6-\U0001f1ff"
+    "\U0001f300-\U0001f5ff"
+    "\U0001f600-\U0001f64f"
+    "\U0001f680-\U0001f6ff"
+    "\U0001f700-\U0001f77f"
+    "\U0001f780-\U0001f7ff"
+    "\U0001f800-\U0001f8ff"
+    "\U0001f900-\U0001f9ff"
+    "\U0001fa00-\U0001faff"
+    "\u2600-\u27bf"
+    "]+",
+    flags=re.UNICODE,
+)
+ONEBOT_FACE_RE = re.compile(r"\[(?:CQ:)?(?:face|表情)[^\]]*\]", re.IGNORECASE)
+
+
+def _sanitize_generated_text(text: str) -> str:
+    cleaned = ONEBOT_FACE_RE.sub("", text)
+    cleaned = EMOJI_RE.sub("", cleaned)
+    cleaned = re.sub(r"[ \t]{2,}", " ", cleaned)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    return cleaned.strip()
 
 
 def _has_long_common_substring(a: str, b: str, *, min_len: int) -> bool:

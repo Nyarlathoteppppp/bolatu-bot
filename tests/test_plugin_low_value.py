@@ -25,7 +25,10 @@ from qq_social_agent.plugin import (
     _extract_message_id,
     _format_memory_context,
     _format_member_context,
+    _format_member_impression_report,
+    _format_raw_corpus_context,
     _format_recall_feedback_context,
+    _daily_review_window,
     _apply_backend_tool_decision,
     _is_explicit_market_lookup,
     _is_low_value_group_text,
@@ -34,12 +37,13 @@ from qq_social_agent.plugin import (
     _passive_decision_allowed,
     _pre_decision_gate,
     _record_user_reply,
+    _sanitize_generated_text,
     _user_reply_cooling_down,
 )
 from qq_social_agent.cue_patterns import CueRepeatState
 from qq_social_agent.config import parse_llm_model_route
 from qq_social_agent.deepseek_client import ReplyDecision
-from qq_social_agent.memory import MemoryStore, MemorySummary, MemberProfile, RecalledReplyFeedback
+from qq_social_agent.memory import ChatMessage, MemoryStore, MemorySummary, MemberImpression, MemberProfile, RawCorpusExample, RecalledReplyFeedback
 from qq_social_agent.tools.fresh_context import FreshIntent
 from qq_social_agent.tools.market_intent import MarketIntent
 
@@ -225,6 +229,7 @@ def test_approval_help_commands() -> None:
     assert "拦截 20" in plugin._bot_tool_message("bot工具 查看")
     assert "记忆 8" in plugin._bot_tool_message("bot工具 学习")
     assert "风格学习 20" in plugin._bot_tool_message("bot工具 风格")
+    assert "群友画像 20" in plugin._bot_tool_message("bot工具 学习")
     assert "加审批" in plugin._bot_tool_message("bot工具 审批人")
     assert "回 1/2/3" in plugin._bot_tool_message("bot 工具 审批")
     assert "关闭审查" in plugin.APPROVAL_RULES_MESSAGE
@@ -386,9 +391,37 @@ def test_passive_decision_gate_allows_after_thirty_second_gap() -> None:
     assert GROUP_PASSIVE_DECISION_GAP_SECONDS == 30
 
 
+def test_daily_review_window_uses_previous_24h_at_midnight() -> None:
+    midnight = time.mktime((2026, 7, 11, 0, 0, 0, -1, -1, -1))
+
+    start_at, end_at, label = _daily_review_window(midnight + 1)
+
+    assert start_at == midnight - 24 * 60 * 60
+    assert end_at == midnight
+    assert label == "2026-07-10"
+
+
 def test_meaningful_group_text_not_low_value() -> None:
     for text in ["股票又亏了", "你用什么刮胡子", "可以去投算法岗", "哈哈这项目真离谱"]:
         assert not _is_low_value_group_text(text)
+
+
+def test_format_raw_corpus_context_includes_original_warning_and_neighbors() -> None:
+    example = RawCorpusExample(
+        message=ChatMessage(1, 101, "B", "股票又亏麻了，真的顶不住", False, 101.0, id=2),
+        before=(ChatMessage(1, 100, "A", "今天午饭吃什么", False, 100.0, id=1),),
+        after=(ChatMessage(1, 102, "C", "这就是资本市场教育费", False, 102.0, id=3),),
+        tags=("倒霉", "行情"),
+        score=6,
+    )
+
+    context = _format_raw_corpus_context([example])
+
+    assert "禁止复制完整原句" in context
+    assert "B[#101]" in context
+    assert "股票又亏麻了" in context
+    assert "A[#100]" in context
+    assert "C[#102]" in context
 
 
 def test_pre_decision_gate_allows_weak_passive_text_to_llm() -> None:
@@ -532,6 +565,50 @@ def test_format_member_context_includes_aliases() -> None:
     )
 
     assert context == "- 🦕[#98238]，曾用名/历史名：乌木、旧名"
+
+
+def test_format_member_context_includes_impression_details() -> None:
+    context = _format_member_context(
+        [
+            MemberImpression(
+                group_id=1026813421,
+                user_id=3370998238,
+                display_name="乌木",
+                aliases=("乌木", "🦕"),
+                message_count=12,
+                top_tags=(("行情", 3), ("代码", 2)),
+                top_keywords=(("比特币", 2), ("代码", 1)),
+                recent_texts=("股票又亏麻了",),
+                ai_summary="经常聊行情和代码，亏钱时情绪很直接。",
+                ai_interests=("股票", "比特币"),
+                ai_speaking_style="短句吐槽，喜欢直接破防。",
+                ai_representative_texts=("股票又亏麻了",),
+                ai_summary_at=1000.0,
+                last_seen_at=1000.0,
+                updated_at=1000.0,
+            )
+        ]
+    )
+
+    assert "长期印象" in context
+    assert "股票、比特币" in context
+    assert "后端标签：行情x3、代码x2" in context
+    assert "股票又亏麻了" in context
+
+
+def test_format_member_impression_report(monkeypatch, tmp_path) -> None:
+    store = _use_temp_plugin_memory(monkeypatch, tmp_path)
+    store.add_message(1026813421, 3370998238, "乌木", "股票又亏麻了", created_at=100)
+
+    report = _format_member_impression_report(1026813421, 5)
+
+    assert "群友画像" in report
+    assert "乌木[#98238]" in report
+    assert "后端标签" in report
+
+
+def test_sanitize_generated_text_removes_emoji_and_onebot_face() -> None:
+    assert _sanitize_generated_text("可以[CQ:face,id=14] 😂 继续说") == "可以 继续说"
 
 
 def test_extract_message_id_from_action_result() -> None:

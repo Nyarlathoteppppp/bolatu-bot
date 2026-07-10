@@ -4,6 +4,7 @@ import json
 import re
 import sqlite3
 import time
+from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -17,6 +18,15 @@ class ChatMessage:
     is_bot: bool
     created_at: float
     id: int = 0
+
+
+@dataclass(frozen=True)
+class RawCorpusExample:
+    message: ChatMessage
+    before: tuple[ChatMessage, ...]
+    after: tuple[ChatMessage, ...]
+    tags: tuple[str, ...]
+    score: int
 
 
 @dataclass(frozen=True)
@@ -45,6 +55,39 @@ class MemberProfile:
     display_name: str
     aliases: tuple[str, ...]
     last_seen_at: float
+
+
+@dataclass(frozen=True)
+class MemberImpression:
+    group_id: int
+    user_id: int
+    display_name: str
+    aliases: tuple[str, ...]
+    message_count: int
+    top_tags: tuple[tuple[str, int], ...]
+    top_keywords: tuple[tuple[str, int], ...]
+    recent_texts: tuple[str, ...]
+    ai_summary: str
+    ai_interests: tuple[str, ...]
+    ai_speaking_style: str
+    ai_representative_texts: tuple[str, ...]
+    ai_summary_at: float
+    last_seen_at: float
+    updated_at: float
+
+
+@dataclass(frozen=True)
+class MemberProfileSummary:
+    group_id: int
+    user_id: int
+    profile_summary: str
+    interests: tuple[str, ...]
+    speaking_style: str
+    representative_texts: tuple[str, ...]
+    start_at: float
+    end_at: float
+    message_count: int
+    created_at: float
 
 
 @dataclass(frozen=True)
@@ -130,7 +173,14 @@ class MemoryStore:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self.conn = sqlite3.connect(self.db_path)
         self.conn.row_factory = sqlite3.Row
+        self._configure_connection()
         self._init_schema()
+
+    def _configure_connection(self) -> None:
+        self.conn.execute("pragma busy_timeout = 5000")
+        self.conn.execute("pragma journal_mode = WAL")
+        self.conn.execute("pragma synchronous = NORMAL")
+        self.conn.execute("pragma temp_store = MEMORY")
 
     def _init_schema(self) -> None:
         self.conn.executescript(
@@ -147,6 +197,22 @@ class MemoryStore:
 
             create index if not exists idx_messages_group_time
               on messages(group_id, created_at);
+
+            create index if not exists idx_messages_group_id
+              on messages(group_id, id);
+
+            create index if not exists idx_messages_group_bot_id
+              on messages(group_id, is_bot, id);
+
+            create index if not exists idx_messages_group_bot_text_id
+              on messages(group_id, is_bot, id)
+              where length(trim(text)) >= 2;
+
+            create index if not exists idx_messages_group_user_time
+              on messages(group_id, user_id, created_at);
+
+            create index if not exists idx_messages_group_user_id
+              on messages(group_id, user_id, id);
 
             create table if not exists memory_summaries (
               id integer primary key autoincrement,
@@ -201,6 +267,40 @@ class MemoryStore:
               last_seen_at real not null,
               primary key(group_id, user_id)
             );
+
+            create index if not exists idx_member_profiles_group_seen
+              on member_profiles(group_id, last_seen_at);
+
+            create table if not exists member_impressions (
+              group_id integer not null,
+              user_id integer not null,
+              message_count integer not null default 0,
+              tag_counts_json text not null,
+              keyword_counts_json text not null,
+              recent_texts_json text not null,
+              updated_at real not null,
+              primary key(group_id, user_id)
+            );
+
+            create index if not exists idx_member_impressions_group_updated
+              on member_impressions(group_id, updated_at);
+
+            create table if not exists member_profile_summaries (
+              id integer primary key autoincrement,
+              group_id integer not null,
+              user_id integer not null,
+              profile_summary text not null,
+              interests_json text not null,
+              speaking_style text not null,
+              representative_texts_json text not null,
+              start_at real not null,
+              end_at real not null,
+              message_count integer not null,
+              created_at real not null
+            );
+
+            create index if not exists idx_member_profile_summaries_group_user_time
+              on member_profile_summaries(group_id, user_id, created_at);
 
             create table if not exists bot_sent_messages (
               group_id integer not null,
@@ -286,6 +386,8 @@ class MemoryStore:
         )
         self._ensure_llm_usage_source_key()
         self._backfill_member_profiles()
+        self._backfill_member_impressions()
+        self.conn.execute("pragma optimize")
         self.conn.commit()
 
     def _ensure_llm_usage_source_key(self) -> None:
@@ -323,6 +425,27 @@ class MemoryStore:
                 last_seen_at=float(row["created_at"]),
             )
 
+    def _backfill_member_impressions(self) -> None:
+        existing = self.conn.execute("select 1 from member_impressions limit 1").fetchone()
+        if existing:
+            return
+        rows = self.conn.execute(
+            """
+            select group_id, user_id, nickname, text, created_at
+            from messages
+            where is_bot = 0
+            order by created_at asc, id asc
+            """
+        ).fetchall()
+        for row in rows:
+            self._update_member_impression(
+                int(row["group_id"]),
+                int(row["user_id"]),
+                str(row["nickname"]),
+                str(row["text"]),
+                created_at=float(row["created_at"]),
+            )
+
     def add_message(
         self,
         group_id: int,
@@ -343,6 +466,13 @@ class MemoryStore:
         )
         if not is_bot:
             self._upsert_member_profile(group_id, user_id, nickname, last_seen_at=created)
+            self._update_member_impression(
+                group_id,
+                user_id,
+                nickname,
+                text,
+                created_at=created,
+            )
         self.conn.commit()
 
     def _upsert_member_profile(
@@ -406,6 +536,26 @@ class MemoryStore:
             for row in reversed(rows)
         ]
 
+    def messages_between(
+        self,
+        group_id: int,
+        *,
+        start_at: float,
+        end_at: float,
+        limit: int,
+    ) -> list[ChatMessage]:
+        rows = self.conn.execute(
+            """
+            select id, group_id, user_id, nickname, text, is_bot, created_at
+            from messages
+            where group_id = ? and created_at >= ? and created_at < ?
+            order by created_at desc, id desc
+            limit ?
+            """,
+            (group_id, start_at, end_at, limit),
+        ).fetchall()
+        return [_message_from_row(row) for row in reversed(rows)]
+
     def messages_before(self, group_id: int, *, before_at: float, limit: int) -> list[ChatMessage]:
         rows = self.conn.execute(
             """
@@ -418,6 +568,103 @@ class MemoryStore:
             (group_id, before_at, limit),
         ).fetchall()
         return [_message_from_row(row) for row in reversed(rows)]
+
+    def relevant_raw_corpus_examples(
+        self,
+        group_id: int,
+        query: str,
+        *,
+        limit: int,
+        candidate_limit: int = 240,
+        context_radius: int = 2,
+        exclude_user_id: int | None = None,
+        exclude_text: str = "",
+    ) -> list[RawCorpusExample]:
+        rows = self.conn.execute(
+            """
+            select id, group_id, user_id, nickname, text, is_bot, created_at
+            from messages
+            where group_id = ? and is_bot = 0 and length(trim(text)) >= 2
+            order by id desc
+            limit ?
+            """,
+            (group_id, candidate_limit),
+        ).fetchall()
+        scored: list[tuple[int, float, int, ChatMessage, tuple[str, ...]]] = []
+        excluded_text_key = _compact_text(exclude_text)
+        for row in rows:
+            message = _message_from_row(row)
+            if exclude_user_id is not None and message.user_id == exclude_user_id:
+                if excluded_text_key and _compact_text(message.text) == excluded_text_key:
+                    continue
+            if _is_low_value_raw_corpus_text(message.text):
+                continue
+            tags = _raw_corpus_tags(message.text)
+            haystack = f"{message.nickname} {message.text} {' '.join(tags)}"
+            score = _text_relevance_score(query, haystack)
+            if score <= 0:
+                continue
+            scored.append((score, message.created_at, message.id, message, tags))
+        scored.sort(key=lambda item: (item[0], item[1], item[2]), reverse=True)
+
+        examples: list[RawCorpusExample] = []
+        seen_texts: set[str] = set()
+        for score, _, _, message, tags in scored:
+            text_key = _compact_text(message.text)
+            if text_key in seen_texts:
+                continue
+            seen_texts.add(text_key)
+            before, after = self._message_neighbors(
+                group_id,
+                message.id,
+                radius=context_radius,
+            )
+            examples.append(
+                RawCorpusExample(
+                    message=message,
+                    before=tuple(before),
+                    after=tuple(after),
+                    tags=tags,
+                    score=score,
+                )
+            )
+            if len(examples) >= limit:
+                break
+        return examples
+
+    def _message_neighbors(
+        self,
+        group_id: int,
+        message_id: int,
+        *,
+        radius: int,
+    ) -> tuple[list[ChatMessage], list[ChatMessage]]:
+        if radius <= 0:
+            return [], []
+        before_rows = self.conn.execute(
+            """
+            select id, group_id, user_id, nickname, text, is_bot, created_at
+            from messages
+            where group_id = ? and id < ?
+            order by id desc
+            limit ?
+            """,
+            (group_id, message_id, radius),
+        ).fetchall()
+        after_rows = self.conn.execute(
+            """
+            select id, group_id, user_id, nickname, text, is_bot, created_at
+            from messages
+            where group_id = ? and id > ?
+            order by id asc
+            limit ?
+            """,
+            (group_id, message_id, radius),
+        ).fetchall()
+        return (
+            [_message_from_row(row) for row in reversed(before_rows)],
+            [_message_from_row(row) for row in after_rows],
+        )
 
     def recent_bot_replies(self, group_id: int, seconds: int) -> list[ChatMessage]:
         since = time.time() - seconds
@@ -707,6 +954,292 @@ class MemoryStore:
         ).fetchall()
         by_user_id = {int(row["user_id"]): _profile_from_row(row) for row in rows}
         return [by_user_id[user_id] for user_id in ordered_user_ids if user_id in by_user_id]
+
+    def member_impressions_for_context(
+        self,
+        group_id: int,
+        user_ids: list[int],
+        *,
+        limit: int,
+    ) -> list[MemberImpression]:
+        ordered_user_ids = _dedupe_ints(user_ids)[:limit]
+        if not ordered_user_ids:
+            return []
+        placeholders = ",".join("?" for _ in ordered_user_ids)
+        rows = self.conn.execute(
+            f"""
+            select
+              p.group_id,
+              p.user_id,
+              p.display_name,
+              p.aliases_json,
+              p.last_seen_at,
+              coalesce(i.message_count, 0) as message_count,
+              coalesce(i.tag_counts_json, '{{}}') as tag_counts_json,
+              coalesce(i.keyword_counts_json, '{{}}') as keyword_counts_json,
+              coalesce(i.recent_texts_json, '[]') as recent_texts_json,
+              coalesce(i.updated_at, p.last_seen_at) as updated_at,
+              coalesce(s.profile_summary, '') as ai_summary,
+              coalesce(s.interests_json, '[]') as ai_interests_json,
+              coalesce(s.speaking_style, '') as ai_speaking_style,
+              coalesce(s.representative_texts_json, '[]') as ai_representative_texts_json,
+              coalesce(s.created_at, 0) as ai_summary_at
+            from member_profiles p
+            left join member_impressions i
+              on i.group_id = p.group_id and i.user_id = p.user_id
+            left join member_profile_summaries s
+              on s.id = (
+                select latest.id
+                from member_profile_summaries latest
+                where latest.group_id = p.group_id and latest.user_id = p.user_id
+                order by latest.created_at desc, latest.id desc
+                limit 1
+              )
+            where p.group_id = ? and p.user_id in ({placeholders})
+            """,
+            (group_id, *ordered_user_ids),
+        ).fetchall()
+        by_user_id = {int(row["user_id"]): _member_impression_from_row(row) for row in rows}
+        return [by_user_id[user_id] for user_id in ordered_user_ids if user_id in by_user_id]
+
+    def recent_member_impressions(self, group_id: int, limit: int) -> list[MemberImpression]:
+        rows = self.conn.execute(
+            """
+            select
+              p.group_id,
+              p.user_id,
+              p.display_name,
+              p.aliases_json,
+              p.last_seen_at,
+              coalesce(i.message_count, 0) as message_count,
+              coalesce(i.tag_counts_json, '{}') as tag_counts_json,
+              coalesce(i.keyword_counts_json, '{}') as keyword_counts_json,
+              coalesce(i.recent_texts_json, '[]') as recent_texts_json,
+              coalesce(i.updated_at, p.last_seen_at) as updated_at,
+              coalesce(s.profile_summary, '') as ai_summary,
+              coalesce(s.interests_json, '[]') as ai_interests_json,
+              coalesce(s.speaking_style, '') as ai_speaking_style,
+              coalesce(s.representative_texts_json, '[]') as ai_representative_texts_json,
+              coalesce(s.created_at, 0) as ai_summary_at
+            from member_profiles p
+            left join member_impressions i
+              on i.group_id = p.group_id and i.user_id = p.user_id
+            left join member_profile_summaries s
+              on s.id = (
+                select latest.id
+                from member_profile_summaries latest
+                where latest.group_id = p.group_id and latest.user_id = p.user_id
+                order by latest.created_at desc, latest.id desc
+                limit 1
+              )
+            where p.group_id = ?
+            order by p.last_seen_at desc
+            limit ?
+            """,
+            (group_id, limit),
+        ).fetchall()
+        return [_member_impression_from_row(row) for row in rows]
+
+    def active_member_ids_since(
+        self,
+        group_id: int,
+        *,
+        since_at: float,
+        limit: int,
+        min_messages: int,
+    ) -> list[int]:
+        rows = self.conn.execute(
+            """
+            select user_id, count(*) as message_count, max(created_at) as last_seen_at
+            from messages
+            where group_id = ? and is_bot = 0 and created_at >= ? and length(trim(text)) >= 2
+            group by user_id
+            having count(*) >= ?
+            order by message_count desc, last_seen_at desc
+            limit ?
+            """,
+            (group_id, since_at, min_messages, limit),
+        ).fetchall()
+        return [int(row["user_id"]) for row in rows]
+
+    def member_messages_between(
+        self,
+        group_id: int,
+        user_id: int,
+        *,
+        start_at: float,
+        end_at: float,
+        limit: int,
+    ) -> list[ChatMessage]:
+        rows = self.conn.execute(
+            """
+            select id, group_id, user_id, nickname, text, is_bot, created_at
+            from messages
+            where group_id = ?
+              and user_id = ?
+              and is_bot = 0
+              and created_at >= ?
+              and created_at < ?
+              and length(trim(text)) >= 2
+            order by created_at desc, id desc
+            limit ?
+            """,
+            (group_id, user_id, start_at, end_at, limit),
+        ).fetchall()
+        return [_message_from_row(row) for row in reversed(rows)]
+
+    def last_member_profile_summary_at(self, group_id: int, user_id: int) -> float:
+        row = self.conn.execute(
+            """
+            select max(created_at) as ts
+            from member_profile_summaries
+            where group_id = ? and user_id = ?
+            """,
+            (group_id, user_id),
+        ).fetchone()
+        return float(row["ts"] or 0.0) if row else 0.0
+
+    def add_member_profile_summary(
+        self,
+        *,
+        group_id: int,
+        user_id: int,
+        profile_summary: str,
+        interests: list[str],
+        speaking_style: str,
+        representative_texts: list[str],
+        start_at: float,
+        end_at: float,
+        message_count: int,
+        keep_per_member: int = 14,
+    ) -> None:
+        summary = profile_summary.strip()
+        if not summary:
+            return
+        now = time.time()
+        self.conn.execute(
+            """
+            insert into member_profile_summaries(
+              group_id, user_id, profile_summary, interests_json, speaking_style,
+              representative_texts_json, start_at, end_at, message_count, created_at
+            )
+            values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                group_id,
+                user_id,
+                summary[:420],
+                json.dumps(_clean_text_list(interests, limit=8, item_limit=32), ensure_ascii=False),
+                speaking_style.strip()[:260],
+                json.dumps(_clean_text_list(representative_texts, limit=5, item_limit=140), ensure_ascii=False),
+                start_at,
+                end_at,
+                max(0, int(message_count)),
+                now,
+            ),
+        )
+        self.conn.execute(
+            """
+            delete from member_profile_summaries
+            where group_id = ? and user_id = ?
+              and id not in (
+                select id from member_profile_summaries
+                where group_id = ? and user_id = ?
+                order by created_at desc, id desc
+                limit ?
+              )
+            """,
+            (group_id, user_id, group_id, user_id, keep_per_member),
+        )
+        self.conn.commit()
+
+    def recent_member_profile_summaries(
+        self,
+        group_id: int,
+        user_id: int,
+        limit: int,
+    ) -> list[MemberProfileSummary]:
+        rows = self.conn.execute(
+            """
+            select group_id, user_id, profile_summary, interests_json, speaking_style,
+                   representative_texts_json, start_at, end_at, message_count, created_at
+            from member_profile_summaries
+            where group_id = ? and user_id = ?
+            order by created_at desc, id desc
+            limit ?
+            """,
+            (group_id, user_id, limit),
+        ).fetchall()
+        return [_member_profile_summary_from_row(row) for row in rows]
+
+    def _update_member_impression(
+        self,
+        group_id: int,
+        user_id: int,
+        nickname: str,
+        text: str,
+        *,
+        created_at: float,
+    ) -> None:
+        clean_text = text.strip()
+        row = self.conn.execute(
+            """
+            select message_count, tag_counts_json, keyword_counts_json, recent_texts_json
+            from member_impressions
+            where group_id = ? and user_id = ?
+            """,
+            (group_id, user_id),
+        ).fetchone()
+        if row:
+            message_count = int(row["message_count"]) + 1
+            tag_counts = _counter_from_json(row["tag_counts_json"])
+            keyword_counts = _counter_from_json(row["keyword_counts_json"])
+            recent_texts = _recent_texts_from_json(row["recent_texts_json"])
+        else:
+            message_count = 1
+            tag_counts = Counter()
+            keyword_counts = Counter()
+            recent_texts = []
+
+        tags = _raw_corpus_tags(clean_text)
+        tag_counts.update(tags)
+        keyword_counts.update(_impression_keywords(clean_text))
+        tag_counts = _cap_counter(tag_counts, 60)
+        keyword_counts = _cap_counter(keyword_counts, 80)
+        if clean_text and not _is_low_value_raw_corpus_text(clean_text):
+            recent_texts.append(
+                {
+                    "text": clean_text[:140],
+                    "tags": list(tags[:4]),
+                    "at": created_at,
+                }
+            )
+            recent_texts = recent_texts[-16:]
+
+        self.conn.execute(
+            """
+            insert into member_impressions(
+              group_id, user_id, message_count, tag_counts_json,
+              keyword_counts_json, recent_texts_json, updated_at
+            )
+            values (?, ?, ?, ?, ?, ?, ?)
+            on conflict(group_id, user_id) do update set
+              message_count = excluded.message_count,
+              tag_counts_json = excluded.tag_counts_json,
+              keyword_counts_json = excluded.keyword_counts_json,
+              recent_texts_json = excluded.recent_texts_json,
+              updated_at = excluded.updated_at
+            """,
+            (
+                group_id,
+                user_id,
+                message_count,
+                json.dumps(dict(tag_counts), ensure_ascii=False, sort_keys=True),
+                json.dumps(dict(keyword_counts), ensure_ascii=False, sort_keys=True),
+                json.dumps(recent_texts, ensure_ascii=False),
+                created_at,
+            ),
+        )
 
     def add_bot_sent_message(
         self,
@@ -1169,6 +1702,170 @@ def _relevance_terms(text: str) -> set[str]:
     return {term for term in terms if term not in stop_terms}
 
 
+def _raw_corpus_tags(text: str) -> tuple[str, ...]:
+    compact = _compact_text(text)
+    tag_patterns = (
+        ("玩梗", ("草", "哈哈", "笑死", "绷", "典", "麻了", "乐", "抽象", "梗", "开宰")),
+        ("互损", ("傻逼", "弱智", "废物", "滚", "爹", "别学", "不如", "唐")),
+        ("安慰", ("难受", "不开心", "顶不住", "撑不住", "压力", "破防", "烦死", "累")),
+        ("反串", ("建议", "支持", "感觉不如", "这下", "赢", "什么成分")),
+        ("政治", ("政治", "资本", "无产", "阶级", "粉红", "神友", "咱妈", "霓虹", "美国", "日本")),
+        ("代码", ("代码", "bug", "报错", "炸了", "python", "java", "ai", "模型", "api")),
+        ("倒霉", ("亏", "完蛋", "坏了", "炸了", "寄", "崩", "没人理")),
+        ("恋爱", ("老婆", "喜欢", "暧昧", "女友", "男朋友", "宝宝")),
+        ("行情", ("股票", "美股", "比特币", "btc", "eth", "亏钱", "涨", "跌")),
+    )
+    tags: list[str] = []
+    for tag, patterns in tag_patterns:
+        if any(pattern in compact for pattern in patterns):
+            tags.append(tag)
+    return tuple(tags)
+
+
+def _impression_keywords(text: str) -> list[str]:
+    compact = _compact_text(text)
+    if not compact or _is_low_value_raw_corpus_text(compact):
+        return []
+    stop_terms = {
+        "真的",
+        "现在",
+        "今天",
+        "这个",
+        "那个",
+        "还是",
+        "感觉",
+        "不是",
+        "没有",
+        "怎么",
+        "什么",
+        "因为",
+        "所以",
+        "但是",
+        "然后",
+        "自己",
+        "他们",
+        "我们",
+        "你们",
+        "一样",
+        "直接",
+    }
+    terms = [
+        term
+        for term in _relevance_terms(text)
+        if 2 <= len(term) <= 12 and term not in stop_terms and not term.isdigit()
+    ]
+    terms.sort(key=lambda term: (len(term), term), reverse=True)
+    return terms[:12]
+
+
+def _is_low_value_raw_corpus_text(text: str) -> bool:
+    compact = _compact_text(text)
+    if not compact:
+        return True
+    if len(compact) <= 1:
+        return True
+    return compact in {
+        "6",
+        "66",
+        "666",
+        "草",
+        "哈哈",
+        "哈哈哈",
+        "嗯",
+        "哦",
+        "好",
+        "好的",
+        "可以",
+        "绷",
+    }
+
+
+def _compact_text(text: str) -> str:
+    return re.sub(r"\s+", "", text).casefold()
+
+
+def _counter_from_json(value: object) -> Counter[str]:
+    try:
+        raw = json.loads(str(value))
+    except json.JSONDecodeError:
+        raw = {}
+    counter: Counter[str] = Counter()
+    if not isinstance(raw, dict):
+        return counter
+    for key, count in raw.items():
+        text = str(key).strip()
+        if not text:
+            continue
+        try:
+            counter[text] = max(0, int(count))
+        except (TypeError, ValueError):
+            continue
+    return counter
+
+
+def _recent_texts_from_json(value: object) -> list[dict[str, object]]:
+    try:
+        raw = json.loads(str(value))
+    except json.JSONDecodeError:
+        raw = []
+    if not isinstance(raw, list):
+        return []
+    result: list[dict[str, object]] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        text = str(item.get("text", "")).strip()
+        if not text:
+            continue
+        tags_raw = item.get("tags", [])
+        tags = (
+            [str(tag).strip() for tag in tags_raw if str(tag).strip()]
+            if isinstance(tags_raw, list)
+            else []
+        )
+        try:
+            created_at = float(item.get("at", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            created_at = 0.0
+        result.append({"text": text[:140], "tags": tags[:4], "at": created_at})
+    return result
+
+
+def _cap_counter(counter: Counter[str], limit: int) -> Counter[str]:
+    return Counter(dict(counter.most_common(limit)))
+
+
+def _top_counter_items(counter: Counter[str], limit: int) -> tuple[tuple[str, int], ...]:
+    return tuple((key, int(count)) for key, count in counter.most_common(limit) if count > 0)
+
+
+def _json_text_list(value: object, *, limit: int) -> list[str]:
+    try:
+        raw = json.loads(str(value))
+    except json.JSONDecodeError:
+        raw = []
+    if not isinstance(raw, list):
+        return []
+    return _clean_text_list([str(item) for item in raw], limit=limit, item_limit=140)
+
+
+def _clean_text_list(items: list[str], *, limit: int, item_limit: int) -> list[str]:
+    cleaned: list[str] = []
+    seen: set[str] = set()
+    for item in items:
+        text = re.sub(r"\s+", " ", str(item)).strip()
+        if not text:
+            continue
+        key = text.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        cleaned.append(text[:item_limit])
+        if len(cleaned) >= limit:
+            break
+    return cleaned
+
+
 def _profile_from_row(row: sqlite3.Row) -> MemberProfile:
     try:
         raw_aliases = json.loads(str(row["aliases_json"]))
@@ -1183,6 +1880,47 @@ def _profile_from_row(row: sqlite3.Row) -> MemberProfile:
         display_name=str(row["display_name"]),
         aliases=aliases,
         last_seen_at=float(row["last_seen_at"]),
+    )
+
+
+def _member_impression_from_row(row: sqlite3.Row) -> MemberImpression:
+    profile = _profile_from_row(row)
+    recent_texts = _recent_texts_from_json(row["recent_texts_json"])
+    return MemberImpression(
+        group_id=profile.group_id,
+        user_id=profile.user_id,
+        display_name=profile.display_name,
+        aliases=profile.aliases,
+        message_count=int(row["message_count"] or 0),
+        top_tags=_top_counter_items(_counter_from_json(row["tag_counts_json"]), limit=6),
+        top_keywords=_top_counter_items(_counter_from_json(row["keyword_counts_json"]), limit=8),
+        recent_texts=tuple(
+            str(item["text"])
+            for item in recent_texts[-5:]
+            if str(item.get("text", "")).strip()
+        ),
+        ai_summary=str(row["ai_summary"] or "").strip(),
+        ai_interests=tuple(_json_text_list(row["ai_interests_json"], limit=8)),
+        ai_speaking_style=str(row["ai_speaking_style"] or "").strip(),
+        ai_representative_texts=tuple(_json_text_list(row["ai_representative_texts_json"], limit=5)),
+        ai_summary_at=float(row["ai_summary_at"] or 0.0),
+        last_seen_at=profile.last_seen_at,
+        updated_at=float(row["updated_at"] or profile.last_seen_at),
+    )
+
+
+def _member_profile_summary_from_row(row: sqlite3.Row) -> MemberProfileSummary:
+    return MemberProfileSummary(
+        group_id=int(row["group_id"]),
+        user_id=int(row["user_id"]),
+        profile_summary=str(row["profile_summary"]),
+        interests=tuple(_json_text_list(row["interests_json"], limit=8)),
+        speaking_style=str(row["speaking_style"]),
+        representative_texts=tuple(_json_text_list(row["representative_texts_json"], limit=5)),
+        start_at=float(row["start_at"]),
+        end_at=float(row["end_at"]),
+        message_count=int(row["message_count"]),
+        created_at=float(row["created_at"]),
     )
 
 
