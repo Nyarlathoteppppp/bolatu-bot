@@ -91,6 +91,7 @@ group_processing_locks: dict[int, asyncio.Lock] = {}
 group_learning_tasks: dict[int, asyncio.Task[None]] = {}
 group_message_buffers: dict[int, list["BufferedGroupMessage"]] = {}
 group_buffer_tasks: dict[int, asyncio.Task[None]] = {}
+group_generation_inflight: set[int] = set()
 group_passive_retry_buffers: dict[int, list["BufferedGroupMessage"]] = {}
 group_passive_retry_tasks: dict[int, asyncio.Task[None]] = {}
 group_passive_decision_state: dict[int, "PassiveDecisionState"] = {}
@@ -110,6 +111,7 @@ STYLE_RULE_CONTEXT_LIMIT = 12
 JARGON_CONTEXT_LOOKBACK = 4
 CUSTOM_JARGON_CONTEXT_LIMIT = 10
 GROUP_BUFFER_SECONDS = 6.0
+GROUP_INFLIGHT_BUFFER_RETRY_SECONDS = 1.0
 GROUP_PASSIVE_DECISION_GAP_SECONDS = 30
 GROUP_PASSIVE_DECISION_EVERY_MESSAGES = 3
 SUPPRESSION_EVENTS_LIMIT = 80
@@ -1978,19 +1980,31 @@ def _buffer_group_message(bot: Bot, event: GroupMessageEvent, text: str) -> None
         created_at=float(getattr(event, "time", 0) or time.time()),
     )
     group_message_buffers.setdefault(group_id, []).append(item)
-    task = group_buffer_tasks.get(group_id)
-    if task is None or task.done():
-        group_buffer_tasks[group_id] = asyncio.create_task(_flush_group_buffer_after_delay(group_id))
+    _schedule_group_buffer_flush(group_id)
     logger.info(
         "qq_social_agent buffered group message: "
         f"group={group_id} size={len(group_message_buffers.get(group_id, []))}"
     )
 
 
-async def _flush_group_buffer_after_delay(group_id: int) -> None:
+def _schedule_group_buffer_flush(group_id: int, *, delay: float = GROUP_BUFFER_SECONDS) -> None:
+    task = group_buffer_tasks.get(group_id)
+    if task is None or task.done():
+        group_buffer_tasks[group_id] = asyncio.create_task(_flush_group_buffer_after_delay(group_id, delay=delay))
+
+
+async def _flush_group_buffer_after_delay(group_id: int, *, delay: float = GROUP_BUFFER_SECONDS) -> None:
+    should_reschedule = False
     try:
-        await asyncio.sleep(GROUP_BUFFER_SECONDS)
+        await asyncio.sleep(delay)
         async with _group_processing_lock(group_id):
+            if group_id in group_generation_inflight:
+                logger.info(
+                    "qq_social_agent group generation inflight: "
+                    f"group={group_id} buffer_deferred size={len(group_message_buffers.get(group_id, []))}"
+                )
+                should_reschedule = True
+                return
             items = group_message_buffers.pop(group_id, [])
             if not items:
                 return
@@ -1999,11 +2013,24 @@ async def _flush_group_buffer_after_delay(group_id: int) -> None:
                 f"group={group_id} size={len(items)}"
             )
             latest = items[-1]
-            await _handle_group_message_locked(latest.bot, latest.event, buffered_messages=items)
+            group_generation_inflight.add(group_id)
+            try:
+                await _handle_group_message_locked(latest.bot, latest.event, buffered_messages=items)
+            finally:
+                group_generation_inflight.discard(group_id)
+                pending_size = len(group_message_buffers.get(group_id, []))
+                logger.info(
+                    "qq_social_agent group generation finished: "
+                    f"group={group_id} pending_buffer={pending_size}"
+                )
+                if pending_size:
+                    should_reschedule = True
     finally:
         task = asyncio.current_task()
         if group_buffer_tasks.get(group_id) is task:
             group_buffer_tasks.pop(group_id, None)
+        if should_reschedule and group_message_buffers.get(group_id):
+            _schedule_group_buffer_flush(group_id, delay=GROUP_INFLIGHT_BUFFER_RETRY_SECONDS)
 
 
 def _schedule_passive_decision_retry(group_id: int, items: list[BufferedGroupMessage]) -> None:

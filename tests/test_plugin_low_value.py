@@ -1,5 +1,6 @@
 import asyncio
 import time
+from types import SimpleNamespace
 
 import nonebot
 
@@ -12,12 +13,14 @@ from qq_social_agent.plugin import (
     APPROVAL_HELP_COMMANDS,
     APPROVAL_REJECT_REASON_RE,
     GROUP_BUFFER_SECONDS,
+    GROUP_INFLIGHT_BUFFER_RETRY_SECONDS,
     GROUP_PASSIVE_DECISION_EVERY_MESSAGES,
     GROUP_PASSIVE_DECISION_GAP_SECONDS,
     JARGON_ADD_RE,
     JARGON_DELETE_RE,
     JARGON_LIST_RE,
     group_passive_decision_state,
+    group_generation_inflight,
     last_user_reply_times,
     _extract_message_id,
     _format_memory_context,
@@ -81,6 +84,9 @@ def _use_temp_plugin_memory(monkeypatch, tmp_path) -> MemoryStore:
     plugin.last_group_mention_targets.clear()
     plugin.recent_suppression_events.clear()
     plugin.approval_choice_cooldowns.clear()
+    plugin.group_message_buffers.clear()
+    plugin.group_buffer_tasks.clear()
+    plugin.group_generation_inflight.clear()
     return store
 
 
@@ -105,6 +111,76 @@ def _pending_approval() -> plugin.PendingGroupApproval:
 
 def test_group_buffer_seconds_is_six() -> None:
     assert GROUP_BUFFER_SECONDS == 6.0
+
+
+def _buffered_item(group_id: int, text: str, *, user_id: int = 184589072) -> plugin.BufferedGroupMessage:
+    return plugin.BufferedGroupMessage(
+        bot=SimpleNamespace(),
+        event=SimpleNamespace(group_id=group_id, user_id=user_id),
+        text=text,
+        user_id=user_id,
+        nickname="群友",
+        created_at=1000.0,
+    )
+
+
+def test_group_buffer_flush_defers_while_generation_inflight(monkeypatch) -> None:
+    group_id = 1026813421
+    plugin.group_message_buffers.clear()
+    plugin.group_buffer_tasks.clear()
+    group_generation_inflight.clear()
+    item = _buffered_item(group_id, "后来的消息")
+    plugin.group_message_buffers[group_id] = [item]
+    group_generation_inflight.add(group_id)
+    handled = []
+    scheduled = []
+
+    async def fake_handle(*args, **kwargs) -> None:
+        handled.append((args, kwargs))
+
+    monkeypatch.setattr(plugin, "_handle_group_message_locked", fake_handle)
+    monkeypatch.setattr(
+        plugin,
+        "_schedule_group_buffer_flush",
+        lambda gid, *, delay=GROUP_BUFFER_SECONDS: scheduled.append((gid, delay)),
+    )
+
+    asyncio.run(plugin._flush_group_buffer_after_delay(group_id, delay=0))
+
+    assert handled == []
+    assert plugin.group_message_buffers[group_id] == [item]
+    assert scheduled == [(group_id, GROUP_INFLIGHT_BUFFER_RETRY_SECONDS)]
+    group_generation_inflight.clear()
+
+
+def test_group_buffer_flush_marks_generation_and_reschedules_pending(monkeypatch) -> None:
+    group_id = 1026813421
+    plugin.group_message_buffers.clear()
+    plugin.group_buffer_tasks.clear()
+    group_generation_inflight.clear()
+    first_item = _buffered_item(group_id, "第一轮")
+    second_item = _buffered_item(group_id, "生成中来的新消息", user_id=3370998238)
+    plugin.group_message_buffers[group_id] = [first_item]
+    inflight_seen = []
+    scheduled = []
+
+    async def fake_handle(*args, **kwargs) -> None:
+        inflight_seen.append(group_id in group_generation_inflight)
+        plugin.group_message_buffers.setdefault(group_id, []).append(second_item)
+
+    monkeypatch.setattr(plugin, "_handle_group_message_locked", fake_handle)
+    monkeypatch.setattr(
+        plugin,
+        "_schedule_group_buffer_flush",
+        lambda gid, *, delay=GROUP_BUFFER_SECONDS: scheduled.append((gid, delay)),
+    )
+
+    asyncio.run(plugin._flush_group_buffer_after_delay(group_id, delay=0))
+
+    assert inflight_seen == [True]
+    assert group_id not in group_generation_inflight
+    assert plugin.group_message_buffers[group_id] == [second_item]
+    assert scheduled == [(group_id, GROUP_INFLIGHT_BUFFER_RETRY_SECONDS)]
 
 
 def test_low_value_group_text_ignored() -> None:
