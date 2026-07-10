@@ -116,7 +116,7 @@ MEMBER_PROFILE_SUMMARY_INTERVAL_SECONDS = 24 * 60 * 60
 MEMBER_PROFILE_SUMMARY_LOOKBACK_SECONDS = 7 * 24 * 60 * 60
 MEMBER_PROFILE_SUMMARY_ACTIVE_LIMIT = 20
 MEMBER_PROFILE_SUMMARY_MIN_MESSAGES = 5
-MEMBER_PROFILE_SUMMARY_MESSAGE_LIMIT = 120
+MEMBER_PROFILE_SUMMARY_MESSAGE_LIMIT = 240
 MEMBER_IMPRESSION_CONTEXT_LIMIT = 8
 RAW_CORPUS_CONTEXT_LIMIT = 6
 RAW_CORPUS_CANDIDATE_LIMIT = 240
@@ -214,7 +214,7 @@ MODEL_ROUTE_OVERRIDES_KEY = "llm_model_route_overrides"
 MODEL_ROUTE_STATUS_COMMANDS = {"模型状态", "模型", "model status", "/模型状态"}
 MODEL_ROUTE_RESET_COMMANDS = {"清模型覆盖", "清除模型覆盖", "重置模型", "恢复默认模型", "model reset", "/清模型覆盖"}
 MODEL_ROUTE_COMMAND_RE = re.compile(
-    r"^(?:/)?(?:切|设置|更换|改)?(?P<target>回复|reply|决策|decision|黑话|jargon|记忆|memory|回想|风格|style|学习|style_learning|工具|utility|utility_model)模型\s+"
+    r"^(?:/)?(?:切|设置|更换|改)?(?P<target>回复|reply|决策|decision|黑话|jargon|记忆|memory|回想|风格|style|学习|style_learning|画像|群友画像|member_profile|profile|工具|utility|utility_model)模型\s+"
     r"(?P<model>\S.+)$",
     re.IGNORECASE,
 )
@@ -239,10 +239,11 @@ MODEL_ROUTE_INFOS = (
     ("jargon", "黑话", "黑话词典注入选择"),
     ("memory", "记忆", "中期聊天回想压缩"),
     ("style", "风格", "群聊表达风格学习"),
+    ("member_profile", "画像", "群友长期画像摘要"),
 )
 MODEL_ROUTE_NAMES = tuple(route_name for route_name, _, _ in MODEL_ROUTE_INFOS)
 MODEL_ROUTE_STORAGE_NAMES = (*MODEL_ROUTE_NAMES, "utility")
-UTILITY_GROUP_ROUTE_NAMES = ("jargon", "memory", "style")
+UTILITY_GROUP_ROUTE_NAMES = ("jargon", "memory", "style", "member_profile")
 CHANGELOG_NOTICE_KEY = "2026-07-10-model-routes-v5"
 CHANGELOG_NOTICE_MESSAGE = """张风雪后端更新记录：
 1. 1535071184 改为命令专用号：只处理审批/工具命令，不走普通私聊生成。
@@ -980,6 +981,10 @@ def _model_route_name_from_text(target: str) -> str | None:
         "style": "style",
         "学习": "style",
         "style_learning": "style",
+        "画像": "member_profile",
+        "群友画像": "member_profile",
+        "member_profile": "member_profile",
+        "profile": "member_profile",
         "工具": "utility_group",
         "utility": "utility_group",
         "utility_model": "utility_group",
@@ -2654,7 +2659,7 @@ async def _maintain_group_learning(group_id: int) -> None:
         logger.warning(f"qq_social_agent style learning skipped: group={group_id} error={exc}")
 
 
-async def _maintain_member_profile_summaries(group_id: int) -> None:
+async def _maintain_member_profile_summaries(group_id: int, *, force: bool = False) -> None:
     if deepseek_client is None:
         return
     now = time.time()
@@ -2669,7 +2674,7 @@ async def _maintain_member_profile_summaries(group_id: int) -> None:
         return
     for user_id in active_user_ids:
         last_summary_at = memory.last_member_profile_summary_at(group_id, user_id)
-        if now - last_summary_at < MEMBER_PROFILE_SUMMARY_INTERVAL_SECONDS:
+        if not force and now - last_summary_at < MEMBER_PROFILE_SUMMARY_INTERVAL_SECONDS:
             continue
         messages = memory.member_messages_between(
             group_id,
@@ -3187,7 +3192,7 @@ async def _handle_model_route_command(bot: Bot, user_id: int, text: str) -> bool
         return True
     route_name = _model_route_name_from_text(match.group("target"))
     if route_name is None:
-        await _send_private_text(bot, user_id, "未知模型类型，只能切 决策/回复/黑话/记忆/风格/工具 模型。")
+        await _send_private_text(bot, user_id, "未知模型类型，只能切 决策/回复/黑话/记忆/风格/画像/工具 模型。")
         return True
     route_label = match.group("model").strip()
     try:

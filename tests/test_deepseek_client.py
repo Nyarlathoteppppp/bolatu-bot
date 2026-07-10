@@ -318,7 +318,7 @@ def test_client_methods_use_expected_model_routes() -> None:
         ("reply", "reply"),
         ("reply_candidates", "reply"),
         ("daily_review", "reply"),
-        ("member_profile", "memory"),
+        ("member_profile", "member_profile"),
         ("mid_memory", "memory"),
         ("style_learning", "style"),
     ]

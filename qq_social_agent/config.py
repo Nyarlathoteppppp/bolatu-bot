@@ -38,6 +38,7 @@ class DeepSeekConfig:
     jargon_model: str
     memory_model: str
     style_model: str
+    member_profile_model: str
     thinking: str
     reasoning_effort: str
     temperature: float
@@ -93,6 +94,7 @@ class AppConfig:
         jargon_model = str(deepseek.get("jargon_model", utility_model))
         memory_model = str(deepseek.get("memory_model", utility_model))
         style_model = str(deepseek.get("style_model", utility_model))
+        member_profile_model = str(deepseek.get("member_profile_model", style_model))
         fallback_models = deepseek.get("fallback_models", {})
         if not isinstance(fallback_models, dict):
             fallback_models = {}
@@ -104,6 +106,7 @@ class AppConfig:
             "jargon": parse_llm_model_route(jargon_model, providers, default_provider="deepseek"),
             "memory": parse_llm_model_route(memory_model, providers, default_provider="deepseek"),
             "style": parse_llm_model_route(style_model, providers, default_provider="deepseek"),
+            "member_profile": parse_llm_model_route(member_profile_model, providers, default_provider="deepseek"),
         }
         fallback_routes = {
             "decision": _parse_model_route(
@@ -136,6 +139,11 @@ class AppConfig:
                 providers,
                 default_provider="deepseek",
             ),
+            "member_profile": _parse_model_route(
+                str(fallback_models.get("member_profile", fallback_models.get("utility", "deepseek-v4-flash"))),
+                providers,
+                default_provider="deepseek",
+            ),
         }
         self.deepseek = DeepSeekConfig(
             base_url=str(deepseek.get("base_url", "https://api.deepseek.com")),
@@ -146,6 +154,7 @@ class AppConfig:
             jargon_model=jargon_model,
             memory_model=memory_model,
             style_model=style_model,
+            member_profile_model=member_profile_model,
             thinking=thinking,
             reasoning_effort=str(deepseek.get("reasoning_effort", "high")),
             temperature=float(deepseek.get("temperature", 0.72)),

@@ -909,6 +909,7 @@ def test_owner_can_query_model_status(monkeypatch, tmp_path) -> None:
     assert "模型状态" in bot.private_messages[-1][1]
     assert "回复" in bot.private_messages[-1][1]
     assert "风格" in bot.private_messages[-1][1]
+    assert "画像" in bot.private_messages[-1][1]
     assert "可切换模型" in bot.private_messages[-1][1]
     assert "fallback" in bot.private_messages[-1][1]
 
@@ -959,6 +960,29 @@ def test_owner_can_switch_style_model(monkeypatch, tmp_path) -> None:
     )
 
 
+def test_owner_can_switch_member_profile_model(monkeypatch, tmp_path) -> None:
+    store = _use_temp_plugin_memory(monkeypatch, tmp_path)
+    client = FakeModelClient()
+    monkeypatch.setattr(plugin, "deepseek_client", client)
+    bot = FakeApprovalBot()
+
+    handled = asyncio.run(
+        plugin._handle_group_approval_private(
+            bot,
+            1535071184,
+            "切画像模型 siliconflow/MiniMaxAI/MiniMax-M2.5",
+        )
+    )
+
+    assert handled
+    assert client.current_route("member_profile").label == "siliconflow/MiniMaxAI/MiniMax-M2.5"
+    assert "MiniMaxAI/MiniMax-M2.5" in store.app_kv_get(plugin.MODEL_ROUTE_OVERRIDES_KEY)
+    assert bot.private_messages[-1] == (
+        1535071184,
+        "已切画像模型：siliconflow/MiniMaxAI/MiniMax-M2.5\n影响路由：member_profile",
+    )
+
+
 def test_owner_can_switch_utility_group_models(monkeypatch, tmp_path) -> None:
     store = _use_temp_plugin_memory(monkeypatch, tmp_path)
     client = FakeModelClient()
@@ -977,10 +1001,11 @@ def test_owner_can_switch_utility_group_models(monkeypatch, tmp_path) -> None:
     assert client.current_route("jargon").label == "deepseek/deepseek-v4-flash"
     assert client.current_route("memory").label == "deepseek/deepseek-v4-flash"
     assert client.current_route("style").label == "deepseek/deepseek-v4-flash"
+    assert client.current_route("member_profile").label == "deepseek/deepseek-v4-flash"
     assert '"jargon": "deepseek/deepseek-v4-flash"' in store.app_kv_get(plugin.MODEL_ROUTE_OVERRIDES_KEY)
     assert bot.private_messages[-1] == (
         1535071184,
-        "已切工具模型：deepseek/deepseek-v4-flash\n影响路由：jargon、memory、style",
+        "已切工具模型：deepseek/deepseek-v4-flash\n影响路由：jargon、memory、style、member_profile",
     )
 
 

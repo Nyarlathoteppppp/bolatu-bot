@@ -86,17 +86,19 @@ BOT_TOOL_SECTION_MESSAGES = {
 9. 测试号 2776760548 可用 强服从：具体内容，单次注入最高优先级调试提示。""",
     "model": """bot工具 模型：
 1. 模型状态：展开可切换部分、当前模型、fallback、API key 来源、可切换模型清单。
-2. 可切换部分：决策模型、回复模型、黑话模型、记忆模型、风格模型。
+2. 可切换部分：决策模型、回复模型、黑话模型、记忆模型、风格模型、画像模型。
 3. 决策模型：群聊是否插嘴、action、是否需要联网搜索。
 4. 回复模型：私聊回复、群聊审批三候选。
 5. 黑话模型：黑话词典注入选择。
 6. 记忆模型：中期聊天回想压缩。
 7. 风格模型：群聊表达风格学习。
-8. 切回复模型 siliconflow/MiniMaxAI/MiniMax-M2.5。
-9. 切风格模型 siliconflow/MiniMaxAI/MiniMax-M2.5。
-10. 切决策模型 siliconflow/Qwen/Qwen3.5-35B-A3B。
-11. 切工具模型 deepseek/deepseek-v4-flash：批量切黑话/记忆/风格。
-12. 清模型覆盖：恢复 config.yaml 默认模型。""",
+8. 画像模型：群友长期画像摘要。
+9. 切回复模型 siliconflow/MiniMaxAI/MiniMax-M2.5。
+10. 切风格模型 siliconflow/MiniMaxAI/MiniMax-M2.5。
+11. 切画像模型 siliconflow/MiniMaxAI/MiniMax-M2.5。
+12. 切决策模型 siliconflow/Qwen/Qwen3.5-35B-A3B。
+13. 切工具模型 deepseek/deepseek-v4-flash：批量切黑话/记忆/风格/画像。
+14. 清模型覆盖：恢复 config.yaml 默认模型。""",
     "learning": """bot工具 学习：
 1. 记忆 8：查看最近 8 条中期聊天回想。
 2. 近期记忆 20：查看最近 20 条中期聊天回想，最多 30 条。

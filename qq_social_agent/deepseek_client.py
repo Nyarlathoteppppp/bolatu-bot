@@ -384,18 +384,20 @@ class DeepSeekClient:
         member_label: str,
         chat_label: str = "QQ 群聊",
     ) -> MemberProfileDraft:
-        context = "\n".join(_format_message(msg) for msg in messages[-120:])
+        context = "\n".join(_format_message(msg) for msg in messages)
         if not context:
             return MemberProfileDraft("", (), "", ())
         system = (
             "你只做群友画像摘要。只根据给出的这个人的原始发言判断，"
-            "不要编造身份、现实信息、政治立场或关系。输出严格 JSON。"
+            "不要编造身份、现实信息或关系；不要给政治立场、意识形态、阵营归属下定性标签，"
+            "只可客观写成常聊话题和表达习惯。输出严格 JSON。"
         )
         user = (
             f"聊天场景：{chat_label}\n"
             f"画像对象：{member_label}\n"
             "任务：总结这个群友的发言印象、兴趣话题、说话方式，并挑选少量代表性原话。\n"
-            "要求：短、具体、可用于以后回复这个人；代表性原话必须来自原文，不要改写。\n"
+            "要求：短、具体、可用于以后回复这个人；不要用政治立场标签概括这个人；"
+            "代表性原话必须来自原文，不要改写。\n"
             "JSON 格式："
             "{\"summary\":\"...\",\"interests\":[\"...\"],"
             "\"speaking_style\":\"...\",\"representative_texts\":[\"...\"]}\n\n"
@@ -403,7 +405,7 @@ class DeepSeekClient:
         )
         response = await self._chat_completion(
             task="member_profile",
-            route_name="memory",
+            route_name="member_profile",
             request={
                 "temperature": 0.2,
                 "max_tokens": 420,

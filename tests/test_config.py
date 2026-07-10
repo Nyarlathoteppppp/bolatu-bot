@@ -89,10 +89,11 @@ def test_llm_route_catalog_and_split_utility_flows() -> None:
         }
     ).deepseek
 
-    assert set(config.routes) >= {"decision", "reply", "jargon", "memory", "style"}
+    assert set(config.routes) >= {"decision", "reply", "jargon", "memory", "style", "member_profile"}
     assert config.routes["jargon"].label == "siliconflow/Qwen/Qwen3.5-35B-A3B"
     assert config.routes["memory"].label == "deepseek/deepseek-v4-flash"
     assert config.routes["style"].label == "siliconflow/MiniMaxAI/MiniMax-M2.5"
+    assert config.routes["member_profile"].label == "siliconflow/MiniMaxAI/MiniMax-M2.5"
     assert tuple(route.label for route in config.model_catalog) == (
         "deepseek/deepseek-v4-flash",
         "siliconflow/Pro/moonshotai/Kimi-K2.6",
