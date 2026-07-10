@@ -18,6 +18,8 @@ class FreshItem:
     source: str
     published_at: str
     summary: str = ""
+    url: str = ""
+    score: float | None = None
 
     def to_prompt_line(self) -> str:
         parts = [self.title]
@@ -37,6 +39,7 @@ class FreshLookup:
     items: tuple[FreshItem, ...]
     status: str
     provider: str = "google_news"
+    answer: str = ""
     cached: bool = False
 
 
@@ -87,6 +90,7 @@ class FreshContextTool:
                     lookup.items,
                     lookup.status,
                     provider=lookup.provider,
+                    answer=lookup.answer,
                     cached=True,
                 )
 
@@ -94,8 +98,9 @@ class FreshContextTool:
             return FreshLookup(normalized_query, normalized_kind, (), "rate_limited")
 
         provider = self._resolved_provider()
+        answer = ""
         if provider == "tavily":
-            items = await _fetch_tavily_items(
+            answer, items = await _fetch_tavily_lookup(
                 normalized_query,
                 kind=normalized_kind,
                 api_key=self.tavily_api_key,
@@ -105,8 +110,8 @@ class FreshContextTool:
                 items = await _fetch_google_news_items(normalized_query, kind=normalized_kind)
         else:
             items = await _fetch_google_news_items(normalized_query, kind=normalized_kind)
-        status = "ok" if items else "failed"
-        lookup = FreshLookup(normalized_query, normalized_kind, items, status, provider=provider)
+        status = "ok" if items or answer else "failed"
+        lookup = FreshLookup(normalized_query, normalized_kind, items, status, provider=provider, answer=answer)
         self._cache[key] = (now, lookup)
         return lookup
 
@@ -135,7 +140,7 @@ def _prompt_context_from_lookup(lookup: FreshLookup) -> str:
             "最新背景信息：本分钟外部信息源查询已达上限；这不是没有网络。"
             "回复时不要编造最新事实，不要说“没联网”；可以说这类刚发生的事需要等可靠消息。"
         )
-    if not lookup.items:
+    if not lookup.items and not lookup.answer:
         return (
             f"最新背景信息：信息源可用，但查询“{lookup.query}”没有拿到可靠结果。"
             "回复时不要编造最新事实，不要说“没联网”；可以承认没拿到可靠新消息。"
@@ -148,26 +153,28 @@ def _prompt_context_from_lookup(lookup: FreshLookup) -> str:
             "只当背景，不要播报搜索过程）："
         ),
     ]
+    if lookup.answer:
+        lines.append(f"快速摘要：{lookup.answer}")
     lines.extend(item.to_prompt_line() for item in lookup.items[:4])
-    lines.append("回复时基于这些背景做短评；信息源可能滞后或不完整，不要装作百分百确定。")
+    lines.append("回复时基于这些背景做短评；优先相信多来源共同支持的信息，不要把单条摘要当成绝对事实。")
     return "\n".join(lines)
 
 
-async def _fetch_tavily_items(
+async def _fetch_tavily_lookup(
     query: str,
     *,
     kind: str,
     api_key: str,
-) -> tuple[FreshItem, ...]:
+) -> tuple[str, tuple[FreshItem, ...]]:
     if not api_key:
-        return ()
+        return "", ()
     topic = "news" if kind in {"news", "sports"} else "general"
     payload: dict[str, object] = {
         "query": _tavily_query(query, kind=kind),
         "search_depth": "basic",
         "topic": topic,
-        "max_results": 5,
-        "include_answer": False,
+        "max_results": 4,
+        "include_answer": True,
         "include_raw_content": False,
         "include_images": False,
     }
@@ -186,8 +193,8 @@ async def _fetch_tavily_items(
             response.raise_for_status()
             data = response.json()
     except Exception:
-        return ()
-    return _parse_tavily_results(data)
+        return "", ()
+    return _parse_tavily_answer(data), _parse_tavily_results(data)
 
 
 def _tavily_query(query: str, *, kind: str) -> str:
@@ -205,6 +212,7 @@ def _parse_tavily_results(data: object) -> tuple[FreshItem, ...]:
     if not isinstance(raw_results, list):
         return ()
     items: list[FreshItem] = []
+    seen: set[str] = set()
     for raw in raw_results:
         if not isinstance(raw, dict):
             continue
@@ -213,17 +221,30 @@ def _parse_tavily_results(data: object) -> tuple[FreshItem, ...]:
         content = str(raw.get("content") or "").strip()
         if not title or _looks_like_low_quality_result(title, url):
             continue
+        key = _fresh_result_key(title, url)
+        if key in seen:
+            continue
+        seen.add(key)
         items.append(
             FreshItem(
                 title=title[:120],
                 source=_source_from_url(url)[:40],
                 published_at=str(raw.get("published_date") or "")[:40],
                 summary=_clean_text(content)[:180],
+                url=url[:240],
+                score=_as_float(raw.get("score")),
             )
         )
-        if len(items) >= 5:
-            break
-    return tuple(items)
+    return tuple(sorted(items, key=_fresh_item_sort_key)[:5])
+
+
+def _parse_tavily_answer(data: object) -> str:
+    if not isinstance(data, dict):
+        return ""
+    answer = str(data.get("answer") or "").strip()
+    if not answer:
+        return ""
+    return _clean_text(answer)[:260]
 
 
 async def _fetch_google_news_items(query: str, *, kind: str) -> tuple[FreshItem, ...]:
@@ -314,12 +335,32 @@ def _clean_text(value: str) -> str:
     return text
 
 
+def _as_float(value: object) -> float | None:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def _source_from_url(url: str) -> str:
     try:
         host = urlparse(url).netloc
     except ValueError:
         return ""
     return host.removeprefix("www.")
+
+
+def _fresh_result_key(title: str, url: str) -> str:
+    host = _source_from_url(url).casefold()
+    title_key = re.sub(r"\W+", "", title.casefold())[:80]
+    return f"{host}:{title_key}"
+
+
+def _fresh_item_sort_key(item: FreshItem) -> tuple[int, int, float]:
+    has_date = 1 if item.published_at else 0
+    has_summary = 1 if item.summary else 0
+    score = item.score if item.score is not None else 0.0
+    return (-has_date, -has_summary, -score)
 
 
 def _looks_like_low_quality_result(title: str, source: str) -> bool:

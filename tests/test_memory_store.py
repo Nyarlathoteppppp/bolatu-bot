@@ -28,6 +28,32 @@ def test_add_memory_summary_advances_state(tmp_path) -> None:
     assert memory.messages_for_mid_summary(1, keep_recent=3, batch_size=10) == []
 
 
+def test_relevant_memory_summaries_match_query_cues(tmp_path) -> None:
+    memory = MemoryStore(tmp_path / "bot.sqlite3")
+    for index in range(8):
+        memory.add_message(1, index, f"u{index}", f"m{index}", created_at=100 + index)
+
+    first_batch = memory.messages_for_mid_summary(1, keep_recent=0, batch_size=4)
+    memory.add_memory_summary(
+        1,
+        first_batch,
+        summary="群里聊过 Claude 封中国号，态度很烦。",
+        recall_cues=["Claude 封号", "讨厌中国用户"],
+    )
+    second_batch = memory.messages_for_mid_summary(1, keep_recent=0, batch_size=4)
+    memory.add_memory_summary(
+        1,
+        second_batch,
+        summary="群里聊过剩饭和外卖。",
+        recall_cues=["剩饭", "外卖"],
+    )
+
+    summaries = memory.relevant_memory_summaries(1, "claude 为什么封号", limit=1)
+
+    assert len(summaries) == 1
+    assert "Claude" in summaries[0].summary
+
+
 def test_style_rules_are_kept_recent(tmp_path) -> None:
     memory = MemoryStore(tmp_path / "bot.sqlite3")
 
@@ -40,6 +66,23 @@ def test_style_rules_are_kept_recent(tmp_path) -> None:
     rules = memory.recent_style_rules(1, 10)
     assert len(rules) == 3
     assert [rule.situation for rule in rules] == ["场景2", "场景3", "场景4"]
+
+
+def test_relevant_style_rules_match_current_text(tmp_path) -> None:
+    memory = MemoryStore(tmp_path / "bot.sqlite3")
+    memory.add_style_rules(
+        1,
+        [
+            ("聊亏钱", "用一句现实成本短评", "股票又亏了"),
+            ("聊吃饭", "用短句接日常", "中午吃什么"),
+        ],
+        keep=10,
+    )
+
+    rules = memory.relevant_style_rules(1, "股票亏麻了", limit=1)
+
+    assert len(rules) == 1
+    assert rules[0].situation == "聊亏钱"
 
 
 def test_member_profiles_track_aliases_by_user_id(tmp_path) -> None:
@@ -273,3 +316,12 @@ def test_llm_usage_source_key_deduplicates(tmp_path) -> None:
     summaries = memory.llm_usage_summary()
     assert len(summaries) == 1
     assert summaries[0].call_count == 1
+
+
+def test_app_kv_round_trip(tmp_path) -> None:
+    memory = MemoryStore(tmp_path / "bot.sqlite3")
+
+    assert memory.app_kv_get("notice:1") is None
+    memory.app_kv_set("notice:1", "sent")
+
+    assert memory.app_kv_get("notice:1") == "sent"

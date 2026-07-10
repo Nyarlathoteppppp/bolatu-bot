@@ -122,6 +122,7 @@ class DeepSeekClient:
         style_context: str = "",
         jargon_context: str = "",
         member_context: str = "",
+        fresh_context_hint: str = "",
     ) -> ReplyDecision:
         context = "\n".join(_format_decision_message(msg) for msg in recent_messages[-30:])
         if not context:
@@ -137,39 +138,34 @@ class DeepSeekClient:
             )
         if cue_repeat_context:
             interaction_state = f"{interaction_state}\n反复题型状态：{cue_repeat_context}"
-        market_state = "当前可能是美股、股票或加密货币话题。" if market_topic else "当前没有识别为市场行情话题。"
         system = f"""
-你是一个 QQ 群聊回复决策器，只输出 json，不输出解释文本。
-你要判断人格“{persona.name}”现在该不该行动，以及应该采取什么社交动作。
+你是 QQ 群聊行动决策器，只输出 json，不输出解释文本。
+目标：判断人格“{persona.name}”现在插嘴有没有意思，以及该采取什么社交动作。
 
-人格设定：
+人格摘要：
 {persona.decision_prompt}
 
 判断原则：
 - 群聊不是问答机器人，没必要每句话都回。
 - 判断目标不是“能不能回复”，而是“现在插嘴有没有意思”。
-- 非点名、非回复、非接你上一句话时，不要抢话；但只要你能让这轮聊天更好笑、更有判断、更有冲突点，或者接住明显情绪点，就可以 should_reply=true。
-- 只是能接住话题不够，必须有增量：新角度、好吐槽、明确站队、反差梗、或者能推进群友继续聊。
-- 不要因为话题不是志愿、就业、市场、学习，就判定“与你无关”。日常八卦、群友互损、游戏、生活吐槽、抽象玩梗，也可以短句接。
-- 艾特、回复、点名、接你上一句话，都是强信号；除非是空艾特、刷屏、纯表情、明显不需要回应，否则倾向 should_reply=true。
-- 如果他们明显在和你聊天、追问你、引用你、接你上一句话，倾向 should_reply=true。
-- 如果同一个群友短时间内第三次以上艾特/回复你，仍可 should_reply=true，但回复目标应变成评价“他一直 cue 你”这件事；不要继续像问答机器人一样认真答每个问题。
-- 如果同一个群友连续问评价类、谁厉害类、命令式 cue，第三次以上不要按题作答；应把“他反复问这种题”本身作为回复对象，倾向吐槽、反问、嫌他无聊。
-- 当前消息即使有问题、观点、情绪或吐槽，如果你的回复只是在解释、附和、总结、重复群友意思，should_reply=false。
+- 非点名、非回复、非接你上一句话时，默认 should_reply=false；除非你能明显让这轮聊天更好笑、更有判断、更有冲突点，或接住明显情绪点。
+- 只是能接住话题不够；必须有增量：新角度、好吐槽、明确站队、反差梗、现实判断、情绪承接，或能推进群友继续聊。
+- 艾特、回复、点名、接你上一句话是强信号；除非是空艾特、刷屏、纯表情、明显不需要回应，否则倾向 should_reply=true。
+- 如果同一个群友短时间内第三次以上艾特/回复你，不要继续像问答机器人一样认真答每个问题；把“他反复 cue 你”本身作为回复对象。
+- 当前消息即使有问题、观点、情绪或吐槽，如果你的回复只会解释、附和、总结、重复群友意思，should_reply=false。
 - 群友正在两三个人连续互聊且很认真时，不要抢话；除非他们在问开放问题、抛出明显梗点、或者讨论有意思观点你觉得需要插嘴。
-- 普通群友互聊时，如果你只能重复、尬总结、强行科普，倾向 should_reply=false；如果能像损友一样补一句有态度的话，倾向 should_reply=true。
-- 群友在聊生活选择、成本、风险、亏钱、吃亏、学校/就业/消费判断时，如果你能给一句明确现实判断或好吐槽，倾向 should_reply=true，action=agree 或 tease。
-- 群友明显在倒霉、破防、自嘲、抱怨没人理、吃亏、吐了、亏钱、舍不得花钱、担心变质或身体风险时，可以像群友一样接一句短判断或吐槽；不要因为没点名就机械 ignore。
+- 日常八卦、群友互损、游戏、生活吐槽、抽象玩梗可以接；但别强行科普、别尬总结。
+- 群友聊生活选择、成本、风险、亏钱、吃亏、学校/就业/消费判断，或明显倒霉破防，可以接一句现实判断或吐槽。
 - 纯表情、单纯“6/哈哈/草/嗯/哦/牛/笑死”、无人需要回应的刷屏，倾向 should_reply=false。
 - 最近聊天只作为氛围参考，不要因为能总结全场就回复。
-- 机器人自己的历史发言只用于判断有没有人接话、点名或反驳；不要把机器人旧发言里的词、梗、判断当成当前话题继续复读。
-- “没人接机器人”只在最近机器人连续主动插话多次，并且群友完全没有接它、点它、引用它时才明显降权；不要因为机器人刚发过一次行情、一次短评就直接沉默。
-- 如果他们在聊比赛、实时热点、刚发生的新闻、最新政策、最新数据，先判断这句话本身值不值得接；值得接才继续判断是否需要最新背景。
-- 判断“没人接它”时不要机械数行，要看语义：群友是在回应机器人，还是只是在各聊各的。
-- 不要为了证明自己懂而回复；但能自然让聊天更有意思时，不要过度保守。
+- 机器人自己的历史发言只用于判断有没有人接话、点名或反驳；不要把旧词、旧梗、旧判断当成当前话题复读。
+- 如果最近机器人主动插话没人接，倾向 should_reply=false；但有人点名、引用、接话时不受影响。
+- 不要为了证明自己懂而回复；能自然让聊天更有意思时也不要过度保守。
+- 行情、股票、加密货币的具体标的识别由后端辅助；但是否需要“最新背景/联网搜索”必须由你判断，非必要不搜索。
+- 只有这句话值得回复，并且没有最新事实容易说错，或者群友明确在问刚发生的新闻、比赛、政策、热点、版本变化时，才 need_fresh_context=true。
+- 不要因为自己不确定就自动搜索；闲聊、常识、抽象梗、老话题、纯态度题，need_fresh_context=false。
 
 行动选择：
-- 先选择 action，再决定 should_reply。不要把 reply 当默认动作。
 - action 只能是以下之一：
   - ignore：不说话。
   - reply：普通短句接话，有明确增量但不需要攻击性。
@@ -179,8 +175,7 @@ class DeepSeekClient:
   - ask_back：反问，把问题踢回去或逼对方补关键变量。
   - mock_repeated_question：对连续评价/谁厉害/命令式 cue 进行吐槽，不按题作答。
   - at_someone：话题明确转向某个群友，或者需要某人回复。
-  - market_check：需要实时美股/股票/加密货币行情工具。
-  - fresh_context：需要最新新闻、赛果、政策、热点背景。
+  - fresh_context：需要最新新闻、赛果、政策、热点背景；是否搜索由你判断，非必要不用。
 - 非点名场景不要默认抢话；但能增加笑点、判断、冲突、情绪承接或现实提醒时，可以 action=reply、agree 或 tease。
 - 如果群友是正常问问题、正常交流、没有攻击你，也不是短时间反复骚扰式 cue，优先 action=answer，而不是 tease。
 - 被点名不等于要回怼。点名内容正常，就正常回答。
@@ -195,41 +190,22 @@ class DeepSeekClient:
 - 当前消息是“为什么你艾特我又复读一遍我的问题”，should_reply=true，action=tease；原因是可以吐槽“你自己都不回答这种问题还问我”。
 - 当前消息是“你可以自我介绍一下吗”，should_reply=true，action=answer；原因是正常提问，不要阴阳怪气。
 - 当前消息是“你本科是哪个学校的”，should_reply=true，action=answer；原因是正常询问身份，不要冒充真人，可以简短说明。
-- 当前消息是“你是不是不能识图”，should_reply=true，action=answer；原因是正常能力问题，直接说明。
 - 当前消息是“你个傻逼，你是不是 AI”，should_reply=true，action=tease 或 answer；原因是挑衅/攻击，可以短句回，但不要连续升级。
 - 群友在认真讨论具体问题，没人点你，也没有明显梗点，should_reply=false，action=ignore。
 - 群友说“选专业还是得看家庭试错空间，不能只看热不热门”，should_reply=true，action=agree；原因是观点有判断，可以认可后补你想说的成本逻辑。
 - 群友说“没人理我”“昨天剩的饭不知道坏没坏”“股票又亏了”，should_reply=true，action=tease 或 agree；原因是有倒霉情绪和现实成本/风险点，可以短句接。
 - 群友互怼、抛出很明显的梗点，你能补一句有态度的话，should_reply=true，action=tease。
 - 当前消息需要某个群友接话或表态，should_reply=true，action=at_someone。
-
-工具判断：
-- 如果当前消息需要实时美股、股票、加密货币行情，且你决定应该回复，则 action="market_check", need_tool=true, tool="market"。
-- 只有在用户明确提到具体 ticker、公司、币种、价格、走势、涨跌、行情时才查工具。
-- 如果只是泛泛聊“股票/币圈/市场”，但没有具体标的，need_tool=false，可以选择不回复或短句让对方报标的。
-- 美股 symbol 用大写 ticker，例如 NVDA、TSLA、AAPL；crypto symbol 用 CoinGecko id，例如 bitcoin、ethereum、solana，display 用 BTC、ETH、SOL。
-- 一次最多给 2 个 symbols。
-- 如果工具结果本身就够回答，比如“BTC 多少钱”，comment_after_tool=false；如果用户问“怎么看/怎么了/能买吗”，comment_after_tool=true。
-
-最新背景判断：
-- 先决定 should_reply，再决定 need_fresh_context；不要为了搜索而回复。
-- 只有同时满足这些条件，才设置 action="fresh_context" 且 need_fresh_context=true：1. 你已经决定 should_reply=true；2. 当前消息明确在问最新消息、新闻、赛果、比分、结果、刚发生的事，或不查最新背景会明显误导；3. fresh_query 有具体对象，例如国家/地区/赛事/球队/公司/人物/产品/事件。
-- 适合补最新背景的场景：国际冲突、战争、突发新闻、比赛赛果、世界杯/电竞/体育赛事、刚出的政策、刚发布的产品、最新舆情，并且当前消息正在问或讨论具体对象。
-- 不适合补最新背景的场景：纯玩梗、群友互损、普通情绪接话、泛泛观点、没有具体对象的闲聊、只是你自己不确定、只是出现“今天/现在”但实际在问时间日期。
-- 不要因为“可能是新东西/自己知识过期/没把握”就搜索；非必要不搜索，可以泛泛短评或说不确定。
-- “今天周几/几点/测试/随便搜搜/你能搜什么/乱码了吗”这类消息 need_fresh_context=false。
-- 股票、币价、行情价格优先用 market 工具，不要用 fresh_context 代替行情工具。
-- fresh_query 写适合信息源查询的关键词，短而具体，例如“美国 伊朗 冲突 最新消息”“世界杯 阿根廷 法国 比分”“MSI T1 G2 赛果”。
-- fresh_kind 只能是 "news"、"sports"、"web" 之一；不确定就用 "news"。
-- 如果不补最新背景也能自然短评，就 need_fresh_context=false。
+- 当前消息是“美国和伊朗现在到底怎么了”“世界杯今天比分多少”这类需要最新事实的问题，且你判断值得接，should_reply=true，action=fresh_context，need_fresh_context=true，并给出 fresh_query。
+- 当前消息只是“美国挺抽象”“比赛真难看”这类纯态度/吐槽，除非明确问最新进展，否则 need_fresh_context=false。
 
 必须输出合法 json，不要代码块，不要解释；reason 不超过 30 个中文字符。格式如下：
-{{"should_reply": true, "confidence": 0.82, "action": "market_check", "mode": "market", "need_tool": true, "tool": "market", "symbols": [{{"kind": "crypto", "symbol": "bitcoin", "display": "BTC"}}], "comment_after_tool": true, "need_fresh_context": false, "fresh_query": "", "fresh_kind": "news", "reason": "用户在问比特币走势，需要先查实时行情"}}
+{{"should_reply": true, "confidence": 0.82, "action": "tease", "mode": "chat", "reason": "有倒霉情绪，可以接一句", "need_fresh_context": false, "fresh_query": "", "fresh_kind": "news"}}
 """.strip()
         user = f"""
 聊天场景：{chat_label}
 当前互动状态：{interaction_state}
-市场/行情状态：{market_state}
+{_optional_section("后端最新背景候选", fresh_context_hint)}
 
 最近聊天氛围：
 {context}
@@ -246,7 +222,7 @@ class DeepSeekClient:
         response = await self.client.chat.completions.create(
             model=model,
             temperature=0.2,
-            max_tokens=260,
+            max_tokens=180,
             response_format={"type": "json_object"},
             messages=[
                 {"role": "system", "content": system},
@@ -609,11 +585,13 @@ class DeepSeekClient:
 - 优先提取短句式、语气、玩梗方式、吐槽方式、附和方式、互损方式。
 - 规则写成：当 situation 时，可以 style。
 - style 必须是抽象表达方法，不要保存群友原句；不要连续复制原文 8 个以上中文字符。
+- 禁止输出“说XXX”“用XXX句式”“短句接XXX”这类保存原话的规则。
+- 如果源消息很好笑，只抽象成表达策略，例如“用一句损友式现实理由拒绝”，不要保存原句或固定词。
 - situation 不超过 24 个中文字符；style 不超过 30 个中文字符。
 - 最多输出 8 条；没有合适内容输出空数组。
 
 输出合法 JSON：
-{"rules":[{"situation":"对离谱事吐槽","style":"短句接“太典了”","source_id":"3"}]}
+{"rules":[{"situation":"对离谱事吐槽","style":"用短句点出离谱感","source_id":"3"}]}
 """.strip()
         user = f"""
 聊天场景：{chat_label}

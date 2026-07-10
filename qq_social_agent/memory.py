@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 import time
 from dataclasses import dataclass
@@ -165,6 +166,12 @@ class MemoryStore:
             create table if not exists memory_summary_state (
               group_id integer primary key,
               last_message_id integer not null default 0
+            );
+
+            create table if not exists app_kv (
+              key text primary key,
+              value text not null,
+              updated_at real not null
             );
 
             create table if not exists style_rules (
@@ -529,6 +536,33 @@ class MemoryStore:
         ).fetchall()
         return [_summary_from_row(row) for row in reversed(rows)]
 
+    def relevant_memory_summaries(
+        self,
+        group_id: int,
+        query: str,
+        *,
+        limit: int,
+        candidate_limit: int = 80,
+    ) -> list[MemorySummary]:
+        rows = self.conn.execute(
+            """
+            select group_id, start_at, end_at, summary, recall_cues_json, created_at
+            from memory_summaries
+            where group_id = ?
+            order by created_at desc
+            limit ?
+            """,
+            (group_id, candidate_limit),
+        ).fetchall()
+        scored: list[tuple[int, float, sqlite3.Row]] = []
+        for row in rows:
+            haystack = f"{row['summary']} {row['recall_cues_json']}"
+            score = _text_relevance_score(query, haystack)
+            if score > 0:
+                scored.append((score, float(row["created_at"]), row))
+        scored.sort(key=lambda item: (item[0], item[1]), reverse=True)
+        return [_summary_from_row(row) for _, _, row in scored[:limit]]
+
     def messages_for_style_learning(
         self,
         group_id: int,
@@ -614,6 +648,42 @@ class MemoryStore:
                 created_at=float(row["created_at"]),
             )
             for row in reversed(rows)
+        ]
+
+    def relevant_style_rules(
+        self,
+        group_id: int,
+        query: str,
+        *,
+        limit: int,
+        candidate_limit: int = 80,
+    ) -> list[StyleRule]:
+        rows = self.conn.execute(
+            """
+            select group_id, situation, style, source_text, created_at
+            from style_rules
+            where group_id = ?
+            order by created_at desc, id desc
+            limit ?
+            """,
+            (group_id, candidate_limit),
+        ).fetchall()
+        scored: list[tuple[int, float, sqlite3.Row]] = []
+        for row in rows:
+            haystack = f"{row['situation']} {row['style']} {row['source_text']}"
+            score = _text_relevance_score(query, haystack)
+            if score > 0:
+                scored.append((score, float(row["created_at"]), row))
+        scored.sort(key=lambda item: (item[0], item[1]), reverse=True)
+        return [
+            StyleRule(
+                group_id=int(row["group_id"]),
+                situation=str(row["situation"]),
+                style=str(row["style"]),
+                source_text=str(row["source_text"]),
+                created_at=float(row["created_at"]),
+            )
+            for _, _, row in scored[:limit]
         ]
 
     def member_profiles_for_context(
@@ -1006,6 +1076,25 @@ class MemoryStore:
             "muted_until": float(row["muted_until"]),
         }
 
+    def app_kv_get(self, key: str) -> str | None:
+        row = self.conn.execute("select value from app_kv where key = ?", (key,)).fetchone()
+        if not row:
+            return None
+        return str(row["value"])
+
+    def app_kv_set(self, key: str, value: str) -> None:
+        self.conn.execute(
+            """
+            insert into app_kv(key, value, updated_at)
+            values (?, ?, ?)
+            on conflict(key) do update set
+              value = excluded.value,
+              updated_at = excluded.updated_at
+            """,
+            (key, value, time.time()),
+        )
+        self.conn.commit()
+
 
 def _message_from_row(row: sqlite3.Row) -> ChatMessage:
     return ChatMessage(
@@ -1033,6 +1122,51 @@ def _summary_from_row(row: sqlite3.Row) -> MemorySummary:
         end_at=float(row["end_at"]),
         created_at=float(row["created_at"]),
     )
+
+
+def _text_relevance_score(query: str, haystack: str) -> int:
+    query_terms = _relevance_terms(query)
+    if not query_terms:
+        return 0
+    haystack_lower = haystack.casefold()
+    score = 0
+    for term in query_terms:
+        term_lower = term.casefold()
+        if term_lower not in haystack_lower:
+            continue
+        score += 3 if len(term_lower) >= 4 else 1
+    return score
+
+
+def _relevance_terms(text: str) -> set[str]:
+    lowered = text.casefold()
+    terms = {
+        match.group(0)
+        for match in re.finditer(r"[a-z0-9_]{2,}", lowered)
+    }
+    for chunk in re.findall(r"[\u4e00-\u9fff]{2,}", text):
+        if len(chunk) <= 8:
+            terms.add(chunk)
+        for size in (2, 3, 4):
+            if len(chunk) < size:
+                continue
+            for index in range(0, len(chunk) - size + 1):
+                terms.add(chunk[index : index + size])
+    stop_terms = {
+        "这个",
+        "那个",
+        "什么",
+        "怎么",
+        "就是",
+        "然后",
+        "可以",
+        "不是",
+        "没有",
+        "一下",
+        "感觉",
+        "时候",
+    }
+    return {term for term in terms if term not in stop_terms}
 
 
 def _profile_from_row(row: sqlite3.Row) -> MemberProfile:

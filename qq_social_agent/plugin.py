@@ -16,8 +16,27 @@ from nonebot.matcher import Matcher
 from nonebot.params import CommandArg
 from nonebot.rule import Rule
 
+from .approval_rules import (
+    APPROVAL_CHOICE_RE,
+    APPROVAL_DETAIL_COMMANDS,
+    APPROVAL_HELP_COMMANDS,
+    APPROVAL_REJECT_REASON_RE,
+    APPROVAL_RULES_DETAIL_MESSAGE,
+    APPROVAL_RULES_MESSAGE,
+    JARGON_ADD_RE,
+    JARGON_DELETE_RE,
+    JARGON_LIST_RE,
+    TOKEN_REPORT_COMMAND_ALIASES,
+)
 from .config import load_config
 from .cue_patterns import CuePatternTracker, CueRepeatState
+from .decision_gate import (
+    apply_backend_tool_decision as _apply_backend_tool_decision,
+    context_query_text as _context_query_text,
+    is_explicit_market_lookup as _is_explicit_market_lookup,
+    is_low_value_group_text as _is_low_value_group_text,
+    pre_decision_gate as _pre_decision_gate,
+)
 from .deepseek_client import DeepSeekClient, ReplyDecision, set_usage_recorder
 from .group_jargon import (
     GroupJargonEntry,
@@ -44,7 +63,6 @@ from .reply_splitter import split_reply_messages
 from .tools.fresh_context import (
     FreshContextTool,
     detect_fresh_intent,
-    should_use_fresh_context,
 )
 from .tools.market import MarketTool
 from .tools.market_intent import MarketIntent, detect_market_intents, is_market_topic
@@ -71,6 +89,7 @@ group_message_buffers: dict[int, list["BufferedGroupMessage"]] = {}
 group_buffer_tasks: dict[int, asyncio.Task[None]] = {}
 group_passive_decision_state: dict[int, tuple[float, int]] = {}
 pending_group_approvals: dict[int, "PendingGroupApproval"] = {}
+last_suppression_notice_times: dict[tuple[int, str], float] = {}
 
 MID_MEMORY_KEEP_SUMMARIES = 4
 MID_MEMORY_BATCH_SIZE = 60
@@ -85,19 +104,17 @@ CUSTOM_JARGON_CONTEXT_LIMIT = 10
 GROUP_BUFFER_SECONDS = 6.0
 GROUP_PASSIVE_DECISION_GAP_SECONDS = 30
 GROUP_PASSIVE_DECISION_EVERY_MESSAGES = 3
+SUPPRESSION_NOTICE_COOLDOWN_SECONDS = 60
 ADDRESS_REPEAT_WINDOW_SECONDS = 10 * 60
 MENTION_TARGET_LIMIT = 8
 REPEAT_MENTION_SUPPRESS_SECONDS = 10 * 60
 PRIVATE_DEBUG_OWNER_ID = 2776760548
 GROUP_APPROVAL_USER_IDS = (1535071184, 3370998238)
-JARGON_COMMAND_USER_IDS = tuple(sorted({PRIVATE_DEBUG_OWNER_ID, *GROUP_APPROVAL_USER_IDS}))
+JARGON_COMMAND_USER_IDS = tuple(
+    sorted({PRIVATE_DEBUG_OWNER_ID, *GROUP_APPROVAL_USER_IDS, *app_config.allowed_private_users})
+)
 RECALL_FEEDBACK_CONTEXT_LIMIT = 3
 POSITIVE_FEEDBACK_CONTEXT_LIMIT = 4
-APPROVAL_REJECT_REASON_RE = re.compile(r"^不准奏(?P<index>[1-3])?原因\s*[:：]\s*(?P<reason>.+)$", re.DOTALL)
-APPROVAL_CHOICE_RE = re.compile(r"^([1-3])([!！])?$")
-JARGON_ADD_RE = re.compile(r"^/黑话\s*[:：]?\s*(?P<term>.+?)\s+指代\s*[:：]\s*(?P<meaning>.+)$")
-JARGON_DELETE_RE = re.compile(r"^/删黑话\s*[:：]?\s*(?P<term>.+)$")
-JARGON_LIST_RE = re.compile(r"^/黑话列表\s*$")
 LLM_USAGE_LOG_RE = re.compile(
     r"^(?P<month>\d{2})-(?P<day>\d{2}) "
     r"(?P<hms>\d{2}:\d{2}:\d{2}).*qq_social_agent llm usage: "
@@ -106,57 +123,26 @@ LLM_USAGE_LOG_RE = re.compile(
     r"completion_tokens=(?P<completion>\d+|None) "
     r"total_tokens=(?P<total>\d+|None)"
 )
-APPROVAL_HELP_COMMANDS = {"审批规则", "规则", "帮助"}
-APPROVAL_DETAIL_COMMANDS = {"审批规则详情", "详细规则", "规则详情", "详细解释"}
-TOKEN_REPORT_COMMAND_ALIASES = {"token用量", "tokens", "token", "usage", "用量", "消耗", "费用"}
-APPROVAL_RULES_MESSAGE = """张风雪群发审批规则：
-1. AI 默认把最想发的候选放在 1；准奏=发 1。
-2. 回 1/2/3：发送对应候选；回 1!/2!/3!：发送并标记优质。
-3. 回 不准奏原因：xxx：取消并默认批评第 1 条。
-4. 回 不准奏1原因/不准奏2原因/不准奏3原因：xxx：取消并批评指定候选。
-5. 回 开启/关闭：恢复或暂停群聊进入决策，并重发本规则。
-6. 回 token用量：查看近 24 小时 token 明细；也可回 token用量 1h/7d/all。
-7. 回 token用量 2026-07-10：查看指定日期。
-8. 回 审批规则详情：展开完整说明。"""
-APPROVAL_RULES_DETAIL_MESSAGE = """张风雪群发审批规则详情：
-一、候选规则
-1. 机器人想发群时，会先把候选回复私聊发给审批人，不会直接发群。
-2. 两个审批人谁先回复听谁的；只保留最新一条候选，没有超时。
-3. AI 默认把最想发、最符合当前氛围、最像群友自然发言的候选放在 1。
-4. 2/3 是不同角度备选，不一定比 1 更推荐。
-
-二、发送指令
-1. 回复“1/2/3”：发送对应候选。
-2. 回复“1!/2!/3!”：发送对应候选，并把这条标记为优质发言，后续学习它的表达策略。
-3. 回复“准奏”：默认发送第 1 条候选。
-
-三、不准奏/负反馈指令
-1. 回复“不准奏原因：原因内容”：取消候选，并默认把原因记到第 1 条候选。
-2. 回复“不准奏1原因：原因内容”：取消候选，把原因记到第 1 条候选。
-3. 回复“不准奏2原因：原因内容”：取消候选，把原因记到第 2 条候选。
-4. 回复“不准奏3原因：原因内容”：取消候选，把原因记到第 3 条候选。
-5. 原因尽量写具体，比如“太凶”“没接住梗”“像解释器”“对群宠小鸟不够温柔”“不该骂这个人”。
-6. 不准奏反馈会影响后续风格；只写一句“垃圾/不行”也能保存，但学习价值低。
-
-四、开关
-1. 回复“关闭”：群聊不进入决策，待审候选会清空。
-2. 回复“开启”：恢复群聊进入决策。
-3. 每次开启或关闭后，系统会把简版审批规则重新发给两个审批人。
-
-五、其他
-1. 回复“审批规则”：查看简版规则。
-2. 回复“审批规则详情”或“详细规则”：展开这份完整说明。
-3. 回复“token用量”：查看近 24 小时 token 明细。
-4. 回复“token用量 1h/7d/all”：查看指定窗口 token 明细；也可用 /bot tokens 24h。
-5. 回复“token用量 2026-07-10”：查看本机时区这一天 00:00 到次日 00:00 的用量；也支持 2026/07/10。
-6. 回复其他内容：取消上一条候选，不写反馈。
-7. 黑话命令：/黑话：咱妈 指代：中国；/黑话列表；/删黑话：咱妈。"""
 TOKEN_REPORT_DEFAULT_WINDOW_SECONDS = 24 * 60 * 60
 TOKEN_REPORT_MAX_RECENT_EVENTS = 8
 TOKEN_USAGE_LOG_BACKFILL_FILES = (
     Path(__file__).resolve().parent.parent / "logs" / "bot-runtime.log",
     Path(__file__).resolve().parent.parent / "logs" / "bot.log",
 )
+CHANGELOG_NOTICE_KEY = "2026-07-10-search-approval-v2"
+CHANGELOG_NOTICE_MESSAGE = """张风雪后端更新记录：
+1. 搜索优化：是否联网搜索交给 decision LLM 判断；后端只给“可能需要最新背景”的候选提示。
+2. Tavily 搜索结果现在会注入快速摘要、去重后的来源和更稳的短摘要，失败时明确提示没拿到可靠新消息。
+3. 最新新闻/赛果类消息不会再被普通频率门提前挡掉，但是否搜索、是否回复仍由 LLM 决策。
+4. 人设已调整为毒舌美少女现实判断型损友，同时保留 answer/agree 的正常好好讲话分支。
+5. 清理了一条会错误泛化语气的旧反馈；保留温和认可 action，不会把所有人都当成要哄。
+6. 后端拦截、频率门拦截或 LLM 判断不发时，会限流给审批人发一条调试通知，方便判断为什么没进候选。
+
+审批提醒：
+- 黑话：/黑话：词 指代：解释；/黑话列表；/删黑话：词。
+- 不准奏：不准奏原因：xxx；不准奏2原因：xxx 可批评指定候选。
+- token：token用量 / token用量 2026-07-10 / token用量 7d。
+"""
 
 
 @dataclass(frozen=True)
@@ -223,6 +209,7 @@ def _record_llm_usage(
 @get_driver().on_bot_connect
 async def _send_approval_rules_on_connect(bot: Bot) -> None:
     await _send_approval_rules_to_approvers(bot, reason="bot_connect")
+    await _send_changelog_notice_to_approvers(bot)
 
 
 async def _send_approval_rules_to_approvers(bot: Bot, *, reason: str) -> None:
@@ -234,6 +221,76 @@ async def _send_approval_rules_to_approvers(bot: Bot, *, reason: str) -> None:
                 "qq_social_agent failed sending approval rules: "
                 f"reason={reason} approver={approver_id} {_action_failed_summary(exc)}"
             )
+
+
+async def _send_changelog_notice_to_approvers(bot: Bot) -> None:
+    marker_key = f"changelog_notice:{CHANGELOG_NOTICE_KEY}"
+    delivered: list[int] = []
+    for approver_id in GROUP_APPROVAL_USER_IDS:
+        if _changelog_notice_sent(marker_key, approver_id):
+            continue
+        try:
+            await bot.send_private_msg(user_id=approver_id, message=Message(CHANGELOG_NOTICE_MESSAGE))
+        except ActionFailed as exc:
+            logger.warning(
+                "qq_social_agent failed sending changelog notice: "
+                f"approver={approver_id} {_action_failed_summary(exc)}"
+            )
+            continue
+        _mark_changelog_notice_sent(marker_key, approver_id)
+        delivered.append(approver_id)
+    if delivered:
+        logger.info(
+            "qq_social_agent changelog notice sent: "
+            f"key={CHANGELOG_NOTICE_KEY} approvers={delivered}"
+        )
+
+
+def _changelog_notice_sent(marker_key: str, approver_id: int) -> bool:
+    return memory.app_kv_get(_changelog_notice_marker(marker_key, approver_id)) == "sent"
+
+
+def _mark_changelog_notice_sent(marker_key: str, approver_id: int) -> None:
+    memory.app_kv_set(_changelog_notice_marker(marker_key, approver_id), "sent")
+
+
+def _changelog_notice_marker(marker_key: str, approver_id: int) -> str:
+    return f"{marker_key}:{approver_id}"
+
+
+async def _send_approval_suppression_notice(
+    bot: Bot,
+    *,
+    group_id: int,
+    user_id: int,
+    nickname: str,
+    text: str,
+    stage: str,
+    reason: str,
+) -> None:
+    now = time.monotonic()
+    key = (group_id, stage)
+    last_sent_at = last_suppression_notice_times.get(key)
+    if last_sent_at is not None and now - last_sent_at < SUPPRESSION_NOTICE_COOLDOWN_SECONDS:
+        return
+    last_suppression_notice_times[key] = now
+    message = (
+        "拦截通知：这不是待审候选\n"
+        f"群：{group_id}\n"
+        f"阶段：{stage}\n"
+        f"触发人：{_member_label(user_id, nickname)}\n"
+        f"消息：{_short_notice_text(text, 180)}\n"
+        f"原因：{_short_notice_text(reason, 220)}"
+    )
+    for approver_id in GROUP_APPROVAL_USER_IDS:
+        await _send_private_text(bot, approver_id, message)
+
+
+def _short_notice_text(text: str, limit: int) -> str:
+    compact = re.sub(r"\s+", " ", str(text or "")).strip()
+    if len(compact) <= limit:
+        return compact
+    return compact[: max(0, limit - 1)] + "…"
 
 
 PRIVATE_CHAT_OFFSET = 10_000_000_000_000
@@ -251,11 +308,7 @@ def _is_jargon_command_event(event: Event) -> bool:
     if not isinstance(event, (GroupMessageEvent, PrivateMessageEvent)):
         return False
     text = _event_plain_text(event)
-    return bool(
-        JARGON_ADD_RE.match(text)
-        or JARGON_DELETE_RE.match(text)
-        or JARGON_LIST_RE.match(text)
-    )
+    return _is_jargon_command_text(text)
 
 
 jargon_command = on_message(rule=Rule(_is_jargon_command_event), priority=9, block=True)
@@ -266,41 +319,14 @@ private_message = on_message(rule=Rule(_is_private_event), priority=50, block=Fa
 @jargon_command.handle()
 async def handle_jargon_command(event: Event, matcher: Matcher) -> None:
     user_id = int(getattr(event, "user_id", 0) or 0)
-    if user_id not in JARGON_COMMAND_USER_IDS:
-        await matcher.finish("没权限。")
     group_id = _jargon_command_group_id(event)
-    if group_id is None:
-        await matcher.finish("没找到要写入的群。")
-
-    text = _event_plain_text(event)
-    if JARGON_LIST_RE.match(text):
-        entries = memory.custom_jargon_entries(group_id)
-        if not entries:
-            await matcher.finish("暂无自定义黑话。")
-        await matcher.finish(_format_custom_jargon_list(entries))
-
-    delete_match = JARGON_DELETE_RE.match(text)
-    if delete_match is not None:
-        term = delete_match.group("term").strip()
-        if not term:
-            await matcher.finish("格式：/删黑话：词")
-        deleted = memory.delete_custom_jargon(group_id, term)
-        await matcher.finish("已删。" if deleted else "没找到这条自定义黑话。")
-
-    add_match = JARGON_ADD_RE.match(text)
-    if add_match is None:
-        await matcher.finish("格式：/黑话：咱妈 指代：中国")
-    term = add_match.group("term").strip()
-    meaning = add_match.group("meaning").strip()
-    if not term or not meaning:
-        await matcher.finish("格式：/黑话：咱妈 指代：中国")
-    memory.upsert_custom_jargon(
-        group_id=group_id,
-        term=term,
-        explanation=f"指代：{meaning}",
-        created_by=user_id,
+    await matcher.finish(
+        _handle_jargon_command_text(
+            user_id=user_id,
+            group_id=group_id,
+            text=_event_plain_text(event),
+        )
     )
-    await matcher.finish(f"已记黑话：{term} -> {meaning}")
 
 
 @group_message.handle()
@@ -324,6 +350,15 @@ async def handle_group_message(bot: Bot, event: GroupMessageEvent) -> None:
         logger.info(
             "qq_social_agent ignored group low value text: "
             f"group={group_id} user={int(event.user_id)} text={text!r}"
+        )
+        await _send_approval_suppression_notice(
+            bot,
+            group_id=group_id,
+            user_id=int(event.user_id),
+            nickname=_nickname(event),
+            text=text,
+            stage="backend_low_value",
+            reason="后端低价值硬拦截：纯表情/单字/短笑声，不进入 buffer 和 LLM decision。",
         )
         return
     if (
@@ -376,10 +411,12 @@ async def _handle_group_message_locked(
 
     market_intents = detect_market_intents(text, limit=2)
     market_topic = bool(market_intents) or is_market_topic(text)
-    fresh_topic = detect_fresh_intent(text) is not None
+    fresh_intent = detect_fresh_intent(text)
+    market_forced = bool(market_intents) and _is_explicit_market_lookup(text)
+    fresh_candidate = fresh_intent is not None
     if addressed_bot:
         _mark_passive_decision_forced(group_id)
-    elif not market_topic and not fresh_topic:
+    elif not market_forced and not fresh_candidate:
         message_count = len(buffered_messages) if buffered_messages else 1
         first_message_at = _buffered_first_created_at(buffered_messages)
         last_message_at = _buffered_last_created_at(buffered_messages)
@@ -393,6 +430,15 @@ async def _handle_group_message_locked(
             logger.info(
                 "qq_social_agent skipped passive decision gate: "
                 f"group={group_id} messages={message_count} reason={reason}"
+            )
+            await _send_approval_suppression_notice(
+                bot,
+                group_id=group_id,
+                user_id=user_id,
+                nickname=nickname,
+                text=text,
+                stage="passive_frequency_gate",
+                reason=f"被动发言频率门拦截：{reason}。30 秒内连续聊天时，每 3 条才进一次 decision。",
             )
             _schedule_group_learning(group_id)
             return
@@ -418,6 +464,15 @@ async def _handle_group_message_locked(
     rate = rate_limiter.allow(group_id, mentioned=addressed_bot)
     if not rate.allowed:
         logger.info(f"qq_social_agent suppressed by rate: group={group_id} reason={rate.reason}")
+        await _send_approval_suppression_notice(
+            bot,
+            group_id=group_id,
+            user_id=user_id,
+            nickname=nickname,
+            text=text,
+            stage="reply_rate_limiter",
+            reason=f"发言频率限制拦截：{rate.reason}",
+        )
         return
 
     if has_political_redline(text):
@@ -426,6 +481,15 @@ async def _handle_group_message_locked(
             f"group={group_id} addressed={addressed_bot} text={text!r}"
         )
         if not addressed_bot:
+            await _send_approval_suppression_notice(
+                bot,
+                group_id=group_id,
+                user_id=user_id,
+                nickname=nickname,
+                text=text,
+                stage="political_guard",
+                reason="非点名消息命中中国政治红线兜底，后端直接不插话。",
+            )
             return
         reply = political_safe_reply()
         await _request_group_approval(
@@ -449,68 +513,143 @@ async def _handle_group_message_locked(
             "qq_social_agent suppressed by user cooldown: "
             f"group={group_id} user={user_id} cooldown={app_config.user_reply_cooldowns[user_id]}"
         )
+        await _send_approval_suppression_notice(
+            bot,
+            group_id=group_id,
+            user_id=user_id,
+            nickname=nickname,
+            text=text,
+            stage="user_cooldown",
+            reason=f"该用户单独限频中：{app_config.user_reply_cooldowns[user_id]} 秒内最多回一次。",
+        )
         _schedule_group_learning(group_id)
         return
 
     if deepseek_client is None:
         logger.warning("qq_social_agent skipped: deepseek_client_not_ready")
+        await _send_approval_suppression_notice(
+            bot,
+            group_id=group_id,
+            user_id=user_id,
+            nickname=nickname,
+            text=text,
+            stage="deepseek_not_ready",
+            reason="DeepSeek client 还没初始化，无法进入 LLM decision。",
+        )
         return
 
-    memory_context = _format_memory_context(
-        memory.recent_memory_summaries(group_id, MID_MEMORY_KEEP_SUMMARIES)
-    )
-    recall_feedback_context = _format_recall_feedback_context(
-        memory.recent_recalled_reply_feedback(group_id, RECALL_FEEDBACK_CONTEXT_LIMIT)
-    )
-    positive_feedback_context = _format_positive_feedback_context(
-        memory.recent_approved_reply_feedback(group_id, POSITIVE_FEEDBACK_CONTEXT_LIMIT)
-    )
-    member_context = _format_member_context(
-        memory.member_profiles_for_context(
-            group_id,
-            _related_member_user_ids(context_recent, current_user_id=user_id),
-            limit=8,
-        )
-    )
-    style_context = _format_style_context(
-        memory.recent_style_rules(group_id, STYLE_RULE_CONTEXT_LIMIT)
-    )
-    jargon_context = await _selected_group_jargon_context(
-        group_id,
-        context_recent,
-        current_text=text,
-        current_nickname=nickname,
-    )
+    decision: ReplyDecision | None = None
+    memory_context = ""
+    recall_feedback_context = ""
+    positive_feedback_context = ""
+    member_context = ""
+    style_context = ""
+    jargon_context = ""
+    context_query = _context_query_text(text, nickname, context_recent)
 
-    try:
-        decision = await deepseek_client.should_reply(
-            persona=persona,
-            recent_messages=context_recent,
+    pre_decision = _pre_decision_gate(
+        text=text,
+        recent_messages=context_recent,
+        persona=persona,
+        addressed_bot=addressed_bot,
+        mentioned=mentioned,
+        replied_to_bot=replied_to_bot,
+        cue_repeat_state=cue_repeat_state,
+        market_intents=market_intents,
+        fresh_intent=fresh_intent,
+    )
+    if pre_decision.skip_reason:
+        logger.info(
+            "qq_social_agent skipped by local pre-decision gate: "
+            f"group={group_id} reason={pre_decision.skip_reason}"
+        )
+        await _send_approval_suppression_notice(
+            bot,
+            group_id=group_id,
+            user_id=user_id,
+            nickname=nickname,
+            text=text,
+            stage="backend_pre_decision",
+            reason=f"本地预决策拦截：{pre_decision.skip_reason}",
+        )
+        _schedule_group_learning(group_id)
+        return
+    decision = pre_decision.decision
+
+    if decision is None:
+        memory_context = _format_memory_context(
+            memory.relevant_memory_summaries(
+                group_id,
+                context_query,
+                limit=MID_MEMORY_KEEP_SUMMARIES,
+            )
+        )
+        member_context = _format_member_context(
+            memory.member_profiles_for_context(
+                group_id,
+                _related_member_user_ids(context_recent, current_user_id=user_id),
+                limit=8,
+            )
+        )
+        style_context = _format_style_context(
+            memory.relevant_style_rules(
+                group_id,
+                context_query,
+                limit=STYLE_RULE_CONTEXT_LIMIT,
+            )
+        )
+        jargon_context = await _selected_group_jargon_context(
+            group_id,
+            context_recent,
             current_text=text,
-            current_nickname=_member_label(user_id, nickname),
-            mentioned=mentioned,
-            replied_to_bot=replied_to_bot,
-            addressed_repeat_count=addressed_repeat_count,
-            cue_repeat_context=_format_cue_repeat_context(cue_repeat_state),
-            market_topic=market_topic,
-            chat_label="QQ 群聊",
-            memory_context=memory_context,
-            style_context=style_context,
-            jargon_context=jargon_context,
-            member_context=member_context,
+            current_nickname=nickname,
         )
-    except Exception as exc:
-        decision = _decision_failure_fallback(
-            addressed_bot=addressed_bot,
-            reason="decision_error",
+
+        try:
+            decision = await deepseek_client.should_reply(
+                persona=persona,
+                recent_messages=context_recent,
+                current_text=text,
+                current_nickname=_member_label(user_id, nickname),
+                mentioned=mentioned,
+                replied_to_bot=replied_to_bot,
+                addressed_repeat_count=addressed_repeat_count,
+                cue_repeat_context=_format_cue_repeat_context(cue_repeat_state),
+                market_topic=market_topic,
+                chat_label="QQ 群聊",
+                memory_context=memory_context,
+                style_context=style_context,
+                jargon_context=jargon_context,
+                member_context=member_context,
+                fresh_context_hint=_format_fresh_context_hint(fresh_intent),
+            )
+        except Exception as exc:
+            decision = _decision_failure_fallback(
+                addressed_bot=addressed_bot,
+                reason="decision_error",
+            )
+            logger.warning(
+                "qq_social_agent decision failed: "
+                f"group={group_id} addressed={addressed_bot} error={exc}"
+            )
+            if decision is None:
+                await _send_approval_suppression_notice(
+                    bot,
+                    group_id=group_id,
+                    user_id=user_id,
+                    nickname=nickname,
+                    text=text,
+                    stage="llm_decision_error",
+                    reason=f"decision LLM 调用失败，且非点名没有兜底回复：{exc}",
+                )
+                _schedule_group_learning(group_id)
+                return
+    else:
+        logger.info(
+            "qq_social_agent local pre-decision: "
+            f"group={group_id} should_reply={decision.should_reply} "
+            f"action={decision.action} mode={decision.mode} reason={decision.reason}"
         )
-        logger.warning(
-            "qq_social_agent decision failed: "
-            f"group={group_id} addressed={addressed_bot} error={exc}"
-        )
-        if decision is None:
-            _schedule_group_learning(group_id)
-            return
     if decision.reason == "invalid_json":
         fallback_decision = _decision_failure_fallback(
             addressed_bot=addressed_bot,
@@ -521,6 +660,15 @@ async def _handle_group_message_locked(
                 "qq_social_agent decision invalid json ignored: "
                 f"group={group_id} addressed={addressed_bot}"
             )
+            await _send_approval_suppression_notice(
+                bot,
+                group_id=group_id,
+                user_id=user_id,
+                nickname=nickname,
+                text=text,
+                stage="llm_invalid_json",
+                reason="decision LLM 返回 invalid_json，且非点名没有兜底回复。",
+            )
             _schedule_group_learning(group_id)
             return
         logger.warning(
@@ -528,6 +676,12 @@ async def _handle_group_message_locked(
             f"group={group_id} addressed={addressed_bot}"
         )
         decision = fallback_decision
+    decision = _apply_backend_tool_decision(
+        decision,
+        text=text,
+        market_intents=market_intents,
+        fresh_intent=fresh_intent,
+    )
     if addressed_bot and "非点名" in decision.reason:
         logger.warning(
             "qq_social_agent decision state mismatch: "
@@ -542,7 +696,57 @@ async def _handle_group_message_locked(
     )
     _schedule_group_learning(group_id)
     if not decision.should_reply:
+        await _send_approval_suppression_notice(
+            bot,
+            group_id=group_id,
+            user_id=user_id,
+            nickname=nickname,
+            text=text,
+            stage="llm_ignore",
+            reason=(
+                f"LLM 判断不发：action={decision.action} mode={decision.mode} "
+                f"confidence={decision.confidence:.2f} reason={decision.reason}"
+            ),
+        )
         return
+
+    if not memory_context:
+        memory_context = _format_memory_context(
+            memory.relevant_memory_summaries(
+                group_id,
+                context_query,
+                limit=MID_MEMORY_KEEP_SUMMARIES,
+            )
+        )
+    if not member_context:
+        member_context = _format_member_context(
+            memory.member_profiles_for_context(
+                group_id,
+                _related_member_user_ids(context_recent, current_user_id=user_id),
+                limit=8,
+            )
+        )
+    if not style_context:
+        style_context = _format_style_context(
+            memory.relevant_style_rules(
+                group_id,
+                context_query,
+                limit=STYLE_RULE_CONTEXT_LIMIT,
+            )
+        )
+    if not jargon_context:
+        jargon_context = await _selected_group_jargon_context(
+            group_id,
+            context_recent,
+            current_text=text,
+            current_nickname=nickname,
+        )
+    recall_feedback_context = _format_recall_feedback_context(
+        memory.recent_recalled_reply_feedback(group_id, RECALL_FEEDBACK_CONTEXT_LIMIT)
+    )
+    positive_feedback_context = _format_positive_feedback_context(
+        memory.recent_approved_reply_feedback(group_id, POSITIVE_FEEDBACK_CONTEXT_LIMIT)
+    )
 
     market_context = ""
     market_report = ""
@@ -1063,10 +1267,61 @@ def _jargon_command_group_id(event: Event) -> int | None:
             return None
         return group_id
     if isinstance(event, PrivateMessageEvent):
-        allowed_groups = sorted(app_config.allowed_groups)
-        if len(allowed_groups) == 1:
-            return allowed_groups[0]
+        return _private_jargon_group_id()
     return None
+
+
+def _private_jargon_group_id() -> int | None:
+    allowed_groups = sorted(app_config.allowed_groups)
+    if len(allowed_groups) == 1:
+        return allowed_groups[0]
+    return None
+
+
+def _is_jargon_command_text(text: str) -> bool:
+    stripped = text.strip()
+    return stripped.startswith("/黑话") or stripped.startswith("/删黑话")
+
+
+def _handle_jargon_command_text(
+    *,
+    user_id: int,
+    group_id: int | None,
+    text: str,
+) -> str:
+    if user_id not in JARGON_COMMAND_USER_IDS:
+        return "没权限。"
+    if group_id is None:
+        return "没找到要写入的群。"
+
+    if JARGON_LIST_RE.match(text):
+        entries = memory.custom_jargon_entries(group_id)
+        if not entries:
+            return "暂无自定义黑话。"
+        return _format_custom_jargon_list(entries)
+
+    delete_match = JARGON_DELETE_RE.match(text)
+    if delete_match is not None:
+        term = delete_match.group("term").strip()
+        if not term:
+            return "格式：/删黑话：词"
+        deleted = memory.delete_custom_jargon(group_id, term)
+        return "已删。" if deleted else "没找到这条自定义黑话。"
+
+    add_match = JARGON_ADD_RE.match(text)
+    if add_match is None:
+        return "格式：/黑话：咱妈 指代：中国"
+    term = add_match.group("term").strip()
+    meaning = add_match.group("meaning").strip()
+    if not term or not meaning:
+        return "格式：/黑话：咱妈 指代：中国"
+    memory.upsert_custom_jargon(
+        group_id=group_id,
+        term=term,
+        explanation=f"指代：{meaning}",
+        created_by=user_id,
+    )
+    return f"已记黑话：{term} -> {meaning}"
 
 
 def _format_custom_jargon_list(entries: list[CustomJargonEntry]) -> str:
@@ -1074,49 +1329,6 @@ def _format_custom_jargon_list(entries: list[CustomJargonEntry]) -> str:
     for entry in entries[:40]:
         lines.append(f"- {entry.term}：{entry.explanation}")
     return "\n".join(lines)
-
-
-LOW_VALUE_GROUP_TEXTS = {
-    "6",
-    "66",
-    "666",
-    "嗯",
-    "嗯嗯",
-    "哦",
-    "噢",
-    "喔",
-    "好的",
-    "好",
-    "可以",
-    "行",
-    "一般",
-    "绷",
-    "没绷住",
-    "哈哈",
-    "哈哈哈",
-    "哈哈哈哈",
-    "草",
-    "艹",
-    "笑死",
-    "乐",
-    "乐死",
-    "牛",
-    "牛逼",
-    "nb",
-    "ok",
-    "OK",
-}
-
-
-def _is_low_value_group_text(text: str) -> bool:
-    compact = re.sub(r"[^\w\u4e00-\u9fff]+", "", text)
-    if not compact:
-        return True
-    if compact in LOW_VALUE_GROUP_TEXTS:
-        return True
-    if re.fullmatch(r"[6哈啊呃嗯哦噢喔草艹绷乐笑wW]+", compact) and len(compact) <= 8:
-        return True
-    return False
 
 
 def _action_failed_summary(exc: ActionFailed) -> str:
@@ -1186,7 +1398,7 @@ async def _market_report_and_context_for(
 
 async def _fresh_context_for(decision: ReplyDecision, *, fallback_text: str) -> str:
     query = decision.fresh_query.strip() or fallback_text.strip()
-    if not query or not should_use_fresh_context(query, fallback_text):
+    if not query:
         logger.info(
             "qq_social_agent fresh context skipped: "
             f"query={query!r} fallback={fallback_text!r}"
@@ -1198,6 +1410,19 @@ async def _fresh_context_for(decision: ReplyDecision, *, fallback_text: str) -> 
         f"kind={decision.fresh_kind} query={query!r} has_context={bool(context)}"
     )
     return context
+
+
+def _format_fresh_context_hint(intent: object | None) -> str:
+    if intent is None:
+        return ""
+    query = str(getattr(intent, "query", "") or "").strip()
+    kind = str(getattr(intent, "kind", "news") or "news").strip()
+    if not query:
+        return ""
+    return (
+        f"后端检测到这句话可能涉及最新背景，候选查询：{query}，类型：{kind}。"
+        "是否真的需要搜索由你判断；非必要不要搜索。"
+    )
 
 
 async def _private_fresh_context_for(text: str) -> str:
@@ -1724,6 +1949,17 @@ async def _handle_group_approval_private(bot: Bot, user_id: int, text: str) -> b
     if user_id not in GROUP_APPROVAL_USER_IDS:
         return False
     compact_text = text.strip()
+    if _is_jargon_command_text(compact_text):
+        await _send_private_text(
+            bot,
+            user_id,
+            _handle_jargon_command_text(
+                user_id=user_id,
+                group_id=_private_jargon_group_id(),
+                text=compact_text,
+            ),
+        )
+        return True
     if compact_text in APPROVAL_HELP_COMMANDS:
         await _send_private_text(bot, user_id, APPROVAL_RULES_MESSAGE)
         return True
@@ -2030,7 +2266,50 @@ def _is_useful_style_rule(situation: str, style: str, source_text: str = "") -> 
         return False
     if len(style_compact) <= 3 and style_compact in {"赞同", "附和", "吐槽"}:
         return False
+    if _looks_like_literal_style_rule(style):
+        return False
+    if source_compact and _has_long_common_substring(style_compact, source_compact, min_len=6):
+        return False
     return True
+
+
+def _looks_like_literal_style_rule(style: str) -> bool:
+    stripped = style.strip()
+    compact = re.sub(r"\s+", "", stripped)
+    if not compact:
+        return True
+    literal_markers = (
+        "说“",
+        "说\"",
+        "用“",
+        "用\"",
+        "短句接“",
+        "直接说“",
+        "表达“",
+        "接“",
+    )
+    if any(marker in compact for marker in literal_markers):
+        return True
+    if compact.startswith(("说", "发")) and len(compact) <= 18:
+        return True
+    if compact in {"重复对方原句", "复读对方原句"}:
+        return True
+    if re.fullmatch(r"发?[^\w\u4e00-\u9fff]{1,8}", compact):
+        return True
+    quote_count = compact.count("“") + compact.count("”") + compact.count("\"")
+    return quote_count > 0 and len(compact) <= 28
+
+
+def _has_long_common_substring(a: str, b: str, *, min_len: int) -> bool:
+    if len(a) < min_len or len(b) < min_len:
+        return False
+    shorter, longer = (a, b) if len(a) <= len(b) else (b, a)
+    max_size = min(len(shorter), 24)
+    for size in range(max_size, min_len - 1, -1):
+        for start in range(0, len(shorter) - size + 1):
+            if shorter[start : start + size] in longer:
+                return True
+    return False
 
 
 

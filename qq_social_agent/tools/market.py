@@ -107,6 +107,7 @@ def _prompt_context_from_lookups(lookups: list[MarketLookup]) -> str:
     for lookup in lookups:
         if lookup.snapshot is not None:
             lines.append(lookup.snapshot.to_prompt_line())
+            lines.append(f"  判断提示：{_snapshot_insight(lookup.snapshot)}")
             continue
         lines.append(_failure_prompt_line(lookup))
 
@@ -117,7 +118,7 @@ def _prompt_context_from_lookups(lookups: list[MarketLookup]) -> str:
         [
             "市场工具结果（成功就引用数据；失败就明确告诉群友查询失败，不要编造价格）：",
             *lines,
-            "回复时可以引用这些数据，但不要直接给买卖/满仓/梭哈结论。",
+            "回复时必须给一句短评或风险判断；不要直接给买卖/满仓/梭哈结论。",
         ]
     )
 
@@ -147,6 +148,7 @@ def _snapshot_chat_line(snapshot: MarketSnapshot) -> str:
     if snapshot.updated_at:
         parts.append(f"更新 {snapshot.updated_at}")
     parts.append(f"源 {snapshot.source}")
+    parts.append(f"短评 {_snapshot_insight(snapshot).rstrip('。.!！')}")
     return "，".join(parts) + "。"
 
 
@@ -158,6 +160,65 @@ def _failure_chat_line(lookup: MarketLookup) -> str:
 
 
 def _fetch_stock_snapshot(intent: MarketIntent) -> MarketSnapshot | None:
+    snapshot = _fetch_stock_snapshot_from_yahoo_chart(intent)
+    if snapshot is not None:
+        return snapshot
+    return _fetch_stock_snapshot_from_yfinance(intent)
+
+
+def _fetch_stock_snapshot_from_yahoo_chart(intent: MarketIntent) -> MarketSnapshot | None:
+    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{intent.symbol}"
+    params = {"range": "1d", "interval": "1m"}
+    try:
+        with httpx.Client(timeout=10, follow_redirects=True) as client:
+            response = client.get(
+                url,
+                params=params,
+                headers={"User-Agent": "Mozilla/5.0 qq-social-agent/0.1"},
+            )
+            response.raise_for_status()
+        result = response.json()["chart"]["result"][0]
+        meta = result.get("meta") or {}
+        price = _as_float(meta.get("regularMarketPrice"))
+        previous_close = _as_float(
+            meta.get("chartPreviousClose")
+            or meta.get("previousClose")
+            or meta.get("regularMarketPreviousClose")
+        )
+        if price is None:
+            indicators = result.get("indicators") or {}
+            quotes = indicators.get("quote") or []
+            closes = quotes[0].get("close", []) if quotes else []
+            for value in reversed(closes):
+                price = _as_float(value)
+                if price is not None:
+                    break
+        if price is None:
+            return None
+        change_percent = None
+        if previous_close:
+            change_percent = (price - previous_close) / previous_close * 100
+        updated_at = None
+        regular_market_time = meta.get("regularMarketTime")
+        if isinstance(regular_market_time, (int, float)):
+            updated_at = datetime.fromtimestamp(regular_market_time).strftime("%Y-%m-%d %H:%M")
+        return MarketSnapshot(
+            kind="stock",
+            symbol=str(meta.get("symbol") or intent.symbol).upper(),
+            display_name=intent.display_name,
+            price=price,
+            currency=str(meta.get("currency") or "USD"),
+            change_percent=change_percent,
+            volume=_as_float(meta.get("regularMarketVolume")),
+            market_cap=None,
+            source="Yahoo Finance Chart",
+            updated_at=updated_at,
+        )
+    except Exception:
+        return None
+
+
+def _fetch_stock_snapshot_from_yfinance(intent: MarketIntent) -> MarketSnapshot | None:
     import yfinance as yf
 
     try:
@@ -263,6 +324,24 @@ def _format_number(value: float) -> str:
     if abs_value >= 1:
         return f"{value:.2f}"
     return f"{value:.6f}".rstrip("0").rstrip(".")
+
+
+def _snapshot_insight(snapshot: MarketSnapshot) -> str:
+    if snapshot.change_percent is None:
+        return "只有价格，缺少涨跌幅，别只拿单点价格当方向。"
+    change = snapshot.change_percent
+    abs_change = abs(change)
+    if abs_change < 0.5:
+        return "波动很小，短线没明显方向，别硬解读。"
+    if change >= 3:
+        return "短线明显偏强，但这种幅度追进去容易吃波动。"
+    if change >= 1:
+        return "短线偏强，先看是不是消息或大盘一起带的。"
+    if change <= -3:
+        return "短线明显偏弱，先别急着抄底，容易还有惯性。"
+    if change <= -1:
+        return "短线偏弱，适合先看原因，不适合只凭跌幅上头。"
+    return "小幅波动，更多像噪音，重点看后续量和消息。"
 
 
 def _failure_prompt_line(lookup: MarketLookup) -> str:

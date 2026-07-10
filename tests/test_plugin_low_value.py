@@ -22,13 +22,21 @@ from qq_social_agent.plugin import (
     _extract_message_id,
     _format_member_context,
     _format_recall_feedback_context,
+    _apply_backend_tool_decision,
+    _is_explicit_market_lookup,
     _is_low_value_group_text,
+    _is_useful_style_rule,
     _member_label,
     _passive_decision_allowed,
+    _pre_decision_gate,
     _record_user_reply,
     _user_reply_cooling_down,
 )
+from qq_social_agent.cue_patterns import CueRepeatState
+from qq_social_agent.deepseek_client import ReplyDecision
 from qq_social_agent.memory import MemoryStore, MemberProfile, RecalledReplyFeedback
+from qq_social_agent.tools.fresh_context import FreshIntent
+from qq_social_agent.tools.market_intent import MarketIntent
 
 
 class FakeApprovalBot:
@@ -50,6 +58,7 @@ def _use_temp_plugin_memory(monkeypatch, tmp_path) -> MemoryStore:
     monkeypatch.setattr(plugin, "memory", store)
     plugin.pending_group_approvals.clear()
     plugin.last_group_mention_targets.clear()
+    plugin.last_suppression_notice_times.clear()
     return store
 
 
@@ -76,8 +85,13 @@ def test_group_buffer_seconds_is_six() -> None:
 
 
 def test_low_value_group_text_ignored() -> None:
-    for text in ["好的", "一般", "绷", "嗯", "6", "哈哈", "可以", "哈哈哈哈！！！"]:
+    for text in ["绷", "嗯", "6", "哈哈", "哈哈哈哈！！！", "草"]:
         assert _is_low_value_group_text(text)
+
+
+def test_acknowledgement_text_not_hard_ignored() -> None:
+    for text in ["好的", "一般", "可以"]:
+        assert not _is_low_value_group_text(text)
 
 
 def test_approval_reject_reason_regex() -> None:
@@ -104,8 +118,12 @@ def test_approval_help_commands() -> None:
     assert "审批规则详情" in APPROVAL_DETAIL_COMMANDS
     assert "详细规则" in APPROVAL_DETAIL_COMMANDS
     assert "token用量" in plugin.APPROVAL_RULES_MESSAGE
+    assert "/黑话：词 指代：解释" in plugin.APPROVAL_RULES_MESSAGE
     assert "token用量 1h/7d/all" in plugin.APPROVAL_RULES_DETAIL_MESSAGE
     assert "token用量 2026-07-10" in plugin.APPROVAL_RULES_DETAIL_MESSAGE
+    assert "/黑话：咱妈 指代：中国" in plugin.APPROVAL_RULES_DETAIL_MESSAGE
+    assert "拦截" in plugin.APPROVAL_RULES_MESSAGE
+    assert "不是待审候选" in plugin.APPROVAL_RULES_DETAIL_MESSAGE
 
 
 def test_parse_token_report_date_window() -> None:
@@ -166,6 +184,10 @@ def test_jargon_command_regexes() -> None:
     assert add is not None
     assert add.group("term") == "咱妈"
     assert add.group("meaning") == "中国"
+    flexible_add = JARGON_ADD_RE.match("/黑话 达斯=打死")
+    assert flexible_add is not None
+    assert flexible_add.group("term") == "达斯"
+    assert flexible_add.group("meaning") == "打死"
     assert JARGON_LIST_RE.match("/黑话列表")
     delete = JARGON_DELETE_RE.match("/删黑话：咱妈")
     assert delete is not None
@@ -257,6 +279,119 @@ def test_passive_decision_gate_allows_after_thirty_second_gap() -> None:
 def test_meaningful_group_text_not_low_value() -> None:
     for text in ["股票又亏了", "你用什么刮胡子", "可以去投算法岗", "哈哈这项目真离谱"]:
         assert not _is_low_value_group_text(text)
+
+
+def test_pre_decision_gate_skips_weak_passive_text() -> None:
+    result = _pre_decision_gate(
+        text="收到回复",
+        recent_messages=[],
+        persona=plugin.personas.get(plugin.app_config.default_persona),
+        addressed_bot=False,
+        mentioned=False,
+        replied_to_bot=False,
+        cue_repeat_state=None,
+        market_intents=[],
+        fresh_intent=None,
+    )
+
+    assert result.decision is None
+    assert result.skip_reason.startswith("weak_passive")
+
+
+def test_pre_decision_gate_skips_plain_ack_after_buffer() -> None:
+    result = _pre_decision_gate(
+        text="可以",
+        recent_messages=[],
+        persona=plugin.personas.get(plugin.app_config.default_persona),
+        addressed_bot=False,
+        mentioned=False,
+        replied_to_bot=False,
+        cue_repeat_state=None,
+        market_intents=[],
+        fresh_intent=None,
+    )
+
+    assert result.decision is None
+    assert result.skip_reason.startswith("weak_passive")
+
+
+def test_pre_decision_gate_handles_explicit_market_lookup_locally() -> None:
+    result = _pre_decision_gate(
+        text="BTC 怎么了",
+        recent_messages=[],
+        persona=plugin.personas.get(plugin.app_config.default_persona),
+        addressed_bot=False,
+        mentioned=False,
+        replied_to_bot=False,
+        cue_repeat_state=None,
+        market_intents=[MarketIntent("crypto", "bitcoin", "BTC")],
+        fresh_intent=None,
+    )
+
+    assert _is_explicit_market_lookup("BTC 怎么了")
+    assert _is_explicit_market_lookup("NVDA 咋样")
+    assert result.skip_reason == ""
+    assert result.decision is not None
+    assert result.decision.action == "market_check"
+    assert result.decision.need_tool
+    assert result.decision.symbols[0].display == "BTC"
+
+
+def test_backend_tool_decision_overrides_addressed_market_reply() -> None:
+    decision = _apply_backend_tool_decision(
+        ReplyDecision(True, 0.7, "正常回答", mode="chat", action="answer"),
+        text="NVDA 今天咋样",
+        market_intents=[MarketIntent("stock", "NVDA", "NVDA")],
+        fresh_intent=None,
+    )
+
+    assert decision.action == "market_check"
+    assert decision.need_tool
+    assert decision.tool == "market"
+    assert decision.comment_after_tool
+    assert decision.symbols[0].symbol == "NVDA"
+
+
+def test_fresh_lookup_goes_to_llm_decision() -> None:
+    result = _pre_decision_gate(
+        text="美国和伊朗现在怎么了",
+        recent_messages=[],
+        persona=plugin.personas.get(plugin.app_config.default_persona),
+        addressed_bot=False,
+        mentioned=False,
+        replied_to_bot=False,
+        cue_repeat_state=None,
+        market_intents=[],
+        fresh_intent=FreshIntent(query="美国和伊朗", kind="news"),
+    )
+
+    assert result.skip_reason == ""
+    assert result.decision is None
+
+
+def test_pre_decision_gate_handles_repeated_addressed_cue_locally() -> None:
+    result = _pre_decision_gate(
+        text="c 罗和梅西谁厉害",
+        recent_messages=[],
+        persona=plugin.personas.get(plugin.app_config.default_persona),
+        addressed_bot=True,
+        mentioned=True,
+        replied_to_bot=False,
+        cue_repeat_state=CueRepeatState("comparison", "连续问谁厉害/谁更强", 3),
+        market_intents=[],
+        fresh_intent=None,
+    )
+
+    assert result.decision is not None
+    assert result.decision.action == "mock_repeated_question"
+
+
+def test_style_rule_filter_rejects_literal_examples() -> None:
+    assert not _is_useful_style_rule("自嘲场景", "说“我完蛋了”", "我完蛋了")
+    assert not _is_useful_style_rule("对离谱事吐槽", "短句接“太典了”", "太典了")
+    assert not _is_useful_style_rule("模仿对方说话", "重复对方原句", "你说啥")
+    assert not _is_useful_style_rule("表示赞赏或附和", "发👍👍👍", "👍👍👍")
+    assert _is_useful_style_rule("拒绝请求", "用一句损友式现实理由拒绝", "不能，你胖的不差这点")
 
 
 def test_specific_user_reply_cooldown() -> None:
@@ -447,15 +582,91 @@ def test_approval_open_restores_decision_and_resends_rules(monkeypatch, tmp_path
     assert {user_id for user_id, _ in rule_messages} == set(plugin.GROUP_APPROVAL_USER_IDS)
 
 
+def test_changelog_notice_sent_once(monkeypatch, tmp_path) -> None:
+    _use_temp_plugin_memory(monkeypatch, tmp_path)
+    bot = FakeApprovalBot()
+
+    asyncio.run(plugin._send_changelog_notice_to_approvers(bot))
+    asyncio.run(plugin._send_changelog_notice_to_approvers(bot))
+
+    notices = [message for _, message in bot.private_messages if "后端更新记录" in message]
+    assert len(notices) == len(plugin.GROUP_APPROVAL_USER_IDS)
+    assert all("搜索优化" in message for message in notices)
+
+
+def test_suppression_notice_is_limited_and_not_pending(monkeypatch, tmp_path) -> None:
+    _use_temp_plugin_memory(monkeypatch, tmp_path)
+    bot = FakeApprovalBot()
+
+    asyncio.run(
+        plugin._send_approval_suppression_notice(
+            bot,
+            group_id=1026813421,
+            user_id=184589072,
+            nickname="小鸟",
+            text="哈哈哈哈",
+            stage="backend_low_value",
+            reason="后端低价值硬拦截",
+        )
+    )
+    asyncio.run(
+        plugin._send_approval_suppression_notice(
+            bot,
+            group_id=1026813421,
+            user_id=184589072,
+            nickname="小鸟",
+            text="哈哈哈哈",
+            stage="backend_low_value",
+            reason="后端低价值硬拦截",
+        )
+    )
+
+    notices = [message for _, message in bot.private_messages if "拦截通知" in message]
+    assert len(notices) == len(plugin.GROUP_APPROVAL_USER_IDS)
+    assert "这不是待审候选" in notices[0]
+    assert "backend_low_value" in notices[0]
+    assert plugin.pending_group_approvals == {}
+
+
+def test_approval_private_jargon_command_does_not_consume_pending(monkeypatch, tmp_path) -> None:
+    store = _use_temp_plugin_memory(monkeypatch, tmp_path)
+    approval = _pending_approval()
+    plugin.pending_group_approvals[approval.group_id] = approval
+    bot = FakeApprovalBot()
+
+    handled = asyncio.run(plugin._handle_group_approval_private(bot, 3370998238, "/黑话 达斯=打死"))
+
+    assert handled
+    assert plugin.pending_group_approvals[approval.group_id] == approval
+    entries = store.custom_jargon_entries(1026813421)
+    assert len(entries) == 1
+    assert entries[0].term == "达斯"
+    assert entries[0].explanation == "指代：打死"
+    assert bot.private_messages[-1] == (3370998238, "已记黑话：达斯 -> 打死")
+
+
+def test_allowed_private_user_can_write_custom_jargon(monkeypatch, tmp_path) -> None:
+    store = _use_temp_plugin_memory(monkeypatch, tmp_path)
+
+    response = plugin._handle_jargon_command_text(
+        user_id=3115344487,
+        group_id=1026813421,
+        text="/黑话：火宅：活摘",
+    )
+
+    assert response == "已记黑话：火宅 -> 活摘"
+    entries = store.custom_jargon_entries(1026813421)
+    assert len(entries) == 1
+    assert entries[0].term == "火宅"
+
+
 def test_approval_reject_second_candidate_records_that_candidate(monkeypatch, tmp_path) -> None:
     store = _use_temp_plugin_memory(monkeypatch, tmp_path)
     approval = _pending_approval()
     plugin.pending_group_approvals[approval.group_id] = approval
     bot = FakeApprovalBot()
 
-    handled = asyncio.run(
-        plugin._handle_group_approval_private(bot, 3370998238, "不准奏2原因：应该写对群宠小鸟不够温柔")
-    )
+    handled = asyncio.run(plugin._handle_group_approval_private(bot, 3370998238, "不准奏2原因：这句太端水，少点客服味"))
 
     assert handled
     assert not bot.group_messages
@@ -463,7 +674,7 @@ def test_approval_reject_second_candidate_records_that_candidate(monkeypatch, tm
     assert len(feedback) == 1
     assert feedback[0].bot_reply == "第二条回复"
     assert feedback[0].scene_summary == "审批不准奏原始评价，针对第 2 条候选"
-    assert feedback[0].owner_reason == "应该写对群宠小鸟不够温柔"
+    assert feedback[0].owner_reason == "这句太端水，少点客服味"
 
 
 def test_approval_high_quality_choice_sends_and_records_positive(monkeypatch, tmp_path) -> None:
