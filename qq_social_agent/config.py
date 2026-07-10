@@ -11,17 +11,43 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 
 @dataclass(frozen=True)
+class LLMProviderConfig:
+    name: str
+    base_url: str
+    api_key_env: str
+    thinking: str
+
+
+@dataclass(frozen=True)
+class LLMModelRoute:
+    provider: str
+    model: str
+
+    @property
+    def label(self) -> str:
+        return f"{self.provider}/{self.model}"
+
+
+@dataclass(frozen=True)
 class DeepSeekConfig:
     base_url: str
     model: str
     decision_model: str
     reply_model: str
     utility_model: str
+    jargon_model: str
+    memory_model: str
+    style_model: str
     thinking: str
     reasoning_effort: str
     temperature: float
     max_tokens: int
     timeout_seconds: int
+    providers: dict[str, LLMProviderConfig]
+    routes: dict[str, LLMModelRoute]
+    fallback_routes: dict[str, LLMModelRoute]
+    model_catalog: tuple[LLMModelRoute, ...]
+    usage_tracking_enabled: bool
 
 
 @dataclass(frozen=True)
@@ -48,7 +74,7 @@ class AppConfig:
         self.context_limit = int(bot.get("context_limit", 60))
         self.active_reply_on_mention = bool(bot.get("active_reply_on_mention", True))
         self.data_path = PROJECT_ROOT / str(bot.get("data_path", "data/bot.sqlite3"))
-        self.persona_dir = PROJECT_ROOT / "personas"
+        self.persona_dir = PROJECT_ROOT / str(bot.get("persona_dir", "prompts"))
         self.groups = raw.get("groups", {})
         access = raw.get("access_control", {})
         self.allowed_groups = _int_set(access.get("allowed_groups", []))
@@ -59,18 +85,77 @@ class AppConfig:
         if thinking not in {"enabled", "disabled"}:
             raise ValueError("deepseek.thinking must be 'enabled' or 'disabled'")
 
+        providers = _llm_providers(deepseek)
         base_model = str(deepseek.get("model", "deepseek-v4-flash"))
+        decision_model = str(deepseek.get("decision_model", "deepseek-v4-flash"))
+        reply_model = str(deepseek.get("reply_model", base_model))
+        utility_model = str(deepseek.get("utility_model", "deepseek-v4-flash"))
+        jargon_model = str(deepseek.get("jargon_model", utility_model))
+        memory_model = str(deepseek.get("memory_model", utility_model))
+        style_model = str(deepseek.get("style_model", utility_model))
+        fallback_models = deepseek.get("fallback_models", {})
+        if not isinstance(fallback_models, dict):
+            fallback_models = {}
+        routes = {
+            "base": parse_llm_model_route(base_model, providers, default_provider="deepseek"),
+            "decision": parse_llm_model_route(decision_model, providers, default_provider="deepseek"),
+            "reply": parse_llm_model_route(reply_model, providers, default_provider="deepseek"),
+            "utility": parse_llm_model_route(utility_model, providers, default_provider="deepseek"),
+            "jargon": parse_llm_model_route(jargon_model, providers, default_provider="deepseek"),
+            "memory": parse_llm_model_route(memory_model, providers, default_provider="deepseek"),
+            "style": parse_llm_model_route(style_model, providers, default_provider="deepseek"),
+        }
+        fallback_routes = {
+            "decision": _parse_model_route(
+                str(fallback_models.get("decision", "deepseek-v4-flash")),
+                providers,
+                default_provider="deepseek",
+            ),
+            "reply": _parse_model_route(
+                str(fallback_models.get("reply", reply_model)),
+                providers,
+                default_provider="deepseek",
+            ),
+            "utility": _parse_model_route(
+                str(fallback_models.get("utility", "deepseek-v4-flash")),
+                providers,
+                default_provider="deepseek",
+            ),
+            "jargon": _parse_model_route(
+                str(fallback_models.get("jargon", fallback_models.get("utility", "deepseek-v4-flash"))),
+                providers,
+                default_provider="deepseek",
+            ),
+            "memory": _parse_model_route(
+                str(fallback_models.get("memory", fallback_models.get("utility", "deepseek-v4-flash"))),
+                providers,
+                default_provider="deepseek",
+            ),
+            "style": _parse_model_route(
+                str(fallback_models.get("style", fallback_models.get("utility", "deepseek-v4-flash"))),
+                providers,
+                default_provider="deepseek",
+            ),
+        }
         self.deepseek = DeepSeekConfig(
             base_url=str(deepseek.get("base_url", "https://api.deepseek.com")),
             model=base_model,
-            decision_model=str(deepseek.get("decision_model", "deepseek-v4-flash")),
-            reply_model=str(deepseek.get("reply_model", base_model)),
-            utility_model=str(deepseek.get("utility_model", "deepseek-v4-flash")),
+            decision_model=decision_model,
+            reply_model=reply_model,
+            utility_model=utility_model,
+            jargon_model=jargon_model,
+            memory_model=memory_model,
+            style_model=style_model,
             thinking=thinking,
             reasoning_effort=str(deepseek.get("reasoning_effort", "high")),
             temperature=float(deepseek.get("temperature", 0.72)),
             max_tokens=int(deepseek.get("max_tokens", 220)),
             timeout_seconds=int(deepseek.get("timeout_seconds", 30)),
+            providers=providers,
+            routes=routes,
+            fallback_routes=fallback_routes,
+            model_catalog=_model_catalog(deepseek, routes, fallback_routes, providers),
+            usage_tracking_enabled=bool(deepseek.get("usage_tracking_enabled", True)),
         )
         self.rate = RateConfig(
             min_interval_seconds=int(rate.get("min_interval_seconds", 60)),
@@ -117,3 +202,77 @@ def _int_int_dict(values: object) -> dict[int, int]:
     if not isinstance(values, dict):
         raise ValueError("expected mapping of int keys to int values")
     return {int(key): int(value) for key, value in values.items()}
+
+
+def _llm_providers(deepseek: dict[str, Any]) -> dict[str, LLMProviderConfig]:
+    raw_providers = deepseek.get("providers", {})
+    providers: dict[str, LLMProviderConfig] = {
+        "deepseek": LLMProviderConfig(
+            name="deepseek",
+            base_url=str(deepseek.get("base_url", "https://api.deepseek.com")),
+            api_key_env=str(deepseek.get("api_key_env", "DEEPSEEK_API_KEY")),
+            thinking=str(deepseek.get("thinking", "disabled")).lower(),
+        )
+    }
+    if isinstance(raw_providers, dict):
+        for name, raw in raw_providers.items():
+            if not isinstance(raw, dict):
+                continue
+            provider_name = str(name).strip()
+            if not provider_name:
+                continue
+            providers[provider_name] = LLMProviderConfig(
+                name=provider_name,
+                base_url=str(raw.get("base_url", providers.get(provider_name, providers["deepseek"]).base_url)),
+                api_key_env=str(raw.get("api_key_env", f"{provider_name.upper()}_API_KEY")),
+                thinking=str(raw.get("thinking", "disabled")).lower(),
+            )
+    return providers
+
+
+def parse_llm_model_route(
+    value: str,
+    providers: dict[str, LLMProviderConfig],
+    *,
+    default_provider: str,
+) -> LLMModelRoute:
+    text = value.strip()
+    for provider in sorted(providers, key=len, reverse=True):
+        prefix = f"{provider}/"
+        if text.startswith(prefix):
+            return LLMModelRoute(provider=provider, model=text[len(prefix) :])
+    return LLMModelRoute(provider=default_provider, model=text)
+
+
+def _parse_model_route(
+    value: str,
+    providers: dict[str, LLMProviderConfig],
+    *,
+    default_provider: str,
+) -> LLMModelRoute:
+    return parse_llm_model_route(value, providers, default_provider=default_provider)
+
+
+def _model_catalog(
+    deepseek: dict[str, Any],
+    routes: dict[str, LLMModelRoute],
+    fallback_routes: dict[str, LLMModelRoute],
+    providers: dict[str, LLMProviderConfig],
+) -> tuple[LLMModelRoute, ...]:
+    raw_catalog = deepseek.get("model_catalog")
+    values: list[str] = []
+    if isinstance(raw_catalog, list):
+        values.extend(str(item).strip() for item in raw_catalog if str(item).strip())
+    else:
+        values.extend(route.label for route in routes.values())
+        values.extend(route.label for route in fallback_routes.values())
+
+    seen: set[str] = set()
+    catalog: list[LLMModelRoute] = []
+    for value in values:
+        route = parse_llm_model_route(value, providers, default_provider="deepseek")
+        if route.label in seen:
+            continue
+        seen.add(route.label)
+        catalog.append(route)
+    return tuple(catalog)

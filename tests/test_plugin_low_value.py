@@ -20,6 +20,7 @@ from qq_social_agent.plugin import (
     group_passive_decision_state,
     last_user_reply_times,
     _extract_message_id,
+    _format_memory_context,
     _format_member_context,
     _format_recall_feedback_context,
     _apply_backend_tool_decision,
@@ -33,8 +34,9 @@ from qq_social_agent.plugin import (
     _user_reply_cooling_down,
 )
 from qq_social_agent.cue_patterns import CueRepeatState
+from qq_social_agent.config import parse_llm_model_route
 from qq_social_agent.deepseek_client import ReplyDecision
-from qq_social_agent.memory import MemoryStore, MemberProfile, RecalledReplyFeedback
+from qq_social_agent.memory import MemoryStore, MemorySummary, MemberProfile, RecalledReplyFeedback
 from qq_social_agent.tools.fresh_context import FreshIntent
 from qq_social_agent.tools.market_intent import MarketIntent
 
@@ -53,9 +55,28 @@ class FakeApprovalBot:
         return {"message_id": 2000 + len(self.group_messages)}
 
 
+class FakeModelClient:
+    def __init__(self) -> None:
+        self.config = plugin.app_config.deepseek
+        self.route_overrides = {}
+
+    def parse_model_route(self, value: str, *, default_provider: str = "siliconflow"):
+        return parse_llm_model_route(value, self.config.providers, default_provider=default_provider)
+
+    def set_route_override(self, route_name: str, route) -> None:
+        if route is None:
+            self.route_overrides.pop(route_name, None)
+        else:
+            self.route_overrides[route_name] = route
+
+    def current_route(self, route_name: str):
+        return self.route_overrides.get(route_name, self.config.routes[route_name])
+
+
 def _use_temp_plugin_memory(monkeypatch, tmp_path) -> MemoryStore:
     store = MemoryStore(tmp_path / "bot.sqlite3")
     monkeypatch.setattr(plugin, "memory", store)
+    monkeypatch.setattr(plugin, "deepseek_client", None)
     plugin.pending_group_approvals.clear()
     plugin.last_group_mention_targets.clear()
     plugin.recent_suppression_events.clear()
@@ -121,11 +142,22 @@ def test_approval_help_commands() -> None:
     assert "详细规则" in APPROVAL_DETAIL_COMMANDS
     assert "1/2/3" in plugin.APPROVAL_RULES_MESSAGE
     assert "bot工具" in plugin.APPROVAL_RULES_MESSAGE
-    assert "token用量 1h/7d/all" in plugin.APPROVAL_RULES_DETAIL_MESSAGE
-    assert "token用量 2026-07-10" in plugin.APPROVAL_RULES_DETAIL_MESSAGE
-    assert "/黑话：咱妈 指代：中国" in plugin.APPROVAL_RULES_DETAIL_MESSAGE
-    assert "拦截 20" in plugin.APPROVAL_RULES_DETAIL_MESSAGE
-    assert "加审批" in plugin.APPROVAL_RULES_DETAIL_MESSAGE
+    assert "bot工具目录" in plugin.APPROVAL_RULES_DETAIL_MESSAGE
+    assert "bot工具 私聊" in plugin.APPROVAL_RULES_DETAIL_MESSAGE
+    assert "bot工具 学习" in plugin.APPROVAL_RULES_DETAIL_MESSAGE
+    assert "/黑话：咱妈 指代：中国" in plugin._bot_tool_message("bot工具 黑话")
+    assert "拦截 20" in plugin._bot_tool_message("bot工具 查看")
+    assert "记忆 8" in plugin._bot_tool_message("bot工具 学习")
+    assert "风格学习 20" in plugin._bot_tool_message("bot工具 风格")
+    assert "加审批" in plugin._bot_tool_message("bot工具 审批人")
+    assert "回 1/2/3" in plugin._bot_tool_message("bot 工具 审批")
+    assert "关闭审查" in plugin.APPROVAL_RULES_MESSAGE
+    assert "开启审查" in plugin._bot_tool_message("bot工具 开关")
+    assert "切回复模型" in plugin._bot_tool_message("bot工具 模型")
+    assert "切风格模型" in plugin._bot_tool_message("bot工具 模型")
+    assert "可切换部分" in plugin._bot_tool_message("bot工具 模型")
+    assert "模型状态" in plugin._bot_tool_message("bot工具 模型")
+    assert "flows.decision" in plugin._bot_tool_message("bot工具 prompt")
 
 
 def test_parse_token_report_date_window() -> None:
@@ -489,6 +521,25 @@ def test_format_recall_feedback_context_owner_feedback_raw() -> None:
     assert context == "- 主人原始评价：只保存我给的评价"
 
 
+def test_format_memory_context_warns_against_wrong_attribution() -> None:
+    context = _format_memory_context(
+        [
+            MemorySummary(
+                group_id=1026813421,
+                summary="按人：灰機haru[#98238]：经常 cue 机器人；多人讨论：柏拉图活跃度。",
+                recall_cues=("灰機haru[#98238] cue 机器人", "柏拉图活跃度",),
+                start_at=1000.0,
+                end_at=1100.0,
+                created_at=1200.0,
+            )
+        ]
+    )
+
+    assert "不要把旧回想误认为当前发言人说过的话" in context
+    assert "只有回想里明确写了昵称/QQ尾号" in context
+    assert "灰機haru[#98238]" in context
+
+
 def test_approval_detail_command_does_not_consume_pending(monkeypatch, tmp_path) -> None:
     _use_temp_plugin_memory(monkeypatch, tmp_path)
     approval = _pending_approval()
@@ -499,7 +550,7 @@ def test_approval_detail_command_does_not_consume_pending(monkeypatch, tmp_path)
 
     assert handled
     assert plugin.pending_group_approvals[approval.group_id] == approval
-    assert "张风雪 bot 工具单" in bot.private_messages[-1][1]
+    assert "张风雪 bot工具目录" in bot.private_messages[-1][1]
 
 
 def test_approval_token_report_command_does_not_consume_pending(monkeypatch, tmp_path) -> None:
@@ -520,8 +571,7 @@ def test_approval_token_report_command_does_not_consume_pending(monkeypatch, tmp
 
     assert handled
     assert plugin.pending_group_approvals[approval.group_id] == approval
-    assert "Token 用量报告（全部）" in bot.private_messages[-1][1]
-    assert "decision / deepseek-v4-flash" in bot.private_messages[-1][1]
+    assert "Token 用量统计：已关闭" in bot.private_messages[-1][1]
 
 
 def test_basic_approver_cannot_use_token_tool(monkeypatch, tmp_path) -> None:
@@ -531,6 +581,52 @@ def test_basic_approver_cannot_use_token_tool(monkeypatch, tmp_path) -> None:
     bot = FakeApprovalBot()
 
     handled = asyncio.run(plugin._handle_group_approval_private(bot, 3370998238, "token用量 all"))
+
+    assert handled
+    assert plugin.pending_group_approvals[approval.group_id] == approval
+    assert bot.private_messages[-1] == (3370998238, "你只有基础审批权限：1/2/3 发送，取消 不发。")
+
+
+def test_owner_can_query_recent_memory_and_style(monkeypatch, tmp_path) -> None:
+    store = _use_temp_plugin_memory(monkeypatch, tmp_path)
+    store.add_message(1026813421, 184589072, "小鸟", "股票又亏了", created_at=1000.0)
+    store.add_message(1026813421, 3370998238, "乌木", "这成本太高", created_at=1010.0)
+    batch = store.recent_messages(1026813421, 2)
+    store.add_memory_summary(
+        1026813421,
+        batch,
+        summary="按人：小鸟[#89072]说股票又亏了；乌木[#98238]说成本太高。",
+        recall_cues=["小鸟股票亏损", "乌木成本判断"],
+    )
+    store.add_style_rules(
+        1026813421,
+        [("聊亏钱", "先短句吐槽，再补现实成本", "股票又亏了")],
+    )
+    bot = FakeApprovalBot()
+
+    handled = asyncio.run(plugin._handle_group_approval_private(bot, 1535071184, "记忆 5"))
+
+    assert handled
+    assert "近期记忆：group=1026813421 limit=5" in bot.private_messages[-1][1]
+    assert "小鸟" in bot.private_messages[-1][1]
+    assert "#89072" in bot.private_messages[-1][1]
+    assert "乌木成本判断" in bot.private_messages[-1][1]
+
+    handled = asyncio.run(plugin._handle_group_approval_private(bot, 1535071184, "风格 5"))
+
+    assert handled
+    assert "近期风格学习：group=1026813421 limit=5" in bot.private_messages[-1][1]
+    assert "当聊亏钱时，可以先短句吐槽" in bot.private_messages[-1][1]
+    assert "股票又亏了" in bot.private_messages[-1][1]
+
+
+def test_basic_approver_cannot_query_recent_memory(monkeypatch, tmp_path) -> None:
+    _use_temp_plugin_memory(monkeypatch, tmp_path)
+    approval = _pending_approval()
+    plugin.pending_group_approvals[approval.group_id] = approval
+    bot = FakeApprovalBot()
+
+    handled = asyncio.run(plugin._handle_group_approval_private(bot, 3370998238, "记忆 5"))
 
     assert handled
     assert plugin.pending_group_approvals[approval.group_id] == approval
@@ -564,8 +660,7 @@ def test_approval_token_report_date_command(monkeypatch, tmp_path) -> None:
 
     assert handled
     assert plugin.pending_group_approvals[approval.group_id] == approval
-    assert "Token 用量报告（2026-07-10）" in bot.private_messages[-1][1]
-    assert "decision / deepseek-v4-flash" in bot.private_messages[-1][1]
+    assert "Token 用量统计：已关闭" in bot.private_messages[-1][1]
     assert "old / deepseek-v4-flash" not in bot.private_messages[-1][1]
 
 
@@ -597,6 +692,194 @@ def test_approval_open_restores_decision_and_resends_rules(monkeypatch, tmp_path
     assert {user_id for user_id, _ in rule_messages} == set(plugin._approval_user_ids())
 
 
+def test_owner_can_disable_review_and_clear_pending(monkeypatch, tmp_path) -> None:
+    store = _use_temp_plugin_memory(monkeypatch, tmp_path)
+    approval = _pending_approval()
+    plugin.pending_group_approvals[approval.group_id] = approval
+    bot = FakeApprovalBot()
+
+    handled = asyncio.run(plugin._handle_group_approval_private(bot, 1535071184, "关闭审查"))
+
+    assert handled
+    assert not plugin._approval_review_enabled()
+    assert plugin.pending_group_approvals == {}
+    assert store.app_kv_get(plugin.APPROVAL_REVIEW_ENABLED_KEY) == "false"
+    assert bot.private_messages[0] == (
+        1535071184,
+        "已关闭审查，后续 bot 会直接发送第 1 候选；当前待审候选已清空。",
+    )
+
+
+def test_owner_can_enable_review(monkeypatch, tmp_path) -> None:
+    store = _use_temp_plugin_memory(monkeypatch, tmp_path)
+    store.app_kv_set(plugin.APPROVAL_REVIEW_ENABLED_KEY, "false")
+    bot = FakeApprovalBot()
+
+    handled = asyncio.run(plugin._handle_group_approval_private(bot, 1535071184, "开启审查"))
+
+    assert handled
+    assert plugin._approval_review_enabled()
+    assert store.app_kv_get(plugin.APPROVAL_REVIEW_ENABLED_KEY) == "true"
+    assert bot.private_messages[0] == (1535071184, "已开启审查，bot 发群前会先发审批单。")
+
+
+def test_owner_can_query_review_status(monkeypatch, tmp_path) -> None:
+    store = _use_temp_plugin_memory(monkeypatch, tmp_path)
+    store.app_kv_set(plugin.APPROVAL_REVIEW_ENABLED_KEY, "false")
+    bot = FakeApprovalBot()
+
+    handled = asyncio.run(plugin._handle_group_approval_private(bot, 1535071184, "审查状态"))
+
+    assert handled
+    assert "关闭审查" in bot.private_messages[-1][1]
+
+
+def test_basic_approver_cannot_disable_review(monkeypatch, tmp_path) -> None:
+    _use_temp_plugin_memory(monkeypatch, tmp_path)
+    bot = FakeApprovalBot()
+
+    handled = asyncio.run(plugin._handle_group_approval_private(bot, 3370998238, "关闭审查"))
+
+    assert handled
+    assert plugin._approval_review_enabled()
+    assert bot.private_messages[-1] == (3370998238, "你只有基础审批权限：1/2/3 发送，取消 不发。")
+
+
+def test_owner_can_query_model_status(monkeypatch, tmp_path) -> None:
+    _use_temp_plugin_memory(monkeypatch, tmp_path)
+    monkeypatch.setattr(plugin, "deepseek_client", FakeModelClient())
+    bot = FakeApprovalBot()
+
+    handled = asyncio.run(plugin._handle_group_approval_private(bot, 1535071184, "模型状态"))
+
+    assert handled
+    assert "模型状态" in bot.private_messages[-1][1]
+    assert "回复" in bot.private_messages[-1][1]
+    assert "风格" in bot.private_messages[-1][1]
+    assert "可切换模型" in bot.private_messages[-1][1]
+    assert "fallback" in bot.private_messages[-1][1]
+
+
+def test_owner_can_switch_reply_model(monkeypatch, tmp_path) -> None:
+    store = _use_temp_plugin_memory(monkeypatch, tmp_path)
+    client = FakeModelClient()
+    monkeypatch.setattr(plugin, "deepseek_client", client)
+    bot = FakeApprovalBot()
+
+    handled = asyncio.run(
+        plugin._handle_group_approval_private(
+            bot,
+            1535071184,
+            "切回复模型 siliconflow/MiniMaxAI/MiniMax-M2.5",
+        )
+    )
+
+    assert handled
+    assert client.current_route("reply").label == "siliconflow/MiniMaxAI/MiniMax-M2.5"
+    assert "MiniMaxAI/MiniMax-M2.5" in store.app_kv_get(plugin.MODEL_ROUTE_OVERRIDES_KEY)
+    assert bot.private_messages[-1] == (
+        1535071184,
+        "已切回复模型：siliconflow/MiniMaxAI/MiniMax-M2.5\n影响路由：reply",
+    )
+
+
+def test_owner_can_switch_style_model(monkeypatch, tmp_path) -> None:
+    store = _use_temp_plugin_memory(monkeypatch, tmp_path)
+    client = FakeModelClient()
+    monkeypatch.setattr(plugin, "deepseek_client", client)
+    bot = FakeApprovalBot()
+
+    handled = asyncio.run(
+        plugin._handle_group_approval_private(
+            bot,
+            1535071184,
+            "切风格模型 siliconflow/MiniMaxAI/MiniMax-M2.5",
+        )
+    )
+
+    assert handled
+    assert client.current_route("style").label == "siliconflow/MiniMaxAI/MiniMax-M2.5"
+    assert "MiniMaxAI/MiniMax-M2.5" in store.app_kv_get(plugin.MODEL_ROUTE_OVERRIDES_KEY)
+    assert bot.private_messages[-1] == (
+        1535071184,
+        "已切风格模型：siliconflow/MiniMaxAI/MiniMax-M2.5\n影响路由：style",
+    )
+
+
+def test_owner_can_switch_utility_group_models(monkeypatch, tmp_path) -> None:
+    store = _use_temp_plugin_memory(monkeypatch, tmp_path)
+    client = FakeModelClient()
+    monkeypatch.setattr(plugin, "deepseek_client", client)
+    bot = FakeApprovalBot()
+
+    handled = asyncio.run(
+        plugin._handle_group_approval_private(
+            bot,
+            1535071184,
+            "切工具模型 deepseek/deepseek-v4-flash",
+        )
+    )
+
+    assert handled
+    assert client.current_route("jargon").label == "deepseek/deepseek-v4-flash"
+    assert client.current_route("memory").label == "deepseek/deepseek-v4-flash"
+    assert client.current_route("style").label == "deepseek/deepseek-v4-flash"
+    assert '"jargon": "deepseek/deepseek-v4-flash"' in store.app_kv_get(plugin.MODEL_ROUTE_OVERRIDES_KEY)
+    assert bot.private_messages[-1] == (
+        1535071184,
+        "已切工具模型：deepseek/deepseek-v4-flash\n影响路由：jargon、memory、style",
+    )
+
+
+def test_owner_can_clear_model_overrides(monkeypatch, tmp_path) -> None:
+    store = _use_temp_plugin_memory(monkeypatch, tmp_path)
+    client = FakeModelClient()
+    route = client.parse_model_route("siliconflow/MiniMaxAI/MiniMax-M2.5")
+    client.set_route_override("reply", route)
+    store.app_kv_set(plugin.MODEL_ROUTE_OVERRIDES_KEY, '{"reply":"siliconflow/MiniMaxAI/MiniMax-M2.5"}')
+    monkeypatch.setattr(plugin, "deepseek_client", client)
+    bot = FakeApprovalBot()
+
+    handled = asyncio.run(plugin._handle_group_approval_private(bot, 1535071184, "清模型覆盖"))
+
+    assert handled
+    assert client.current_route("reply").label == plugin.app_config.deepseek.routes["reply"].label
+    assert store.app_kv_get(plugin.MODEL_ROUTE_OVERRIDES_KEY) == "{}"
+    assert bot.private_messages[-1] == (1535071184, "已清除模型覆盖，恢复 config.yaml 默认模型。")
+
+
+def test_basic_approver_cannot_switch_model(monkeypatch, tmp_path) -> None:
+    _use_temp_plugin_memory(monkeypatch, tmp_path)
+    monkeypatch.setattr(plugin, "deepseek_client", FakeModelClient())
+    bot = FakeApprovalBot()
+
+    handled = asyncio.run(
+        plugin._handle_group_approval_private(
+            bot,
+            3370998238,
+            "切回复模型 siliconflow/MiniMaxAI/MiniMax-M2.5",
+        )
+    )
+
+    assert handled
+    assert bot.private_messages[-1] == (3370998238, "你只有基础审批权限：1/2/3 发送，取消 不发。")
+
+
+def test_request_group_approval_auto_sends_first_candidate_when_review_disabled(monkeypatch, tmp_path) -> None:
+    store = _use_temp_plugin_memory(monkeypatch, tmp_path)
+    store.app_kv_set(plugin.APPROVAL_REVIEW_ENABLED_KEY, "false")
+    approval = _pending_approval()
+    bot = FakeApprovalBot()
+
+    asyncio.run(plugin._request_group_approval(bot, approval))
+
+    assert plugin.pending_group_approvals == {}
+    assert bot.group_messages == [(1026813421, "第一条回复")]
+    assert bot.private_messages == []
+    sent_messages = store.recent_messages(1026813421, 3)
+    assert sent_messages[-1].text == "第一条回复"
+
+
 def test_changelog_notice_sent_once(monkeypatch, tmp_path) -> None:
     _use_temp_plugin_memory(monkeypatch, tmp_path)
     bot = FakeApprovalBot()
@@ -606,7 +889,7 @@ def test_changelog_notice_sent_once(monkeypatch, tmp_path) -> None:
 
     notices = [message for _, message in bot.private_messages if "后端更新记录" in message]
     assert len(notices) == len(plugin._approval_user_ids())
-    assert all("取消自动拦截私聊刷屏" in message for message in notices)
+    assert all("LLM 路由拆细" in message for message in notices)
 
 
 def test_suppression_notice_records_without_private_spam(monkeypatch, tmp_path) -> None:
@@ -674,6 +957,45 @@ def test_allowed_private_user_cannot_write_custom_jargon(monkeypatch, tmp_path) 
     assert response == "没权限。"
     entries = store.custom_jargon_entries(1026813421)
     assert len(entries) == 0
+
+
+def test_owner_can_manage_private_whitelist(monkeypatch, tmp_path) -> None:
+    store = _use_temp_plugin_memory(monkeypatch, tmp_path)
+    bot = FakeApprovalBot()
+
+    assert plugin._private_user_allowed(1535071184)
+    assert not plugin._private_user_can_chat(1535071184)
+    assert plugin._private_user_can_chat(plugin.PRIVATE_DEBUG_OWNER_ID)
+
+    handled = asyncio.run(plugin._handle_group_approval_private(bot, 1535071184, "加私聊 123456789"))
+
+    assert handled
+    assert store.app_kv_get(plugin.PRIVATE_WHITELIST_KEY) == "[123456789]"
+    assert plugin._private_user_allowed(123456789)
+    assert bot.private_messages[-1] == (1535071184, "已添加私聊白名单：123456789")
+
+    handled = asyncio.run(plugin._handle_group_approval_private(bot, 1535071184, "私聊白名单"))
+
+    assert handled
+    assert "运行时添加：123456789" in bot.private_messages[-1][1]
+    assert "config 固定" in bot.private_messages[-1][1]
+
+    handled = asyncio.run(plugin._handle_group_approval_private(bot, 1535071184, "删私聊 123456789"))
+
+    assert handled
+    assert store.app_kv_get(plugin.PRIVATE_WHITELIST_KEY) == "[]"
+    assert not plugin._private_user_allowed(123456789)
+
+
+def test_basic_approver_cannot_manage_private_whitelist(monkeypatch, tmp_path) -> None:
+    _use_temp_plugin_memory(monkeypatch, tmp_path)
+    bot = FakeApprovalBot()
+
+    handled = asyncio.run(plugin._handle_group_approval_private(bot, 3370998238, "加私聊 123456789"))
+
+    assert handled
+    assert bot.private_messages[-1] == (3370998238, "你只有基础审批权限：1/2/3 发送，取消 不发。")
+    assert not plugin._private_user_allowed(123456789)
 
 
 def test_approval_reject_second_candidate_records_that_candidate(monkeypatch, tmp_path) -> None:

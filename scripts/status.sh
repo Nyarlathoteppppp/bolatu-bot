@@ -7,14 +7,36 @@ echo "Project: /Users/ywbw/qq-social-agent"
 echo "Venv:    /Users/ywbw/qq-social-agent/.venv"
 echo
 
-echo "DeepSeek model:"
+echo "LLM routes:"
 .venv/bin/python - <<'PY'
+import json
+from pathlib import Path
 from qq_social_agent.config import load_config
+from qq_social_agent.memory import MemoryStore
+
 config = load_config().deepseek
-print(f"base={config.model} / thinking={config.thinking}")
-print(f"decision={config.decision_model}")
-print(f"reply={config.reply_model}")
-print(f"utility={config.utility_model}")
+memory = MemoryStore(Path("/Users/ywbw/qq-social-agent/data/bot.sqlite3"))
+raw_overrides = memory.app_kv_get("llm_model_route_overrides") or "{}"
+try:
+    overrides = json.loads(raw_overrides)
+except json.JSONDecodeError:
+    overrides = {}
+
+print("providers=" + ", ".join(sorted(config.providers)))
+print(f"thinking={config.thinking}")
+for route_name, title in (
+    ("decision", "decision"),
+    ("reply", "reply"),
+    ("jargon", "jargon"),
+    ("memory", "memory"),
+    ("style", "style"),
+):
+    active = overrides.get(route_name, config.routes[route_name].label)
+    marker = " override" if route_name in overrides else ""
+    print(f"{title}={active}{marker}")
+    print(f"  config={config.routes[route_name].label}")
+    print(f"  fallback={config.fallback_routes[route_name].label}")
+print("available_models=" + ", ".join(route.label for route in config.model_catalog))
 PY
 echo
 

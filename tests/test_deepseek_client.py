@@ -1,6 +1,9 @@
+import asyncio
 from types import SimpleNamespace
 
 from qq_social_agent.deepseek_client import (
+    ChatMessage,
+    DeepSeekClient,
     _log_llm_usage,
     _parse_jargon_terms,
     _parse_reply_decision,
@@ -8,6 +11,8 @@ from qq_social_agent.deepseek_client import (
     _usage_value,
     set_usage_recorder,
 )
+from qq_social_agent.persona import Persona
+from qq_social_agent.prompts import PromptRegistry
 
 
 def test_sanitize_empty_string_markers() -> None:
@@ -189,3 +194,96 @@ def test_log_llm_usage_calls_recorder() -> None:
         set_usage_recorder(None)
 
     assert events == [("decision", "deepseek-v4-flash", 12, 3, 15)]
+
+
+def test_client_methods_use_expected_model_routes() -> None:
+    client = object.__new__(DeepSeekClient)
+    client.config = SimpleNamespace(
+        max_tokens=120,
+        temperature=0.7,
+        thinking="disabled",
+        reasoning_effort="high",
+    )
+    client.prompts = PromptRegistry()
+    calls: list[tuple[str, str]] = []
+    contents = {
+        "decision": '{"should_reply":false,"confidence":0.1,"action":"ignore","reason":"test"}',
+        "jargon": '{"terms":["柏拉图"]}',
+        "reply": "一句话",
+        "reply_candidates": '{"candidates":[{"text":"候选一句话","style":"自然","action":"reply"}]}',
+        "mid_memory": '{"summary":"按人：A[#11111]说了事","recall_cues":["A[#11111]"]}',
+        "style_learning": '{"rules":[{"situation":"聊亏钱","style":"短句吐槽","source_id":1}]}',
+    }
+
+    async def fake_chat_completion(*, task: str, route_name: str, request: dict[str, object]) -> object:
+        calls.append((task, route_name))
+        return SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(content=contents[task]),
+                )
+            ]
+        )
+
+    client._chat_completion = fake_chat_completion
+    persona = Persona(
+        id="test",
+        name="张风雪",
+        description="",
+        prompt="人格",
+        decision_prompt="决策人格",
+        keywords=(),
+        max_reply_chars=120,
+        passive_reply_probability=0.5,
+    )
+    messages = [
+        ChatMessage(
+            group_id=1026813421,
+            user_id=11111,
+            nickname="A",
+            text="股票又亏了",
+            is_bot=False,
+            created_at=1000.0,
+        )
+    ]
+
+    async def run_all() -> None:
+        await client.should_reply(
+            persona=persona,
+            recent_messages=messages,
+            current_text="股票又亏了",
+            current_nickname="A",
+        )
+        await client.select_jargon_terms(
+            recent_messages=messages,
+            current_text="柏拉图今天好安静",
+            current_nickname="A",
+            jargon_catalog="- 柏拉图：群名",
+        )
+        await client.reply(
+            persona=persona,
+            recent_messages=messages,
+            current_text="股票又亏了",
+            current_nickname="A",
+            mentioned=False,
+        )
+        await client.reply_candidates(
+            persona=persona,
+            recent_messages=messages,
+            current_text="股票又亏了",
+            current_nickname="A",
+            mentioned=False,
+        )
+        await client.summarize_mid_memory(messages=messages)
+        await client.learn_style_rules(messages=messages)
+
+    asyncio.run(run_all())
+
+    assert calls == [
+        ("decision", "decision"),
+        ("jargon", "jargon"),
+        ("reply", "reply"),
+        ("reply_candidates", "reply"),
+        ("mid_memory", "memory"),
+        ("style_learning", "style"),
+    ]

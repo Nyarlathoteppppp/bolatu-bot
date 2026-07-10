@@ -24,6 +24,9 @@ from .approval_rules import (
     APPROVAL_REJECT_REASON_RE,
     APPROVAL_RULES_DETAIL_MESSAGE,
     APPROVAL_RULES_MESSAGE,
+    BOT_TOOL_FULL_MESSAGE,
+    BOT_TOOL_INDEX_MESSAGE,
+    BOT_TOOL_SECTION_MESSAGES,
     JARGON_ADD_RE,
     JARGON_DELETE_RE,
     JARGON_LIST_RE,
@@ -115,6 +118,7 @@ MENTION_TARGET_LIMIT = 8
 REPEAT_MENTION_SUPPRESS_SECONDS = 10 * 60
 PRIVATE_DEBUG_OWNER_ID = 2776760548
 OWNER_USER_IDS = (1535071184,)
+COMMAND_ONLY_PRIVATE_USER_IDS = OWNER_USER_IDS
 TOOL_ADMIN_USER_IDS = tuple(sorted({PRIVATE_DEBUG_OWNER_ID, *OWNER_USER_IDS}))
 DEFAULT_BASIC_APPROVAL_USER_IDS = (3370998238,)
 GROUP_APPROVAL_USER_IDS = tuple(sorted({*OWNER_USER_IDS, *DEFAULT_BASIC_APPROVAL_USER_IDS}))
@@ -138,24 +142,78 @@ TOKEN_USAGE_LOG_BACKFILL_FILES = (
     Path(__file__).resolve().parent.parent / "logs" / "bot.log",
 )
 APPROVAL_CANCEL_COMMANDS = {"取消", "取消发送", "不发", "别发"}
-APPROVAL_TOOL_COMMANDS = {"bot工具", "工具", "工具单", "审批工具", "机器人工具"}
+APPROVAL_TOOL_COMMANDS = {"bot工具", "工具", "工具单", "审批工具", "机器人工具", "bot 工具"}
+BOT_TOOL_COMMAND_RE = re.compile(r"^(?:bot\s*工具|工具|工具单|审批工具|机器人工具)\s*(?P<section>.*)$", re.IGNORECASE)
+BOT_TOOL_SECTION_ALIASES = {
+    "": "index",
+    "目录": "index",
+    "帮助": "index",
+    "审批": "approval",
+    "审核": "approval",
+    "查看": "view",
+    "查询": "view",
+    "黑话": "jargon",
+    "开关": "switch",
+    "审批人": "approver",
+    "私聊": "private",
+    "私人聊天": "private",
+    "白名单": "private",
+    "模型": "model",
+    "model": "model",
+    "学习": "learning",
+    "记忆": "learning",
+    "回想": "learning",
+    "风格": "learning",
+    "learning": "learning",
+    "prompt": "prompt",
+    "提示词": "prompt",
+    "全部": "full",
+    "全量": "full",
+}
 APPROVER_LIST_COMMANDS = {"审批人列表", "审批列表", "approver list", "/审批人列表"}
 APPROVER_ADD_RE = re.compile(r"^(?:/)?(?:加审批|添加审批人|审批人添加|approver add)\s*[:：]?\s*(?P<user_id>\d{5,12})$")
 APPROVER_DELETE_RE = re.compile(r"^(?:/)?(?:删审批|删除审批人|审批人删除|approver remove)\s*[:：]?\s*(?P<user_id>\d{5,12})$")
-CHANGELOG_NOTICE_KEY = "2026-07-10-approval-gate-v3"
+PRIVATE_WHITELIST_KEY = "private_chat_allowed_user_ids"
+PRIVATE_WHITELIST_LIST_COMMANDS = {"私聊白名单", "私人聊天白名单", "白名单私聊", "private whitelist", "/私聊白名单"}
+PRIVATE_WHITELIST_ADD_RE = re.compile(r"^(?:/)?(?:加私聊|添加私聊|加私聊白名单|添加私聊白名单|private add)\s*[:：]?\s*(?P<user_id>\d{5,12})$")
+PRIVATE_WHITELIST_DELETE_RE = re.compile(r"^(?:/)?(?:删私聊|删除私聊|删私聊白名单|删除私聊白名单|private remove)\s*[:：]?\s*(?P<user_id>\d{5,12})$")
+APPROVAL_REVIEW_ENABLED_KEY = "group_approval_review_enabled"
+APPROVAL_REVIEW_ON_COMMANDS = {"开启审查", "打开审查", "恢复审查", "启用审查", "开启审核", "打开审核"}
+APPROVAL_REVIEW_OFF_COMMANDS = {"关闭审查", "关掉审查", "暂停审查", "免审", "免审批", "关闭审核", "关掉审核"}
+APPROVAL_REVIEW_STATUS_COMMANDS = {"审查状态", "审核状态", "审批状态"}
+MODEL_ROUTE_OVERRIDES_KEY = "llm_model_route_overrides"
+MODEL_ROUTE_STATUS_COMMANDS = {"模型状态", "模型", "model status", "/模型状态"}
+MODEL_ROUTE_RESET_COMMANDS = {"清模型覆盖", "清除模型覆盖", "重置模型", "恢复默认模型", "model reset", "/清模型覆盖"}
+MODEL_ROUTE_COMMAND_RE = re.compile(
+    r"^(?:/)?(?:切|设置|更换|改)?(?P<target>回复|reply|决策|decision|黑话|jargon|记忆|memory|回想|风格|style|学习|style_learning|工具|utility|utility_model)模型\s+"
+    r"(?P<model>\S.+)$",
+    re.IGNORECASE,
+)
+MEMORY_REPORT_COMMAND_RE = re.compile(r"^(?:/)?(?:记忆|近期记忆|查看记忆|回想|聊天回想|memory)\s*(?P<limit>\d{0,2})$")
+STYLE_REPORT_COMMAND_RE = re.compile(r"^(?:/)?(?:风格|近期风格|查看风格|风格学习|学习风格|style)\s*(?P<limit>\d{0,2})$")
+MODEL_ROUTE_INFOS = (
+    ("decision", "决策", "群聊是否插嘴、action、是否需要联网搜索"),
+    ("reply", "回复", "私聊回复、群聊审批三候选生成"),
+    ("jargon", "黑话", "黑话词典注入选择"),
+    ("memory", "记忆", "中期聊天回想压缩"),
+    ("style", "风格", "群聊表达风格学习"),
+)
+MODEL_ROUTE_NAMES = tuple(route_name for route_name, _, _ in MODEL_ROUTE_INFOS)
+MODEL_ROUTE_STORAGE_NAMES = (*MODEL_ROUTE_NAMES, "utility")
+UTILITY_GROUP_ROUTE_NAMES = ("jargon", "memory", "style")
+CHANGELOG_NOTICE_KEY = "2026-07-10-model-routes-v5"
 CHANGELOG_NOTICE_MESSAGE = """张风雪后端更新记录：
-1. 取消自动拦截私聊刷屏：后端拦截、频率门、LLM 不发只入记录，改为手动查询。
-2. 查询方式：主人私聊回“拦截 20”或用 /bot blocked 20。
-3. 放宽本地预决策：删除 weak_passive 硬拦截，普通消息更多交给 decision LLM 判断。
-4. 修复 30 秒频率门：低频单条消息等满 30 秒也会进入 decision；纯低价值消息不刷新频率状态。
-5. 审批单瘦身：候选卡只保留触发消息、审批 ID、1/2/3 和取消。
-6. 权限拆分：主人有工具权限；基础审批人只可 1/2/3/取消。
-7. 审批并发加锁：两人同时审批时只会发一次，旧数字短时间内不会串到下一条。
-8. 1535071184 相关私聊和消息增加温柔、服从、少回怼的高优先级规则。
+1. 1535071184 改为命令专用号：只处理审批/工具命令，不走普通私聊生成。
+2. 工具命令兼容“bot 工具 审批”这种带空格写法。
+3. LLM 路由拆细：决策、回复、黑话、记忆、风格都可以单独切模型。
+4. 群聊风格学习默认改为 siliconflow/MiniMaxAI/MiniMax-M2.5。
+5. 可切换模型目录新增 siliconflow/Pro/moonshotai/Kimi-K2.6。
+6. 模型状态会显示可切换部分、当前模型、fallback、API key 来源和可切换模型清单。
+7. 切工具模型 <模型> 保留为兼容批量命令，会同时切黑话/记忆/风格。
 
 审批提醒：
 - 审批：1/2/3 发送；取消 不发。
-- 工具：回 bot工具 或 审批规则详情。
+- 工具：回 bot工具 或 审批规则详情；回 模型状态 查看模型清单。
 """
 
 
@@ -219,8 +277,9 @@ class SuppressionEvent:
 @get_driver().on_startup
 async def _init_client() -> None:
     global deepseek_client
-    set_usage_recorder(_record_llm_usage)
+    set_usage_recorder(_record_llm_usage if app_config.deepseek.usage_tracking_enabled else None)
     deepseek_client = DeepSeekClient(app_config.deepseek)
+    _apply_model_route_overrides()
 
 
 def _record_llm_usage(
@@ -299,6 +358,129 @@ def _is_tool_admin_user(user_id: int) -> bool:
     return user_id in TOOL_ADMIN_USER_IDS
 
 
+def _bot_tool_message(text: str) -> str | None:
+    compact = text.strip()
+    if compact in APPROVAL_DETAIL_COMMANDS or compact in APPROVAL_TOOL_COMMANDS:
+        return BOT_TOOL_INDEX_MESSAGE
+    match = BOT_TOOL_COMMAND_RE.match(compact)
+    if match is None:
+        return None
+    section = re.sub(r"\s+", "", match.group("section").strip().casefold())
+    key = BOT_TOOL_SECTION_ALIASES.get(section)
+    if key is None:
+        return BOT_TOOL_INDEX_MESSAGE
+    if key == "index":
+        return BOT_TOOL_INDEX_MESSAGE
+    if key == "full":
+        return BOT_TOOL_FULL_MESSAGE
+    return BOT_TOOL_SECTION_MESSAGES.get(key, BOT_TOOL_INDEX_MESSAGE)
+
+
+def _runtime_private_whitelist() -> set[int]:
+    raw = memory.app_kv_get(PRIVATE_WHITELIST_KEY)
+    if raw is None:
+        return set()
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        logger.warning("qq_social_agent invalid private whitelist json, falling back to empty")
+        return set()
+    if not isinstance(data, list):
+        return set()
+    user_ids: set[int] = set()
+    for item in data:
+        try:
+            user_id = int(item)
+        except (TypeError, ValueError):
+            continue
+        if user_id > 0:
+            user_ids.add(user_id)
+    return user_ids
+
+
+def _save_runtime_private_whitelist(user_ids: set[int]) -> None:
+    cleaned = sorted(user_id for user_id in user_ids if user_id > 0)
+    memory.app_kv_set(PRIVATE_WHITELIST_KEY, json.dumps(cleaned, ensure_ascii=False))
+
+
+def _private_user_allowed(user_id: int | str) -> bool:
+    user_int = int(user_id)
+    return (
+        app_config.private_user_allowed(user_int)
+        or user_int in _runtime_private_whitelist()
+        or _is_tool_admin_user(user_int)
+    )
+
+
+def _private_user_can_chat(user_id: int | str) -> bool:
+    user_int = int(user_id)
+    return _private_user_allowed(user_int) and user_int not in COMMAND_ONLY_PRIVATE_USER_IDS
+
+
+def _format_private_whitelist_report() -> str:
+    config_ids = sorted(app_config.allowed_private_users)
+    runtime_ids = sorted(_runtime_private_whitelist())
+    implicit_chat_ids = sorted(set(TOOL_ADMIN_USER_IDS) - set(COMMAND_ONLY_PRIVATE_USER_IDS))
+    command_only_ids = sorted(COMMAND_ONLY_PRIVATE_USER_IDS)
+    return (
+        "私聊白名单：\n"
+        f"config 固定：{_join_user_ids(config_ids)}\n"
+        f"运行时添加：{_join_user_ids(runtime_ids)}\n"
+        f"隐式允许普通私聊（工具管理员/调试号）：{_join_user_ids(implicit_chat_ids)}\n"
+        f"命令专用：{_join_user_ids(command_only_ids)}\n"
+        "说明：白名单只允许普通私聊聊天，不授予 bot 工具权限；命令专用号只处理审批/工具命令。"
+    )
+
+
+def _join_user_ids(user_ids: list[int] | tuple[int, ...]) -> str:
+    return "、".join(str(user_id) for user_id in user_ids) or "无"
+
+
+def _model_route_overrides() -> dict[str, str]:
+    raw = memory.app_kv_get(MODEL_ROUTE_OVERRIDES_KEY)
+    if raw is None:
+        return {}
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        logger.warning("qq_social_agent invalid model route overrides json, clearing")
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    overrides: dict[str, str] = {}
+    for route_name, route_label in data.items():
+        route = str(route_name).strip()
+        label = str(route_label).strip()
+        if route in MODEL_ROUTE_STORAGE_NAMES and label:
+            overrides[route] = label
+    return overrides
+
+
+def _save_model_route_overrides(overrides: dict[str, str]) -> None:
+    cleaned = {
+        route_name: route_label
+        for route_name, route_label in overrides.items()
+        if route_name in MODEL_ROUTE_STORAGE_NAMES and route_label
+    }
+    memory.app_kv_set(MODEL_ROUTE_OVERRIDES_KEY, json.dumps(cleaned, ensure_ascii=False, sort_keys=True))
+
+
+def _apply_model_route_overrides() -> None:
+    if deepseek_client is None:
+        return
+    for route_name, route_label in _model_route_overrides().items():
+        try:
+            deepseek_client.set_route_override(
+                route_name,
+                deepseek_client.parse_model_route(route_label, default_provider="siliconflow"),
+            )
+        except Exception as exc:
+            logger.warning(
+                "qq_social_agent failed applying model route override: "
+                f"route={route_name} label={route_label!r} error={exc}"
+            )
+
+
 def _basic_approval_user_ids() -> set[int]:
     raw = memory.app_kv_get(APPROVAL_USER_IDS_KEY)
     if raw is None:
@@ -336,6 +518,125 @@ def _is_approval_user(user_id: int) -> bool:
 
 def _is_basic_approval_user(user_id: int) -> bool:
     return _is_approval_user(user_id) and not _is_owner_user(user_id)
+
+
+def _approval_review_enabled() -> bool:
+    raw = memory.app_kv_get(APPROVAL_REVIEW_ENABLED_KEY)
+    if raw is None:
+        return True
+    return raw.strip().lower() not in {"0", "false", "off", "disabled", "no"}
+
+
+def _set_approval_review_enabled_value(enabled: bool) -> None:
+    memory.app_kv_set(APPROVAL_REVIEW_ENABLED_KEY, "true" if enabled else "false")
+
+
+def _format_approval_review_status() -> str:
+    mode = "开启审查：bot 发群前会先发审批单。" if _approval_review_enabled() else "关闭审查：bot 直接发送第 1 候选。"
+    pending_count = len(pending_group_approvals)
+    return f"审查状态：{mode}\n当前待审候选：{pending_count} 条。"
+
+
+def _format_model_route_status() -> str:
+    overrides = _model_route_overrides()
+    lines = ["模型状态：", "可切换部分："]
+    for route_name, title, flow in MODEL_ROUTE_INFOS:
+        configured = app_config.deepseek.routes[route_name].label
+        fallback = app_config.deepseek.fallback_routes[route_name].label
+        if deepseek_client is not None:
+            active = deepseek_client.current_route(route_name).label
+        else:
+            active = overrides.get(route_name, configured)
+        suffix = "（覆盖）" if route_name in overrides else "（配置）"
+        lines.append(f"- {title}模型（{route_name}）：{flow}")
+        lines.append(f"  当前：{active} {suffix}")
+        lines.append(f"  config：{configured}")
+        lines.append(f"  fallback：{fallback}")
+    lines.append("兼容命令：切工具模型 <模型> = 同时切黑话/记忆/风格。")
+    lines.append("")
+    lines.append("可切换模型：")
+    for route in app_config.deepseek.model_catalog:
+        provider = app_config.deepseek.providers[route.provider]
+        lines.append(f"- {route.label}（{_provider_key_source(provider.name)} / {provider.api_key_env}）")
+    lines.append("")
+    lines.append("命令示例：切回复模型 siliconflow/MiniMaxAI/MiniMax-M2.5；切风格模型 siliconflow/MiniMaxAI/MiniMax-M2.5；切决策模型 deepseek/deepseek-v4-pro；清模型覆盖。")
+    return "\n".join(lines)
+
+
+def _parse_memory_report_limit(text: str, pattern: re.Pattern[str]) -> int | None:
+    match = pattern.match(text.strip())
+    if match is None:
+        return None
+    return _parse_report_limit(match.group("limit") or "", default=8, maximum=30)
+
+
+def _format_recent_memory_report(group_id: int | None, limit: int) -> str:
+    if group_id is None:
+        return "近期记忆：当前配置了多个群或没有群，暂不支持默认查询。"
+    summaries = memory.recent_memory_summaries(group_id, limit)
+    lines = [f"近期记忆：group={group_id} limit={limit}"]
+    if not summaries:
+        lines.append("暂无中期聊天回想。")
+        return "\n".join(lines)
+    for index, summary in enumerate(summaries, start=1):
+        cues = "；".join(summary.recall_cues[:5]) or "无"
+        created_at = _format_local_time(summary.created_at)
+        lines.append(f"{index}. {summary.summary}")
+        lines.append(f"   线索：{cues}")
+        lines.append(f"   生成：{created_at}")
+    return "\n".join(lines)
+
+
+def _format_recent_style_report(group_id: int | None, limit: int) -> str:
+    if group_id is None:
+        return "近期风格学习：当前配置了多个群或没有群，暂不支持默认查询。"
+    rules = memory.recent_style_rules(group_id, limit)
+    lines = [f"近期风格学习：group={group_id} limit={limit}"]
+    if not rules:
+        lines.append("暂无风格规则。")
+        return "\n".join(lines)
+    for index, rule in enumerate(rules, start=1):
+        source = rule.source_text.strip().replace("\n", " ")[:80] or "无"
+        created_at = _format_local_time(rule.created_at)
+        lines.append(f"{index}. 当{rule.situation}时，可以{rule.style}")
+        lines.append(f"   来源：{source}")
+        lines.append(f"   生成：{created_at}")
+    return "\n".join(lines)
+
+
+def _format_local_time(timestamp: float) -> str:
+    return time.strftime("%m-%d %H:%M", time.localtime(timestamp))
+
+
+def _provider_key_source(provider_name: str) -> str:
+    if provider_name == "deepseek":
+        return "DeepSeek 官方 key，第一次提供"
+    if provider_name == "siliconflow":
+        return "硅基流动 key，第二次提供"
+    return f"{provider_name} key"
+
+
+def _model_route_name_from_text(target: str) -> str | None:
+    key = target.strip().casefold()
+    mapping = {
+        "回复": "reply",
+        "reply": "reply",
+        "决策": "decision",
+        "decision": "decision",
+        "黑话": "jargon",
+        "jargon": "jargon",
+        "记忆": "memory",
+        "memory": "memory",
+        "回想": "memory",
+        "风格": "style",
+        "style": "style",
+        "学习": "style",
+        "style_learning": "style",
+        "工具": "utility_group",
+        "utility": "utility_group",
+        "utility_model": "utility_group",
+    }
+    return mapping.get(key)
 
 
 def _new_approval_id(group_id: int) -> str:
@@ -1015,7 +1316,11 @@ async def handle_private_message(bot: Bot, event: PrivateMessageEvent) -> None:
     if await _handle_group_approval_private(bot, user_id, text):
         return
 
-    if not app_config.private_user_allowed(user_id):
+    if user_id in COMMAND_ONLY_PRIVATE_USER_IDS:
+        logger.info(f"qq_social_agent ignored private: user={user_id} command_only")
+        return
+
+    if not _private_user_can_chat(user_id):
         logger.info(f"qq_social_agent ignored private: user={user_id} not_allowed")
         return
 
@@ -1161,11 +1466,26 @@ async def handle_bot_command(event: Event, matcher: Matcher, args: Message = Com
         persona_id = str(state["persona"] or group_cfg.get("persona") or app_config.default_persona)
         enabled = bool(group_cfg.get("enabled", True)) and bool(state["enabled"])
         muted_left = max(0, int(float(state["muted_until"]) - time.time()))
+        decision_model = (
+            deepseek_client.current_route("decision").label
+            if deepseek_client is not None
+            else app_config.deepseek.routes["decision"].label
+        )
+        reply_model = (
+            deepseek_client.current_route("reply").label
+            if deepseek_client is not None
+            else app_config.deepseek.routes["reply"].label
+        )
+        utility_model = (
+            deepseek_client.current_route("utility").label
+            if deepseek_client is not None
+            else app_config.deepseek.routes["utility"].label
+        )
         await matcher.finish(
             f"enabled={enabled} persona={persona_id} muted_left={muted_left}s "
-            f"decision_model={app_config.deepseek.decision_model} "
-            f"reply_model={app_config.deepseek.reply_model} "
-            f"utility_model={app_config.deepseek.utility_model}"
+            f"decision_model={decision_model} "
+            f"reply_model={reply_model} "
+            f"utility_model={utility_model}"
         )
     if action in {"tokens", "token", "usage"}:
         window = _parse_token_report_window(parts[1] if len(parts) >= 2 else "")
@@ -1250,6 +1570,12 @@ def _parse_approval_suppression_report_command(text: str) -> int | None:
 
 
 def _token_usage_report_for_window(window: TokenReportWindow) -> str:
+    if not app_config.deepseek.usage_tracking_enabled:
+        return (
+            "Token 用量统计：已关闭。\n"
+            "原因：当前接入多个模型，暂时不做统一 token/费用计算。\n"
+            "重新开启：改 config.yaml 里的 deepseek.usage_tracking_enabled=true 后重启后端。"
+        )
     imported = _backfill_llm_usage_from_logs()
     if imported:
         logger.info(f"qq_social_agent imported llm usage from logs: rows={imported}")
@@ -1922,7 +2248,10 @@ async def _maintain_group_learning(group_id: int) -> None:
 def _format_memory_context(summaries: list[MemorySummary]) -> str:
     if not summaries:
         return ""
-    lines: list[str] = []
+    lines: list[str] = [
+        "以下是旧聊天回想，只作背景；不要把旧回想误认为当前发言人说过的话。"
+        "只有回想里明确写了昵称/QQ尾号，才可按该人归因。"
+    ]
     for index, summary in enumerate(summaries, start=1):
         cues = "；".join(summary.recall_cues[:3])
         if cues:
@@ -2092,6 +2421,28 @@ def _custom_jargon_entry_to_group_jargon(entry: CustomJargonEntry) -> GroupJargo
 
 
 async def _request_group_approval(bot: Bot, approval: PendingGroupApproval) -> None:
+    if not _approval_review_enabled():
+        pending_group_approvals.pop(approval.group_id, None)
+        candidate = approval.candidates[0] if approval.candidates else None
+        if candidate is None:
+            logger.info(
+                "qq_social_agent auto approval skipped: "
+                f"group={approval.group_id} reason=no_candidate"
+            )
+            return
+        logger.info(
+            "qq_social_agent auto approval send: "
+            f"group={approval.group_id} approval_id={approval.approval_id} candidate={candidate.index}"
+        )
+        await _send_approved_group_reply(
+            bot,
+            approval,
+            candidate,
+            approver_id=None,
+            high_quality=False,
+            notify_success=False,
+        )
+        return
     pending_group_approvals[approval.group_id] = approval
     preview = _format_approval_candidates(approval)
     message = (
@@ -2166,6 +2517,24 @@ async def _set_approval_group_decision_enabled(bot: Bot, user_id: int, enabled: 
     )
 
 
+async def _set_approval_review_enabled(bot: Bot, user_id: int, enabled: bool) -> None:
+    _set_approval_review_enabled_value(enabled)
+    if enabled:
+        response_text = "已开启审查，bot 发群前会先发审批单。"
+    else:
+        pending_group_approvals.clear()
+        response_text = "已关闭审查，后续 bot 会直接发送第 1 候选；当前待审候选已清空。"
+    try:
+        await bot.send_private_msg(user_id=user_id, message=Message(response_text))
+    except ActionFailed:
+        pass
+    await _send_approval_rules_to_approvers(bot, reason="review_switch")
+    logger.info(
+        "qq_social_agent approval review switch: "
+        f"operator={user_id} enabled={enabled}"
+    )
+
+
 def _is_approval_control_text(text: str) -> bool:
     return (
         APPROVAL_CHOICE_RE.match(text) is not None
@@ -2183,11 +2552,23 @@ def _is_private_tool_text(text: str) -> bool:
     return (
         _is_jargon_command_text(text)
         or text in APPROVAL_TOOL_COMMANDS
+        or _bot_tool_message(text) is not None
         or text in APPROVER_LIST_COMMANDS
+        or text in PRIVATE_WHITELIST_LIST_COMMANDS
+        or PRIVATE_WHITELIST_ADD_RE.match(text) is not None
+        or PRIVATE_WHITELIST_DELETE_RE.match(text) is not None
+        or text in MODEL_ROUTE_STATUS_COMMANDS
+        or text in MODEL_ROUTE_RESET_COMMANDS
+        or MODEL_ROUTE_COMMAND_RE.match(text) is not None
+        or MEMORY_REPORT_COMMAND_RE.match(text) is not None
+        or STYLE_REPORT_COMMAND_RE.match(text) is not None
         or APPROVER_ADD_RE.match(text) is not None
         or APPROVER_DELETE_RE.match(text) is not None
         or _parse_approval_token_report_command(text) is not None
         or _parse_approval_suppression_report_command(text) is not None
+        or text in APPROVAL_REVIEW_ON_COMMANDS
+        or text in APPROVAL_REVIEW_OFF_COMMANDS
+        or text in APPROVAL_REVIEW_STATUS_COMMANDS
         or text in {"开启", "打开", "恢复", "关闭", "关掉", "暂停"}
     )
 
@@ -2237,6 +2618,69 @@ async def _handle_approver_management_command(bot: Bot, user_id: int, text: str)
     return True
 
 
+async def _handle_private_whitelist_command(bot: Bot, user_id: int, text: str) -> bool:
+    if text in PRIVATE_WHITELIST_LIST_COMMANDS:
+        await _send_private_text(bot, user_id, _format_private_whitelist_report())
+        return True
+    add_match = PRIVATE_WHITELIST_ADD_RE.match(text)
+    delete_match = PRIVATE_WHITELIST_DELETE_RE.match(text)
+    if add_match is None and delete_match is None:
+        return False
+    if not _is_owner_user(user_id):
+        await _send_private_text(bot, user_id, "只有主人能增删私聊白名单。")
+        return True
+    runtime_ids = _runtime_private_whitelist()
+    if add_match is not None:
+        target_id = int(add_match.group("user_id"))
+        runtime_ids.add(target_id)
+        _save_runtime_private_whitelist(runtime_ids)
+        await _send_private_text(bot, user_id, f"已添加私聊白名单：{target_id}")
+        return True
+    target_id = int(delete_match.group("user_id"))
+    runtime_ids.discard(target_id)
+    _save_runtime_private_whitelist(runtime_ids)
+    await _send_private_text(bot, user_id, f"已删除运行时私聊白名单：{target_id}")
+    return True
+
+
+async def _handle_model_route_command(bot: Bot, user_id: int, text: str) -> bool:
+    if text in MODEL_ROUTE_STATUS_COMMANDS:
+        await _send_private_text(bot, user_id, _format_model_route_status())
+        return True
+    if text in MODEL_ROUTE_RESET_COMMANDS:
+        _save_model_route_overrides({})
+        if deepseek_client is not None:
+            for route_name in MODEL_ROUTE_STORAGE_NAMES:
+                deepseek_client.set_route_override(route_name, None)
+        await _send_private_text(bot, user_id, "已清除模型覆盖，恢复 config.yaml 默认模型。")
+        return True
+    match = MODEL_ROUTE_COMMAND_RE.match(text)
+    if match is None:
+        return False
+    if deepseek_client is None:
+        await _send_private_text(bot, user_id, "模型客户端还没初始化，稍后再切。")
+        return True
+    route_name = _model_route_name_from_text(match.group("target"))
+    if route_name is None:
+        await _send_private_text(bot, user_id, "未知模型类型，只能切 决策/回复/黑话/记忆/风格/工具 模型。")
+        return True
+    route_label = match.group("model").strip()
+    try:
+        route = deepseek_client.parse_model_route(route_label, default_provider="siliconflow")
+    except Exception as exc:
+        await _send_private_text(bot, user_id, f"模型路由解析失败：{exc}")
+        return True
+    target_routes = UTILITY_GROUP_ROUTE_NAMES if route_name == "utility_group" else (route_name,)
+    overrides = _model_route_overrides()
+    for target_route in target_routes:
+        deepseek_client.set_route_override(target_route, route)
+        overrides[target_route] = route.label
+    _save_model_route_overrides(overrides)
+    target_label = "、".join(target_routes)
+    await _send_private_text(bot, user_id, f"已切{match.group('target')}模型：{route.label}\n影响路由：{target_label}")
+    return True
+
+
 async def _handle_group_approval_private(bot: Bot, user_id: int, text: str) -> bool:
     if not _is_approval_user(user_id) and not _is_tool_admin_user(user_id):
         return False
@@ -2259,10 +2703,34 @@ async def _handle_group_approval_private(bot: Bot, user_id: int, text: str) -> b
     if compact_text in APPROVAL_HELP_COMMANDS:
         await _send_private_text(bot, user_id, APPROVAL_RULES_MESSAGE)
         return True
-    if compact_text in APPROVAL_DETAIL_COMMANDS or compact_text in APPROVAL_TOOL_COMMANDS:
-        await _send_private_text(bot, user_id, APPROVAL_RULES_DETAIL_MESSAGE)
+    bot_tool_message = _bot_tool_message(compact_text)
+    if bot_tool_message is not None or compact_text in APPROVAL_DETAIL_COMMANDS:
+        await _send_private_text(bot, user_id, bot_tool_message or APPROVAL_RULES_DETAIL_MESSAGE)
         return True
     if await _handle_approver_management_command(bot, user_id, compact_text):
+        return True
+    if _is_private_tool_text(compact_text) and not is_admin:
+        await _send_private_text(bot, user_id, "你只有基础审批权限：1/2/3 发送，取消 不发。")
+        return True
+    if await _handle_private_whitelist_command(bot, user_id, compact_text):
+        return True
+    if await _handle_model_route_command(bot, user_id, compact_text):
+        return True
+    memory_report_limit = _parse_memory_report_limit(compact_text, MEMORY_REPORT_COMMAND_RE)
+    if memory_report_limit is not None:
+        await _send_private_text(
+            bot,
+            user_id,
+            _format_recent_memory_report(_private_jargon_group_id(), memory_report_limit),
+        )
+        return True
+    style_report_limit = _parse_memory_report_limit(compact_text, STYLE_REPORT_COMMAND_RE)
+    if style_report_limit is not None:
+        await _send_private_text(
+            bot,
+            user_id,
+            _format_recent_style_report(_private_jargon_group_id(), style_report_limit),
+        )
         return True
     token_report_window = _parse_approval_token_report_command(compact_text)
     if token_report_window is not None:
@@ -2281,6 +2749,24 @@ async def _handle_group_approval_private(bot: Bot, user_id: int, text: str) -> b
             await _send_private_text(bot, user_id, "你只有基础审批权限：1/2/3 发送，取消 不发。")
             return True
         await _send_private_text(bot, user_id, _format_suppression_report(suppression_report_limit))
+        return True
+    if compact_text in APPROVAL_REVIEW_STATUS_COMMANDS:
+        if not is_admin:
+            await _send_private_text(bot, user_id, "你只有基础审批权限：1/2/3 发送，取消 不发。")
+            return True
+        await _send_private_text(bot, user_id, _format_approval_review_status())
+        return True
+    if compact_text in APPROVAL_REVIEW_ON_COMMANDS:
+        if not is_admin:
+            await _send_private_text(bot, user_id, "你只有基础审批权限：1/2/3 发送，取消 不发。")
+            return True
+        await _set_approval_review_enabled(bot, user_id, True)
+        return True
+    if compact_text in APPROVAL_REVIEW_OFF_COMMANDS:
+        if not is_admin:
+            await _send_private_text(bot, user_id, "你只有基础审批权限：1/2/3 发送，取消 不发。")
+            return True
+        await _set_approval_review_enabled(bot, user_id, False)
         return True
     if compact_text in {"开启", "打开", "恢复"}:
         if not is_admin:
@@ -2431,8 +2917,9 @@ async def _send_approved_group_reply(
     approval: PendingGroupApproval,
     candidate: PendingApprovalCandidate,
     *,
-    approver_id: int,
+    approver_id: int | None,
     high_quality: bool,
+    notify_success: bool = True,
 ) -> None:
     logger.info(
         "qq_social_agent group approval accepted: "
@@ -2477,10 +2964,11 @@ async def _send_approved_group_reply(
                 f"group={approval.group_id} {_action_failed_summary(exc)}"
             )
             try:
-                await bot.send_private_msg(
-                    user_id=approver_id,
-                    message=Message(f"发送失败：{_action_failed_summary(exc)}"),
-                )
+                if approver_id is not None:
+                    await bot.send_private_msg(
+                        user_id=approver_id,
+                        message=Message(f"发送失败：{_action_failed_summary(exc)}"),
+                    )
             except ActionFailed:
                 pass
             return
@@ -2491,7 +2979,9 @@ async def _send_approved_group_reply(
     else:
         last_group_mention_targets.pop(approval.group_id, None)
     if high_quality:
-        _save_approved_reply_feedback(approval, candidate, approver_id=approver_id)
+        _save_approved_reply_feedback(approval, candidate, approver_id=approver_id or 0)
+    if not notify_success or approver_id is None:
+        return
     try:
         await bot.send_private_msg(user_id=approver_id, message=Message("已发。"))
     except ActionFailed:
@@ -2806,7 +3296,7 @@ def _command_chat_id(event: Event) -> int | None:
     if isinstance(event, PrivateMessageEvent):
         user_id = int(event.user_id)
         if (
-            not app_config.private_user_allowed(user_id)
+            not _private_user_allowed(user_id)
             and not _is_approval_user(user_id)
             and not _is_tool_admin_user(user_id)
         ):

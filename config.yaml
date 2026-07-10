@@ -1,5 +1,6 @@
 bot:
   default_persona: zhangxuefeng
+  persona_dir: prompts
   data_path: data/bot.sqlite3
   context_limit: 30
   active_reply_on_mention: true
@@ -13,11 +14,37 @@ access_control:
 
 deepseek:
   base_url: https://api.deepseek.com
-  model: deepseek-v4-pro
-  decision_model: deepseek-v4-flash
-  reply_model: deepseek-v4-flash
-  utility_model: deepseek-v4-flash
+  providers:
+    deepseek:
+      base_url: https://api.deepseek.com
+      api_key_env: DEEPSEEK_API_KEY
+      thinking: disabled
+    siliconflow:
+      base_url: https://api.siliconflow.cn/v1
+      api_key_env: SILICONFLOW_API_KEY
+      thinking: disabled
+  model: siliconflow/MiniMaxAI/MiniMax-M2.5
+  decision_model: siliconflow/Qwen/Qwen3.5-35B-A3B
+  reply_model: siliconflow/MiniMaxAI/MiniMax-M2.5
+  utility_model: siliconflow/MiniMaxAI/MiniMax-M2.5
+  jargon_model: siliconflow/Qwen/Qwen3.5-35B-A3B
+  memory_model: siliconflow/Qwen/Qwen3.5-35B-A3B
+  style_model: siliconflow/MiniMaxAI/MiniMax-M2.5
+  model_catalog:
+    - deepseek/deepseek-v4-flash
+    - deepseek/deepseek-v4-pro
+    - siliconflow/Qwen/Qwen3.5-35B-A3B
+    - siliconflow/MiniMaxAI/MiniMax-M2.5
+    - siliconflow/Pro/moonshotai/Kimi-K2.6
+  fallback_models:
+    decision: deepseek/deepseek-v4-flash
+    reply: deepseek/deepseek-v4-flash
+    utility: deepseek/deepseek-v4-flash
+    jargon: deepseek/deepseek-v4-flash
+    memory: deepseek/deepseek-v4-flash
+    style: deepseek/deepseek-v4-flash
   thinking: disabled
+  usage_tracking_enabled: false
   reasoning_effort: high
   temperature: 0.72
   max_tokens: 260

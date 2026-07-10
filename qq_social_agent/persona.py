@@ -29,6 +29,9 @@ class PersonaRegistry:
         for path in sorted(self.persona_dir.glob("*.yaml")):
             with path.open("r", encoding="utf-8") as f:
                 raw: dict[str, Any] = yaml.safe_load(f) or {}
+            raw = raw.get("persona", raw)
+            if "id" not in raw:
+                continue
             interests = raw.get("interests", {})
             style = raw.get("style", {})
             persona = Persona(
