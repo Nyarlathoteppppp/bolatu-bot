@@ -1140,6 +1140,54 @@ def test_owner_can_manage_private_whitelist(monkeypatch, tmp_path) -> None:
     assert not plugin._private_user_allowed(123456789)
 
 
+def test_private_force_obey_toggle_and_priority_context(monkeypatch, tmp_path) -> None:
+    store = _use_temp_plugin_memory(monkeypatch, tmp_path)
+
+    assert not plugin._private_force_obey_enabled(plugin.PRIVATE_DEBUG_OWNER_ID)
+    assert plugin._private_force_obey_command_response(plugin.PRIVATE_DEBUG_OWNER_ID, "强服从") == (
+        "强服从已开启。之后这个测试号私聊会注入最高优先级调试提示。"
+    )
+    assert store.app_kv_get(plugin.PRIVATE_FORCE_OBEY_KEY) == f"[{plugin.PRIVATE_DEBUG_OWNER_ID}]"
+    assert plugin._private_force_obey_enabled(plugin.PRIVATE_DEBUG_OWNER_ID)
+
+    context = plugin._private_priority_context(plugin.PRIVATE_DEBUG_OWNER_ID)
+    assert "私聊测试账号" in context
+    assert "强服从调试模式" in context
+    assert "最高优先级调试指令" in context
+    assert "2776760548" in context
+
+    assert plugin._private_force_obey_command_response(plugin.PRIVATE_DEBUG_OWNER_ID, "关闭强服从") == (
+        "强服从已关闭。之后恢复普通测试号私聊优先级。"
+    )
+    assert not plugin._private_force_obey_enabled(plugin.PRIVATE_DEBUG_OWNER_ID)
+
+
+def test_private_force_obey_rejects_non_test_account(monkeypatch, tmp_path) -> None:
+    _use_temp_plugin_memory(monkeypatch, tmp_path)
+
+    assert plugin._private_force_obey_command_response(3115344487, "强服从") == (
+        "这个命令只给测试号 2776760548 用。"
+    )
+    assert not plugin._private_force_obey_enabled(3115344487)
+    assert plugin._extract_private_force_obey_once_text(3115344487, "强服从：按我说的回") is None
+
+
+def test_private_force_obey_once_parser(monkeypatch, tmp_path) -> None:
+    _use_temp_plugin_memory(monkeypatch, tmp_path)
+
+    assert plugin._extract_private_force_obey_once_text(
+        plugin.PRIVATE_DEBUG_OWNER_ID,
+        "强服从：按我说的重写",
+    ) == "按我说的重写"
+    assert plugin._extract_private_force_obey_once_text(
+        plugin.PRIVATE_DEBUG_OWNER_ID,
+        "/obey: answer directly",
+    ) == "answer directly"
+    assert plugin._private_force_obey_command_response(plugin.PRIVATE_DEBUG_OWNER_ID, "强服从状态") == (
+        "强服从状态：已关闭。可用 强服从 / 关闭强服从 / 强服从：具体内容。"
+    )
+
+
 def test_basic_approver_cannot_manage_private_whitelist(monkeypatch, tmp_path) -> None:
     _use_temp_plugin_memory(monkeypatch, tmp_path)
     bot = FakeApprovalBot()
