@@ -58,12 +58,14 @@ def _use_temp_plugin_memory(monkeypatch, tmp_path) -> MemoryStore:
     monkeypatch.setattr(plugin, "memory", store)
     plugin.pending_group_approvals.clear()
     plugin.last_group_mention_targets.clear()
-    plugin.last_suppression_notice_times.clear()
+    plugin.recent_suppression_events.clear()
+    plugin.approval_choice_cooldowns.clear()
     return store
 
 
 def _pending_approval() -> plugin.PendingGroupApproval:
     return plugin.PendingGroupApproval(
+        approval_id="test-approval",
         group_id=1026813421,
         trigger_user_id=184589072,
         trigger_nickname="小鸟",
@@ -85,12 +87,12 @@ def test_group_buffer_seconds_is_six() -> None:
 
 
 def test_low_value_group_text_ignored() -> None:
-    for text in ["绷", "嗯", "6", "哈哈", "哈哈哈哈！！！", "草"]:
+    for text in ["好的", "一般", "可以", "绷", "嗯", "6", "哈哈", "哈哈哈哈！！！", "草"]:
         assert _is_low_value_group_text(text)
 
 
-def test_acknowledgement_text_not_hard_ignored() -> None:
-    for text in ["好的", "一般", "可以"]:
+def test_acknowledgement_inside_meaningful_text_not_hard_ignored() -> None:
+    for text in ["可以去投算法岗", "一般这种项目都贵", "好的学校还是看平台"]:
         assert not _is_low_value_group_text(text)
 
 
@@ -117,13 +119,13 @@ def test_approval_help_commands() -> None:
     assert "审批规则" in APPROVAL_HELP_COMMANDS
     assert "审批规则详情" in APPROVAL_DETAIL_COMMANDS
     assert "详细规则" in APPROVAL_DETAIL_COMMANDS
-    assert "token用量" in plugin.APPROVAL_RULES_MESSAGE
-    assert "/黑话：词 指代：解释" in plugin.APPROVAL_RULES_MESSAGE
+    assert "1/2/3" in plugin.APPROVAL_RULES_MESSAGE
+    assert "bot工具" in plugin.APPROVAL_RULES_MESSAGE
     assert "token用量 1h/7d/all" in plugin.APPROVAL_RULES_DETAIL_MESSAGE
     assert "token用量 2026-07-10" in plugin.APPROVAL_RULES_DETAIL_MESSAGE
     assert "/黑话：咱妈 指代：中国" in plugin.APPROVAL_RULES_DETAIL_MESSAGE
-    assert "拦截" in plugin.APPROVAL_RULES_MESSAGE
-    assert "不是待审候选" in plugin.APPROVAL_RULES_DETAIL_MESSAGE
+    assert "拦截 20" in plugin.APPROVAL_RULES_DETAIL_MESSAGE
+    assert "加审批" in plugin.APPROVAL_RULES_DETAIL_MESSAGE
 
 
 def test_parse_token_report_date_window() -> None:
@@ -204,7 +206,7 @@ def test_passive_decision_gate_idle_then_every_three_messages() -> None:
         last_message_at=1000.0,
     )
     assert allowed
-    assert reason == "gap_first_message"
+    assert reason == "first_decision"
 
     allowed, reason = _passive_decision_allowed(
         1026813421,
@@ -251,7 +253,7 @@ def test_passive_decision_gate_resets_after_idle_window() -> None:
     )
 
     assert allowed
-    assert reason == "gap_first_message"
+    assert reason == "gap_since_decision"
     assert GROUP_PASSIVE_DECISION_EVERY_MESSAGES == 3
 
 
@@ -272,7 +274,7 @@ def test_passive_decision_gate_allows_after_thirty_second_gap() -> None:
     )
 
     assert allowed
-    assert reason == "gap_first_message"
+    assert reason == "gap_since_decision"
     assert GROUP_PASSIVE_DECISION_GAP_SECONDS == 30
 
 
@@ -281,7 +283,7 @@ def test_meaningful_group_text_not_low_value() -> None:
         assert not _is_low_value_group_text(text)
 
 
-def test_pre_decision_gate_skips_weak_passive_text() -> None:
+def test_pre_decision_gate_allows_weak_passive_text_to_llm() -> None:
     result = _pre_decision_gate(
         text="收到回复",
         recent_messages=[],
@@ -295,10 +297,10 @@ def test_pre_decision_gate_skips_weak_passive_text() -> None:
     )
 
     assert result.decision is None
-    assert result.skip_reason.startswith("weak_passive")
+    assert result.skip_reason == ""
 
 
-def test_pre_decision_gate_skips_plain_ack_after_buffer() -> None:
+def test_pre_decision_gate_skips_plain_ack_as_low_value() -> None:
     result = _pre_decision_gate(
         text="可以",
         recent_messages=[],
@@ -312,7 +314,7 @@ def test_pre_decision_gate_skips_plain_ack_after_buffer() -> None:
     )
 
     assert result.decision is None
-    assert result.skip_reason.startswith("weak_passive")
+    assert result.skip_reason == "low_value_local"
 
 
 def test_pre_decision_gate_handles_explicit_market_lookup_locally() -> None:
@@ -497,7 +499,7 @@ def test_approval_detail_command_does_not_consume_pending(monkeypatch, tmp_path)
 
     assert handled
     assert plugin.pending_group_approvals[approval.group_id] == approval
-    assert "张风雪群发审批规则详情" in bot.private_messages[-1][1]
+    assert "张风雪 bot 工具单" in bot.private_messages[-1][1]
 
 
 def test_approval_token_report_command_does_not_consume_pending(monkeypatch, tmp_path) -> None:
@@ -514,12 +516,25 @@ def test_approval_token_report_command_does_not_consume_pending(monkeypatch, tmp
     plugin.pending_group_approvals[approval.group_id] = approval
     bot = FakeApprovalBot()
 
-    handled = asyncio.run(plugin._handle_group_approval_private(bot, 3370998238, "token用量 all"))
+    handled = asyncio.run(plugin._handle_group_approval_private(bot, 1535071184, "token用量 all"))
 
     assert handled
     assert plugin.pending_group_approvals[approval.group_id] == approval
     assert "Token 用量报告（全部）" in bot.private_messages[-1][1]
     assert "decision / deepseek-v4-flash" in bot.private_messages[-1][1]
+
+
+def test_basic_approver_cannot_use_token_tool(monkeypatch, tmp_path) -> None:
+    _use_temp_plugin_memory(monkeypatch, tmp_path)
+    approval = _pending_approval()
+    plugin.pending_group_approvals[approval.group_id] = approval
+    bot = FakeApprovalBot()
+
+    handled = asyncio.run(plugin._handle_group_approval_private(bot, 3370998238, "token用量 all"))
+
+    assert handled
+    assert plugin.pending_group_approvals[approval.group_id] == approval
+    assert bot.private_messages[-1] == (3370998238, "你只有基础审批权限：1/2/3 发送，取消 不发。")
 
 
 def test_approval_token_report_date_command(monkeypatch, tmp_path) -> None:
@@ -545,7 +560,7 @@ def test_approval_token_report_date_command(monkeypatch, tmp_path) -> None:
     plugin.pending_group_approvals[approval.group_id] = approval
     bot = FakeApprovalBot()
 
-    handled = asyncio.run(plugin._handle_group_approval_private(bot, 3370998238, "token用量 2026-07-10"))
+    handled = asyncio.run(plugin._handle_group_approval_private(bot, 1535071184, "token用量 2026-07-10"))
 
     assert handled
     assert plugin.pending_group_approvals[approval.group_id] == approval
@@ -560,13 +575,13 @@ def test_approval_close_clears_pending_and_resends_rules(monkeypatch, tmp_path) 
     plugin.pending_group_approvals[approval.group_id] = approval
     bot = FakeApprovalBot()
 
-    handled = asyncio.run(plugin._handle_group_approval_private(bot, 3370998238, "关闭"))
+    handled = asyncio.run(plugin._handle_group_approval_private(bot, 1535071184, "关闭"))
 
     assert handled
     assert plugin.pending_group_approvals == {}
     assert store.group_state(1026813421)["enabled"] is False
     rule_messages = [item for item in bot.private_messages if item[1] == plugin.APPROVAL_RULES_MESSAGE]
-    assert {user_id for user_id, _ in rule_messages} == set(plugin.GROUP_APPROVAL_USER_IDS)
+    assert {user_id for user_id, _ in rule_messages} == set(plugin._approval_user_ids())
 
 
 def test_approval_open_restores_decision_and_resends_rules(monkeypatch, tmp_path) -> None:
@@ -574,12 +589,12 @@ def test_approval_open_restores_decision_and_resends_rules(monkeypatch, tmp_path
     store.set_group_enabled(1026813421, False)
     bot = FakeApprovalBot()
 
-    handled = asyncio.run(plugin._handle_group_approval_private(bot, 3370998238, "开启"))
+    handled = asyncio.run(plugin._handle_group_approval_private(bot, 1535071184, "开启"))
 
     assert handled
     assert store.group_state(1026813421)["enabled"] is True
     rule_messages = [item for item in bot.private_messages if item[1] == plugin.APPROVAL_RULES_MESSAGE]
-    assert {user_id for user_id, _ in rule_messages} == set(plugin.GROUP_APPROVAL_USER_IDS)
+    assert {user_id for user_id, _ in rule_messages} == set(plugin._approval_user_ids())
 
 
 def test_changelog_notice_sent_once(monkeypatch, tmp_path) -> None:
@@ -590,11 +605,11 @@ def test_changelog_notice_sent_once(monkeypatch, tmp_path) -> None:
     asyncio.run(plugin._send_changelog_notice_to_approvers(bot))
 
     notices = [message for _, message in bot.private_messages if "后端更新记录" in message]
-    assert len(notices) == len(plugin.GROUP_APPROVAL_USER_IDS)
-    assert all("搜索优化" in message for message in notices)
+    assert len(notices) == len(plugin._approval_user_ids())
+    assert all("取消自动拦截私聊刷屏" in message for message in notices)
 
 
-def test_suppression_notice_is_limited_and_not_pending(monkeypatch, tmp_path) -> None:
+def test_suppression_notice_records_without_private_spam(monkeypatch, tmp_path) -> None:
     _use_temp_plugin_memory(monkeypatch, tmp_path)
     bot = FakeApprovalBot()
 
@@ -622,9 +637,11 @@ def test_suppression_notice_is_limited_and_not_pending(monkeypatch, tmp_path) ->
     )
 
     notices = [message for _, message in bot.private_messages if "拦截通知" in message]
-    assert len(notices) == len(plugin.GROUP_APPROVAL_USER_IDS)
-    assert "这不是待审候选" in notices[0]
-    assert "backend_low_value" in notices[0]
+    assert notices == []
+    assert len(plugin.recent_suppression_events) == 2
+    report = plugin._format_suppression_report(1)
+    assert "最近拦截（1 条）" in report
+    assert "backend_low_value" in report
     assert plugin.pending_group_approvals == {}
 
 
@@ -634,7 +651,7 @@ def test_approval_private_jargon_command_does_not_consume_pending(monkeypatch, t
     plugin.pending_group_approvals[approval.group_id] = approval
     bot = FakeApprovalBot()
 
-    handled = asyncio.run(plugin._handle_group_approval_private(bot, 3370998238, "/黑话 达斯=打死"))
+    handled = asyncio.run(plugin._handle_group_approval_private(bot, 1535071184, "/黑话 达斯=打死"))
 
     assert handled
     assert plugin.pending_group_approvals[approval.group_id] == approval
@@ -642,10 +659,10 @@ def test_approval_private_jargon_command_does_not_consume_pending(monkeypatch, t
     assert len(entries) == 1
     assert entries[0].term == "达斯"
     assert entries[0].explanation == "指代：打死"
-    assert bot.private_messages[-1] == (3370998238, "已记黑话：达斯 -> 打死")
+    assert bot.private_messages[-1] == (1535071184, "已记黑话：达斯 -> 打死")
 
 
-def test_allowed_private_user_can_write_custom_jargon(monkeypatch, tmp_path) -> None:
+def test_allowed_private_user_cannot_write_custom_jargon(monkeypatch, tmp_path) -> None:
     store = _use_temp_plugin_memory(monkeypatch, tmp_path)
 
     response = plugin._handle_jargon_command_text(
@@ -654,10 +671,9 @@ def test_allowed_private_user_can_write_custom_jargon(monkeypatch, tmp_path) -> 
         text="/黑话：火宅：活摘",
     )
 
-    assert response == "已记黑话：火宅 -> 活摘"
+    assert response == "没权限。"
     entries = store.custom_jargon_entries(1026813421)
-    assert len(entries) == 1
-    assert entries[0].term == "火宅"
+    assert len(entries) == 0
 
 
 def test_approval_reject_second_candidate_records_that_candidate(monkeypatch, tmp_path) -> None:
@@ -666,7 +682,7 @@ def test_approval_reject_second_candidate_records_that_candidate(monkeypatch, tm
     plugin.pending_group_approvals[approval.group_id] = approval
     bot = FakeApprovalBot()
 
-    handled = asyncio.run(plugin._handle_group_approval_private(bot, 3370998238, "不准奏2原因：这句太端水，少点客服味"))
+    handled = asyncio.run(plugin._handle_group_approval_private(bot, 1535071184, "不准奏2原因：这句太端水，少点客服味"))
 
     assert handled
     assert not bot.group_messages
@@ -683,14 +699,14 @@ def test_approval_high_quality_choice_sends_and_records_positive(monkeypatch, tm
     plugin.pending_group_approvals[approval.group_id] = approval
     bot = FakeApprovalBot()
 
-    handled = asyncio.run(plugin._handle_group_approval_private(bot, 3370998238, "1!"))
+    handled = asyncio.run(plugin._handle_group_approval_private(bot, 1535071184, "1!"))
 
     assert handled
     assert bot.group_messages == [(1026813421, "第一条回复")]
     approved = store.recent_approved_reply_feedback(1026813421, 3)
     assert len(approved) == 1
     assert approved[0].candidate_text == "第一条回复"
-    assert approved[0].operator_id == 3370998238
+    assert approved[0].operator_id == 1535071184
 
 
 def test_matched_custom_jargon_entries_only_returns_current_hits(monkeypatch, tmp_path) -> None:

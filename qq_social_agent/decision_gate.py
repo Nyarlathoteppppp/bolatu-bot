@@ -7,7 +7,6 @@ from .cue_patterns import CueRepeatState
 from .deepseek_client import ReplyDecision, ToolSymbol
 from .memory import ChatMessage
 from .persona import Persona
-from .scorer import score_message
 from .tools.fresh_context import FreshIntent
 from .tools.market_intent import MarketIntent
 
@@ -54,19 +53,6 @@ def pre_decision_gate(
                 reason="local_explicit_market_lookup",
             )
         )
-
-    if not _has_interesting_local_signal(text, persona):
-        score = score_message(
-            text=text,
-            recent_messages=recent_messages,
-            persona=persona,
-            mentioned=mentioned,
-            replied_to_bot=replied_to_bot,
-            passive_threshold=42,
-            passive_probability=1.0,
-        )
-        if score.score < 22:
-            return PreDecisionGateResult(skip_reason=f"weak_passive:{score.score}")
 
     return PreDecisionGateResult()
 
@@ -282,6 +268,10 @@ LOW_VALUE_GROUP_TEXTS = {
     "哈哈",
     "哈哈哈",
     "哈哈哈哈",
+    "好",
+    "好的",
+    "一般",
+    "可以",
     "草",
     "艹",
     "nb",

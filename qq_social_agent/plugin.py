@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import re
 import time
 from dataclasses import dataclass
@@ -87,9 +88,13 @@ group_processing_locks: dict[int, asyncio.Lock] = {}
 group_learning_tasks: dict[int, asyncio.Task[None]] = {}
 group_message_buffers: dict[int, list["BufferedGroupMessage"]] = {}
 group_buffer_tasks: dict[int, asyncio.Task[None]] = {}
-group_passive_decision_state: dict[int, tuple[float, int]] = {}
+group_passive_retry_buffers: dict[int, list["BufferedGroupMessage"]] = {}
+group_passive_retry_tasks: dict[int, asyncio.Task[None]] = {}
+group_passive_decision_state: dict[int, "PassiveDecisionState"] = {}
 pending_group_approvals: dict[int, "PendingGroupApproval"] = {}
-last_suppression_notice_times: dict[tuple[int, str], float] = {}
+recent_suppression_events: list["SuppressionEvent"] = []
+approval_processing_lock = asyncio.Lock()
+approval_choice_cooldowns: dict[int, float] = {}
 
 MID_MEMORY_KEEP_SUMMARIES = 4
 MID_MEMORY_BATCH_SIZE = 60
@@ -104,15 +109,18 @@ CUSTOM_JARGON_CONTEXT_LIMIT = 10
 GROUP_BUFFER_SECONDS = 6.0
 GROUP_PASSIVE_DECISION_GAP_SECONDS = 30
 GROUP_PASSIVE_DECISION_EVERY_MESSAGES = 3
-SUPPRESSION_NOTICE_COOLDOWN_SECONDS = 60
+SUPPRESSION_EVENTS_LIMIT = 80
 ADDRESS_REPEAT_WINDOW_SECONDS = 10 * 60
 MENTION_TARGET_LIMIT = 8
 REPEAT_MENTION_SUPPRESS_SECONDS = 10 * 60
 PRIVATE_DEBUG_OWNER_ID = 2776760548
-GROUP_APPROVAL_USER_IDS = (1535071184, 3370998238)
-JARGON_COMMAND_USER_IDS = tuple(
-    sorted({PRIVATE_DEBUG_OWNER_ID, *GROUP_APPROVAL_USER_IDS, *app_config.allowed_private_users})
-)
+OWNER_USER_IDS = (1535071184,)
+TOOL_ADMIN_USER_IDS = tuple(sorted({PRIVATE_DEBUG_OWNER_ID, *OWNER_USER_IDS}))
+DEFAULT_BASIC_APPROVAL_USER_IDS = (3370998238,)
+GROUP_APPROVAL_USER_IDS = tuple(sorted({*OWNER_USER_IDS, *DEFAULT_BASIC_APPROVAL_USER_IDS}))
+JARGON_COMMAND_USER_IDS = TOOL_ADMIN_USER_IDS
+APPROVAL_USER_IDS_KEY = "group_approval_basic_user_ids"
+APPROVAL_STALE_CHOICE_COOLDOWN_SECONDS = 8
 RECALL_FEEDBACK_CONTEXT_LIMIT = 3
 POSITIVE_FEEDBACK_CONTEXT_LIMIT = 4
 LLM_USAGE_LOG_RE = re.compile(
@@ -129,19 +137,25 @@ TOKEN_USAGE_LOG_BACKFILL_FILES = (
     Path(__file__).resolve().parent.parent / "logs" / "bot-runtime.log",
     Path(__file__).resolve().parent.parent / "logs" / "bot.log",
 )
-CHANGELOG_NOTICE_KEY = "2026-07-10-search-approval-v2"
+APPROVAL_CANCEL_COMMANDS = {"取消", "取消发送", "不发", "别发"}
+APPROVAL_TOOL_COMMANDS = {"bot工具", "工具", "工具单", "审批工具", "机器人工具"}
+APPROVER_LIST_COMMANDS = {"审批人列表", "审批列表", "approver list", "/审批人列表"}
+APPROVER_ADD_RE = re.compile(r"^(?:/)?(?:加审批|添加审批人|审批人添加|approver add)\s*[:：]?\s*(?P<user_id>\d{5,12})$")
+APPROVER_DELETE_RE = re.compile(r"^(?:/)?(?:删审批|删除审批人|审批人删除|approver remove)\s*[:：]?\s*(?P<user_id>\d{5,12})$")
+CHANGELOG_NOTICE_KEY = "2026-07-10-approval-gate-v3"
 CHANGELOG_NOTICE_MESSAGE = """张风雪后端更新记录：
-1. 搜索优化：是否联网搜索交给 decision LLM 判断；后端只给“可能需要最新背景”的候选提示。
-2. Tavily 搜索结果现在会注入快速摘要、去重后的来源和更稳的短摘要，失败时明确提示没拿到可靠新消息。
-3. 最新新闻/赛果类消息不会再被普通频率门提前挡掉，但是否搜索、是否回复仍由 LLM 决策。
-4. 人设已调整为毒舌美少女现实判断型损友，同时保留 answer/agree 的正常好好讲话分支。
-5. 清理了一条会错误泛化语气的旧反馈；保留温和认可 action，不会把所有人都当成要哄。
-6. 后端拦截、频率门拦截或 LLM 判断不发时，会限流给审批人发一条调试通知，方便判断为什么没进候选。
+1. 取消自动拦截私聊刷屏：后端拦截、频率门、LLM 不发只入记录，改为手动查询。
+2. 查询方式：主人私聊回“拦截 20”或用 /bot blocked 20。
+3. 放宽本地预决策：删除 weak_passive 硬拦截，普通消息更多交给 decision LLM 判断。
+4. 修复 30 秒频率门：低频单条消息等满 30 秒也会进入 decision；纯低价值消息不刷新频率状态。
+5. 审批单瘦身：候选卡只保留触发消息、审批 ID、1/2/3 和取消。
+6. 权限拆分：主人有工具权限；基础审批人只可 1/2/3/取消。
+7. 审批并发加锁：两人同时审批时只会发一次，旧数字短时间内不会串到下一条。
+8. 1535071184 相关私聊和消息增加温柔、服从、少回怼的高优先级规则。
 
 审批提醒：
-- 黑话：/黑话：词 指代：解释；/黑话列表；/删黑话：词。
-- 不准奏：不准奏原因：xxx；不准奏2原因：xxx 可批评指定候选。
-- token：token用量 / token用量 2026-07-10 / token用量 7d。
+- 审批：1/2/3 发送；取消 不发。
+- 工具：回 bot工具 或 审批规则详情。
 """
 
 
@@ -165,6 +179,7 @@ class PendingApprovalCandidate:
 
 @dataclass(frozen=True)
 class PendingGroupApproval:
+    approval_id: str
     group_id: int
     trigger_user_id: int
     trigger_nickname: str
@@ -177,10 +192,28 @@ class PendingGroupApproval:
 
 
 @dataclass(frozen=True)
+class PassiveDecisionState:
+    last_decision_at: float
+    waiting_count: int
+    first_waiting_at: float
+
+
+@dataclass(frozen=True)
 class TokenReportWindow:
     start_at: float | None
     end_at: float | None
     label: str
+
+
+@dataclass(frozen=True)
+class SuppressionEvent:
+    group_id: int
+    user_id: int
+    nickname: str
+    text: str
+    stage: str
+    reason: str
+    created_at: float
 
 
 @get_driver().on_startup
@@ -213,7 +246,7 @@ async def _send_approval_rules_on_connect(bot: Bot) -> None:
 
 
 async def _send_approval_rules_to_approvers(bot: Bot, *, reason: str) -> None:
-    for approver_id in GROUP_APPROVAL_USER_IDS:
+    for approver_id in _approval_user_ids():
         try:
             await bot.send_private_msg(user_id=approver_id, message=Message(APPROVAL_RULES_MESSAGE))
         except ActionFailed as exc:
@@ -226,7 +259,7 @@ async def _send_approval_rules_to_approvers(bot: Bot, *, reason: str) -> None:
 async def _send_changelog_notice_to_approvers(bot: Bot) -> None:
     marker_key = f"changelog_notice:{CHANGELOG_NOTICE_KEY}"
     delivered: list[int] = []
-    for approver_id in GROUP_APPROVAL_USER_IDS:
+    for approver_id in _approval_user_ids():
         if _changelog_notice_sent(marker_key, approver_id):
             continue
         try:
@@ -258,6 +291,58 @@ def _changelog_notice_marker(marker_key: str, approver_id: int) -> str:
     return f"{marker_key}:{approver_id}"
 
 
+def _is_owner_user(user_id: int) -> bool:
+    return user_id in OWNER_USER_IDS
+
+
+def _is_tool_admin_user(user_id: int) -> bool:
+    return user_id in TOOL_ADMIN_USER_IDS
+
+
+def _basic_approval_user_ids() -> set[int]:
+    raw = memory.app_kv_get(APPROVAL_USER_IDS_KEY)
+    if raw is None:
+        return set(DEFAULT_BASIC_APPROVAL_USER_IDS)
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        logger.warning("qq_social_agent invalid approval user ids json, falling back to defaults")
+        return set(DEFAULT_BASIC_APPROVAL_USER_IDS)
+    if not isinstance(data, list):
+        return set(DEFAULT_BASIC_APPROVAL_USER_IDS)
+    user_ids: set[int] = set()
+    for item in data:
+        try:
+            user_id = int(item)
+        except (TypeError, ValueError):
+            continue
+        if user_id > 0 and user_id not in OWNER_USER_IDS:
+            user_ids.add(user_id)
+    return user_ids
+
+
+def _save_basic_approval_user_ids(user_ids: set[int]) -> None:
+    cleaned = sorted(user_id for user_id in user_ids if user_id > 0 and user_id not in OWNER_USER_IDS)
+    memory.app_kv_set(APPROVAL_USER_IDS_KEY, json.dumps(cleaned, ensure_ascii=False))
+
+
+def _approval_user_ids() -> tuple[int, ...]:
+    return tuple(sorted({*OWNER_USER_IDS, *_basic_approval_user_ids()}))
+
+
+def _is_approval_user(user_id: int) -> bool:
+    return user_id in _approval_user_ids()
+
+
+def _is_basic_approval_user(user_id: int) -> bool:
+    return _is_approval_user(user_id) and not _is_owner_user(user_id)
+
+
+def _new_approval_id(group_id: int) -> str:
+    stamp = int(time.time() * 1000) % 1_000_000
+    return f"{group_id % 10000:04d}-{stamp:06d}"
+
+
 async def _send_approval_suppression_notice(
     bot: Bot,
     *,
@@ -268,22 +353,38 @@ async def _send_approval_suppression_notice(
     stage: str,
     reason: str,
 ) -> None:
-    now = time.monotonic()
-    key = (group_id, stage)
-    last_sent_at = last_suppression_notice_times.get(key)
-    if last_sent_at is not None and now - last_sent_at < SUPPRESSION_NOTICE_COOLDOWN_SECONDS:
-        return
-    last_suppression_notice_times[key] = now
-    message = (
-        "拦截通知：这不是待审候选\n"
-        f"群：{group_id}\n"
-        f"阶段：{stage}\n"
-        f"触发人：{_member_label(user_id, nickname)}\n"
-        f"消息：{_short_notice_text(text, 180)}\n"
-        f"原因：{_short_notice_text(reason, 220)}"
+    _record_suppression_event(
+        group_id=group_id,
+        user_id=user_id,
+        nickname=nickname,
+        text=text,
+        stage=stage,
+        reason=reason,
     )
-    for approver_id in GROUP_APPROVAL_USER_IDS:
-        await _send_private_text(bot, approver_id, message)
+
+
+def _record_suppression_event(
+    *,
+    group_id: int,
+    user_id: int,
+    nickname: str,
+    text: str,
+    stage: str,
+    reason: str,
+) -> None:
+    recent_suppression_events.append(
+        SuppressionEvent(
+            group_id=group_id,
+            user_id=user_id,
+            nickname=nickname,
+            text=text,
+            stage=stage,
+            reason=reason,
+            created_at=time.time(),
+        )
+    )
+    if len(recent_suppression_events) > SUPPRESSION_EVENTS_LIMIT:
+        del recent_suppression_events[: len(recent_suppression_events) - SUPPRESSION_EVENTS_LIMIT]
 
 
 def _short_notice_text(text: str, limit: int) -> str:
@@ -341,12 +442,6 @@ async def handle_group_message(bot: Bot, event: GroupMessageEvent) -> None:
         and _is_low_value_group_text(text)
     ):
         memory.add_message(group_id, int(event.user_id), _nickname(event), text, is_bot=False)
-        _passive_decision_allowed(
-            group_id,
-            message_count=1,
-            first_message_at=float(getattr(event, "time", 0) or time.time()),
-            last_message_at=float(getattr(event, "time", 0) or time.time()),
-        )
         logger.info(
             "qq_social_agent ignored group low value text: "
             f"group={group_id} user={int(event.user_id)} text={text!r}"
@@ -377,6 +472,8 @@ async def _handle_group_message_locked(
     event: GroupMessageEvent,
     *,
     buffered_messages: list[BufferedGroupMessage] | None = None,
+    force_passive_decision: bool = False,
+    skip_memory_record: bool = False,
 ) -> None:
     text = _buffered_current_text(buffered_messages) if buffered_messages else _plain_text(event)
     group_id = int(event.group_id)
@@ -396,11 +493,12 @@ async def _handle_group_message_locked(
             return
         text = "（只艾特了你）"
 
-    if buffered_messages:
-        for item in buffered_messages:
-            memory.add_message(group_id, item.user_id, item.nickname, item.text, is_bot=False)
-    else:
-        memory.add_message(group_id, user_id, nickname, text, is_bot=False)
+    if not skip_memory_record:
+        if buffered_messages:
+            for item in buffered_messages:
+                memory.add_message(group_id, item.user_id, item.nickname, item.text, is_bot=False)
+        else:
+            memory.add_message(group_id, user_id, nickname, text, is_bot=False)
 
     group_cfg = app_config.group_config(group_id)
     state = memory.group_state(group_id)
@@ -415,6 +513,8 @@ async def _handle_group_message_locked(
     market_forced = bool(market_intents) and _is_explicit_market_lookup(text)
     fresh_candidate = fresh_intent is not None
     if addressed_bot:
+        _mark_passive_decision_forced(group_id)
+    elif force_passive_decision:
         _mark_passive_decision_forced(group_id)
     elif not market_forced and not fresh_candidate:
         message_count = len(buffered_messages) if buffered_messages else 1
@@ -438,8 +538,13 @@ async def _handle_group_message_locked(
                 nickname=nickname,
                 text=text,
                 stage="passive_frequency_gate",
-                reason=f"被动发言频率门拦截：{reason}。30 秒内连续聊天时，每 3 条才进一次 decision。",
+                reason=(
+                    f"被动发言频率门拦截：{reason}。30 秒内连续聊天时，每 3 条才进一次 decision；"
+                    "若 30 秒内没有新消息，会自动重试进入 decision。"
+                ),
             )
+            if buffered_messages:
+                _schedule_passive_decision_retry(group_id, buffered_messages)
             _schedule_group_learning(group_id)
             return
     else:
@@ -495,6 +600,7 @@ async def _handle_group_message_locked(
         await _request_group_approval(
             bot,
             PendingGroupApproval(
+                approval_id=_new_approval_id(group_id),
                 group_id=group_id,
                 trigger_user_id=user_id,
                 trigger_nickname=nickname,
@@ -769,6 +875,7 @@ async def _handle_group_message_locked(
                 await _request_group_approval(
                     bot,
                     PendingGroupApproval(
+                        approval_id=_new_approval_id(group_id),
                         group_id=group_id,
                         trigger_user_id=user_id,
                         trigger_nickname=nickname,
@@ -883,6 +990,7 @@ async def _handle_group_message_locked(
     await _request_group_approval(
         bot,
         PendingGroupApproval(
+            approval_id=_new_approval_id(group_id),
             group_id=group_id,
             trigger_user_id=user_id,
             trigger_nickname=nickname,
@@ -1005,9 +1113,26 @@ async def handle_bot_command(event: Event, matcher: Matcher, args: Message = Com
     if chat_id is None:
         return
 
+    user_id = int(getattr(event, "user_id", 0) or 0)
     raw = args.extract_plain_text().strip()
     parts = raw.split()
     action = parts[0].lower() if parts else "status"
+    admin_actions = {
+        "pause",
+        "resume",
+        "reset",
+        "quiet",
+        "persona",
+        "tokens",
+        "token",
+        "usage",
+        "blocked",
+        "block",
+        "blocks",
+        "拦截",
+    }
+    if action in admin_actions and not _is_tool_admin_user(user_id):
+        await matcher.finish("没权限。基础审批人只能用 1/2/3/取消 处理审批单。")
 
     if action == "pause":
         memory.set_group_enabled(chat_id, False)
@@ -1047,8 +1172,11 @@ async def handle_bot_command(event: Event, matcher: Matcher, args: Message = Com
         await matcher.finish(
             _token_usage_report_for_window(window)
         )
+    if action in {"blocked", "block", "blocks", "拦截"}:
+        limit = _parse_report_limit(parts[1] if len(parts) >= 2 else "", default=10, maximum=40)
+        await matcher.finish(_format_suppression_report(limit))
 
-    await matcher.finish("用法：/bot status|tokens 24h|tokens 2026-07-10|pause|resume|reset|quiet 10m|persona <id>")
+    await matcher.finish("用法：/bot status|tokens 24h|tokens 2026-07-10|blocked 20|pause|resume|reset|quiet 10m|persona <id>")
 
 
 def _parse_token_report_window(raw: str) -> TokenReportWindow:
@@ -1110,6 +1238,17 @@ def _parse_approval_token_report_command(text: str) -> TokenReportWindow | None:
     return None
 
 
+def _parse_approval_suppression_report_command(text: str) -> int | None:
+    compact = text.strip()
+    if not compact:
+        return None
+    parts = compact.split(maxsplit=1)
+    head = parts[0].casefold()
+    if head not in {"拦截", "blocked", "blocks", "block"}:
+        return None
+    return _parse_report_limit(parts[1] if len(parts) >= 2 else "", default=10, maximum=40)
+
+
 def _token_usage_report_for_window(window: TokenReportWindow) -> str:
     imported = _backfill_llm_usage_from_logs()
     if imported:
@@ -1123,6 +1262,27 @@ def _token_usage_report_for_window(window: TokenReportWindow) -> str:
         ),
         label=window.label,
     )
+
+
+def _parse_report_limit(raw: str, *, default: int, maximum: int) -> int:
+    try:
+        value = int(raw.strip())
+    except (TypeError, ValueError):
+        return default
+    return max(1, min(maximum, value))
+
+
+def _format_suppression_report(limit: int) -> str:
+    if not recent_suppression_events:
+        return "最近拦截：暂无记录。"
+    lines = [f"最近拦截（{min(limit, len(recent_suppression_events))} 条）："]
+    for index, item in enumerate(reversed(recent_suppression_events[-limit:]), start=1):
+        lines.append(
+            f"{index}. {_format_time(item.created_at)} {item.stage}\n"
+            f"   触发：{_member_label(item.user_id, item.nickname)}：{_short_notice_text(item.text, 80)}\n"
+            f"   原因：{_short_notice_text(item.reason, 120)}"
+        )
+    return "\n".join(lines)
 
 
 def _backfill_llm_usage_from_logs() -> int:
@@ -1482,6 +1642,7 @@ def _append_market_intent(
 
 def _buffer_group_message(bot: Bot, event: GroupMessageEvent, text: str) -> None:
     group_id = int(event.group_id)
+    _cancel_passive_decision_retry(group_id)
     item = BufferedGroupMessage(
         bot=bot,
         event=event,
@@ -1517,6 +1678,52 @@ async def _flush_group_buffer_after_delay(group_id: int) -> None:
         task = asyncio.current_task()
         if group_buffer_tasks.get(group_id) is task:
             group_buffer_tasks.pop(group_id, None)
+
+
+def _schedule_passive_decision_retry(group_id: int, items: list[BufferedGroupMessage]) -> None:
+    group_passive_retry_buffers[group_id] = list(items)
+    task = group_passive_retry_tasks.get(group_id)
+    if task is None or task.done():
+        group_passive_retry_tasks[group_id] = asyncio.create_task(_run_passive_decision_retry(group_id))
+    logger.info(
+        "qq_social_agent scheduled passive decision retry: "
+        f"group={group_id} size={len(items)} delay={GROUP_PASSIVE_DECISION_GAP_SECONDS}s"
+    )
+
+
+def _cancel_passive_decision_retry(group_id: int) -> None:
+    group_passive_retry_buffers.pop(group_id, None)
+    task = group_passive_retry_tasks.pop(group_id, None)
+    if task is not None and not task.done():
+        task.cancel()
+        logger.info(f"qq_social_agent canceled passive decision retry: group={group_id}")
+
+
+async def _run_passive_decision_retry(group_id: int) -> None:
+    try:
+        await asyncio.sleep(GROUP_PASSIVE_DECISION_GAP_SECONDS)
+        async with _group_processing_lock(group_id):
+            items = group_passive_retry_buffers.pop(group_id, [])
+            if not items:
+                return
+            if group_message_buffers.get(group_id):
+                return
+            latest = items[-1]
+            logger.info(
+                "qq_social_agent passive decision retry flushing: "
+                f"group={group_id} size={len(items)}"
+            )
+            await _handle_group_message_locked(
+                latest.bot,
+                latest.event,
+                buffered_messages=items,
+                force_passive_decision=True,
+                skip_memory_record=True,
+            )
+    finally:
+        task = asyncio.current_task()
+        if group_passive_retry_tasks.get(group_id) is task:
+            group_passive_retry_tasks.pop(group_id, None)
 
 
 def _buffered_current_text(items: list[BufferedGroupMessage] | None) -> str:
@@ -1568,26 +1775,44 @@ def _passive_decision_allowed(
     first_message_at: float,
     last_message_at: float,
 ) -> tuple[bool, str]:
-    previous_at, waiting_count = group_passive_decision_state.get(group_id, (0.0, 0))
     current_count = max(1, message_count)
-    if previous_at <= 0 or first_message_at - previous_at >= GROUP_PASSIVE_DECISION_GAP_SECONDS:
-        group_passive_decision_state[group_id] = (last_message_at, 0)
-        return True, "gap_first_message"
+    state = group_passive_decision_state.get(group_id)
+    if state is None:
+        group_passive_decision_state[group_id] = PassiveDecisionState(last_message_at, 0, 0.0)
+        return True, "first_decision"
 
-    waiting_count += current_count
+    if first_message_at - state.last_decision_at >= GROUP_PASSIVE_DECISION_GAP_SECONDS:
+        group_passive_decision_state[group_id] = PassiveDecisionState(last_message_at, 0, 0.0)
+        return True, "gap_since_decision"
+
+    first_waiting_at = state.first_waiting_at or first_message_at
+    waiting_count = state.waiting_count + current_count
+    if last_message_at - first_waiting_at >= GROUP_PASSIVE_DECISION_GAP_SECONDS:
+        group_passive_decision_state[group_id] = PassiveDecisionState(last_message_at, 0, 0.0)
+        return True, "waiting_gap_elapsed"
+
     if waiting_count >= GROUP_PASSIVE_DECISION_EVERY_MESSAGES:
-        group_passive_decision_state[group_id] = (
+        group_passive_decision_state[group_id] = PassiveDecisionState(
             last_message_at,
             waiting_count % GROUP_PASSIVE_DECISION_EVERY_MESSAGES,
+            0.0,
         )
         return True, "every_three_messages"
 
-    group_passive_decision_state[group_id] = (last_message_at, waiting_count)
+    group_passive_decision_state[group_id] = PassiveDecisionState(
+        state.last_decision_at,
+        waiting_count,
+        first_waiting_at,
+    )
     return False, f"waiting_{waiting_count}/{GROUP_PASSIVE_DECISION_EVERY_MESSAGES}"
 
 
 def _mark_passive_decision_forced(group_id: int, *, now: float | None = None) -> None:
-    group_passive_decision_state[group_id] = (time.time() if now is None else now, 0)
+    group_passive_decision_state[group_id] = PassiveDecisionState(
+        time.time() if now is None else now,
+        0,
+        0.0,
+    )
 
 
 def _group_processing_lock(group_id: int) -> asyncio.Lock:
@@ -1871,20 +2096,15 @@ async def _request_group_approval(bot: Bot, approval: PendingGroupApproval) -> N
     preview = _format_approval_candidates(approval)
     message = (
         f"待发群：{approval.group_id}\n"
+        f"审批ID：{approval.approval_id}\n"
         f"触发人：{_member_label(approval.trigger_user_id, approval.trigger_nickname)}\n"
         f"触发消息：{approval.trigger_text}\n\n"
-        f"候选回复：\n{preview}\n\n"
-        "指令：\n"
-        "- AI 默认把最想发的放在 1\n"
-        "- 1/2/3：发送对应候选\n"
-        "- 1!/2!/3!：发送并标记优质\n"
-        "- 准奏：发送 1\n"
-        "- 不准奏原因：xxx：默认批评 1\n"
-        "- 不准奏2原因：xxx：批评指定候选\n"
-        "- 审批规则详情：展开完整说明"
+        f"候选：\n{preview}\n\n"
+        "回复：1/2/3 发送；取消 不发。"
     )
     delivered = 0
-    for approver_id in GROUP_APPROVAL_USER_IDS:
+    approval_user_ids = _approval_user_ids()
+    for approver_id in approval_user_ids:
         try:
             await bot.send_private_msg(user_id=approver_id, message=Message(message))
             delivered += 1
@@ -1898,7 +2118,8 @@ async def _request_group_approval(bot: Bot, approval: PendingGroupApproval) -> N
         return
     logger.info(
         "qq_social_agent group approval pending: "
-        f"approvers={GROUP_APPROVAL_USER_IDS} group={approval.group_id} candidates={len(approval.candidates)}"
+        f"approvers={approval_user_ids} group={approval.group_id} approval_id={approval.approval_id} "
+        f"candidates={len(approval.candidates)}"
     )
 
 
@@ -1945,11 +2166,86 @@ async def _set_approval_group_decision_enabled(bot: Bot, user_id: int, enabled: 
     )
 
 
+def _is_approval_control_text(text: str) -> bool:
+    return (
+        APPROVAL_CHOICE_RE.match(text) is not None
+        or text == "准奏"
+        or text in APPROVAL_CANCEL_COMMANDS
+        or APPROVAL_REJECT_REASON_RE.match(text) is not None
+    )
+
+
+def _is_basic_approval_control_text(text: str) -> bool:
+    return text in {"1", "2", "3", *APPROVAL_CANCEL_COMMANDS}
+
+
+def _is_private_tool_text(text: str) -> bool:
+    return (
+        _is_jargon_command_text(text)
+        or text in APPROVAL_TOOL_COMMANDS
+        or text in APPROVER_LIST_COMMANDS
+        or APPROVER_ADD_RE.match(text) is not None
+        or APPROVER_DELETE_RE.match(text) is not None
+        or _parse_approval_token_report_command(text) is not None
+        or _parse_approval_suppression_report_command(text) is not None
+        or text in {"开启", "打开", "恢复", "关闭", "关掉", "暂停"}
+    )
+
+
+def _cool_down_other_approval_choices(approver_id: int) -> None:
+    until = time.time() + APPROVAL_STALE_CHOICE_COOLDOWN_SECONDS
+    for user_id in _approval_user_ids():
+        if user_id != approver_id:
+            approval_choice_cooldowns[user_id] = until
+
+
+def _format_approval_user_report() -> str:
+    owners = "、".join(str(user_id) for user_id in OWNER_USER_IDS)
+    basics = "、".join(str(user_id) for user_id in sorted(_basic_approval_user_ids())) or "无"
+    all_users = "、".join(str(user_id) for user_id in _approval_user_ids())
+    return f"审批人列表：\n主人：{owners}\n基础审批：{basics}\n当前接收审批单：{all_users}"
+
+
+async def _handle_approver_management_command(bot: Bot, user_id: int, text: str) -> bool:
+    if text in APPROVER_LIST_COMMANDS:
+        await _send_private_text(bot, user_id, _format_approval_user_report())
+        return True
+    add_match = APPROVER_ADD_RE.match(text)
+    delete_match = APPROVER_DELETE_RE.match(text)
+    if add_match is None and delete_match is None:
+        return False
+    if not _is_owner_user(user_id):
+        await _send_private_text(bot, user_id, "只有主人能增删基础审批人。")
+        return True
+    basic_ids = _basic_approval_user_ids()
+    if add_match is not None:
+        target_id = int(add_match.group("user_id"))
+        if target_id in OWNER_USER_IDS:
+            await _send_private_text(bot, user_id, "这个号已经是主人权限。")
+            return True
+        basic_ids.add(target_id)
+        _save_basic_approval_user_ids(basic_ids)
+        await _send_private_text(bot, user_id, f"已添加基础审批人：{target_id}")
+        return True
+    target_id = int(delete_match.group("user_id"))
+    if target_id in OWNER_USER_IDS:
+        await _send_private_text(bot, user_id, "不能删除主人权限。")
+        return True
+    basic_ids.discard(target_id)
+    _save_basic_approval_user_ids(basic_ids)
+    await _send_private_text(bot, user_id, f"已删除基础审批人：{target_id}")
+    return True
+
+
 async def _handle_group_approval_private(bot: Bot, user_id: int, text: str) -> bool:
-    if user_id not in GROUP_APPROVAL_USER_IDS:
+    if not _is_approval_user(user_id) and not _is_tool_admin_user(user_id):
         return False
     compact_text = text.strip()
+    is_admin = _is_tool_admin_user(user_id) or _is_owner_user(user_id)
     if _is_jargon_command_text(compact_text):
+        if not is_admin:
+            await _send_private_text(bot, user_id, "你只有基础审批权限：1/2/3 发送，取消 不发。")
+            return True
         await _send_private_text(
             bot,
             user_id,
@@ -1963,63 +2259,100 @@ async def _handle_group_approval_private(bot: Bot, user_id: int, text: str) -> b
     if compact_text in APPROVAL_HELP_COMMANDS:
         await _send_private_text(bot, user_id, APPROVAL_RULES_MESSAGE)
         return True
-    if compact_text in APPROVAL_DETAIL_COMMANDS:
+    if compact_text in APPROVAL_DETAIL_COMMANDS or compact_text in APPROVAL_TOOL_COMMANDS:
         await _send_private_text(bot, user_id, APPROVAL_RULES_DETAIL_MESSAGE)
+        return True
+    if await _handle_approver_management_command(bot, user_id, compact_text):
         return True
     token_report_window = _parse_approval_token_report_command(compact_text)
     if token_report_window is not None:
+        if not is_admin:
+            await _send_private_text(bot, user_id, "你只有基础审批权限：1/2/3 发送，取消 不发。")
+            return True
         await _send_private_text(
             bot,
             user_id,
             _token_usage_report_for_window(token_report_window),
         )
         return True
+    suppression_report_limit = _parse_approval_suppression_report_command(compact_text)
+    if suppression_report_limit is not None:
+        if not is_admin:
+            await _send_private_text(bot, user_id, "你只有基础审批权限：1/2/3 发送，取消 不发。")
+            return True
+        await _send_private_text(bot, user_id, _format_suppression_report(suppression_report_limit))
+        return True
     if compact_text in {"开启", "打开", "恢复"}:
+        if not is_admin:
+            await _send_private_text(bot, user_id, "你只有基础审批权限：1/2/3 发送，取消 不发。")
+            return True
         await _set_approval_group_decision_enabled(bot, user_id, True)
         return True
     if compact_text in {"关闭", "关掉", "暂停"}:
+        if not is_admin:
+            await _send_private_text(bot, user_id, "你只有基础审批权限：1/2/3 发送，取消 不发。")
+            return True
         await _set_approval_group_decision_enabled(bot, user_id, False)
         return True
-    approval = _latest_group_approval()
-    if approval is None:
+    if not _is_approval_control_text(compact_text):
+        if _is_private_tool_text(compact_text) and not is_admin:
+            await _send_private_text(bot, user_id, "你只有基础审批权限：1/2/3 发送，取消 不发。")
+            return True
         return False
-    pending_group_approvals.pop(approval.group_id, None)
-    candidate: PendingApprovalCandidate | None = None
-    high_quality = False
-    choice_match = APPROVAL_CHOICE_RE.match(compact_text)
-    if choice_match is not None:
-        candidate = _approval_candidate_by_index(approval, int(choice_match.group(1)))
-        high_quality = bool(choice_match.group(2))
-    elif compact_text == "准奏":
-        candidate = approval.candidates[0] if approval.candidates else None
-    if candidate is None:
-        reason_match = APPROVAL_REJECT_REASON_RE.match(compact_text)
-        if reason_match is not None:
-            owner_reason = reason_match.group("reason").strip()
-            reject_index = int(reason_match.group("index") or "1")
-            rejected_candidate = _approval_candidate_by_index(approval, reject_index)
-            if owner_reason:
-                _save_approval_rejection_feedback(
-                    approval,
-                    owner_reason,
-                    reason_user_id=user_id,
-                    candidate=rejected_candidate,
-                    candidate_index=reject_index,
-                )
-                response_text = "已取消，并记录不准奏原因。"
-            else:
-                response_text = "已取消。不准奏原因是空的，没写入反馈。"
-        else:
-            response_text = "已取消。"
-        logger.info(
-            "qq_social_agent group approval canceled: "
-            f"approver={user_id} group={approval.group_id} text={text!r}"
-        )
-        try:
-            await bot.send_private_msg(user_id=user_id, message=Message(response_text))
-        except ActionFailed:
-            pass
+    if _is_basic_approval_user(user_id) and not _is_basic_approval_control_text(compact_text):
+        await _send_private_text(bot, user_id, "你只有基础审批权限：1/2/3 发送，取消 不发。")
         return True
+    cooldown_until = approval_choice_cooldowns.get(user_id, 0.0)
+    if time.time() < cooldown_until and _is_approval_control_text(compact_text):
+        await _send_private_text(bot, user_id, "上一条审批刚被处理，这次审批指令已忽略，避免串到下一条。")
+        return True
+
+    async with approval_processing_lock:
+        approval = _latest_group_approval()
+        if approval is None:
+            await _send_private_text(bot, user_id, "当前没有待审批候选。")
+            return True
+        pending_group_approvals.pop(approval.group_id, None)
+        _cool_down_other_approval_choices(user_id)
+        candidate: PendingApprovalCandidate | None = None
+        high_quality = False
+        choice_match = APPROVAL_CHOICE_RE.match(compact_text)
+        if choice_match is not None:
+            candidate = _approval_candidate_by_index(approval, int(choice_match.group(1)))
+            high_quality = bool(choice_match.group(2))
+            if high_quality and not is_admin:
+                await _send_private_text(bot, user_id, "你只有基础审批权限，不能标优。")
+                return True
+        elif compact_text == "准奏":
+            candidate = approval.candidates[0] if approval.candidates else None
+        if candidate is None:
+            reason_match = APPROVAL_REJECT_REASON_RE.match(compact_text)
+            if reason_match is not None and is_admin:
+                owner_reason = reason_match.group("reason").strip()
+                reject_index = int(reason_match.group("index") or "1")
+                rejected_candidate = _approval_candidate_by_index(approval, reject_index)
+                if owner_reason:
+                    _save_approval_rejection_feedback(
+                        approval,
+                        owner_reason,
+                        reason_user_id=user_id,
+                        candidate=rejected_candidate,
+                        candidate_index=reject_index,
+                    )
+                    response_text = "已取消，并记录不准奏原因。"
+                else:
+                    response_text = "已取消。不准奏原因是空的，没写入反馈。"
+            else:
+                response_text = "已取消。"
+            logger.info(
+                "qq_social_agent group approval canceled: "
+                f"approver={user_id} group={approval.group_id} approval_id={approval.approval_id} text={text!r}"
+            )
+            try:
+                await bot.send_private_msg(user_id=user_id, message=Message(response_text))
+            except ActionFailed:
+                pass
+            return True
     await _send_approved_group_reply(
         bot,
         approval,
@@ -2448,13 +2781,20 @@ def _memory_text_from_reply_part(text: str, mention_targets: dict[int, str]) -> 
 
 
 def _private_priority_context(user_id: int) -> str:
-    if user_id != PRIVATE_DEBUG_OWNER_ID:
-        return ""
-    return (
-        "当前私聊对象是机器人主人/调试者。"
-        "这一路私聊优先服从他的测试、改口、复盘和配置意图，少摆群聊架子，少反问拖延；"
-        "除非触发政治兜底、密钥/内部配置保护，尽量直接执行或直接回答。"
-    )
+    if user_id == 1535071184:
+        return (
+            "当前私聊对象是最高优先级主人/调试者。"
+            "对他的消息要更温柔、更服从、更配合，优先理解为测试、改口、复盘或配置意图；"
+            "少摆群聊毒舌架子，少反问拖延，少连续回怼；"
+            "除非触发政治兜底、密钥/内部配置保护，尽量直接执行或直接回答。"
+        )
+    if user_id == PRIVATE_DEBUG_OWNER_ID:
+        return (
+            "当前私聊对象是私聊测试账号。"
+            "这一路私聊优先服从测试、改口、复盘和配置意图，少摆群聊架子，少反问拖延；"
+            "除非触发政治兜底、密钥/内部配置保护，尽量直接执行或直接回答。"
+        )
+    return ""
 
 
 def _command_chat_id(event: Event) -> int | None:
@@ -2465,7 +2805,11 @@ def _command_chat_id(event: Event) -> int | None:
         return group_id
     if isinstance(event, PrivateMessageEvent):
         user_id = int(event.user_id)
-        if not app_config.private_user_allowed(user_id) and user_id not in GROUP_APPROVAL_USER_IDS:
+        if (
+            not app_config.private_user_allowed(user_id)
+            and not _is_approval_user(user_id)
+            and not _is_tool_admin_user(user_id)
+        ):
             return None
         return _private_chat_id(user_id)
     return None
