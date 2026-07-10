@@ -1,11 +1,13 @@
 import asyncio
 from types import SimpleNamespace
 
+import qq_social_agent.deepseek_client as deepseek_module
 from qq_social_agent.deepseek_client import (
     ChatMessage,
     DeepSeekClient,
     _log_llm_usage,
     _parse_jargon_terms,
+    _parse_reply_candidates,
     _parse_reply_decision,
     _sanitize_reply,
     _usage_value,
@@ -286,4 +288,39 @@ def test_client_methods_use_expected_model_routes() -> None:
         ("reply_candidates", "reply"),
         ("mid_memory", "memory"),
         ("style_learning", "style"),
+    ]
+
+
+def test_parse_reply_candidates_logs_diagnostic_when_short(monkeypatch) -> None:
+    logs: list[str] = []
+    monkeypatch.setattr(
+        deepseek_module,
+        "logger",
+        SimpleNamespace(
+            info=lambda message: logs.append(message),
+            warning=lambda message: None,
+        ),
+    )
+
+    candidates = _parse_reply_candidates(
+        """
+        {
+          "candidates": [
+            {"text": "第一条", "style": "自然", "action": "reply"},
+            {"text": "第一条", "style": "重复", "action": "reply"},
+            {"text": "", "style": "空", "action": "reply"},
+            "bad"
+          ]
+        }
+        """,
+        max_chars=120,
+        fallback_action="reply",
+        limit=3,
+    )
+
+    assert len(candidates) == 1
+    assert logs == [
+        "qq_social_agent reply candidates parse diagnostic: "
+        "raw_count=4 parsed_count=1 limit=3 "
+        "dropped_reason=duplicate_text=1,empty_text=1,item_not_object=1"
     ]

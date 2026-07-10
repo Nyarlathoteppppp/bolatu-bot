@@ -850,27 +850,45 @@ def _parse_reply_candidates(
     fallback_action: str,
     limit: int,
 ) -> tuple[ReplyCandidateDraft, ...]:
+    dropped_reasons: list[str] = []
     try:
         raw = _loads_json_object(content)
     except json.JSONDecodeError:
         text = _sanitize_reply(content, max_chars)
         if not text:
+            _log_reply_candidate_parse_diagnostic(
+                raw_count=0,
+                parsed_count=0,
+                limit=limit,
+                dropped_reasons=("invalid_json_empty",),
+            )
             return ()
+        _log_reply_candidate_parse_diagnostic(
+            raw_count=0,
+            parsed_count=1,
+            limit=limit,
+            dropped_reasons=("non_json_fallback",),
+        )
         return (ReplyCandidateDraft(text=text, action=fallback_action, style="模型返回非 JSON，按原回复处理"),)
 
     raw_candidates = raw.get("candidates", [])
     if not isinstance(raw_candidates, list):
+        dropped_reasons.append("candidates_not_list")
         raw_candidates = []
+    raw_count = len(raw_candidates)
     parsed: list[ReplyCandidateDraft] = []
     seen_texts: set[str] = set()
     for item in raw_candidates:
         if not isinstance(item, dict):
+            dropped_reasons.append("item_not_object")
             continue
         text = _sanitize_reply(str(item.get("text", "") or ""), max_chars)
         if not text:
+            dropped_reasons.append("empty_text")
             continue
         compact_text = re.sub(r"\s+", "", text)
         if compact_text in seen_texts:
+            dropped_reasons.append("duplicate_text")
             continue
         seen_texts.add(compact_text)
         action = _normalize_action(str(item.get("action", fallback_action) or fallback_action), should_reply=True)
@@ -886,7 +904,39 @@ def _parse_reply_candidates(
         )
         if len(parsed) >= limit:
             break
+    if len(parsed) < limit:
+        _log_reply_candidate_parse_diagnostic(
+            raw_count=raw_count,
+            parsed_count=len(parsed),
+            limit=limit,
+            dropped_reasons=tuple(dropped_reasons),
+        )
     return tuple(parsed)
+
+
+def _log_reply_candidate_parse_diagnostic(
+    *,
+    raw_count: int,
+    parsed_count: int,
+    limit: int,
+    dropped_reasons: tuple[str, ...],
+) -> None:
+    if parsed_count >= limit:
+        return
+    logger.info(
+        "qq_social_agent reply candidates parse diagnostic: "
+        f"raw_count={raw_count} parsed_count={parsed_count} "
+        f"limit={limit} dropped_reason={_format_drop_reasons(dropped_reasons)}"
+    )
+
+
+def _format_drop_reasons(reasons: tuple[str, ...]) -> str:
+    if not reasons:
+        return "none"
+    counts: dict[str, int] = {}
+    for reason in reasons:
+        counts[reason] = counts.get(reason, 0) + 1
+    return ",".join(f"{reason}={count}" for reason, count in sorted(counts.items()))
 
 
 def _trim_to_sentence(text: str, max_chars: int) -> str:
