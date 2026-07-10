@@ -30,6 +30,7 @@ for route_name, title in (
     ("jargon", "jargon"),
     ("memory", "memory"),
     ("style", "style"),
+    ("member_profile", "member_profile"),
 ):
     active = overrides.get(route_name, config.routes[route_name].label)
     marker = " override" if route_name in overrides else ""
