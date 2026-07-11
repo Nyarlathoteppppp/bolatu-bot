@@ -1231,7 +1231,7 @@ async def handle_jargon_command(event: Event, matcher: Matcher) -> None:
 async def handle_group_message(bot: Bot, event: GroupMessageEvent) -> None:
     group_id = int(event.group_id)
     plain_text = _plain_text(event)
-    raw_text = _message_context_text(event)
+    raw_text = _message_context_text(event, bot_id=int(bot.self_id))
     addressed_bot = _mentioned_bot(event, bot) or _replied_to_bot(event, bot)
     group_allowed = app_config.group_allowed(group_id)
     forward_context = ""
@@ -2472,9 +2472,9 @@ def _event_plain_text(event: GroupMessageEvent | PrivateMessageEvent) -> str:
     return re.sub(r"\s+", " ", text)
 
 
-def _message_context_text(event: GroupMessageEvent | PrivateMessageEvent) -> str:
+def _message_context_text(event: GroupMessageEvent | PrivateMessageEvent, *, bot_id: int | None = None) -> str:
     parts: list[str] = []
-    has_structured_reply_context = bool(_event_reply_context(event))
+    has_structured_reply_context = bool(_event_reply_context(event, bot_id=bot_id))
     for segment in event.message:
         segment_type = str(getattr(segment, "type", "") or "")
         data = getattr(segment, "data", {}) or {}
@@ -2488,7 +2488,7 @@ def _message_context_text(event: GroupMessageEvent | PrivateMessageEvent) -> str
         placeholder = _message_segment_placeholder(segment_type, data)
         if placeholder:
             parts.append(placeholder)
-    reply_context = _event_reply_context(event, reply_text=" ".join(parts).strip())
+    reply_context = _event_reply_context(event, reply_text=" ".join(parts).strip(), bot_id=bot_id)
     if reply_context:
         parts = [reply_context]
     text = " ".join(parts).strip()
@@ -2615,7 +2615,12 @@ def _message_segment_placeholder(segment_type: str, data: dict[str, object]) -> 
     return ""
 
 
-def _event_reply_context(event: GroupMessageEvent | PrivateMessageEvent, *, reply_text: str = "") -> str:
+def _event_reply_context(
+    event: GroupMessageEvent | PrivateMessageEvent,
+    *,
+    reply_text: str = "",
+    bot_id: int | None = None,
+) -> str:
     reply = getattr(event, "reply", None)
     if reply is None:
         return ""
@@ -2645,10 +2650,14 @@ def _event_reply_context(event: GroupMessageEvent | PrivateMessageEvent, *, repl
         else "当前发言人"
     )
     current_reply = _short_notice_text(reply_text, 100) if reply_text else "空消息"
+    self_identity_hint = ""
+    if bot_id is not None and user_id is not None and int(user_id) == int(bot_id):
+        self_identity_hint = "注：张风雪和风雪都是你自己；群友回复张风雪/风雪，就是在回复你之前说的话。"
     if message_text:
         original_text = _short_notice_text(message_text, 100)
         return (
             f"{current_label}回复{replied_label}消息【"
+            f"{self_identity_hint}"
             f"{replied_label}说：{original_text}；"
             f"{current_label}回复{replied_label}：{current_reply}】"
         )
@@ -2658,6 +2667,7 @@ def _event_reply_context(event: GroupMessageEvent | PrivateMessageEvent, *, repl
         original_hint = f"{replied_label}原消息内容未知，消息ID：{message_id}"
     return (
         f"{current_label}回复{replied_label}消息【"
+        f"{self_identity_hint}"
         f"{original_hint}；"
         f"{current_label}回复{replied_label}：{current_reply}】"
     )
