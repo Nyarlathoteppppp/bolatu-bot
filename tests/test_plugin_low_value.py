@@ -273,7 +273,12 @@ def test_approval_help_commands() -> None:
     assert "切风格模型" in plugin._bot_tool_message("bot工具 模型")
     assert "可切换部分" in plugin._bot_tool_message("bot工具 模型")
     assert "模型状态" in plugin._bot_tool_message("bot工具 模型")
+    assert "模型名要完整复制" in plugin._bot_tool_message("bot工具 模型")
     assert "flows.decision" in plugin._bot_tool_message("bot工具 prompt")
+    assert "加私聊 QQ号" in plugin._bot_tool_message("bot工具 私聊")
+    assert "格式是 /黑话：词 指代：解释" in plugin._bot_tool_message("bot工具 黑话")
+    assert "回 A/B/C" in plugin._bot_tool_message("bot工具 审批")
+    assert "拦截 50" in plugin._bot_tool_message("bot工具 查看")
     assert plugin._bot_tool_shortcut_command("B3") == "群友画像 20"
     assert plugin._bot_tool_shortcut_command("A 1") == "拦截 20"
 
