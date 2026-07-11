@@ -362,6 +362,45 @@ def test_low_value_reply_to_bot_event_allows_media_reply() -> None:
     assert not plugin._is_low_value_reply_to_bot_event(event)
 
 
+def test_weak_reply_to_other_event_ignores_short_directed_answer() -> None:
+    event = SimpleNamespace(
+        reply=SimpleNamespace(user_id=123456789),
+        message=[
+            SimpleNamespace(type="reply", data={"id": "42"}),
+            SimpleNamespace(type="text", data={"text": "南下了"}),
+        ],
+        get_plaintext=lambda: "南下了",
+    )
+
+    assert plugin._is_weak_reply_to_other_event(event)
+
+
+def test_weak_reply_to_other_event_allows_question_or_opinion() -> None:
+    event = SimpleNamespace(
+        reply=SimpleNamespace(user_id=123456789),
+        message=[
+            SimpleNamespace(type="reply", data={"id": "42"}),
+            SimpleNamespace(type="text", data={"text": "那你怎么看这个学校"}),
+        ],
+        get_plaintext=lambda: "那你怎么看这个学校",
+    )
+
+    assert not plugin._is_weak_reply_to_other_event(event)
+
+
+def test_weak_reply_to_other_event_allows_media() -> None:
+    event = SimpleNamespace(
+        reply=SimpleNamespace(user_id=123456789),
+        message=[
+            SimpleNamespace(type="reply", data={"id": "42"}),
+            SimpleNamespace(type="image", data={"summary": "截图"}),
+        ],
+        get_plaintext=lambda: "",
+    )
+
+    assert not plugin._is_weak_reply_to_other_event(event)
+
+
 def test_unreadable_image_only_event_should_not_enter_passive_buffer() -> None:
     event = SimpleNamespace(
         message=[SimpleNamespace(type="image", data={"summary": "截图"})],

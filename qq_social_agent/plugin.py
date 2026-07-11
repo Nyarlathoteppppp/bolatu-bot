@@ -1249,6 +1249,22 @@ async def handle_group_message(bot: Bot, event: GroupMessageEvent) -> None:
         has_media=_message_has_context_media(event),
     )
     text = raw_text
+    if group_allowed and not addressed_bot and _is_weak_reply_to_other_event(event):
+        memory.add_message(group_id, int(event.user_id), _nickname(event), raw_text or plain_text, is_bot=False)
+        logger.info(
+            "qq_social_agent ignored weak reply to another member: "
+            f"group={group_id} user={int(event.user_id)} text={raw_text!r}"
+        )
+        await _send_approval_suppression_notice(
+            bot,
+            group_id=group_id,
+            user_id=int(event.user_id),
+            nickname=_nickname(event),
+            text=raw_text,
+            stage="backend_weak_reply_to_other",
+            reason="后端拦截：这条是回复其他群友的短答/定向回应，不是开放话题，不进入 buffer 和 LLM decision。",
+        )
+        return
     if group_allowed and not addressed_bot and _should_ignore_unreadable_media_event(event, forward_context=forward_context):
         memory.add_message(group_id, int(event.user_id), _nickname(event), raw_text or plain_text or "[不可见媒体]", is_bot=False)
         logger.info(
@@ -2542,6 +2558,70 @@ def _should_ignore_unreadable_media_event(
     if _message_has_unreadable_media(event):
         return _is_weak_media_caption(plain_text)
     return False
+
+
+def _is_weak_reply_to_other_event(event: GroupMessageEvent | PrivateMessageEvent) -> bool:
+    if not _event_has_reply_context(event):
+        return False
+    if _message_has_non_reply_media(event):
+        return False
+    plain_text = _plain_text(event) if isinstance(event, GroupMessageEvent) else _event_plain_text(event)
+    return _is_weak_directed_reply_text(plain_text)
+
+
+def _event_has_reply_context(event: GroupMessageEvent | PrivateMessageEvent) -> bool:
+    if getattr(event, "reply", None) is not None:
+        return True
+    for segment in event.message:
+        if str(getattr(segment, "type", "") or "") == "reply":
+            return True
+    return False
+
+
+def _is_weak_directed_reply_text(text: str) -> bool:
+    compact = re.sub(r"[^\w\u4e00-\u9fff]+", "", text).casefold()
+    if not compact:
+        return True
+    if _is_low_value_group_text(text):
+        return True
+    if len(compact) > 8:
+        return False
+    strong_markers = (
+        "？",
+        "?",
+        "怎么",
+        "为啥",
+        "为什么",
+        "咋",
+        "咋办",
+        "怎么看",
+        "要不要",
+        "值不值",
+        "亏",
+        "赚",
+        "风险",
+        "学校",
+        "专业",
+        "就业",
+        "工资",
+        "破防",
+        "难受",
+        "烦",
+        "气死",
+        "离谱",
+        "抽象",
+        "典",
+        "绷",
+        "闹麻",
+        "赢麻",
+        "Claude",
+        "claude",
+        "AI",
+        "ai",
+    )
+    if any(marker in text for marker in strong_markers):
+        return False
+    return True
 
 
 def _is_weak_media_caption(text: str) -> bool:
