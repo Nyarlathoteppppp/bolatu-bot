@@ -146,6 +146,49 @@ def test_compact_long_message_fallback_keeps_short_marker() -> None:
     assert "已省略" in compacted
 
 
+def test_short_reply_context_does_not_compact_only_because_of_labels() -> None:
+    reply_message = SimpleNamespace(extract_plain_text=lambda: "你今天是不是刚到自贡荣县，耍起了吗")
+    event = SimpleNamespace(
+        user_id=2849687751,
+        sender=SimpleNamespace(card="🐖linbar🐖（旅游中）", nickname=""),
+        reply=SimpleNamespace(
+            user_id=1660502091,
+            sender=SimpleNamespace(card="entp大人", nickname=""),
+            message=reply_message,
+        ),
+        message=[
+            SimpleNamespace(type="reply", data={"id": "42"}),
+            SimpleNamespace(type="text", data={"text": "我今天刚到"}),
+        ],
+    )
+    raw_text = plugin._message_context_text(event, bot_id=1801507496)
+
+    assert len(raw_text) > plugin.LONG_MESSAGE_SUMMARY_THRESHOLD
+    assert len(raw_text) <= plugin.REPLY_CONTEXT_SUMMARY_THRESHOLD
+    assert not plugin._should_compact_group_context_message(event, raw_text=raw_text, plain_text="我今天刚到")
+
+
+def test_long_plain_reply_context_still_compacts() -> None:
+    reply_message = SimpleNamespace(extract_plain_text=lambda: "原话")
+    plain_text = "这是真正很长的当前回复" * 12
+    event = SimpleNamespace(
+        user_id=2849687751,
+        sender=SimpleNamespace(card="🐖linbar🐖（旅游中）", nickname=""),
+        reply=SimpleNamespace(
+            user_id=1660502091,
+            sender=SimpleNamespace(card="entp大人", nickname=""),
+            message=reply_message,
+        ),
+        message=[
+            SimpleNamespace(type="reply", data={"id": "42"}),
+            SimpleNamespace(type="text", data={"text": plain_text}),
+        ],
+    )
+    raw_text = plugin._message_context_text(event, bot_id=1801507496)
+
+    assert plugin._should_compact_group_context_message(event, raw_text=raw_text, plain_text=plain_text)
+
+
 def test_style_learning_messages_with_focus_adds_xiaoniao(monkeypatch, tmp_path) -> None:
     store = _use_temp_plugin_memory(monkeypatch, tmp_path)
     store.add_message(1026813421, 100, "A", "普通群友一句话", created_at=100)

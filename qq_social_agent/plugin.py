@@ -139,6 +139,7 @@ FOCUSED_RAW_CORPUS_LIMIT = 2
 FOCUSED_RAW_CORPUS_SCORE_MULTIPLIER = 1.25
 FOCUSED_RAW_CORPUS_SCORE_BONUS = 2.0
 LONG_MESSAGE_SUMMARY_THRESHOLD = 100
+REPLY_CONTEXT_SUMMARY_THRESHOLD = 180
 LONG_MESSAGE_SUMMARY_SOURCE_LIMIT = 1800
 LONG_MESSAGE_SUMMARY_FALLBACK_HEAD = 72
 LONG_MESSAGE_SUMMARY_FALLBACK_TAIL = 28
@@ -1320,7 +1321,13 @@ async def handle_group_message(bot: Bot, event: GroupMessageEvent) -> None:
             reason="后端拦截：这条主要是图片/语音/视频或无法读取的转发记录，bot 看不到内容，不进入 buffer 和 LLM decision。",
         )
         return
-    if raw_text and group_allowed and plain_text and not _is_low_value_group_text(plain_text):
+    if (
+        raw_text
+        and group_allowed
+        and plain_text
+        and not _is_low_value_group_text(plain_text)
+        and _should_compact_group_context_message(event, raw_text=raw_text, plain_text=plain_text)
+    ):
         text = await _message_text_for_context(
             raw_text,
             nickname=_nickname(event),
@@ -2973,6 +2980,25 @@ async def _message_text_for_context(text: str, *, nickname: str, chat_label: str
         f"chat={chat_label} nickname={nickname!r} raw_chars={len(clean)} summary_chars={len(summary)}"
     )
     return f"[长消息{len(clean)}字摘要] {summary}"
+
+
+def _should_compact_group_context_message(
+    event: GroupMessageEvent | PrivateMessageEvent,
+    *,
+    raw_text: str,
+    plain_text: str,
+) -> bool:
+    raw_clean = raw_text.strip()
+    plain_clean = plain_text.strip()
+    if len(raw_clean) <= LONG_MESSAGE_SUMMARY_THRESHOLD:
+        return False
+    if (
+        _event_has_reply_context(event)
+        and len(plain_clean) <= LONG_MESSAGE_SUMMARY_THRESHOLD
+        and len(raw_clean) <= REPLY_CONTEXT_SUMMARY_THRESHOLD
+    ):
+        return False
+    return True
 
 
 async def _forward_context_text(
