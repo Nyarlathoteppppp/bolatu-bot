@@ -2,6 +2,8 @@
 
 Mac 本机可跑的 QQ 群聊 Agent：
 
+- AI / 开发者工程交接文档：[AI_PROJECT_GUIDE.md](AI_PROJECT_GUIDE.md)
+
 - NapCatQQ 负责 QQ 登录和 OneBot v11 事件转发
 - NoneBot2 接收群聊消息
 - 本地 scorer 决定是否插话
