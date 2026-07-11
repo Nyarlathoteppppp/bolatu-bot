@@ -115,6 +115,23 @@ def _pending_approval() -> plugin.PendingGroupApproval:
     )
 
 
+def test_pad_approval_candidates_fills_to_three() -> None:
+    candidates = [
+        plugin.PendingApprovalCandidate(
+            index=1,
+            text="走错了都能吃上也挺离谱的",
+            action="tease",
+            style="模型原始候选",
+        )
+    ]
+
+    plugin._pad_approval_candidates(candidates, action="tease", limit=3)
+
+    assert len(candidates) == 3
+    assert [candidate.index for candidate in candidates] == [1, 2, 3]
+    assert candidates[1].style.startswith("后端补齐")
+
+
 def test_group_buffer_seconds_is_six() -> None:
     assert GROUP_BUFFER_SECONDS == 6.0
 

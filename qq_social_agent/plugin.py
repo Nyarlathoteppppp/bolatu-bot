@@ -1911,6 +1911,8 @@ async def _handle_group_message_locked(
     if not approval_candidates:
         logger.info(f"qq_social_agent skipped group={group_id}: empty_candidate_after_guard")
         return
+    if len(approval_candidates) < 3:
+        _pad_approval_candidates(approval_candidates, action=decision.action, limit=3)
     logger.info(
         "qq_social_agent pending group reply candidates approval: "
         f"group={group_id} candidates={len(approval_candidates)}"
@@ -3949,6 +3951,68 @@ def _format_approval_candidates(approval: PendingGroupApproval) -> str:
         style_line = f"\n   style：{style}" if style else ""
         lines.append(f"{candidate.index}. {candidate.text}{style_line}")
     return "\n\n".join(lines).strip()
+
+
+def _pad_approval_candidates(
+    candidates: list[PendingApprovalCandidate],
+    *,
+    action: str,
+    limit: int,
+) -> None:
+    seen = {re.sub(r"\s+", "", candidate.text) for candidate in candidates}
+    for text in _fallback_approval_candidate_texts(action):
+        compact = re.sub(r"\s+", "", text)
+        if not compact or compact in seen:
+            continue
+        seen.add(compact)
+        candidates.append(
+            PendingApprovalCandidate(
+                index=len(candidates) + 1,
+                text=text,
+                action=action or "reply",
+                style="后端补齐：模型或清洗后候选不足时的保守备选",
+            )
+        )
+        if len(candidates) >= limit:
+            break
+
+
+def _fallback_approval_candidate_texts(action: str) -> tuple[str, ...]:
+    if action == "care":
+        return (
+            "风雪觉得这事先别急，慢慢捋清楚比较好。",
+            "先缓一下，别把自己逼太紧。",
+            "这个先别硬扛，能少受点罪就少受点。",
+        )
+    if action == "agree":
+        return (
+            "风雪觉得这个说法有点道理。",
+            "这句方向没跑偏，至少抓到重点了。",
+            "这个判断还行，不算乱说。",
+        )
+    if action == "answer":
+        return (
+            "风雪觉得先按这个方向看，别把关键点漏了。",
+            "简单说，这事要看成本和后果。",
+            "先别绕，核心就是值不值。",
+        )
+    if action in {"tease", "mock_repeated_question"}:
+        return (
+            "风雪觉得这事有点抽象。",
+            "这也太会给自己加戏了。",
+            "先别急着上强度，路都快走歪了。",
+        )
+    if action == "ask_back":
+        return (
+            "风雪有点好奇，你这是认真问还是在钓我？",
+            "那你自己先说，你到底想听哪种答案？",
+            "你这句重点是问结果，还是问态度？",
+        )
+    return (
+        "风雪觉得这句可以先轻轻放着。",
+        "那先看他后面怎么说。",
+        "这句接一下可以，但别聊太满。",
+    )
 
 
 def _approval_candidate_by_index(

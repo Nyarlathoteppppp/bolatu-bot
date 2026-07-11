@@ -248,7 +248,13 @@ def test_client_methods_use_expected_model_routes() -> None:
         "decision": '{"should_reply":false,"confidence":0.1,"action":"ignore","reason":"test"}',
         "jargon": '{"terms":["柏拉图"]}',
         "reply": "一句话",
-        "reply_candidates": '{"candidates":[{"text":"候选一句话","style":"自然","action":"reply"}]}',
+        "reply_candidates": (
+            '{"candidates":['
+            '{"text":"候选一句话","style":"自然","action":"reply"},'
+            '{"text":"第二个候选","style":"温和","action":"reply"},'
+            '{"text":"第三个候选","style":"调侃","action":"tease"}'
+            ']}'
+        ),
         "daily_review": "今天群里聊得挺热闹，我也算接上了几句。",
         "member_profile": '{"summary":"爱聊行情和代码","interests":["股票","代码"],"speaking_style":"短句吐槽","representative_texts":["股票又亏了"]}',
         "long_message_summary": '{"summary":"长消息主要是在吐槽股票亏钱和风险控制。"}',
@@ -400,3 +406,78 @@ def test_parse_reply_candidates_logs_diagnostic_when_short(monkeypatch) -> None:
         "raw_count=4 parsed_count=1 limit=3 "
         "dropped_reason=duplicate_text=1,empty_text=1,item_not_object=1"
     ]
+
+
+def test_reply_candidates_retries_when_model_returns_too_few() -> None:
+    client = DeepSeekClient.__new__(DeepSeekClient)
+    client.config = SimpleNamespace(
+        max_tokens=300,
+        thinking="disabled",
+        reasoning_effort="low",
+        temperature=0.6,
+    )
+    client.prompts = PromptRegistry()
+
+    contents = [
+        (
+            '{"candidates":['
+            '{"text":"第一条","style":"自然","action":"reply"},'
+            '{"text":"第二条","style":"温和","action":"reply"}'
+            ']}'
+        ),
+        (
+            '{"candidates":['
+            '{"text":"第一条","style":"自然","action":"reply"},'
+            '{"text":"第二条","style":"温和","action":"reply"},'
+            '{"text":"第三条","style":"调侃","action":"tease"}'
+            ']}'
+        ),
+    ]
+    requests: list[dict[str, object]] = []
+
+    async def fake_chat_completion(*, task: str, route_name: str, request: dict[str, object]) -> object:
+        requests.append(request)
+        return SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(content=contents[len(requests) - 1]),
+                )
+            ]
+        )
+
+    client._chat_completion = fake_chat_completion
+    persona = Persona(
+        id="test",
+        name="张风雪",
+        description="",
+        prompt="人格",
+        decision_prompt="决策人格",
+        keywords=(),
+        max_reply_chars=120,
+        passive_reply_probability=0.5,
+    )
+
+    candidates = asyncio.run(
+        client.reply_candidates(
+            persona=persona,
+            recent_messages=[
+                ChatMessage(
+                    group_id=1026813421,
+                    user_id=11111,
+                    nickname="A",
+                    text="我着急赶地铁",
+                    is_bot=False,
+                    created_at=1000.0,
+                )
+            ],
+            current_text="我着急赶地铁",
+            current_nickname="A[#11111]",
+            mentioned=False,
+        )
+    )
+
+    assert [candidate.text for candidate in candidates] == ["第一条", "第二条", "第三条"]
+    assert len(requests) == 2
+    retry_messages = requests[1]["messages"]
+    assert isinstance(retry_messages, list)
+    assert "必须给满 3 条" in retry_messages[-1]["content"]

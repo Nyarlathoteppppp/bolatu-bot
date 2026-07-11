@@ -531,7 +531,7 @@ class DeepSeekClient:
             candidate_count=candidate_count,
         )
         request = {
-            "max_tokens": max(self.config.max_tokens, 620),
+            "max_tokens": max(self.config.max_tokens, 900),
             "response_format": {"type": "json_object"},
             "messages": [
                 {"role": "system", "content": system},
@@ -545,10 +545,44 @@ class DeepSeekClient:
 
         response = await self._chat_completion(task="reply_candidates", route_name="reply", request=request)
         content = response.choices[0].message.content or ""
-        return _parse_reply_candidates(
+        candidates = _parse_reply_candidates(
             content,
             max_chars=persona.max_reply_chars,
             fallback_action=normalized_action,
+            limit=candidate_count,
+        )
+        if len(candidates) >= candidate_count:
+            return candidates
+
+        retry_request = _reply_candidates_retry_request(
+            request,
+            previous_content=content,
+            parsed_count=len(candidates),
+            candidate_count=candidate_count,
+        )
+        try:
+            retry_response = await self._chat_completion(
+                task="reply_candidates",
+                route_name="reply",
+                request=retry_request,
+            )
+            retry_content = retry_response.choices[0].message.content or ""
+            retry_candidates = _parse_reply_candidates(
+                retry_content,
+                max_chars=persona.max_reply_chars,
+                fallback_action=normalized_action,
+                limit=candidate_count,
+            )
+        except Exception as exc:
+            logger.warning(f"qq_social_agent reply candidates retry failed: error={exc}")
+            retry_candidates = ()
+        merged = _merge_reply_candidates(candidates, retry_candidates, limit=candidate_count)
+        if len(merged) >= candidate_count:
+            return merged
+        return _pad_reply_candidates(
+            merged,
+            fallback_action=normalized_action,
+            max_chars=persona.max_reply_chars,
             limit=candidate_count,
         )
 
@@ -1112,6 +1146,121 @@ def _parse_reply_candidates(
             dropped_reasons=tuple(dropped_reasons),
         )
     return tuple(parsed)
+
+
+def _reply_candidates_retry_request(
+    request: dict[str, object],
+    *,
+    previous_content: str,
+    parsed_count: int,
+    candidate_count: int,
+) -> dict[str, object]:
+    messages = list(request.get("messages", []))
+    messages.extend(
+        [
+            {"role": "assistant", "content": previous_content},
+            {
+                "role": "user",
+                "content": (
+                    f"上一轮只成功解析出 {parsed_count} 条候选，但必须给满 {candidate_count} 条。"
+                    "请重新输出一个完整 JSON 对象，格式严格为 "
+                    '{"candidates":[{"text":"...","style":"...","action":"reply"}]}。'
+                    f"candidates 必须正好 {candidate_count} 条，text 不能空，三条不能重复，"
+                    "不要输出 JSON 以外的任何文字。"
+                ),
+            },
+        ]
+    )
+    retry_request = dict(request)
+    retry_request["messages"] = messages
+    retry_request["max_tokens"] = max(int(request.get("max_tokens", 0) or 0), 900)
+    retry_request["response_format"] = {"type": "json_object"}
+    return retry_request
+
+
+def _merge_reply_candidates(
+    first: tuple[ReplyCandidateDraft, ...],
+    second: tuple[ReplyCandidateDraft, ...],
+    *,
+    limit: int,
+) -> tuple[ReplyCandidateDraft, ...]:
+    merged: list[ReplyCandidateDraft] = []
+    seen: set[str] = set()
+    for candidate in (*first, *second):
+        compact_text = re.sub(r"\s+", "", candidate.text)
+        if not compact_text or compact_text in seen:
+            continue
+        seen.add(compact_text)
+        merged.append(candidate)
+        if len(merged) >= limit:
+            break
+    return tuple(merged)
+
+
+def _pad_reply_candidates(
+    candidates: tuple[ReplyCandidateDraft, ...],
+    *,
+    fallback_action: str,
+    max_chars: int,
+    limit: int,
+) -> tuple[ReplyCandidateDraft, ...]:
+    padded = list(candidates)
+    seen = {re.sub(r"\s+", "", candidate.text) for candidate in padded}
+    fallback_texts = _fallback_candidate_texts(fallback_action)
+    for text in fallback_texts:
+        clean_text = _sanitize_reply(text, max_chars)
+        compact_text = re.sub(r"\s+", "", clean_text)
+        if not clean_text or compact_text in seen:
+            continue
+        seen.add(compact_text)
+        padded.append(
+            ReplyCandidateDraft(
+                text=clean_text,
+                action=fallback_action,
+                style="后端补齐：模型候选不足时的保守备选",
+            )
+        )
+        if len(padded) >= limit:
+            break
+    return tuple(padded[:limit])
+
+
+def _fallback_candidate_texts(action: str) -> tuple[str, ...]:
+    if action == "care":
+        return (
+            "风雪觉得这事先别急，慢慢捋清楚比较好。",
+            "先缓一下，别把自己逼太紧。",
+            "这个先别硬扛，能少受点罪就少受点。",
+        )
+    if action == "agree":
+        return (
+            "风雪觉得这个说法有点道理。",
+            "这句方向没跑偏，至少抓到重点了。",
+            "这个判断还行，不算乱说。",
+        )
+    if action == "answer":
+        return (
+            "风雪觉得先按这个方向看，别把关键点漏了。",
+            "简单说，这事要看成本和后果。",
+            "先别绕，核心就是值不值。",
+        )
+    if action in {"tease", "mock_repeated_question"}:
+        return (
+            "风雪觉得这事有点抽象。",
+            "这也太会给自己加戏了。",
+            "先别急着上强度，路都快走歪了。",
+        )
+    if action == "ask_back":
+        return (
+            "风雪有点好奇，你这是认真问还是在钓我？",
+            "那你自己先说，你到底想听哪种答案？",
+            "你这句重点是问结果，还是问态度？",
+        )
+    return (
+        "风雪觉得这句可以先轻轻放着。",
+        "那先看他后面怎么说。",
+        "这句接一下可以，但别聊太满。",
+    )
 
 
 def _log_reply_candidate_parse_diagnostic(
