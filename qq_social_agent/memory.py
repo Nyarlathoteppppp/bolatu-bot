@@ -26,7 +26,7 @@ class RawCorpusExample:
     before: tuple[ChatMessage, ...]
     after: tuple[ChatMessage, ...]
     tags: tuple[str, ...]
-    score: int
+    score: float
 
 
 @dataclass(frozen=True)
@@ -579,6 +579,10 @@ class MemoryStore:
         context_radius: int = 2,
         exclude_user_id: int | None = None,
         exclude_text: str = "",
+        preferred_user_id: int | None = None,
+        preferred_limit: int = 0,
+        preferred_score_multiplier: float = 1.0,
+        preferred_score_bonus: float = 0.0,
     ) -> list[RawCorpusExample]:
         rows = self.conn.execute(
             """
@@ -590,7 +594,7 @@ class MemoryStore:
             """,
             (group_id, candidate_limit),
         ).fetchall()
-        scored: list[tuple[int, float, int, ChatMessage, tuple[str, ...]]] = []
+        scored: list[tuple[float, float, int, ChatMessage, tuple[str, ...]]] = []
         excluded_text_key = _compact_text(exclude_text)
         for row in rows:
             message = _message_from_row(row)
@@ -604,10 +608,13 @@ class MemoryStore:
             score = _text_relevance_score(query, haystack)
             if score <= 0:
                 continue
+            if preferred_user_id is not None and message.user_id == preferred_user_id:
+                score = score * preferred_score_multiplier + preferred_score_bonus
             scored.append((score, message.created_at, message.id, message, tags))
         scored.sort(key=lambda item: (item[0], item[1], item[2]), reverse=True)
 
-        examples: list[RawCorpusExample] = []
+        preferred_examples: list[RawCorpusExample] = []
+        regular_examples: list[RawCorpusExample] = []
         seen_texts: set[str] = set()
         for score, _, _, message, tags in scored:
             text_key = _compact_text(message.text)
@@ -619,18 +626,26 @@ class MemoryStore:
                 message.id,
                 radius=context_radius,
             )
-            examples.append(
-                RawCorpusExample(
-                    message=message,
-                    before=tuple(before),
-                    after=tuple(after),
-                    tags=tags,
-                    score=score,
-                )
+            example = RawCorpusExample(
+                message=message,
+                before=tuple(before),
+                after=tuple(after),
+                tags=tags,
+                score=score,
             )
-            if len(examples) >= limit:
+            if (
+                preferred_user_id is not None
+                and message.user_id == preferred_user_id
+                and preferred_limit > 0
+            ):
+                if len(preferred_examples) < preferred_limit:
+                    preferred_examples.append(example)
+                continue
+            else:
+                regular_examples.append(example)
+            if len(regular_examples) >= limit and len(preferred_examples) >= preferred_limit:
                 break
-        return examples
+        return (preferred_examples + regular_examples)[:limit]
 
     def _message_neighbors(
         self,

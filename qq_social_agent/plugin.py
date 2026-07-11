@@ -122,6 +122,13 @@ MEMBER_IMPRESSION_CONTEXT_LIMIT = 8
 RAW_CORPUS_CONTEXT_LIMIT = 6
 RAW_CORPUS_CANDIDATE_LIMIT = 240
 RAW_CORPUS_CONTEXT_RADIUS = 2
+FOCUSED_STYLE_USER_ID = 184589072
+FOCUSED_STYLE_USER_NAME = "小鸟"
+FOCUSED_STYLE_EXTRA_LIMIT = 12
+FOCUSED_STYLE_LOOKBACK_SECONDS = 7 * 24 * 60 * 60
+FOCUSED_RAW_CORPUS_LIMIT = 2
+FOCUSED_RAW_CORPUS_SCORE_MULTIPLIER = 1.25
+FOCUSED_RAW_CORPUS_SCORE_BONUS = 2.0
 LONG_MESSAGE_SUMMARY_THRESHOLD = 100
 LONG_MESSAGE_SUMMARY_SOURCE_LIMIT = 1800
 LONG_MESSAGE_SUMMARY_FALLBACK_HEAD = 72
@@ -1545,6 +1552,10 @@ async def _handle_group_message_locked(
             context_radius=RAW_CORPUS_CONTEXT_RADIUS,
             exclude_user_id=user_id,
             exclude_text=text,
+            preferred_user_id=FOCUSED_STYLE_USER_ID,
+            preferred_limit=FOCUSED_RAW_CORPUS_LIMIT,
+            preferred_score_multiplier=FOCUSED_RAW_CORPUS_SCORE_MULTIPLIER,
+            preferred_score_bonus=FOCUSED_RAW_CORPUS_SCORE_BONUS,
         )
     )
     if not jargon_context:
@@ -2719,6 +2730,7 @@ async def _maintain_group_learning(group_id: int) -> None:
         group_id,
         limit=STYLE_LEARN_MESSAGE_LIMIT,
     )
+    style_messages = _style_learning_messages_with_focus(group_id, style_messages)
     if len(style_messages) < STYLE_LEARN_MIN_MESSAGES:
         return
     last_style_learn_attempt[group_id] = time.time()
@@ -2746,6 +2758,36 @@ async def _maintain_group_learning(group_id: int) -> None:
             )
     except Exception as exc:
         logger.warning(f"qq_social_agent style learning skipped: group={group_id} error={exc}")
+
+
+def _style_learning_messages_with_focus(
+    group_id: int,
+    messages: list[ChatMessage],
+    *,
+    now: float | None = None,
+) -> list[ChatMessage]:
+    current_time = now or time.time()
+    focused_messages = memory.member_messages_between(
+        group_id,
+        FOCUSED_STYLE_USER_ID,
+        start_at=current_time - FOCUSED_STYLE_LOOKBACK_SECONDS,
+        end_at=current_time + 1,
+        limit=FOCUSED_STYLE_EXTRA_LIMIT,
+    )
+    if not focused_messages:
+        return messages
+
+    by_key: dict[tuple[int, int, float, str], ChatMessage] = {}
+    for message in (*messages, *focused_messages):
+        key = (message.id, message.user_id, message.created_at, message.text)
+        by_key[key] = message
+    merged = sorted(by_key.values(), key=lambda item: (item.created_at, item.id))
+    logger.info(
+        "qq_social_agent style learning focus boosted: "
+        f"group={group_id} user={FOCUSED_STYLE_USER_ID} base={len(messages)} "
+        f"focused={len(focused_messages)} merged={len(merged)}"
+    )
+    return merged
 
 
 async def _maintain_member_profile_summaries(group_id: int, *, force: bool = False) -> None:

@@ -39,6 +39,7 @@ from qq_social_agent.plugin import (
     _pre_decision_gate,
     _record_user_reply,
     _sanitize_generated_text,
+    _style_learning_messages_with_focus,
     _user_reply_cooling_down,
 )
 from qq_social_agent.cue_patterns import CueRepeatState
@@ -126,6 +127,20 @@ def test_compact_long_message_fallback_keeps_short_marker() -> None:
     assert len(compacted) < len(text)
     assert "长消息" in compacted
     assert "已省略" in compacted
+
+
+def test_style_learning_messages_with_focus_adds_xiaoniao(monkeypatch, tmp_path) -> None:
+    store = _use_temp_plugin_memory(monkeypatch, tmp_path)
+    store.add_message(1026813421, 100, "A", "普通群友一句话", created_at=100)
+    store.add_message(1026813421, 184589072, "小鸟", "小鸟的表达应该额外混入", created_at=120)
+    base = [
+        ChatMessage(1026813421, 100, "A", "普通群友一句话", False, 100.0, id=1),
+    ]
+
+    boosted = _style_learning_messages_with_focus(1026813421, base, now=180)
+
+    assert [message.user_id for message in boosted] == [100, 184589072]
+    assert boosted[-1].text == "小鸟的表达应该额外混入"
 
 
 def _buffered_item(group_id: int, text: str, *, user_id: int = 184589072) -> plugin.BufferedGroupMessage:

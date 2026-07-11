@@ -117,6 +117,28 @@ def test_relevant_raw_corpus_examples_excludes_current_message(tmp_path) -> None
     assert [example.message.user_id for example in examples] == [100]
 
 
+def test_relevant_raw_corpus_examples_prefers_selected_user_with_limit(tmp_path) -> None:
+    memory = MemoryStore(tmp_path / "bot.sqlite3")
+    memory.add_message(1, 100, "A", "股票亏了怎么接", created_at=100)
+    memory.add_message(1, 101, "B", "股票亏了真难受", created_at=101)
+    memory.add_message(1, 184589072, "小鸟", "股票亏了先别装高手", created_at=90)
+    memory.add_message(1, 184589072, "小鸟", "股票亏了就是交学费", created_at=91)
+    memory.add_message(1, 184589072, "小鸟", "股票亏了但这句不用学", created_at=92)
+
+    examples = memory.relevant_raw_corpus_examples(
+        1,
+        "股票亏了",
+        limit=4,
+        preferred_user_id=184589072,
+        preferred_limit=2,
+        preferred_score_multiplier=1.25,
+        preferred_score_bonus=2.0,
+    )
+
+    assert [example.message.user_id for example in examples[:2]] == [184589072, 184589072]
+    assert sum(1 for example in examples if example.message.user_id == 184589072) == 2
+
+
 def test_member_profiles_track_aliases_by_user_id(tmp_path) -> None:
     memory = MemoryStore(tmp_path / "bot.sqlite3")
 
