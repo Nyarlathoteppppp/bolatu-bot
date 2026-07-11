@@ -9,6 +9,8 @@ logs/
 __pycache__/
 .pytest_cache/
 *.pyc
+Dockerfile.server.localbase
+docker-compose.server.yml.bak-*
 data/*.sqlite3-shm
 data/*.sqlite3-wal
 .DS_Store
