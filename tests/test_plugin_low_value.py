@@ -231,7 +231,23 @@ def test_group_buffer_flush_marks_generation_and_reschedules_pending(monkeypatch
 
 
 def test_low_value_group_text_ignored() -> None:
-    for text in ["好的", "一般", "可以", "绷", "嗯", "6", "哈哈", "哈哈哈哈！！！", "草"]:
+    for text in [
+        "好的",
+        "一般",
+        "可以",
+        "绷",
+        "蹦",
+        "没绷住",
+        "没绷住了",
+        "绷不住",
+        "绷不住了",
+        "好好好",
+        "嗯",
+        "6",
+        "哈哈",
+        "哈哈哈哈！！！",
+        "草",
+    ]:
         assert _is_low_value_group_text(text)
 
 
@@ -809,7 +825,7 @@ def test_pre_decision_gate_allows_weak_passive_text_to_llm() -> None:
 
 def test_pre_decision_gate_skips_plain_ack_as_low_value() -> None:
     result = _pre_decision_gate(
-        text="可以",
+        text="没绷住",
         recent_messages=[],
         persona=plugin.personas.get(plugin.app_config.default_persona),
         addressed_bot=False,
