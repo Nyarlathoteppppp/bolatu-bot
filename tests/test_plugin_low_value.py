@@ -330,6 +330,18 @@ def test_replied_to_bot_uses_event_reply_sender() -> None:
     assert plugin._replied_to_bot(event, bot)
 
 
+def test_mentioned_bot_recognizes_fengxue_alias() -> None:
+    bot = SimpleNamespace(self_id=1801507496)
+    event = SimpleNamespace(
+        self_id=1801507496,
+        to_me=False,
+        message=[SimpleNamespace(type="text", data={"text": "风雪你看看"})],
+        get_plaintext=lambda: "风雪你看看",
+    )
+
+    assert plugin._mentioned_bot(event, bot)
+
+
 def test_reply_to_bot_context_marks_zhangfengxue_as_self() -> None:
     reply_message = SimpleNamespace(extract_plain_text=lambda: "风雪觉得这个有点离谱")
     event = SimpleNamespace(
@@ -353,6 +365,47 @@ def test_reply_to_bot_context_marks_zhangfengxue_as_self() -> None:
     assert "群友回复张风雪/风雪，就是在回复你之前说的话" in text
     assert "歌迷老蛆[#71184]回复张风雪[#07496]消息" in text
     assert "张风雪[#07496]说：风雪觉得这个有点离谱" in text
+
+
+def test_plain_mention_of_fengxue_marks_self_context() -> None:
+    event = SimpleNamespace(
+        user_id=1535071184,
+        sender=SimpleNamespace(card="歌迷老蛆", nickname=""),
+        reply=None,
+        message=[
+            SimpleNamespace(type="text", data={"text": "风雪你怎么看这个"}),
+        ],
+        get_plaintext=lambda: "风雪你怎么看这个",
+    )
+
+    text = plugin._message_context_text(event, bot_id=1801507496)
+
+    assert text.startswith("注：张风雪和风雪都是你自己")
+    assert "风雪你怎么看这个" in text
+
+
+def test_reply_to_other_that_mentions_fengxue_marks_self_context() -> None:
+    reply_message = SimpleNamespace(extract_plain_text=lambda: "这个选择怎么样")
+    event = SimpleNamespace(
+        user_id=1535071184,
+        sender=SimpleNamespace(card="歌迷老蛆", nickname=""),
+        reply=SimpleNamespace(
+            user_id=123456789,
+            sender=SimpleNamespace(card="安钰与雨与余", nickname=""),
+            message=reply_message,
+        ),
+        message=[
+            SimpleNamespace(type="reply", data={"id": "42"}),
+            SimpleNamespace(type="text", data={"text": "问问风雪呗"}),
+        ],
+        get_plaintext=lambda: "问问风雪呗",
+    )
+
+    text = plugin._message_context_text(event, bot_id=1801507496)
+
+    assert "张风雪和风雪都是你自己" in text
+    assert "歌迷老蛆[#71184]回复安钰与雨与余[#56789]" in text
+    assert "歌迷老蛆[#71184]回复安钰与雨与余[#56789]：问问风雪呗" in text
 
 
 def test_low_value_reply_to_bot_event_ignores_plain_ack() -> None:

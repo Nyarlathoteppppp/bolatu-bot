@@ -138,6 +138,7 @@ LONG_MESSAGE_SUMMARY_SOURCE_LIMIT = 1800
 LONG_MESSAGE_SUMMARY_FALLBACK_HEAD = 72
 LONG_MESSAGE_SUMMARY_FALLBACK_TAIL = 28
 FORWARD_CONTEXT_MAX_RECORDS = 16
+BOT_SELF_NAME_ALIASES = ("张风雪", "风雪")
 FORWARD_CONTEXT_SUMMARY_THRESHOLD = 120
 UNREADABLE_MEDIA_SEGMENT_TYPES = {"image", "mface", "face", "record", "video"}
 JARGON_CONTEXT_LOOKBACK = 4
@@ -2491,6 +2492,8 @@ def _message_context_text(event: GroupMessageEvent | PrivateMessageEvent, *, bot
     reply_context = _event_reply_context(event, reply_text=" ".join(parts).strip(), bot_id=bot_id)
     if reply_context:
         parts = [reply_context]
+    elif bot_id is not None and _mentions_bot_self_name(" ".join(parts)):
+        parts.insert(0, _bot_self_name_mention_hint())
     text = " ".join(parts).strip()
     return re.sub(r"\s+", " ", text)
 
@@ -2653,6 +2656,8 @@ def _event_reply_context(
     self_identity_hint = ""
     if bot_id is not None and user_id is not None and int(user_id) == int(bot_id):
         self_identity_hint = "注：张风雪和风雪都是你自己；群友回复张风雪/风雪，就是在回复你之前说的话。"
+    elif bot_id is not None and _mentions_bot_self_name(current_reply):
+        self_identity_hint = _bot_self_name_mention_hint()
     if message_text:
         original_text = _short_notice_text(message_text, 100)
         return (
@@ -3737,6 +3742,14 @@ def _handle_memory_atom_command_text(user_id: int, group_id: int | None, text: s
 def _member_label(user_id: int, nickname: str) -> str:
     clean_name = nickname.strip() or str(user_id)
     return f"{clean_name}[#{str(user_id)[-5:]}]"
+
+
+def _mentions_bot_self_name(text: str) -> bool:
+    return any(alias in text for alias in BOT_SELF_NAME_ALIASES)
+
+
+def _bot_self_name_mention_hint() -> str:
+    return "注：张风雪和风雪都是你自己；群友提到张风雪/风雪，就是在说你。"
 
 
 def _format_cue_repeat_context(state: CueRepeatState | None) -> str:
@@ -4963,7 +4976,7 @@ def _mentioned_bot(event: GroupMessageEvent, bot: Bot) -> bool:
         if seg.type == "at" and str(seg.data.get("qq")) in bot_ids:
             return True
 
-    names = get_driver().config.nickname or set()
+    names = set(get_driver().config.nickname or set()) | set(BOT_SELF_NAME_ALIASES)
     text = event.get_plaintext()
     return any(name and str(name) in text for name in names)
 
