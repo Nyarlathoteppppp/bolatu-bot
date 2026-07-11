@@ -128,6 +128,11 @@ RAW_CORPUS_CANDIDATE_LIMIT = 240
 RAW_CORPUS_CONTEXT_RADIUS = 2
 FOCUSED_STYLE_USER_ID = 184589072
 FOCUSED_STYLE_USER_NAME = "小鸟"
+FOCUSED_USER_TONE_CONTEXT = (
+    "当前触发人是小鸟 / 184589072。最高优先级：回复小鸟时必须超级温柔、可爱、亲近，"
+    "像很偏心地哄熟人妹妹一样接她的话。不要对小鸟本人嘴损、冷嘲热讽、压迫式反问或攻击；"
+    "即使 action=tease，也只能轻轻逗她、顺毛式吐槽场景，不能怼她。"
+)
 FOCUSED_STYLE_EXTRA_LIMIT = 12
 FOCUSED_STYLE_LOOKBACK_SECONDS = 7 * 24 * 60 * 60
 FOCUSED_RAW_CORPUS_LIMIT = 2
@@ -1855,6 +1860,7 @@ async def _handle_group_message_locked(
             recall_feedback_context=recall_feedback_context,
             positive_feedback_context=positive_feedback_context,
             mention_targets=_format_mention_targets(mention_targets),
+            priority_context=_focused_user_tone_context(user_id),
             include_bot_history=False,
         )
     except Exception as exc:
@@ -3744,6 +3750,12 @@ def _handle_memory_atom_command_text(user_id: int, group_id: int | None, text: s
 def _member_label(user_id: int, nickname: str) -> str:
     clean_name = nickname.strip() or str(user_id)
     return f"{clean_name}[#{str(user_id)[-5:]}]"
+
+
+def _focused_user_tone_context(user_id: int) -> str:
+    if user_id == FOCUSED_STYLE_USER_ID:
+        return FOCUSED_USER_TONE_CONTEXT
+    return ""
 
 
 def _mentions_bot_self_name(text: str) -> bool:

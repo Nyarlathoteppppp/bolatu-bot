@@ -383,6 +383,7 @@ flows:
       ${raw_corpus_context_section}
       ${jargon_context_section}
       ${mention_targets_section}
+      ${priority_context_section}
       ${market_section}
       ${fresh_section}
 

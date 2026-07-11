@@ -481,3 +481,61 @@ def test_reply_candidates_retries_when_model_returns_too_few() -> None:
     retry_messages = requests[1]["messages"]
     assert isinstance(retry_messages, list)
     assert "必须给满 3 条" in retry_messages[-1]["content"]
+
+
+def test_reply_candidates_includes_priority_context() -> None:
+    client = DeepSeekClient.__new__(DeepSeekClient)
+    client.config = SimpleNamespace(
+        max_tokens=900,
+        thinking="disabled",
+        reasoning_effort="low",
+        temperature=0.6,
+    )
+    client.prompts = PromptRegistry()
+    captured_requests: list[dict[str, object]] = []
+
+    async def fake_chat_completion(*, task: str, route_name: str, request: dict[str, object]) -> object:
+        captured_requests.append(request)
+        return SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(
+                        content=(
+                            '{"candidates":['
+                            '{"text":"小鸟别急呀，风雪陪你慢慢看","style":"温柔可爱","action":"care"},'
+                            '{"text":"这事先别慌，风雪觉得可以一点点拆","style":"顺毛安慰","action":"care"},'
+                            '{"text":"小鸟这句有点委屈欸，先抱一下再说","style":"亲近承接","action":"care"}'
+                            ']}'
+                        )
+                    ),
+                )
+            ]
+        )
+
+    client._chat_completion = fake_chat_completion
+    persona = Persona(
+        id="test",
+        name="张风雪",
+        description="",
+        prompt="人格",
+        decision_prompt="决策人格",
+        keywords=(),
+        max_reply_chars=120,
+        passive_reply_probability=0.5,
+    )
+
+    asyncio.run(
+        client.reply_candidates(
+            persona=persona,
+            recent_messages=[],
+            current_text="我有点难受",
+            current_nickname="小鸟[#89072]",
+            mentioned=True,
+            action="care",
+            priority_context="当前触发人是小鸟 / 184589072。最高优先级：回复小鸟时必须超级温柔、可爱。",
+        )
+    )
+
+    user_prompt = captured_requests[0]["messages"][1]["content"]
+    assert "最高优先级语气要求" in user_prompt
+    assert "回复小鸟时必须超级温柔" in user_prompt

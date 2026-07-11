@@ -475,6 +475,7 @@ class DeepSeekClient:
         recall_feedback_context: str = "",
         positive_feedback_context: str = "",
         mention_targets: str = "",
+        priority_context: str = "",
         include_bot_history: bool = True,
         candidate_count: int = 3,
     ) -> tuple[ReplyCandidateDraft, ...]:
@@ -524,6 +525,7 @@ class DeepSeekClient:
             raw_corpus_context_section=_optional_section("群友原文语料参考", raw_corpus_context),
             jargon_context_section=_optional_section("群内黑话词典", jargon_context),
             mention_targets_section=_optional_section("可艾特目标", mention_targets),
+            priority_context_section=_optional_section("最高优先级语气要求", priority_context),
             market_section=market_section,
             fresh_section=fresh_section,
             current_nickname=current_nickname,

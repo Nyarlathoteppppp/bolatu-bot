@@ -917,6 +917,11 @@ def test_member_label_uses_qq_tail() -> None:
     assert _member_label(3370998238, "乌木") == "乌木[#98238]"
 
 
+def test_focused_user_tone_context_only_for_xiaoniao() -> None:
+    assert "必须超级温柔" in plugin._focused_user_tone_context(184589072)
+    assert plugin._focused_user_tone_context(3370998238) == ""
+
+
 def test_format_member_context_includes_aliases() -> None:
     context = _format_member_context(
         [
