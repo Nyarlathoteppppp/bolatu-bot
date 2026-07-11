@@ -3,6 +3,7 @@
 .env.*
 !.env.example
 logs/
+server-data/
 *.log
 *.pid
 *.egg-info/
