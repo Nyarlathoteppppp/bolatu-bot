@@ -1249,22 +1249,6 @@ async def handle_group_message(bot: Bot, event: GroupMessageEvent) -> None:
         has_media=_message_has_context_media(event),
     )
     text = raw_text
-    if group_allowed and not addressed_bot and _is_weak_reply_to_other_event(event):
-        memory.add_message(group_id, int(event.user_id), _nickname(event), raw_text or plain_text, is_bot=False)
-        logger.info(
-            "qq_social_agent ignored weak reply to another member: "
-            f"group={group_id} user={int(event.user_id)} text={raw_text!r}"
-        )
-        await _send_approval_suppression_notice(
-            bot,
-            group_id=group_id,
-            user_id=int(event.user_id),
-            nickname=_nickname(event),
-            text=raw_text,
-            stage="backend_weak_reply_to_other",
-            reason="后端拦截：这条是回复其他群友的短答/定向回应，不是开放话题，不进入 buffer 和 LLM decision。",
-        )
-        return
     if group_allowed and not addressed_bot and _should_ignore_unreadable_media_event(event, forward_context=forward_context):
         memory.add_message(group_id, int(event.user_id), _nickname(event), raw_text or plain_text or "[不可见媒体]", is_bot=False)
         logger.info(
@@ -2490,9 +2474,12 @@ def _event_plain_text(event: GroupMessageEvent | PrivateMessageEvent) -> str:
 
 def _message_context_text(event: GroupMessageEvent | PrivateMessageEvent) -> str:
     parts: list[str] = []
+    has_structured_reply_context = bool(_event_reply_context(event))
     for segment in event.message:
         segment_type = str(getattr(segment, "type", "") or "")
         data = getattr(segment, "data", {}) or {}
+        if segment_type == "reply" and has_structured_reply_context:
+            continue
         if segment_type == "text":
             text = str(data.get("text", "")).strip()
             if text:
@@ -2501,9 +2488,9 @@ def _message_context_text(event: GroupMessageEvent | PrivateMessageEvent) -> str
         placeholder = _message_segment_placeholder(segment_type, data)
         if placeholder:
             parts.append(placeholder)
-    reply_context = _event_reply_context(event)
+    reply_context = _event_reply_context(event, reply_text=" ".join(parts).strip())
     if reply_context:
-        parts.insert(0, reply_context)
+        parts = [reply_context]
     text = " ".join(parts).strip()
     return re.sub(r"\s+", " ", text)
 
@@ -2560,15 +2547,6 @@ def _should_ignore_unreadable_media_event(
     return False
 
 
-def _is_weak_reply_to_other_event(event: GroupMessageEvent | PrivateMessageEvent) -> bool:
-    if not _event_has_reply_context(event):
-        return False
-    if _message_has_non_reply_media(event):
-        return False
-    plain_text = _plain_text(event) if isinstance(event, GroupMessageEvent) else _event_plain_text(event)
-    return _is_weak_directed_reply_text(plain_text)
-
-
 def _event_has_reply_context(event: GroupMessageEvent | PrivateMessageEvent) -> bool:
     if getattr(event, "reply", None) is not None:
         return True
@@ -2576,52 +2554,6 @@ def _event_has_reply_context(event: GroupMessageEvent | PrivateMessageEvent) -> 
         if str(getattr(segment, "type", "") or "") == "reply":
             return True
     return False
-
-
-def _is_weak_directed_reply_text(text: str) -> bool:
-    compact = re.sub(r"[^\w\u4e00-\u9fff]+", "", text).casefold()
-    if not compact:
-        return True
-    if _is_low_value_group_text(text):
-        return True
-    if len(compact) > 8:
-        return False
-    strong_markers = (
-        "？",
-        "?",
-        "怎么",
-        "为啥",
-        "为什么",
-        "咋",
-        "咋办",
-        "怎么看",
-        "要不要",
-        "值不值",
-        "亏",
-        "赚",
-        "风险",
-        "学校",
-        "专业",
-        "就业",
-        "工资",
-        "破防",
-        "难受",
-        "烦",
-        "气死",
-        "离谱",
-        "抽象",
-        "典",
-        "绷",
-        "闹麻",
-        "赢麻",
-        "Claude",
-        "claude",
-        "AI",
-        "ai",
-    )
-    if any(marker in text for marker in strong_markers):
-        return False
-    return True
 
 
 def _is_weak_media_caption(text: str) -> bool:
@@ -2683,7 +2615,7 @@ def _message_segment_placeholder(segment_type: str, data: dict[str, object]) -> 
     return ""
 
 
-def _event_reply_context(event: GroupMessageEvent | PrivateMessageEvent) -> str:
+def _event_reply_context(event: GroupMessageEvent | PrivateMessageEvent, *, reply_text: str = "") -> str:
     reply = getattr(event, "reply", None)
     if reply is None:
         return ""
@@ -2699,11 +2631,36 @@ def _event_reply_context(event: GroupMessageEvent | PrivateMessageEvent) -> str:
     user_id = getattr(reply, "user_id", None)
     if sender is not None:
         nickname = str(getattr(sender, "card", "") or getattr(sender, "nickname", "") or "").strip()
-    label = _member_label(int(user_id), nickname or str(user_id)) if user_id else (nickname or "某人")
+    replied_label = _member_label(int(user_id), nickname or str(user_id)) if user_id else (nickname or "某人")
+    current_user_id = getattr(event, "user_id", None)
+    current_sender = getattr(event, "sender", None)
+    current_nickname = ""
+    if current_sender is not None:
+        current_nickname = str(
+            getattr(current_sender, "card", "") or getattr(current_sender, "nickname", "") or ""
+        ).strip()
+    current_label = (
+        _member_label(int(current_user_id), current_nickname or str(current_user_id))
+        if current_user_id
+        else "当前发言人"
+    )
+    current_reply = _short_notice_text(reply_text, 100) if reply_text else "空消息"
     if message_text:
-        return f"[回复：{label}: {_short_notice_text(message_text, 80)}]"
+        original_text = _short_notice_text(message_text, 100)
+        return (
+            f"{current_label}回复{replied_label}消息【"
+            f"{replied_label}说：{original_text}；"
+            f"{current_label}回复{replied_label}：{current_reply}】"
+        )
     message_id = getattr(reply, "message_id", None)
-    return f"[回复：{label} 的消息 {message_id}]" if message_id else f"[回复：{label} 的消息]"
+    original_hint = f"{replied_label}原消息内容未知"
+    if message_id:
+        original_hint = f"{replied_label}原消息内容未知，消息ID：{message_id}"
+    return (
+        f"{current_label}回复{replied_label}消息【"
+        f"{original_hint}；"
+        f"{current_label}回复{replied_label}：{current_reply}】"
+    )
 
 
 def _jargon_command_group_id(event: Event) -> int | None:

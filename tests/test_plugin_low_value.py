@@ -299,6 +299,8 @@ def test_message_context_text_includes_media_and_reply() -> None:
         message_id=42,
     )
     event = SimpleNamespace(
+        user_id=1535071184,
+        sender=SimpleNamespace(card="歌迷老蛆", nickname=""),
         reply=reply,
         message=[
             SimpleNamespace(type="reply", data={"id": "42"}),
@@ -310,7 +312,9 @@ def test_message_context_text_includes_media_and_reply() -> None:
 
     text = plugin._message_context_text(event)
 
-    assert "[回复：小鸟[#89072]: 原消息内容很长但是能被摘要]" in text
+    assert "歌迷老蛆[#71184]回复小鸟[#89072]消息" in text
+    assert "小鸟[#89072]说：原消息内容很长但是能被摘要" in text
+    assert "歌迷老蛆[#71184]回复小鸟[#89072]：你看这个 [图片] [转发消息]" in text
     assert "你看这个" in text
     assert "[图片]" in text
     assert "[转发消息]" in text
@@ -362,9 +366,16 @@ def test_low_value_reply_to_bot_event_allows_media_reply() -> None:
     assert not plugin._is_low_value_reply_to_bot_event(event)
 
 
-def test_weak_reply_to_other_event_ignores_short_directed_answer() -> None:
+def test_reply_to_other_short_answer_enters_structured_context() -> None:
+    reply_message = SimpleNamespace(extract_plain_text=lambda: "恩泽去南京了？")
     event = SimpleNamespace(
-        reply=SimpleNamespace(user_id=123456789),
+        user_id=1535071184,
+        sender=SimpleNamespace(card="歌迷老蛆", nickname=""),
+        reply=SimpleNamespace(
+            user_id=123456789,
+            sender=SimpleNamespace(card="安钰与雨与余", nickname=""),
+            message=reply_message,
+        ),
         message=[
             SimpleNamespace(type="reply", data={"id": "42"}),
             SimpleNamespace(type="text", data={"text": "南下了"}),
@@ -372,12 +383,23 @@ def test_weak_reply_to_other_event_ignores_short_directed_answer() -> None:
         get_plaintext=lambda: "南下了",
     )
 
-    assert plugin._is_weak_reply_to_other_event(event)
+    text = plugin._message_context_text(event)
+
+    assert "歌迷老蛆[#71184]回复安钰与雨与余[#56789]消息" in text
+    assert "安钰与雨与余[#56789]说：恩泽去南京了？" in text
+    assert "歌迷老蛆[#71184]回复安钰与雨与余[#56789]：南下了" in text
 
 
-def test_weak_reply_to_other_event_allows_question_or_opinion() -> None:
+def test_reply_to_other_unknown_original_uses_clear_fallback() -> None:
     event = SimpleNamespace(
-        reply=SimpleNamespace(user_id=123456789),
+        user_id=1535071184,
+        sender=SimpleNamespace(card="歌迷老蛆", nickname=""),
+        reply=SimpleNamespace(
+            user_id=123456789,
+            sender=SimpleNamespace(card="安钰与雨与余", nickname=""),
+            message=None,
+            message_id=42,
+        ),
         message=[
             SimpleNamespace(type="reply", data={"id": "42"}),
             SimpleNamespace(type="text", data={"text": "那你怎么看这个学校"}),
@@ -385,12 +407,22 @@ def test_weak_reply_to_other_event_allows_question_or_opinion() -> None:
         get_plaintext=lambda: "那你怎么看这个学校",
     )
 
-    assert not plugin._is_weak_reply_to_other_event(event)
+    text = plugin._message_context_text(event)
+
+    assert "安钰与雨与余[#56789]原消息内容未知，消息ID：42" in text
+    assert "歌迷老蛆[#71184]回复安钰与雨与余[#56789]：那你怎么看这个学校" in text
 
 
-def test_weak_reply_to_other_event_allows_media() -> None:
+def test_reply_to_other_media_stays_in_structured_reply_text() -> None:
+    reply_message = SimpleNamespace(extract_plain_text=lambda: "你看看这个")
     event = SimpleNamespace(
-        reply=SimpleNamespace(user_id=123456789),
+        user_id=1535071184,
+        sender=SimpleNamespace(card="歌迷老蛆", nickname=""),
+        reply=SimpleNamespace(
+            user_id=123456789,
+            sender=SimpleNamespace(card="安钰与雨与余", nickname=""),
+            message=reply_message,
+        ),
         message=[
             SimpleNamespace(type="reply", data={"id": "42"}),
             SimpleNamespace(type="image", data={"summary": "截图"}),
@@ -398,7 +430,9 @@ def test_weak_reply_to_other_event_allows_media() -> None:
         get_plaintext=lambda: "",
     )
 
-    assert not plugin._is_weak_reply_to_other_event(event)
+    text = plugin._message_context_text(event)
+
+    assert "歌迷老蛆[#71184]回复安钰与雨与余[#56789]：[图片:截图]" in text
 
 
 def test_unreadable_image_only_event_should_not_enter_passive_buffer() -> None:
