@@ -256,6 +256,8 @@ def test_approval_help_commands() -> None:
     assert "bot工具 学习" in plugin.APPROVAL_RULES_DETAIL_MESSAGE
     assert "A1拦截" in plugin.APPROVAL_RULES_DETAIL_MESSAGE
     assert "B3群友画像" in plugin.APPROVAL_RULES_DETAIL_MESSAGE
+    assert "D6审批概率" in plugin.APPROVAL_RULES_DETAIL_MESSAGE
+    assert plugin._bot_tool_shortcut_command("D6") == "审批概率"
     assert "/黑话：咱妈 指代：中国" in plugin._bot_tool_message("bot工具 黑话")
     assert "张风雪 bot工具目录" in plugin._bot_tool_message("T")
     assert "bot工具 查看" in plugin._bot_tool_message("A")
@@ -1195,6 +1197,48 @@ def test_basic_approver_cannot_switch_model(monkeypatch, tmp_path) -> None:
 def test_request_group_approval_auto_sends_first_candidate_when_review_disabled(monkeypatch, tmp_path) -> None:
     store = _use_temp_plugin_memory(monkeypatch, tmp_path)
     store.app_kv_set(plugin.APPROVAL_REVIEW_ENABLED_KEY, "false")
+    approval = _pending_approval()
+    bot = FakeApprovalBot()
+
+    asyncio.run(plugin._request_group_approval(bot, approval))
+
+    assert plugin.pending_group_approvals == {}
+    assert bot.group_messages == [(1026813421, "第一条回复")]
+    assert bot.private_messages == []
+    sent_messages = store.recent_messages(1026813421, 3)
+    assert sent_messages[-1].text == "第一条回复"
+
+
+def test_owner_can_set_approval_auto_send_percent(monkeypatch, tmp_path) -> None:
+    _use_temp_plugin_memory(monkeypatch, tmp_path)
+    bot = FakeApprovalBot()
+
+    handled = asyncio.run(plugin._handle_group_approval_private(bot, 1535071184, "审批概率 30"))
+
+    assert handled
+    assert plugin._approval_auto_send_percent() == 30
+    assert "30%" in bot.private_messages[-1][1]
+
+    handled = asyncio.run(plugin._handle_group_approval_private(bot, 1535071184, "审批概率"))
+
+    assert handled
+    assert "免审自动发送概率：30%" in bot.private_messages[-1][1]
+
+
+def test_basic_approver_cannot_set_approval_auto_send_percent(monkeypatch, tmp_path) -> None:
+    _use_temp_plugin_memory(monkeypatch, tmp_path)
+    bot = FakeApprovalBot()
+
+    handled = asyncio.run(plugin._handle_group_approval_private(bot, 3370998238, "审批概率 30"))
+
+    assert handled
+    assert plugin._approval_auto_send_percent() == 0
+    assert bot.private_messages[-1] == (3370998238, "你只有基础审批权限：A/B/C/D/X/1/2/3/取消 处理审批单。")
+
+
+def test_request_group_approval_auto_sends_by_probability(monkeypatch, tmp_path) -> None:
+    store = _use_temp_plugin_memory(monkeypatch, tmp_path)
+    plugin._set_approval_auto_send_percent(100)
     approval = _pending_approval()
     bot = FakeApprovalBot()
 

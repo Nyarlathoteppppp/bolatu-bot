@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import random
 import re
 import time
 from dataclasses import dataclass
@@ -236,9 +237,13 @@ PRIVATE_FORCE_OBEY_ONCE_RE = re.compile(
     re.IGNORECASE | re.DOTALL,
 )
 APPROVAL_REVIEW_ENABLED_KEY = "group_approval_review_enabled"
+APPROVAL_AUTO_SEND_PERCENT_KEY = "group_approval_auto_send_percent"
 APPROVAL_REVIEW_ON_COMMANDS = {"开启审查", "打开审查", "恢复审查", "启用审查", "开启审核", "打开审核"}
 APPROVAL_REVIEW_OFF_COMMANDS = {"关闭审查", "关掉审查", "暂停审查", "免审", "免审批", "关闭审核", "关掉审核"}
 APPROVAL_REVIEW_STATUS_COMMANDS = {"审查状态", "审核状态", "审批状态"}
+APPROVAL_AUTO_SEND_PERCENT_RE = re.compile(
+    r"^(?:/)?(?:审批概率|审查概率|免审概率|自动发送概率)\s*[:：]?\s*(?P<percent>\d{1,3})?%?$"
+)
 MODEL_ROUTE_OVERRIDES_KEY = "llm_model_route_overrides"
 MODEL_ROUTE_STATUS_COMMANDS = {"模型状态", "模型", "model status", "/模型状态"}
 MODEL_ROUTE_RESET_COMMANDS = {"清模型覆盖", "清除模型覆盖", "重置模型", "恢复默认模型", "model reset", "/清模型覆盖"}
@@ -928,10 +933,34 @@ def _set_approval_review_enabled_value(enabled: bool) -> None:
     memory.app_kv_set(APPROVAL_REVIEW_ENABLED_KEY, "true" if enabled else "false")
 
 
+def _approval_auto_send_percent() -> int:
+    raw = memory.app_kv_get(APPROVAL_AUTO_SEND_PERCENT_KEY)
+    try:
+        percent = int((raw or "0").strip())
+    except (TypeError, ValueError):
+        percent = 0
+    return max(0, min(100, percent))
+
+
+def _set_approval_auto_send_percent(percent: int) -> int:
+    cleaned = max(0, min(100, int(percent)))
+    memory.app_kv_set(APPROVAL_AUTO_SEND_PERCENT_KEY, str(cleaned))
+    return cleaned
+
+
+def _approval_auto_send_selected(percent: int) -> bool:
+    return random.random() < max(0, min(100, percent)) / 100.0
+
+
 def _format_approval_review_status() -> str:
     mode = "开启审查：bot 发群前会先发审批单。" if _approval_review_enabled() else "关闭审查：bot 直接发送第 1 候选。"
     pending_count = len(pending_group_approvals)
-    return f"审查状态：{mode}\n当前待审候选：{pending_count} 条。"
+    auto_send_percent = _approval_auto_send_percent()
+    return (
+        f"审查状态：{mode}\n"
+        f"免审自动发送概率：{auto_send_percent}%（审查开启时生效，命中后直接发第 1 候选）。\n"
+        f"当前待审候选：{pending_count} 条。"
+    )
 
 
 def _format_model_route_status() -> str:
@@ -3487,6 +3516,39 @@ async def _request_group_approval(bot: Bot, approval: PendingGroupApproval) -> N
             notify_success=False,
         )
         return
+    auto_send_percent = _approval_auto_send_percent()
+    if auto_send_percent > 0 and _approval_auto_send_selected(auto_send_percent):
+        pending_group_approvals.pop(approval.group_id, None)
+        candidate = approval.candidates[0] if approval.candidates else None
+        if candidate is None:
+            logger.info(
+                "qq_social_agent probabilistic auto approval skipped: "
+                f"group={approval.group_id} reason=no_candidate percent={auto_send_percent}"
+            )
+            return
+        _record_metric_event(
+            "approval_auto_send",
+            group_id=approval.group_id,
+            user_id=approval.trigger_user_id,
+            stage="probability",
+            action=candidate.action,
+            candidate_count=len(approval.candidates),
+            auto_send_percent=auto_send_percent,
+        )
+        logger.info(
+            "qq_social_agent probabilistic auto approval send: "
+            f"group={approval.group_id} approval_id={approval.approval_id} "
+            f"candidate={candidate.index} percent={auto_send_percent}"
+        )
+        await _send_approved_group_reply(
+            bot,
+            approval,
+            candidate,
+            approver_id=None,
+            high_quality=False,
+            notify_success=False,
+        )
+        return
     pending_group_approvals[approval.group_id] = approval
     preview = _format_approval_candidates(approval)
     message = (
@@ -3651,6 +3713,7 @@ def _is_private_tool_text(text: str) -> bool:
         or text in APPROVAL_REVIEW_ON_COMMANDS
         or text in APPROVAL_REVIEW_OFF_COMMANDS
         or text in APPROVAL_REVIEW_STATUS_COMMANDS
+        or APPROVAL_AUTO_SEND_PERCENT_RE.match(text) is not None
         or text in {"开启", "打开", "恢复", "关闭", "关掉", "暂停"}
     )
 
@@ -3868,6 +3931,25 @@ async def _handle_group_approval_private(bot: Bot, user_id: int, text: str) -> b
             await _send_private_text(bot, user_id, BASIC_APPROVAL_DENIED_MESSAGE)
             return True
         await _send_private_text(bot, user_id, _format_suppression_report(suppression_report_limit))
+        return True
+    auto_send_match = APPROVAL_AUTO_SEND_PERCENT_RE.match(compact_text)
+    if auto_send_match is not None:
+        if not is_admin:
+            await _send_private_text(bot, user_id, BASIC_APPROVAL_DENIED_MESSAGE)
+            return True
+        raw_percent = auto_send_match.group("percent")
+        if raw_percent is None:
+            await _send_private_text(bot, user_id, _format_approval_review_status())
+            return True
+        percent = _set_approval_auto_send_percent(int(raw_percent))
+        await _send_private_text(
+            bot,
+            user_id,
+            (
+                f"已设置免审自动发送概率：{percent}%。\n"
+                "审查开启时，命中概率的候选会直接发送第 1 条；未命中仍发审批单。"
+            ),
+        )
         return True
     if compact_text in APPROVAL_REVIEW_STATUS_COMMANDS:
         if not is_admin:

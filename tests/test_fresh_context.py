@@ -1,5 +1,6 @@
 import pytest
 
+import qq_social_agent.tools.fresh_context as fresh_context
 from qq_social_agent.tools.fresh_context import (
     FreshLookup,
     FreshContextTool,
@@ -136,3 +137,22 @@ async def test_fresh_context_rate_limit_failure() -> None:
     assert "查询已达上限" in context
     assert "不要编造最新事实" in context
     assert "不要说“没联网”" in context
+
+
+@pytest.mark.anyio
+async def test_tavily_answer_without_items_keeps_tavily_provider(monkeypatch) -> None:
+    async def fake_tavily_lookup(query: str, *, kind: str, api_key: str):
+        return "只有摘要，没有列表。", ()
+
+    async def fail_google_news(query: str, *, kind: str):
+        raise AssertionError("google news fallback should not run when tavily has answer")
+
+    monkeypatch.setattr(fresh_context, "_fetch_tavily_lookup", fake_tavily_lookup)
+    monkeypatch.setattr(fresh_context, "_fetch_google_news_items", fail_google_news)
+    tool = FreshContextTool(provider="auto", tavily_api_key="test-key")
+
+    lookup = await tool.lookup("美国 伊朗 冲突 最新消息")
+
+    assert lookup.provider == "tavily"
+    assert lookup.status == "ok"
+    assert lookup.answer == "只有摘要，没有列表。"

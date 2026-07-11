@@ -118,7 +118,7 @@ class FreshContextTool:
                 kind=normalized_kind,
                 api_key=self.tavily_api_key,
             )
-            if not items and self.provider == "auto":
+            if not answer and not items and self.provider == "auto":
                 provider = "google_news"
                 items = await _fetch_google_news_items(normalized_query, kind=normalized_kind)
         else:
