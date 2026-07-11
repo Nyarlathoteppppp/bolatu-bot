@@ -261,6 +261,9 @@ def test_approval_help_commands() -> None:
     assert "bot工具 查看" in plugin._bot_tool_message("A")
     assert "bot工具 学习" in plugin._bot_tool_message("B")
     assert "bot工具 模型" in plugin._bot_tool_message("C")
+    assert "统计 今日" in plugin._bot_tool_message("bot工具 查看")
+    assert "记忆单元 20" in plugin._bot_tool_message("bot工具 学习")
+    assert "flows.member_profile" in plugin._bot_tool_message("bot工具 prompt")
     assert "拦截 20" in plugin._bot_tool_message("bot工具 查看")
     assert "记忆 8" in plugin._bot_tool_message("bot工具 学习")
     assert "风格学习 20" in plugin._bot_tool_message("bot工具 风格")
@@ -280,7 +283,35 @@ def test_approval_help_commands() -> None:
     assert "回 A/B/C" in plugin._bot_tool_message("bot工具 审批")
     assert "拦截 50" in plugin._bot_tool_message("bot工具 查看")
     assert plugin._bot_tool_shortcut_command("B3") == "群友画像 20"
+    assert plugin._bot_tool_shortcut_command("A6") == "统计 今日"
+    assert plugin._bot_tool_shortcut_command("B4") == "记忆单元 20"
     assert plugin._bot_tool_shortcut_command("A 1") == "拦截 20"
+
+
+def test_message_context_text_includes_media_and_reply() -> None:
+    reply_message = SimpleNamespace(extract_plain_text=lambda: "原消息内容很长但是能被摘要")
+    reply = SimpleNamespace(
+        message=reply_message,
+        sender=SimpleNamespace(card="小鸟", nickname=""),
+        user_id=184589072,
+        message_id=42,
+    )
+    event = SimpleNamespace(
+        reply=reply,
+        message=[
+            SimpleNamespace(type="reply", data={"id": "42"}),
+            SimpleNamespace(type="text", data={"text": "  你看这个  "}),
+            SimpleNamespace(type="image", data={}),
+            SimpleNamespace(type="json", data={"data": "聊天记录 forward"}),
+        ],
+    )
+
+    text = plugin._message_context_text(event)
+
+    assert "[回复：小鸟[#89072]: 原消息内容很长但是能被摘要]" in text
+    assert "你看这个" in text
+    assert "[图片]" in text
+    assert "[转发消息]" in text
 
 
 def test_parse_token_report_date_window() -> None:
@@ -793,6 +824,35 @@ def test_tool_shortcut_member_profile_report(monkeypatch, tmp_path) -> None:
 
     assert handled
     assert "群友画像：group=1026813421 limit=20" in bot.private_messages[-1][1]
+
+
+def test_owner_can_query_metrics_and_memory_atoms(monkeypatch, tmp_path) -> None:
+    store = _use_temp_plugin_memory(monkeypatch, tmp_path)
+    store.add_metric_event(
+        event_type="decision_result",
+        group_id=1026813421,
+        user_id=184589072,
+        stage="llm",
+        action="echo_mood",
+        metadata={"reason": "接情绪"},
+        created_at=time.time(),
+    )
+    bot = FakeApprovalBot()
+
+    handled = asyncio.run(plugin._handle_group_approval_private(bot, 1535071184, "A6"))
+
+    assert handled
+    assert "Bot 统计" in bot.private_messages[-1][1]
+    assert "decision_result" in bot.private_messages[-1][1]
+
+    handled = asyncio.run(plugin._handle_group_approval_private(bot, 1535071184, "加记忆：小鸟说话要更温柔一点"))
+    assert handled
+    assert "已写入记忆单元" in bot.private_messages[-1][1]
+
+    handled = asyncio.run(plugin._handle_group_approval_private(bot, 1535071184, "B4"))
+    assert handled
+    assert "记忆单元：group=1026813421 limit=20" in bot.private_messages[-1][1]
+    assert "小鸟说话要更温柔一点" in bot.private_messages[-1][1]
 
 
 def test_approval_token_report_command_does_not_consume_pending(monkeypatch, tmp_path) -> None:

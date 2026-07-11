@@ -76,6 +76,11 @@ SOCIAL_ACTIONS = {
     "ask_back",
     "mock_repeated_question",
     "at_someone",
+    "observe",
+    "echo_mood",
+    "shift_topic",
+    "self_comment",
+    "relationship_reply",
     "market_check",
     "fresh_context",
 }
@@ -191,6 +196,7 @@ class DeepSeekClient:
         raw_corpus_context: str = "",
         jargon_context: str = "",
         member_context: str = "",
+        memory_atoms_context: str = "",
         fresh_context_hint: str = "",
     ) -> ReplyDecision:
         context = "\n".join(_format_decision_message(msg) for msg in recent_messages[-30:])
@@ -222,6 +228,7 @@ class DeepSeekClient:
             context=context,
             memory_context_section=_optional_section("中期聊天回想", memory_context),
             member_context_section=_optional_section("当前相关群友", member_context),
+            memory_atoms_context_section=_optional_section("长期记忆单元", memory_atoms_context),
             jargon_context_section=_optional_section("群内黑话词典", jargon_context),
             current_nickname=current_nickname,
             current_text=current_text,
@@ -302,6 +309,7 @@ class DeepSeekClient:
         raw_corpus_context: str = "",
         jargon_context: str = "",
         member_context: str = "",
+        memory_atoms_context: str = "",
         recall_feedback_context: str = "",
         mention_targets: str = "",
         priority_context: str = "",
@@ -350,6 +358,7 @@ class DeepSeekClient:
             context=context,
             memory_context_section=_optional_section("中期聊天回想", memory_context),
             member_context_section=_optional_section("当前相关群友", member_context),
+            memory_atoms_context_section=_optional_section("长期记忆单元", memory_atoms_context),
             recall_feedback_context_section=_optional_section("主人撤回反馈", recall_feedback_context),
             style_context_section=_optional_section("群聊表达风格参考", style_context),
             raw_corpus_context_section=_optional_section("群友原文语料参考", raw_corpus_context),
@@ -420,21 +429,13 @@ class DeepSeekClient:
         context = "\n".join(_format_message(msg) for msg in messages)
         if not context:
             return MemberProfileDraft("", (), "", ())
-        system = (
-            "你只做群友画像摘要。只根据给出的这个人的原始发言判断，"
-            "不要编造身份、现实信息或关系；不要给政治立场、意识形态、阵营归属下定性标签，"
-            "只可客观写成常聊话题和表达习惯。输出严格 JSON。"
-        )
-        user = (
-            f"聊天场景：{chat_label}\n"
-            f"画像对象：{member_label}\n"
-            "任务：总结这个群友的发言印象、兴趣话题、说话方式，并挑选少量代表性原话。\n"
-            "要求：短、具体、可用于以后回复这个人；不要用政治立场标签概括这个人；"
-            "代表性原话必须来自原文，不要改写。\n"
-            "JSON 格式："
-            "{\"summary\":\"...\",\"interests\":[\"...\"],"
-            "\"speaking_style\":\"...\",\"representative_texts\":[\"...\"]}\n\n"
-            f"该群友最近发言：\n{context}"
+        system = self.prompts.render("member_profile", "system")
+        user = self.prompts.render(
+            "member_profile",
+            "user",
+            chat_label=chat_label,
+            member_label=member_label,
+            context=context,
         )
         response = await self._chat_completion(
             task="member_profile",
@@ -470,6 +471,7 @@ class DeepSeekClient:
         raw_corpus_context: str = "",
         jargon_context: str = "",
         member_context: str = "",
+        memory_atoms_context: str = "",
         recall_feedback_context: str = "",
         positive_feedback_context: str = "",
         mention_targets: str = "",
@@ -515,6 +517,7 @@ class DeepSeekClient:
             context=context,
             memory_context_section=_optional_section("中期聊天回想", memory_context),
             member_context_section=_optional_section("当前相关群友", member_context),
+            memory_atoms_context_section=_optional_section("长期记忆单元", memory_atoms_context),
             recall_feedback_context_section=_optional_section("主人撤回/不准奏反馈", recall_feedback_context),
             positive_feedback_context_section=_optional_section("审批人标记过的优质发言方向", positive_feedback_context),
             style_context_section=_optional_section("群聊表达风格参考", style_context),
@@ -818,6 +821,22 @@ def _normalize_action(value: str, *, should_reply: bool) -> str:
         "question": "ask_back",
         "mock_repeated_question": "mock_repeated_question",
         "repeat_mock": "mock_repeated_question",
+        "observe": "observe",
+        "旁观": "observe",
+        "冒泡": "observe",
+        "echo_mood": "echo_mood",
+        "mood": "echo_mood",
+        "情绪承接": "echo_mood",
+        "接情绪": "echo_mood",
+        "shift_topic": "shift_topic",
+        "change_topic": "shift_topic",
+        "转话题": "shift_topic",
+        "self_comment": "self_comment",
+        "自评": "self_comment",
+        "自嘲": "self_comment",
+        "relationship_reply": "relationship_reply",
+        "relation": "relationship_reply",
+        "关系回应": "relationship_reply",
         "at": "at_someone",
         "mention": "at_someone",
         "at_someone": "at_someone",

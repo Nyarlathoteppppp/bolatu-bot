@@ -3,6 +3,7 @@ import pytest
 from qq_social_agent.tools.fresh_context import (
     FreshLookup,
     FreshContextTool,
+    fact_pack_from_lookup,
     _parse_google_news_rss,
     _parse_tavily_answer,
     _parse_tavily_results,
@@ -94,6 +95,36 @@ def test_fresh_context_includes_quick_answer() -> None:
 
     assert "快速摘要：局势仍在变化" in context
     assert "多来源共同支持" in context
+
+
+def test_fresh_fact_pack_structures_sources_and_uncertainty() -> None:
+    lookup = FreshLookup(
+        query="美国 伊朗 冲突",
+        kind="news",
+        items=_parse_tavily_results(
+            {
+                "results": [
+                    {
+                        "title": "美国和伊朗局势仍在变化",
+                        "url": "https://news.example.com/world/iran",
+                        "content": "外交斡旋继续，局势仍需观察。",
+                        "published_date": "2026-07-09",
+                    }
+                ]
+            }
+        ),
+        status="ok",
+        provider="tavily",
+        answer="双方局势仍在变化。",
+    )
+
+    pack = fact_pack_from_lookup(lookup)
+
+    assert pack.topic == "美国 伊朗 冲突"
+    assert pack.status == "ok"
+    assert pack.sources == ("news.example.com",)
+    assert any("快速摘要" in fact for fact in pack.facts)
+    assert "来源较少" in pack.uncertain[0]
 
 
 @pytest.mark.anyio

@@ -383,6 +383,59 @@ def test_llm_usage_summary_accepts_absolute_time_range(tmp_path) -> None:
     assert [event.task for event in recent] == ["inside"]
 
 
+def test_metric_events_and_memory_atoms_round_trip(tmp_path) -> None:
+    memory = MemoryStore(tmp_path / "bot.sqlite3")
+    memory.add_metric_event(
+        event_type="decision_result",
+        group_id=1026813421,
+        user_id=100,
+        stage="llm",
+        action="echo_mood",
+        metadata={"reason": "接情绪"},
+        created_at=1000.0,
+    )
+    memory.add_metric_event(
+        event_type="approval_accepted",
+        group_id=1026813421,
+        user_id=100,
+        stage="approval",
+        action="echo_mood",
+        metadata={},
+        created_at=1010.0,
+    )
+
+    summaries = memory.metric_summary(start_at=900.0, end_at=1100.0, group_id=1026813421)
+    recent = memory.recent_metric_events(start_at=900.0, end_at=1100.0, group_id=1026813421)
+
+    assert [(item.event_type, item.stage, item.action, item.count) for item in summaries] == [
+        ("approval_accepted", "approval", "echo_mood", 1),
+        ("decision_result", "llm", "echo_mood", 1),
+    ]
+    assert recent[0].event_type == "approval_accepted"
+    assert recent[1].metadata == {"reason": "接情绪"}
+
+    atom_id = memory.upsert_memory_atom(
+        atom_type="relation",
+        group_id=1026813421,
+        subject_user_id=1535071184,
+        content="歌迷老蛆是张风雪的主人。",
+        source="test",
+        confidence=1.0,
+        importance=0.9,
+    )
+    assert atom_id > 0
+
+    atoms = memory.relevant_memory_atoms(
+        1026813421,
+        "主人",
+        subject_user_ids=[1535071184],
+        limit=3,
+    )
+    assert len(atoms) == 1
+    assert atoms[0].content == "歌迷老蛆是张风雪的主人。"
+    assert memory.delete_memory_atom(atom_id)
+
+
 def test_llm_usage_source_key_deduplicates(tmp_path) -> None:
     memory = MemoryStore(tmp_path / "bot.sqlite3")
 

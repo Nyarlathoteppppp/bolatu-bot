@@ -122,6 +122,22 @@ def test_parse_reply_decision_action_answer_chinese_alias() -> None:
     assert decision.action == "answer"
 
 
+def test_parse_reply_decision_new_social_actions() -> None:
+    for raw_action, expected in [
+        ("observe", "observe"),
+        ("接情绪", "echo_mood"),
+        ("转话题", "shift_topic"),
+        ("自嘲", "self_comment"),
+        ("关系回应", "relationship_reply"),
+    ]:
+        decision = _parse_reply_decision(
+            f'{{"should_reply": true, "confidence": 0.72, "action": "{raw_action}", "reason": "test"}}'
+        )
+
+        assert decision.should_reply
+        assert decision.action == expected
+
+
 def test_parse_reply_decision_extracts_json_block() -> None:
     decision = _parse_reply_decision(
         '```json\n{"should_reply": true, "confidence": 0.66, "action": "agree", "reason": "能补判断"}\n```'

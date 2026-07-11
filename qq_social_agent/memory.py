@@ -132,6 +132,7 @@ class ApprovedReplyFeedback:
     trigger_text: str
     action: str
     style: str
+    tags: tuple[str, ...]
     operator_id: int
     created_at: float
 
@@ -165,6 +166,41 @@ class LLMUsageEvent:
     completion_tokens: int
     total_tokens: int
     created_at: float
+
+
+@dataclass(frozen=True)
+class BotMetricEvent:
+    event_type: str
+    group_id: int | None
+    user_id: int | None
+    stage: str
+    action: str
+    metadata: dict[str, object]
+    created_at: float
+
+
+@dataclass(frozen=True)
+class BotMetricSummary:
+    event_type: str
+    stage: str
+    action: str
+    count: int
+
+
+@dataclass(frozen=True)
+class MemoryAtom:
+    id: int
+    atom_type: str
+    group_id: int
+    subject_user_id: int | None
+    object_user_id: int | None
+    content: str
+    source: str
+    confidence: float
+    importance: float
+    expires_at: float | None
+    created_at: float
+    updated_at: float
 
 
 class MemoryStore:
@@ -348,12 +384,51 @@ class MemoryStore:
               trigger_text text not null,
               action text not null,
               style text not null,
+              tags_json text not null default '[]',
               operator_id integer not null,
               created_at real not null
             );
 
             create index if not exists idx_approved_feedback_group_time
               on approved_reply_feedback(group_id, created_at);
+
+            create table if not exists bot_metric_events (
+              id integer primary key autoincrement,
+              event_type text not null,
+              group_id integer,
+              user_id integer,
+              stage text not null,
+              action text not null,
+              metadata_json text not null,
+              created_at real not null
+            );
+
+            create index if not exists idx_bot_metric_events_time
+              on bot_metric_events(created_at);
+
+            create index if not exists idx_bot_metric_events_group_time
+              on bot_metric_events(group_id, created_at);
+
+            create table if not exists memory_atoms (
+              id integer primary key autoincrement,
+              atom_type text not null,
+              group_id integer not null,
+              subject_user_id integer,
+              object_user_id integer,
+              content text not null,
+              source text not null,
+              confidence real not null default 0.7,
+              importance real not null default 0.5,
+              expires_at real,
+              created_at real not null,
+              updated_at real not null
+            );
+
+            create index if not exists idx_memory_atoms_group_type_time
+              on memory_atoms(group_id, atom_type, updated_at);
+
+            create index if not exists idx_memory_atoms_group_subject
+              on memory_atoms(group_id, subject_user_id, updated_at);
 
             create table if not exists custom_jargon_entries (
               id integer primary key autoincrement,
@@ -384,11 +459,20 @@ class MemoryStore:
 
             """
         )
+        self._ensure_approved_feedback_tags()
         self._ensure_llm_usage_source_key()
         self._backfill_member_profiles()
         self._backfill_member_impressions()
         self.conn.execute("pragma optimize")
         self.conn.commit()
+
+    def _ensure_approved_feedback_tags(self) -> None:
+        columns = {
+            str(row["name"])
+            for row in self.conn.execute("pragma table_info(approved_reply_feedback)").fetchall()
+        }
+        if "tags_json" not in columns:
+            self.conn.execute("alter table approved_reply_feedback add column tags_json text not null default '[]'")
 
     def _ensure_llm_usage_source_key(self) -> None:
         columns = {
@@ -1388,6 +1472,7 @@ class MemoryStore:
         trigger_text: str,
         action: str,
         style: str,
+        tags: list[str] | None = None,
         operator_id: int,
         created_at: float | None = None,
     ) -> None:
@@ -1395,9 +1480,9 @@ class MemoryStore:
             """
             insert into approved_reply_feedback(
               group_id, candidate_text, trigger_user_id, trigger_nickname,
-              trigger_text, action, style, operator_id, created_at
+              trigger_text, action, style, tags_json, operator_id, created_at
             )
-            values (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 group_id,
@@ -1407,6 +1492,7 @@ class MemoryStore:
                 trigger_text,
                 action,
                 style.strip(),
+                json.dumps((tags or [])[:8], ensure_ascii=False),
                 operator_id,
                 created_at or time.time(),
             ),
@@ -1421,7 +1507,7 @@ class MemoryStore:
         rows = self.conn.execute(
             """
             select group_id, candidate_text, trigger_user_id, trigger_nickname,
-                   trigger_text, action, style, operator_id, created_at
+                   trigger_text, action, style, tags_json, operator_id, created_at
             from approved_reply_feedback
             where group_id = ?
             order by created_at desc, id desc
@@ -1430,6 +1516,225 @@ class MemoryStore:
             (group_id, limit),
         ).fetchall()
         return [_approved_feedback_from_row(row) for row in reversed(rows)]
+
+    def add_metric_event(
+        self,
+        *,
+        event_type: str,
+        group_id: int | None = None,
+        user_id: int | None = None,
+        stage: str = "",
+        action: str = "",
+        metadata: dict[str, object] | None = None,
+        created_at: float | None = None,
+    ) -> None:
+        clean_event_type = event_type.strip() or "unknown"
+        clean_stage = stage.strip()
+        clean_action = action.strip()
+        payload = metadata or {}
+        self.conn.execute(
+            """
+            insert into bot_metric_events(
+              event_type, group_id, user_id, stage, action, metadata_json, created_at
+            )
+            values (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                clean_event_type[:60],
+                group_id,
+                user_id,
+                clean_stage[:80],
+                clean_action[:80],
+                json.dumps(payload, ensure_ascii=False, sort_keys=True),
+                created_at or time.time(),
+            ),
+        )
+        self.conn.commit()
+
+    def metric_summary(
+        self,
+        *,
+        start_at: float | None = None,
+        end_at: float | None = None,
+        group_id: int | None = None,
+        limit: int = 80,
+    ) -> list[BotMetricSummary]:
+        where, params = _metric_where(start_at=start_at, end_at=end_at, group_id=group_id)
+        rows = self.conn.execute(
+            f"""
+            select event_type, stage, action, count(*) as count
+            from bot_metric_events
+            {where}
+            group by event_type, stage, action
+            order by count desc, event_type asc
+            limit ?
+            """,
+            (*params, limit),
+        ).fetchall()
+        return [
+            BotMetricSummary(
+                event_type=str(row["event_type"]),
+                stage=str(row["stage"]),
+                action=str(row["action"]),
+                count=int(row["count"]),
+            )
+            for row in rows
+        ]
+
+    def recent_metric_events(
+        self,
+        *,
+        start_at: float | None = None,
+        end_at: float | None = None,
+        group_id: int | None = None,
+        limit: int = 12,
+    ) -> list[BotMetricEvent]:
+        where, params = _metric_where(start_at=start_at, end_at=end_at, group_id=group_id)
+        rows = self.conn.execute(
+            f"""
+            select event_type, group_id, user_id, stage, action, metadata_json, created_at
+            from bot_metric_events
+            {where}
+            order by created_at desc, id desc
+            limit ?
+            """,
+            (*params, limit),
+        ).fetchall()
+        return [_metric_event_from_row(row) for row in rows]
+
+    def upsert_memory_atom(
+        self,
+        *,
+        atom_type: str,
+        group_id: int,
+        content: str,
+        source: str,
+        subject_user_id: int | None = None,
+        object_user_id: int | None = None,
+        confidence: float = 0.7,
+        importance: float = 0.5,
+        expires_at: float | None = None,
+    ) -> int:
+        clean_content = re.sub(r"\s+", " ", content).strip()
+        if not clean_content:
+            return 0
+        clean_type = atom_type.strip()[:32] or "note"
+        clean_source = source.strip()[:80] or "manual"
+        now = time.time()
+        existing = self.conn.execute(
+            """
+            select id from memory_atoms
+            where group_id = ?
+              and atom_type = ?
+              and coalesce(subject_user_id, -1) = coalesce(?, -1)
+              and coalesce(object_user_id, -1) = coalesce(?, -1)
+              and content = ?
+            order by updated_at desc
+            limit 1
+            """,
+            (group_id, clean_type, subject_user_id, object_user_id, clean_content[:420]),
+        ).fetchone()
+        if existing:
+            atom_id = int(existing["id"])
+            self.conn.execute(
+                """
+                update memory_atoms
+                set source = ?, confidence = ?, importance = ?,
+                    expires_at = ?, updated_at = ?
+                where id = ?
+                """,
+                (
+                    clean_source,
+                    _clamp_float(confidence, 0.0, 1.0),
+                    _clamp_float(importance, 0.0, 1.0),
+                    expires_at,
+                    now,
+                    atom_id,
+                ),
+            )
+            self.conn.commit()
+            return atom_id
+        cursor = self.conn.execute(
+            """
+            insert into memory_atoms(
+              atom_type, group_id, subject_user_id, object_user_id, content,
+              source, confidence, importance, expires_at, created_at, updated_at
+            )
+            values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                clean_type,
+                group_id,
+                subject_user_id,
+                object_user_id,
+                clean_content[:420],
+                clean_source,
+                _clamp_float(confidence, 0.0, 1.0),
+                _clamp_float(importance, 0.0, 1.0),
+                expires_at,
+                now,
+                now,
+            ),
+        )
+        self.conn.commit()
+        return int(cursor.lastrowid or 0)
+
+    def delete_memory_atom(self, atom_id: int) -> bool:
+        cursor = self.conn.execute("delete from memory_atoms where id = ?", (atom_id,))
+        self.conn.commit()
+        return cursor.rowcount > 0
+
+    def recent_memory_atoms(self, group_id: int, limit: int) -> list[MemoryAtom]:
+        rows = self.conn.execute(
+            """
+            select id, atom_type, group_id, subject_user_id, object_user_id,
+                   content, source, confidence, importance, expires_at, created_at, updated_at
+            from memory_atoms
+            where group_id = ?
+              and (expires_at is null or expires_at > ?)
+            order by importance desc, updated_at desc, id desc
+            limit ?
+            """,
+            (group_id, time.time(), limit),
+        ).fetchall()
+        return [_memory_atom_from_row(row) for row in rows]
+
+    def relevant_memory_atoms(
+        self,
+        group_id: int,
+        query: str,
+        *,
+        subject_user_ids: list[int] | None = None,
+        limit: int = 6,
+        candidate_limit: int = 120,
+    ) -> list[MemoryAtom]:
+        rows = self.conn.execute(
+            """
+            select id, atom_type, group_id, subject_user_id, object_user_id,
+                   content, source, confidence, importance, expires_at, created_at, updated_at
+            from memory_atoms
+            where group_id = ?
+              and (expires_at is null or expires_at > ?)
+            order by updated_at desc, id desc
+            limit ?
+            """,
+            (group_id, time.time(), candidate_limit),
+        ).fetchall()
+        subject_set = set(subject_user_ids or [])
+        scored: list[tuple[float, float, sqlite3.Row]] = []
+        for row in rows:
+            content = str(row["content"])
+            score = float(_text_relevance_score(query, content))
+            subject = row["subject_user_id"]
+            obj = row["object_user_id"]
+            if subject_set and (subject in subject_set or obj in subject_set):
+                score += 3.0
+            score += float(row["importance"] or 0.0)
+            if score <= 0:
+                continue
+            scored.append((score, float(row["updated_at"]), row))
+        scored.sort(key=lambda item: (item[0], item[1]), reverse=True)
+        return [_memory_atom_from_row(row) for _, _, row in scored[:limit]]
 
     def upsert_custom_jargon(
         self,
@@ -1670,6 +1975,75 @@ def _summary_from_row(row: sqlite3.Row) -> MemorySummary:
         end_at=float(row["end_at"]),
         created_at=float(row["created_at"]),
     )
+
+
+def _metric_event_from_row(row: sqlite3.Row) -> BotMetricEvent:
+    try:
+        raw_metadata = json.loads(str(row["metadata_json"]))
+    except json.JSONDecodeError:
+        raw_metadata = {}
+    metadata = raw_metadata if isinstance(raw_metadata, dict) else {}
+    group_id = row["group_id"]
+    user_id = row["user_id"]
+    return BotMetricEvent(
+        event_type=str(row["event_type"]),
+        group_id=int(group_id) if group_id is not None else None,
+        user_id=int(user_id) if user_id is not None else None,
+        stage=str(row["stage"]),
+        action=str(row["action"]),
+        metadata=metadata,
+        created_at=float(row["created_at"]),
+    )
+
+
+def _memory_atom_from_row(row: sqlite3.Row) -> MemoryAtom:
+    subject = row["subject_user_id"]
+    obj = row["object_user_id"]
+    expires_at = row["expires_at"]
+    return MemoryAtom(
+        id=int(row["id"]),
+        atom_type=str(row["atom_type"]),
+        group_id=int(row["group_id"]),
+        subject_user_id=int(subject) if subject is not None else None,
+        object_user_id=int(obj) if obj is not None else None,
+        content=str(row["content"]),
+        source=str(row["source"]),
+        confidence=float(row["confidence"]),
+        importance=float(row["importance"]),
+        expires_at=float(expires_at) if expires_at is not None else None,
+        created_at=float(row["created_at"]),
+        updated_at=float(row["updated_at"]),
+    )
+
+
+def _metric_where(
+    *,
+    start_at: float | None,
+    end_at: float | None,
+    group_id: int | None,
+) -> tuple[str, tuple[object, ...]]:
+    clauses: list[str] = []
+    params: list[object] = []
+    if start_at is not None:
+        clauses.append("created_at >= ?")
+        params.append(start_at)
+    if end_at is not None:
+        clauses.append("created_at < ?")
+        params.append(end_at)
+    if group_id is not None:
+        clauses.append("group_id = ?")
+        params.append(group_id)
+    if not clauses:
+        return "", ()
+    return "where " + " and ".join(clauses), tuple(params)
+
+
+def _clamp_float(value: float, low: float, high: float) -> float:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        number = low
+    return max(low, min(high, number))
 
 
 def _text_relevance_score(query: str, haystack: str) -> int:
@@ -1982,6 +2356,13 @@ def _recalled_feedback_from_row(row: sqlite3.Row) -> RecalledReplyFeedback:
 
 
 def _approved_feedback_from_row(row: sqlite3.Row) -> ApprovedReplyFeedback:
+    try:
+        raw_tags = json.loads(str(row["tags_json"]))
+    except (KeyError, json.JSONDecodeError):
+        raw_tags = []
+    tags = ()
+    if isinstance(raw_tags, list):
+        tags = tuple(str(tag).strip() for tag in raw_tags if str(tag).strip())
     return ApprovedReplyFeedback(
         group_id=int(row["group_id"]),
         candidate_text=str(row["candidate_text"]),
@@ -1990,6 +2371,7 @@ def _approved_feedback_from_row(row: sqlite3.Row) -> ApprovedReplyFeedback:
         trigger_text=str(row["trigger_text"]),
         action=str(row["action"]),
         style=str(row["style"]),
+        tags=tags,
         operator_id=int(row["operator_id"]),
         created_at=float(row["created_at"]),
     )

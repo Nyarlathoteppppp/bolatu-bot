@@ -159,6 +159,8 @@ def test_central_prompt_file_contains_all_runtime_flows() -> None:
         "reply",
         "reply_candidates",
         "daily_review",
+        "member_profile",
+        "long_message_summary",
         "mid_memory",
         "style_learning",
     }

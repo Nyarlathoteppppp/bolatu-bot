@@ -51,10 +51,13 @@ from .group_jargon import (
 )
 from .memory import (
     ApprovedReplyFeedback,
+    BotMetricEvent,
+    BotMetricSummary,
     ChatMessage,
     CustomJargonEntry,
     LLMUsageEvent,
     LLMUsageSummary,
+    MemoryAtom,
     MemberImpression,
     MemberProfile,
     MemberProfileSummary,
@@ -157,6 +160,8 @@ APPROVAL_USER_IDS_KEY = "group_approval_basic_user_ids"
 APPROVAL_STALE_CHOICE_COOLDOWN_SECONDS = 8
 RECALL_FEEDBACK_CONTEXT_LIMIT = 3
 POSITIVE_FEEDBACK_CONTEXT_LIMIT = 4
+MEMORY_ATOM_CONTEXT_LIMIT = 6
+MEMORY_ATOM_REPORT_LIMIT = 30
 LLM_USAGE_LOG_RE = re.compile(
     r"^(?P<month>\d{2})-(?P<day>\d{2}) "
     r"(?P<hms>\d{2}:\d{2}:\d{2}).*qq_social_agent llm usage: "
@@ -248,6 +253,19 @@ MEMBER_IMPRESSION_REPORT_COMMAND_RE = re.compile(
     r"^(?:/)?(?:群友画像|成员画像|画像|印象|member(?:s)?|profile)\s*(?P<limit>\d{0,2})$",
     re.IGNORECASE,
 )
+METRIC_REPORT_COMMAND_RE = re.compile(
+    r"^(?:/)?(?:统计|数据|监控|metrics?)\s*(?P<window>.*)$",
+    re.IGNORECASE,
+)
+MEMORY_ATOM_REPORT_COMMAND_RE = re.compile(
+    r"^(?:/)?(?:记忆单元|长期记忆|atoms?)\s*(?P<limit>\d{0,2})$",
+    re.IGNORECASE,
+)
+MEMORY_ATOM_ADD_RE = re.compile(
+    r"^(?:/)?(?:加记忆单元|加长期记忆|加记忆)\s*[:：]\s*(?P<content>.+)$",
+    re.DOTALL,
+)
+MEMORY_ATOM_DELETE_RE = re.compile(r"^(?:/)?(?:删记忆单元|删长期记忆|删记忆)\s*[:：]?\s*(?P<atom_id>\d+)$")
 PRIVATE_CONTEXT_RESET_COMMANDS = {
     "清空上下文",
     "清空背景",
@@ -347,6 +365,7 @@ async def _init_client() -> None:
     set_usage_recorder(_record_llm_usage if app_config.deepseek.usage_tracking_enabled else None)
     deepseek_client = DeepSeekClient(app_config.deepseek)
     _apply_model_route_overrides()
+    _ensure_builtin_memory_atoms()
 
 
 def _record_llm_usage(
@@ -363,6 +382,30 @@ def _record_llm_usage(
         completion_tokens=completion_tokens,
         total_tokens=total_tokens,
     )
+
+
+def _ensure_builtin_memory_atoms() -> None:
+    for group_id in _daily_review_target_groups():
+        memory.upsert_memory_atom(
+            atom_type="relation",
+            group_id=group_id,
+            subject_user_id=1535071184,
+            object_user_id=None,
+            content="歌迷老蛆/1535071184 是制造出张风雪的人，是张风雪的主人；他负责给张风雪 token、调试性格、改 prompt 和后端逻辑。",
+            source="builtin_owner_relation",
+            confidence=1.0,
+            importance=1.0,
+        )
+        memory.upsert_memory_atom(
+            atom_type="preference",
+            group_id=group_id,
+            subject_user_id=FOCUSED_STYLE_USER_ID,
+            object_user_id=None,
+            content="小鸟/184589072 是高权重学习对象；参考她的表达节奏、情绪承接、玩梗方式和说话尺度，但禁止照搬原句。",
+            source="builtin_focused_style_user",
+            confidence=1.0,
+            importance=0.9,
+        )
 
 
 @get_driver().on_bot_connect
@@ -1076,6 +1119,37 @@ def _record_suppression_event(
     )
     if len(recent_suppression_events) > SUPPRESSION_EVENTS_LIMIT:
         del recent_suppression_events[: len(recent_suppression_events) - SUPPRESSION_EVENTS_LIMIT]
+    _record_metric_event(
+        "suppression",
+        group_id=group_id,
+        user_id=user_id,
+        stage=stage,
+        action="ignore",
+        reason=reason,
+        text=_short_notice_text(text, 120),
+    )
+
+
+def _record_metric_event(
+    event_type: str,
+    *,
+    group_id: int | None = None,
+    user_id: int | None = None,
+    stage: str = "",
+    action: str = "",
+    **metadata: object,
+) -> None:
+    try:
+        memory.add_metric_event(
+            event_type=event_type,
+            group_id=group_id,
+            user_id=user_id,
+            stage=stage,
+            action=action,
+            metadata={key: value for key, value in metadata.items() if value is not None},
+        )
+    except Exception as exc:
+        logger.warning(f"qq_social_agent failed recording metric: type={event_type} error={exc}")
 
 
 def _short_notice_text(text: str, limit: int) -> str:
@@ -1124,26 +1198,37 @@ async def handle_jargon_command(event: Event, matcher: Matcher) -> None:
 @group_message.handle()
 async def handle_group_message(bot: Bot, event: GroupMessageEvent) -> None:
     group_id = int(event.group_id)
-    raw_text = _plain_text(event)
+    plain_text = _plain_text(event)
+    raw_text = _message_context_text(event)
     addressed_bot = _mentioned_bot(event, bot) or _replied_to_bot(event, bot)
     group_allowed = app_config.group_allowed(group_id)
+    _record_metric_event(
+        "message_received",
+        group_id=group_id,
+        user_id=int(event.user_id),
+        stage="group",
+        action="received",
+        addressed=addressed_bot,
+        has_media=_message_has_context_media(event),
+    )
     text = raw_text
-    if raw_text and group_allowed and not _is_low_value_group_text(raw_text):
+    if raw_text and group_allowed and plain_text and not _is_low_value_group_text(plain_text):
         text = await _message_text_for_context(
             raw_text,
             nickname=_nickname(event),
             chat_label=f"QQ 群聊 {group_id}",
         )
     if (
-        raw_text
+        plain_text
         and group_allowed
         and not addressed_bot
-        and _is_low_value_group_text(raw_text)
+        and raw_text == plain_text
+        and _is_low_value_group_text(plain_text)
     ):
-        memory.add_message(group_id, int(event.user_id), _nickname(event), raw_text, is_bot=False)
+        memory.add_message(group_id, int(event.user_id), _nickname(event), plain_text, is_bot=False)
         logger.info(
             "qq_social_agent ignored group low value text: "
-            f"group={group_id} user={int(event.user_id)} text={raw_text!r}"
+            f"group={group_id} user={int(event.user_id)} text={plain_text!r}"
         )
         await _send_approval_suppression_notice(
             bot,
@@ -1201,6 +1286,15 @@ async def _handle_group_message_locked(
                 memory.add_message(group_id, item.user_id, item.nickname, item.text, is_bot=False)
         else:
             memory.add_message(group_id, user_id, nickname, text, is_bot=False)
+    _record_metric_event(
+        "message_buffered",
+        group_id=group_id,
+        user_id=user_id,
+        stage="locked",
+        action="recorded",
+        buffered_count=len(buffered_messages) if buffered_messages else 1,
+        addressed=addressed_bot,
+    )
 
     group_cfg = app_config.group_config(group_id)
     state = memory.group_state(group_id)
@@ -1261,6 +1355,15 @@ async def _handle_group_message_locked(
     logger.info(
         "qq_social_agent group decision start: "
         f"group={group_id} user={user_id} mentioned={mentioned} replied_to_bot={replied_to_bot} text={text!r}"
+    )
+    _record_metric_event(
+        "decision_start",
+        group_id=group_id,
+        user_id=user_id,
+        stage="group",
+        action="start",
+        addressed=addressed_bot,
+        text=_short_notice_text(text, 120),
     )
 
     persona_id = str(state["persona"] or group_cfg.get("persona") or app_config.default_persona)
@@ -1351,6 +1454,7 @@ async def _handle_group_message_locked(
     recall_feedback_context = ""
     positive_feedback_context = ""
     member_context = ""
+    memory_atoms_context = ""
     style_context = ""
     raw_corpus_context = ""
     jargon_context = ""
@@ -1400,6 +1504,14 @@ async def _handle_group_message_locked(
                 limit=MEMBER_IMPRESSION_CONTEXT_LIMIT,
             )
         )
+        memory_atoms_context = _format_memory_atom_context(
+            memory.relevant_memory_atoms(
+                group_id,
+                context_query,
+                subject_user_ids=_related_member_user_ids(context_recent, current_user_id=user_id),
+                limit=MEMORY_ATOM_CONTEXT_LIMIT,
+            )
+        )
         style_context = _format_style_context(
             memory.relevant_style_rules(
                 group_id,
@@ -1430,6 +1542,7 @@ async def _handle_group_message_locked(
                 style_context=style_context,
                 jargon_context=jargon_context,
                 member_context=member_context,
+                memory_atoms_context=memory_atoms_context,
                 fresh_context_hint=_format_fresh_context_hint(fresh_intent),
             )
         except Exception as exc:
@@ -1503,6 +1616,17 @@ async def _handle_group_message_locked(
         f"need_fresh={decision.need_fresh_context} fresh_query={decision.fresh_query!r} "
         f"reason={decision.reason}"
     )
+    _record_metric_event(
+        "decision_result",
+        group_id=group_id,
+        user_id=user_id,
+        stage="llm" if pre_decision.decision is None else "backend",
+        action=decision.action,
+        should_reply=decision.should_reply,
+        confidence=round(decision.confidence, 3),
+        decision_reason=decision.reason,
+        need_fresh=decision.need_fresh_context,
+    )
     _schedule_group_learning(group_id)
     if not decision.should_reply:
         await _send_approval_suppression_notice(
@@ -1533,6 +1657,15 @@ async def _handle_group_message_locked(
                 group_id,
                 _related_member_user_ids(context_recent, current_user_id=user_id),
                 limit=MEMBER_IMPRESSION_CONTEXT_LIMIT,
+            )
+        )
+    if not memory_atoms_context:
+        memory_atoms_context = _format_memory_atom_context(
+            memory.relevant_memory_atoms(
+                group_id,
+                context_query,
+                subject_user_ids=_related_member_user_ids(context_recent, current_user_id=user_id),
+                limit=MEMORY_ATOM_CONTEXT_LIMIT,
             )
         )
     if not style_context:
@@ -1644,6 +1777,7 @@ async def _handle_group_message_locked(
             raw_corpus_context=raw_corpus_context,
             jargon_context=jargon_context,
             member_context=member_context,
+            memory_atoms_context=memory_atoms_context,
             recall_feedback_context=recall_feedback_context,
             positive_feedback_context=positive_feedback_context,
             mention_targets=_format_mention_targets(mention_targets),
@@ -1706,6 +1840,14 @@ async def _handle_group_message_locked(
     logger.info(
         "qq_social_agent pending group reply candidates approval: "
         f"group={group_id} candidates={len(approval_candidates)}"
+    )
+    _record_metric_event(
+        "candidate_generated",
+        group_id=group_id,
+        user_id=user_id,
+        stage="reply_candidates",
+        action=decision.action,
+        candidate_count=len(approval_candidates),
     )
     await _request_group_approval(
         bot,
@@ -1879,6 +2021,9 @@ async def handle_bot_command(event: Event, matcher: Matcher, args: Message = Com
         "block",
         "blocks",
         "拦截",
+        "metrics",
+        "metric",
+        "统计",
     }
     if action in admin_actions and not _is_tool_admin_user(user_id):
         await matcher.finish("没权限。基础审批人只能用 A/B/C/D/X/1/2/3/取消 处理审批单。")
@@ -1939,8 +2084,11 @@ async def handle_bot_command(event: Event, matcher: Matcher, args: Message = Com
     if action in {"blocked", "block", "blocks", "拦截"}:
         limit = _parse_report_limit(parts[1] if len(parts) >= 2 else "", default=10, maximum=40)
         await matcher.finish(_format_suppression_report(limit))
+    if action in {"metrics", "metric", "统计"}:
+        window = _parse_token_report_window(parts[1] if len(parts) >= 2 else "today")
+        await matcher.finish(_format_metric_report(window, group_id=chat_id if chat_id > 0 else None))
 
-    await matcher.finish("用法：/bot status|tokens 24h|tokens 2026-07-10|blocked 20|pause|resume|reset|quiet 10m|persona <id>")
+    await matcher.finish("用法：/bot status|tokens 24h|tokens 2026-07-10|metrics today|blocked 20|pause|resume|reset|quiet 10m|persona <id>")
 
 
 def _parse_token_report_window(raw: str) -> TokenReportWindow:
@@ -2011,6 +2159,67 @@ def _parse_approval_suppression_report_command(text: str) -> int | None:
     if head not in {"拦截", "blocked", "blocks", "block"}:
         return None
     return _parse_report_limit(parts[1] if len(parts) >= 2 else "", default=10, maximum=40)
+
+
+def _parse_metric_report_command(text: str) -> TokenReportWindow | None:
+    compact = text.strip()
+    match = METRIC_REPORT_COMMAND_RE.match(compact)
+    if match is None:
+        return None
+    window_text = match.group("window").strip()
+    if window_text in {"", "今日", "今天", "today"}:
+        return _parse_token_report_window("today")
+    return _parse_token_report_window(window_text)
+
+
+def _format_metric_report(window: TokenReportWindow, *, group_id: int | None) -> str:
+    summaries = memory.metric_summary(start_at=window.start_at, end_at=window.end_at, group_id=group_id)
+    recent = memory.recent_metric_events(
+        start_at=window.start_at,
+        end_at=window.end_at,
+        group_id=group_id,
+        limit=10,
+    )
+    if not summaries:
+        return f"Bot 统计（{window.label}）：暂无记录。"
+    total = sum(item.count for item in summaries)
+    by_event: dict[str, int] = {}
+    for item in summaries:
+        by_event[item.event_type] = by_event.get(item.event_type, 0) + item.count
+    lines = [
+        f"Bot 统计（{window.label}）",
+        f"group={group_id or '全部'}；事件总数：{total}",
+        "按类型：" + "；".join(f"{key} {value}" for key, value in sorted(by_event.items())),
+        "",
+        "Top 明细：",
+    ]
+    for item in summaries[:12]:
+        stage = f"/{item.stage}" if item.stage else ""
+        action = f"/{item.action}" if item.action else ""
+        lines.append(f"- {item.event_type}{stage}{action}: {item.count}")
+    if recent:
+        lines.append("")
+        lines.append("最近事件：")
+        for event in recent[:8]:
+            meta = _format_metric_metadata(event.metadata)
+            lines.append(
+                f"- {_format_time(event.created_at)} {event.event_type}/{event.stage}/{event.action}{meta}"
+            )
+    return "\n".join(lines)
+
+
+def _format_metric_metadata(metadata: dict[str, object]) -> str:
+    if not metadata:
+        return ""
+    keys = ("reason", "decision_reason", "text", "candidate_count", "buffered_count")
+    parts = []
+    for key in keys:
+        if key not in metadata:
+            continue
+        value = _short_notice_text(str(metadata[key]), 42)
+        if value:
+            parts.append(f"{key}={value}")
+    return " " + " ".join(parts) if parts else ""
 
 
 def _token_usage_report_for_window(window: TokenReportWindow) -> str:
@@ -2190,6 +2399,83 @@ def _event_plain_text(event: GroupMessageEvent | PrivateMessageEvent) -> str:
     return re.sub(r"\s+", " ", text)
 
 
+def _message_context_text(event: GroupMessageEvent | PrivateMessageEvent) -> str:
+    parts: list[str] = []
+    for segment in event.message:
+        segment_type = str(getattr(segment, "type", "") or "")
+        data = getattr(segment, "data", {}) or {}
+        if segment_type == "text":
+            text = str(data.get("text", "")).strip()
+            if text:
+                parts.append(text)
+            continue
+        placeholder = _message_segment_placeholder(segment_type, data)
+        if placeholder:
+            parts.append(placeholder)
+    reply_context = _event_reply_context(event)
+    if reply_context:
+        parts.insert(0, reply_context)
+    text = " ".join(parts).strip()
+    return re.sub(r"\s+", " ", text)
+
+
+def _message_has_context_media(event: GroupMessageEvent | PrivateMessageEvent) -> bool:
+    for segment in event.message:
+        segment_type = str(getattr(segment, "type", "") or "")
+        if segment_type in {"image", "mface", "face", "record", "video", "forward", "json", "xml", "reply"}:
+            return True
+    return False
+
+
+def _message_segment_placeholder(segment_type: str, data: dict[str, object]) -> str:
+    if segment_type == "at":
+        qq = str(data.get("qq", "") or "").strip()
+        return f"[@{qq}]" if qq else "[@群友]"
+    if segment_type == "reply":
+        message_id = str(data.get("id", "") or "").strip()
+        return f"[回复消息:{message_id}]" if message_id else "[回复消息]"
+    if segment_type in {"image", "mface"}:
+        summary = str(data.get("summary", "") or "").strip()
+        return f"[图片:{summary}]" if summary else "[图片]"
+    if segment_type == "face":
+        face_id = str(data.get("id", "") or "").strip()
+        return f"[表情:{face_id}]" if face_id else "[表情]"
+    if segment_type == "record":
+        return "[语音]"
+    if segment_type == "video":
+        return "[视频]"
+    if segment_type == "forward":
+        return "[转发消息]"
+    if segment_type in {"json", "xml"}:
+        payload = str(data.get("data", "") or "")
+        forward_hint = "转发消息" if "forward" in payload.lower() or "聊天记录" in payload else segment_type
+        return f"[{forward_hint}]"
+    return ""
+
+
+def _event_reply_context(event: GroupMessageEvent | PrivateMessageEvent) -> str:
+    reply = getattr(event, "reply", None)
+    if reply is None:
+        return ""
+    raw_message = getattr(reply, "message", None)
+    message_text = ""
+    if raw_message is not None:
+        try:
+            message_text = raw_message.extract_plain_text().strip()
+        except Exception:
+            message_text = str(raw_message).strip()
+    sender = getattr(reply, "sender", None)
+    nickname = ""
+    user_id = getattr(reply, "user_id", None)
+    if sender is not None:
+        nickname = str(getattr(sender, "card", "") or getattr(sender, "nickname", "") or "").strip()
+    label = _member_label(int(user_id), nickname or str(user_id)) if user_id else (nickname or "某人")
+    if message_text:
+        return f"[回复：{label}: {_short_notice_text(message_text, 80)}]"
+    message_id = getattr(reply, "message_id", None)
+    return f"[回复：{label} 的消息 {message_id}]" if message_id else f"[回复：{label} 的消息]"
+
+
 def _jargon_command_group_id(event: Event) -> int | None:
     if isinstance(event, GroupMessageEvent):
         group_id = int(event.group_id)
@@ -2299,6 +2585,13 @@ async def _market_context_for(intents: list[MarketIntent], *, market_topic: bool
         f"intents={[(intent.kind, intent.symbol) for intent in intents]} "
         f"has_context={bool(context)}"
     )
+    _record_metric_event(
+        "tool_call",
+        stage="market",
+        action="context",
+        has_context=bool(context),
+        symbols=",".join(intent.symbol for intent in intents),
+    )
     return context
 
 
@@ -2323,6 +2616,14 @@ async def _market_report_and_context_for(
         f"intents={[(intent.kind, intent.symbol) for intent in intents]} "
         f"has_report={bool(report)} has_context={bool(context)}"
     )
+    _record_metric_event(
+        "tool_call",
+        stage="market",
+        action="report",
+        has_report=bool(report),
+        has_context=bool(context),
+        symbols=",".join(intent.symbol for intent in intents),
+    )
     return report, context
 
 
@@ -2338,6 +2639,13 @@ async def _fresh_context_for(decision: ReplyDecision, *, fallback_text: str) -> 
     logger.info(
         "qq_social_agent fresh context: "
         f"kind={decision.fresh_kind} query={query!r} has_context={bool(context)}"
+    )
+    _record_metric_event(
+        "tool_call",
+        stage="fresh_context",
+        action=decision.fresh_kind,
+        has_context=bool(context),
+        query=query,
     )
     return context
 
@@ -2406,6 +2714,13 @@ async def _private_fresh_context_for(text: str) -> str:
     logger.info(
         "qq_social_agent private fresh context: "
         f"kind={intent.kind} query={intent.query!r} has_context={bool(context)}"
+    )
+    _record_metric_event(
+        "tool_call",
+        stage="fresh_context_private",
+        action=intent.kind,
+        has_context=bool(context),
+        query=intent.query,
     )
     return context
 
@@ -2997,6 +3312,67 @@ def _format_member_context(profiles: list[MemberProfile | MemberImpression]) -> 
     return "\n".join(lines)
 
 
+def _format_memory_atom_context(atoms: list[MemoryAtom]) -> str:
+    if not atoms:
+        return ""
+    lines = [
+        "以下是明确长期记忆，只在相关时使用；不要编造未写明的关系或事实。"
+    ]
+    for atom in atoms[:MEMORY_ATOM_CONTEXT_LIMIT]:
+        subject = f" subject={atom.subject_user_id}" if atom.subject_user_id is not None else ""
+        obj = f" object={atom.object_user_id}" if atom.object_user_id is not None else ""
+        lines.append(
+            f"- [{atom.atom_type}{subject}{obj}] {atom.content}"
+        )
+    return "\n".join(lines)
+
+
+def _format_memory_atom_report(group_id: int | None, limit: int) -> str:
+    if group_id is None:
+        return "记忆单元：当前配置了多个群或没有群，暂不支持默认查询。"
+    atoms = memory.recent_memory_atoms(group_id, limit)
+    lines = [f"记忆单元：group={group_id} limit={limit}"]
+    if not atoms:
+        lines.append("暂无长期记忆单元。")
+        return "\n".join(lines)
+    for atom in atoms:
+        subject = f" subject={atom.subject_user_id}" if atom.subject_user_id is not None else ""
+        obj = f" object={atom.object_user_id}" if atom.object_user_id is not None else ""
+        lines.append(
+            f"{atom.id}. [{atom.atom_type}{subject}{obj}] "
+            f"重要度{atom.importance:.1f}/置信{atom.confidence:.1f}：{_short_notice_text(atom.content, 120)}"
+        )
+        lines.append(f"   来源：{atom.source}；更新：{_format_local_time(atom.updated_at)}")
+    return "\n".join(lines)
+
+
+def _handle_memory_atom_command_text(user_id: int, group_id: int | None, text: str) -> str | None:
+    add_match = MEMORY_ATOM_ADD_RE.match(text)
+    delete_match = MEMORY_ATOM_DELETE_RE.match(text)
+    if add_match is None and delete_match is None:
+        return None
+    if group_id is None:
+        return "没找到要写入的群。"
+    if user_id not in TOOL_ADMIN_USER_IDS:
+        return BASIC_APPROVAL_DENIED_MESSAGE
+    if add_match is not None:
+        content = add_match.group("content").strip()
+        if not content:
+            return "格式：加记忆：内容"
+        atom_id = memory.upsert_memory_atom(
+            atom_type="preference",
+            group_id=group_id,
+            content=content,
+            source=f"manual:{user_id}",
+            subject_user_id=user_id,
+            confidence=0.9,
+            importance=0.8,
+        )
+        return f"已写入记忆单元：{atom_id}"
+    atom_id = int(delete_match.group("atom_id"))
+    return "已删除记忆单元。" if memory.delete_memory_atom(atom_id) else "没找到这个记忆单元。"
+
+
 def _member_label(user_id: int, nickname: str) -> str:
     clean_name = nickname.strip() or str(user_id)
     return f"{clean_name}[#{str(user_id)[-5:]}]"
@@ -3090,6 +3466,14 @@ async def _request_group_approval(bot: Bot, approval: PendingGroupApproval) -> N
                 f"group={approval.group_id} reason=no_candidate"
             )
             return
+        _record_metric_event(
+            "approval_auto_send",
+            group_id=approval.group_id,
+            user_id=approval.trigger_user_id,
+            stage="review_disabled",
+            action=candidate.action,
+            candidate_count=len(approval.candidates),
+        )
         logger.info(
             "qq_social_agent auto approval send: "
             f"group={approval.group_id} approval_id={approval.approval_id} candidate={candidate.index}"
@@ -3126,7 +3510,24 @@ async def _request_group_approval(bot: Bot, approval: PendingGroupApproval) -> N
             )
     if delivered <= 0:
         pending_group_approvals.pop(approval.group_id, None)
+        _record_metric_event(
+            "approval_request_failed",
+            group_id=approval.group_id,
+            user_id=approval.trigger_user_id,
+            stage="approval",
+            action="send_private_failed",
+            candidate_count=len(approval.candidates),
+        )
         return
+    _record_metric_event(
+        "approval_requested",
+        group_id=approval.group_id,
+        user_id=approval.trigger_user_id,
+        stage="approval",
+        action="pending",
+        candidate_count=len(approval.candidates),
+        delivered=delivered,
+    )
     logger.info(
         "qq_social_agent group approval pending: "
         f"approvers={approval_user_ids} group={approval.group_id} approval_id={approval.approval_id} "
@@ -3239,8 +3640,12 @@ def _is_private_tool_text(text: str) -> bool:
         or MEMORY_REPORT_COMMAND_RE.match(text) is not None
         or STYLE_REPORT_COMMAND_RE.match(text) is not None
         or MEMBER_IMPRESSION_REPORT_COMMAND_RE.match(text) is not None
+        or MEMORY_ATOM_REPORT_COMMAND_RE.match(text) is not None
+        or MEMORY_ATOM_ADD_RE.match(text) is not None
+        or MEMORY_ATOM_DELETE_RE.match(text) is not None
         or APPROVER_ADD_RE.match(text) is not None
         or APPROVER_DELETE_RE.match(text) is not None
+        or _parse_metric_report_command(text) is not None
         or _parse_approval_token_report_command(text) is not None
         or _parse_approval_suppression_report_command(text) is not None
         or text in APPROVAL_REVIEW_ON_COMMANDS
@@ -3423,6 +3828,29 @@ async def _handle_group_approval_private(bot: Bot, user_id: int, text: str) -> b
             _format_member_impression_report(_private_jargon_group_id(), member_report_limit),
         )
         return True
+    atom_command_response = _handle_memory_atom_command_text(user_id, _private_jargon_group_id(), compact_text)
+    if atom_command_response is not None:
+        await _send_private_text(bot, user_id, atom_command_response)
+        return True
+    atom_report_limit = _parse_memory_report_limit(compact_text, MEMORY_ATOM_REPORT_COMMAND_RE)
+    if atom_report_limit is not None:
+        await _send_private_text(
+            bot,
+            user_id,
+            _format_memory_atom_report(_private_jargon_group_id(), atom_report_limit),
+        )
+        return True
+    metric_window = _parse_metric_report_command(compact_text)
+    if metric_window is not None:
+        if not is_admin:
+            await _send_private_text(bot, user_id, BASIC_APPROVAL_DENIED_MESSAGE)
+            return True
+        await _send_private_text(
+            bot,
+            user_id,
+            _format_metric_report(metric_window, group_id=_private_jargon_group_id()),
+        )
+        return True
     token_report_window = _parse_approval_token_report_command(compact_text)
     if token_report_window is not None:
         if not is_admin:
@@ -3525,6 +3953,15 @@ async def _handle_group_approval_private(bot: Bot, user_id: int, text: str) -> b
                 "qq_social_agent group approval canceled: "
                 f"approver={user_id} group={approval.group_id} approval_id={approval.approval_id} text={text!r}"
             )
+            _record_metric_event(
+                "approval_canceled",
+                group_id=approval.group_id,
+                user_id=approval.trigger_user_id,
+                stage="approval",
+                action="reject" if candidate is None else candidate.action,
+                approver_id=user_id,
+                reason=_short_notice_text(compact_text, 120),
+            )
             try:
                 await bot.send_private_msg(user_id=user_id, message=Message(response_text))
             except ActionFailed:
@@ -3556,6 +3993,7 @@ def _save_approval_rejection_feedback(
     )
     action = selected_candidate.action if selected_candidate is not None else "unknown"
     now = time.time()
+    tags = ["owner_feedback", *_feedback_tags_from_reason(owner_reason)]
     memory.add_recalled_reply_feedback(
         group_id=approval.group_id,
         message_id=0,
@@ -3569,11 +4007,24 @@ def _save_approval_rejection_feedback(
         bad_reply_problem=owner_reason,
         avoid_rule=owner_reason,
         better_direction=owner_reason,
-        tags=["owner_feedback"],
+        tags=tags,
         operator_id=reason_user_id,
         reason_user_id=reason_user_id,
         recalled_at=approval.created_at,
         reason_at=now,
+    )
+    memory.upsert_memory_atom(
+        atom_type="feedback",
+        group_id=approval.group_id,
+        subject_user_id=approval.trigger_user_id,
+        object_user_id=None,
+        content=(
+            f"不准奏反馈：触发“{_short_notice_text(approval.trigger_text, 60)}”时，"
+            f"候选“{_short_notice_text(bot_reply, 70)}”的问题是：{owner_reason}"
+        ),
+        source=f"approval_reject:{reason_user_id}",
+        confidence=0.95,
+        importance=0.85,
     )
     logger.info(
         "qq_social_agent approval rejection feedback saved: "
@@ -3595,12 +4046,62 @@ def _save_approved_reply_feedback(
         trigger_text=approval.trigger_text,
         action=candidate.action,
         style=candidate.style,
+        tags=_positive_feedback_tags(candidate),
         operator_id=approver_id,
+    )
+    memory.upsert_memory_atom(
+        atom_type="feedback",
+        group_id=approval.group_id,
+        subject_user_id=approval.trigger_user_id,
+        object_user_id=None,
+        content=(
+            f"优质反馈：触发“{_short_notice_text(approval.trigger_text, 60)}”时，"
+            f"审批人认可 action={candidate.action}、style={candidate.style}；只学策略，禁止照搬原句。"
+        ),
+        source=f"approval_positive:{approver_id}",
+        confidence=0.9,
+        importance=0.75,
     )
     logger.info(
         "qq_social_agent approved reply feedback saved: "
         f"group={approval.group_id} approver={approver_id} candidate={candidate.index}"
     )
+
+
+def _feedback_tags_from_reason(reason: str) -> list[str]:
+    compact = re.sub(r"\s+", "", reason).casefold()
+    tags: list[str] = []
+    patterns = (
+        ("tone_too_aggressive", ("太凶", "太冲", "攻击", "嘴臭", "怼", "骂")),
+        ("tone_too_soft", ("太温柔", "不够毒", "没攻击性", "太软")),
+        ("too_ai_like", ("像ai", "像机器人", "客服", "模板", "僵硬", "不自然")),
+        ("wrong_target", ("认错人", "对象错", "不是说你", "回错", "看错人")),
+        ("context_misread", ("没看懂", "不明所以", "没读懂", "上下文")),
+        ("too_long", ("太长", "啰嗦", "废话")),
+        ("too_short", ("太短", "没说清", "没信息")),
+        ("copied_example", ("照搬", "复读", "例子", "原句")),
+        ("not_funny", ("不好笑", "没意思", "尬")),
+        ("too_serious", ("太认真", "说教", "科普")),
+        ("needs_care", ("不够温柔", "不够关心", "应该安慰", "小鸟")),
+    )
+    for tag, needles in patterns:
+        if any(needle in compact for needle in needles):
+            tags.append(tag)
+    return tags[:6]
+
+
+def _positive_feedback_tags(candidate: PendingApprovalCandidate) -> list[str]:
+    tags = ["approved_high_quality", f"action:{candidate.action}"]
+    style = candidate.style.casefold()
+    if any(word in style for word in ("时机", "自然", "接话")):
+        tags.append("good_timing")
+    if any(word in style for word in ("风格", "语气", "节奏")):
+        tags.append("good_style")
+    if any(word in style for word in ("吐槽", "损", "攻击", "嘴")):
+        tags.append("good_banter")
+    if any(word in style for word in ("关心", "安慰", "情绪", "温柔")):
+        tags.append("good_care")
+    return tags[:8]
 
 
 async def _send_approved_group_reply(
@@ -3615,6 +4116,16 @@ async def _send_approved_group_reply(
     logger.info(
         "qq_social_agent group approval accepted: "
         f"approver={approver_id} group={approval.group_id} candidate={candidate.index} high_quality={high_quality}"
+    )
+    _record_metric_event(
+        "approval_accepted",
+        group_id=approval.group_id,
+        user_id=approval.trigger_user_id,
+        stage="approval",
+        action=candidate.action,
+        approver_id=approver_id,
+        high_quality=high_quality,
+        candidate_index=candidate.index,
     )
     reply_parts = split_reply_messages(candidate.text, max_messages=3)
     sent_mention_user_id: int | None = None
