@@ -2323,9 +2323,12 @@ def _parse_approval_suppression_report_command(text: str) -> int | None:
         return None
     parts = compact.split(maxsplit=1)
     head = parts[0].casefold()
-    if head not in {"拦截", "blocked", "blocks", "block"}:
-        return None
-    return _parse_report_limit(parts[1] if len(parts) >= 2 else "", default=10, maximum=40)
+    if head in {"拦截", "blocked", "blocks", "block"}:
+        return _parse_report_limit(parts[1] if len(parts) >= 2 else "", default=10, maximum=40)
+    match = re.match(r"^(?:拦截)(?P<limit>\d{1,3})$", compact)
+    if match is not None:
+        return _parse_report_limit(match.group("limit"), default=10, maximum=40)
+    return None
 
 
 def _parse_metric_report_command(text: str) -> TokenReportWindow | None:

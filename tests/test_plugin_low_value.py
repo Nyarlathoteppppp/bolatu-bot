@@ -1684,6 +1684,12 @@ def test_changelog_notice_sent_once(monkeypatch, tmp_path) -> None:
     assert all("LLM 路由拆细" in message for message in notices)
 
 
+def test_parse_suppression_report_accepts_compact_chinese_limit() -> None:
+    assert plugin._parse_approval_suppression_report_command("拦截20") == 20
+    assert plugin._parse_approval_suppression_report_command("拦截 20") == 20
+    assert plugin._parse_approval_suppression_report_command("blocked 20") == 20
+
+
 def test_suppression_notice_records_without_private_spam(monkeypatch, tmp_path) -> None:
     _use_temp_plugin_memory(monkeypatch, tmp_path)
     bot = FakeApprovalBot()
