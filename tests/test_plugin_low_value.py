@@ -922,6 +922,20 @@ def test_focused_user_tone_context_only_for_xiaoniao() -> None:
     assert plugin._focused_user_tone_context(3370998238) == ""
 
 
+def test_builtin_memory_atoms_include_owner_alias(monkeypatch, tmp_path) -> None:
+    store = _use_temp_plugin_memory(monkeypatch, tmp_path)
+
+    plugin._ensure_builtin_memory_atoms()
+
+    atoms = store.relevant_memory_atoms(
+        1026813421,
+        "xbw 奈亚子 张风雪制造者",
+        subject_user_ids=[1535071184],
+        limit=5,
+    )
+    assert any("xbw、歌迷老蛆、奈亚子都是同一个人" in atom.content for atom in atoms)
+
+
 def test_format_member_context_includes_aliases() -> None:
     context = _format_member_context(
         [
