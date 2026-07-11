@@ -290,7 +290,9 @@ def test_approval_help_commands() -> None:
     assert "A1拦截" in plugin.APPROVAL_RULES_DETAIL_MESSAGE
     assert "B3群友画像" in plugin.APPROVAL_RULES_DETAIL_MESSAGE
     assert "D6审批概率" in plugin.APPROVAL_RULES_DETAIL_MESSAGE
+    assert "D7工作强度" in plugin.APPROVAL_RULES_DETAIL_MESSAGE
     assert plugin._bot_tool_shortcut_command("D6") == "审批概率"
+    assert plugin._bot_tool_shortcut_command("D7") == "工作强度"
     assert "/黑话：咱妈 指代：中国" in plugin._bot_tool_message("bot工具 黑话")
     assert "张风雪 bot工具目录" in plugin._bot_tool_message("T")
     assert "bot工具 查看" in plugin._bot_tool_message("A")
@@ -307,6 +309,7 @@ def test_approval_help_commands() -> None:
     assert "回 A/B/C" in plugin._bot_tool_message("bot 工具 审批")
     assert "关闭审查" in plugin.APPROVAL_RULES_MESSAGE
     assert "开启审查" in plugin._bot_tool_message("bot工具 开关")
+    assert "工作强度 60" in plugin._bot_tool_message("bot工具 开关")
     assert "切回复模型" in plugin._bot_tool_message("bot工具 模型")
     assert "切风格模型" in plugin._bot_tool_message("bot工具 模型")
     assert "可切换部分" in plugin._bot_tool_message("bot工具 模型")
@@ -1560,6 +1563,50 @@ def test_basic_approver_cannot_set_approval_auto_send_percent(monkeypatch, tmp_p
     assert handled
     assert plugin._approval_auto_send_percent() == 0
     assert bot.private_messages[-1] == (3370998238, "你只有基础审批权限：A/B/C/D/X/1/2/3/取消 处理审批单。")
+
+
+def test_ai_work_intensity_defaults_to_full(monkeypatch, tmp_path) -> None:
+    _use_temp_plugin_memory(monkeypatch, tmp_path)
+
+    assert plugin._ai_work_intensity_percent() == 100
+    assert plugin._ai_work_intensity_selected()
+
+
+def test_owner_can_set_ai_work_intensity_percent(monkeypatch, tmp_path) -> None:
+    _use_temp_plugin_memory(monkeypatch, tmp_path)
+    bot = FakeApprovalBot()
+
+    handled = asyncio.run(plugin._handle_group_approval_private(bot, 1535071184, "工作强度 30"))
+
+    assert handled
+    assert plugin._ai_work_intensity_percent() == 30
+    assert "30%" in bot.private_messages[-1][1]
+
+    handled = asyncio.run(plugin._handle_group_approval_private(bot, 1535071184, "AI强度"))
+
+    assert handled
+    assert "AI工作强度：30%" in bot.private_messages[-1][1]
+    assert "不影响：消息照常写入数据库" in bot.private_messages[-1][1]
+
+
+def test_basic_approver_cannot_set_ai_work_intensity_percent(monkeypatch, tmp_path) -> None:
+    _use_temp_plugin_memory(monkeypatch, tmp_path)
+    bot = FakeApprovalBot()
+
+    handled = asyncio.run(plugin._handle_group_approval_private(bot, 3370998238, "工作强度 30"))
+
+    assert handled
+    assert plugin._ai_work_intensity_percent() == 100
+    assert bot.private_messages[-1] == (3370998238, "你只有基础审批权限：A/B/C/D/X/1/2/3/取消 处理审批单。")
+
+
+def test_ai_work_intensity_selection_respects_bounds(monkeypatch, tmp_path) -> None:
+    _use_temp_plugin_memory(monkeypatch, tmp_path)
+
+    assert plugin._set_ai_work_intensity_percent(-10) == 0
+    assert not plugin._ai_work_intensity_selected()
+    assert plugin._set_ai_work_intensity_percent(120) == 100
+    assert plugin._ai_work_intensity_selected()
 
 
 def test_request_group_approval_auto_sends_by_probability(monkeypatch, tmp_path) -> None:

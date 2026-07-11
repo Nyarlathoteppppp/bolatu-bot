@@ -247,11 +247,16 @@ PRIVATE_FORCE_OBEY_ONCE_RE = re.compile(
 )
 APPROVAL_REVIEW_ENABLED_KEY = "group_approval_review_enabled"
 APPROVAL_AUTO_SEND_PERCENT_KEY = "group_approval_auto_send_percent"
+AI_WORK_INTENSITY_PERCENT_KEY = "group_ai_work_intensity_percent"
 APPROVAL_REVIEW_ON_COMMANDS = {"开启审查", "打开审查", "恢复审查", "启用审查", "开启审核", "打开审核"}
 APPROVAL_REVIEW_OFF_COMMANDS = {"关闭审查", "关掉审查", "暂停审查", "免审", "免审批", "关闭审核", "关掉审核"}
 APPROVAL_REVIEW_STATUS_COMMANDS = {"审查状态", "审核状态", "审批状态"}
 APPROVAL_AUTO_SEND_PERCENT_RE = re.compile(
     r"^(?:/)?(?:审批概率|审查概率|免审概率|自动发送概率)\s*[:：]?\s*(?P<percent>\d{1,3})?%?$"
+)
+AI_WORK_INTENSITY_STATUS_COMMANDS = {"工作强度", "AI强度", "ai强度", "活跃度", "触发概率"}
+AI_WORK_INTENSITY_PERCENT_RE = re.compile(
+    r"^(?:/)?(?:工作强度|AI强度|ai强度|活跃度|触发概率)\s*[:：]?\s*(?P<percent>\d{1,3})?%?$"
 )
 MODEL_ROUTE_OVERRIDES_KEY = "llm_model_route_overrides"
 MODEL_ROUTE_STATUS_COMMANDS = {"模型状态", "模型", "model status", "/模型状态"}
@@ -971,6 +976,40 @@ def _approval_auto_send_selected(percent: int) -> bool:
     return random.random() < max(0, min(100, percent)) / 100.0
 
 
+def _ai_work_intensity_percent() -> int:
+    raw = memory.app_kv_get(AI_WORK_INTENSITY_PERCENT_KEY)
+    try:
+        percent = int((raw or "100").strip())
+    except (TypeError, ValueError):
+        percent = 100
+    return max(0, min(100, percent))
+
+
+def _set_ai_work_intensity_percent(percent: int) -> int:
+    cleaned = max(0, min(100, int(percent)))
+    memory.app_kv_set(AI_WORK_INTENSITY_PERCENT_KEY, str(cleaned))
+    return cleaned
+
+
+def _ai_work_intensity_selected(percent: int | None = None) -> bool:
+    cleaned = _ai_work_intensity_percent() if percent is None else max(0, min(100, int(percent)))
+    if cleaned >= 100:
+        return True
+    if cleaned <= 0:
+        return False
+    return random.random() < cleaned / 100.0
+
+
+def _format_ai_work_intensity_status() -> str:
+    percent = _ai_work_intensity_percent()
+    return (
+        f"AI工作强度：{percent}%\n"
+        "作用：控制群聊触发批次进入硬筛选、decision、搜索/行情和生成的概率。\n"
+        "不影响：消息照常写入数据库、短期上下文、原文语料、画像素材和学习素材。\n"
+        "命令：工作强度 60；AI强度 30%；触发概率 100。0% 等同只记忆不主动插话。"
+    )
+
+
 def _format_approval_review_status() -> str:
     mode = "开启审查：bot 发群前会先发审批单。" if _approval_review_enabled() else "关闭审查：bot 直接发送第 1 候选。"
     pending_count = len(pending_group_approvals)
@@ -1390,6 +1429,27 @@ async def _handle_group_message_locked(
     enabled = bool(group_cfg.get("enabled", True)) and bool(state["enabled"])
     if not enabled:
         logger.info(f"qq_social_agent ignored group={group_id}: disabled")
+        return
+
+    work_intensity_percent = _ai_work_intensity_percent()
+    if not _ai_work_intensity_selected(work_intensity_percent):
+        logger.info(
+            "qq_social_agent skipped by ai work intensity: "
+            f"group={group_id} percent={work_intensity_percent} user={user_id} text={text!r}"
+        )
+        await _send_approval_suppression_notice(
+            bot,
+            group_id=group_id,
+            user_id=user_id,
+            nickname=nickname,
+            text=text,
+            stage="ai_work_intensity",
+            reason=(
+                f"AI工作强度抽样未命中：当前 {work_intensity_percent}%。"
+                "消息已写入上下文和学习素材，但本轮不进入硬筛选、decision、搜索/行情和生成。"
+            ),
+        )
+        _schedule_group_learning(group_id)
         return
 
     market_intents = detect_market_intents(text, limit=2)
@@ -4145,6 +4205,8 @@ def _is_private_tool_text(text: str) -> bool:
         or text in APPROVAL_REVIEW_OFF_COMMANDS
         or text in APPROVAL_REVIEW_STATUS_COMMANDS
         or APPROVAL_AUTO_SEND_PERCENT_RE.match(text) is not None
+        or text in AI_WORK_INTENSITY_STATUS_COMMANDS
+        or AI_WORK_INTENSITY_PERCENT_RE.match(text) is not None
         or text in {"开启", "打开", "恢复", "关闭", "关掉", "暂停"}
     )
 
@@ -4379,6 +4441,25 @@ async def _handle_group_approval_private(bot: Bot, user_id: int, text: str) -> b
             (
                 f"已设置免审自动发送概率：{percent}%。\n"
                 "审查开启时，命中概率的候选会直接发送第 1 条；未命中仍发审批单。"
+            ),
+        )
+        return True
+    work_intensity_match = AI_WORK_INTENSITY_PERCENT_RE.match(compact_text)
+    if work_intensity_match is not None:
+        if not is_admin:
+            await _send_private_text(bot, user_id, BASIC_APPROVAL_DENIED_MESSAGE)
+            return True
+        raw_percent = work_intensity_match.group("percent")
+        if raw_percent is None:
+            await _send_private_text(bot, user_id, _format_ai_work_intensity_status())
+            return True
+        percent = _set_ai_work_intensity_percent(int(raw_percent))
+        await _send_private_text(
+            bot,
+            user_id,
+            (
+                f"已设置 AI 工作强度：{percent}%。\n"
+                "群消息仍会写入上下文和学习素材；只有命中的触发批次会进入硬筛选、decision、搜索/行情和生成。"
             ),
         )
         return True
