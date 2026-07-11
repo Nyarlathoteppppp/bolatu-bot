@@ -1304,6 +1304,26 @@ async def _handle_group_message_locked(
     addressed_bot = mentioned or replied_to_bot
     addressed_repeat_count = _record_addressed_event(group_id, user_id, addressed_bot)
 
+    if not buffered_messages and replied_to_bot and _is_low_value_reply_to_bot_event(event):
+        plain_reply_text = _plain_text(event)
+        if not skip_memory_record:
+            memory.add_message(group_id, user_id, nickname, plain_reply_text or text, is_bot=False)
+        logger.info(
+            "qq_social_agent ignored low value reply to bot: "
+            f"group={group_id} user={user_id} text={plain_reply_text!r}"
+        )
+        await _send_approval_suppression_notice(
+            bot,
+            group_id=group_id,
+            user_id=user_id,
+            nickname=nickname,
+            text=text,
+            stage="backend_low_value_reply_to_bot",
+            reason="后端拦截：这条是回复 bot 旧消息的纯确认/敷衍短句，没有新增信息，不进入 LLM decision。",
+        )
+        _schedule_group_learning(group_id)
+        return
+
     if not text:
         if not addressed_bot:
             return
@@ -2454,6 +2474,21 @@ def _message_has_context_media(event: GroupMessageEvent | PrivateMessageEvent) -
         if segment_type in {"image", "mface", "face", "record", "video", "forward", "json", "xml", "reply"}:
             return True
     return False
+
+
+def _message_has_non_reply_media(event: GroupMessageEvent | PrivateMessageEvent) -> bool:
+    for segment in event.message:
+        segment_type = str(getattr(segment, "type", "") or "")
+        if segment_type in {"image", "mface", "face", "record", "video", "forward", "json", "xml"}:
+            return True
+    return False
+
+
+def _is_low_value_reply_to_bot_event(event: GroupMessageEvent | PrivateMessageEvent) -> bool:
+    plain_text = _plain_text(event) if isinstance(event, GroupMessageEvent) else _event_plain_text(event)
+    if plain_text and not _is_low_value_group_text(plain_text):
+        return False
+    return not _message_has_non_reply_media(event)
 
 
 def _message_segment_placeholder(segment_type: str, data: dict[str, object]) -> str:
@@ -4638,6 +4673,14 @@ def _mentioned_bot(event: GroupMessageEvent, bot: Bot) -> bool:
 
 def _replied_to_bot(event: GroupMessageEvent, bot: Bot) -> bool:
     bot_id = str(bot.self_id)
+    reply = getattr(event, "reply", None)
+    if reply is not None:
+        reply_user_id = getattr(reply, "user_id", None) or getattr(reply, "sender_id", None)
+        sender = getattr(reply, "sender", None)
+        if reply_user_id is None and sender is not None:
+            reply_user_id = getattr(sender, "user_id", None) or getattr(sender, "id", None)
+        if reply_user_id is not None and str(reply_user_id) == bot_id:
+            return True
     for seg in event.message:
         if seg.type == "reply":
             sender_id = seg.data.get("user_id") or seg.data.get("sender_id")

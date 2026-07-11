@@ -316,6 +316,52 @@ def test_message_context_text_includes_media_and_reply() -> None:
     assert "[转发消息]" in text
 
 
+def test_replied_to_bot_uses_event_reply_sender() -> None:
+    bot = SimpleNamespace(self_id=1801507496)
+    event = SimpleNamespace(
+        message=[SimpleNamespace(type="reply", data={"id": "42"})],
+        reply=SimpleNamespace(user_id=1801507496, sender=SimpleNamespace(card="张风雪")),
+    )
+
+    assert plugin._replied_to_bot(event, bot)
+
+
+def test_low_value_reply_to_bot_event_ignores_plain_ack() -> None:
+    event = SimpleNamespace(
+        message=[
+            SimpleNamespace(type="reply", data={"id": "42"}),
+            SimpleNamespace(type="text", data={"text": "好的"}),
+        ],
+        get_plaintext=lambda: "好的",
+    )
+
+    assert plugin._is_low_value_reply_to_bot_event(event)
+
+
+def test_low_value_reply_to_bot_event_allows_meaningful_reply() -> None:
+    event = SimpleNamespace(
+        message=[
+            SimpleNamespace(type="reply", data={"id": "42"}),
+            SimpleNamespace(type="text", data={"text": "好的，那你怎么看这个学校"}),
+        ],
+        get_plaintext=lambda: "好的，那你怎么看这个学校",
+    )
+
+    assert not plugin._is_low_value_reply_to_bot_event(event)
+
+
+def test_low_value_reply_to_bot_event_allows_media_reply() -> None:
+    event = SimpleNamespace(
+        message=[
+            SimpleNamespace(type="reply", data={"id": "42"}),
+            SimpleNamespace(type="image", data={"summary": "截图"}),
+        ],
+        get_plaintext=lambda: "",
+    )
+
+    assert not plugin._is_low_value_reply_to_bot_event(event)
+
+
 def test_parse_token_report_date_window() -> None:
     window = plugin._parse_token_report_window("2026-07-10")
 
