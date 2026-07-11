@@ -30,6 +30,7 @@ from qq_social_agent.plugin import (
     _format_recall_feedback_context,
     _daily_review_window,
     _apply_backend_tool_decision,
+    _compact_long_message_fallback,
     _is_explicit_market_lookup,
     _is_low_value_group_text,
     _is_useful_style_rule,
@@ -115,6 +116,16 @@ def _pending_approval() -> plugin.PendingGroupApproval:
 
 def test_group_buffer_seconds_is_six() -> None:
     assert GROUP_BUFFER_SECONDS == 6.0
+
+
+def test_compact_long_message_fallback_keeps_short_marker() -> None:
+    text = "这是一条很长的消息" * 12
+
+    compacted = _compact_long_message_fallback(text)
+
+    assert len(compacted) < len(text)
+    assert "长消息" in compacted
+    assert "已省略" in compacted
 
 
 def _buffered_item(group_id: int, text: str, *, user_id: int = 184589072) -> plugin.BufferedGroupMessage:

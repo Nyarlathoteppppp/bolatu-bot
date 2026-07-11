@@ -377,6 +377,39 @@ class DeepSeekClient:
         content = response.choices[0].message.content or ""
         return _sanitize_reply(content, persona.max_reply_chars)
 
+    async def summarize_long_message(
+        self,
+        *,
+        text: str,
+        speaker_label: str,
+        chat_label: str = "QQ 群聊",
+        original_chars: int | None = None,
+    ) -> str:
+        source_chars = original_chars if original_chars is not None else len(text)
+        system = self.prompts.render("long_message_summary", "system")
+        user = self.prompts.render(
+            "long_message_summary",
+            "user",
+            chat_label=chat_label,
+            speaker_label=speaker_label,
+            source_chars=source_chars,
+            source_text=text,
+        )
+        response = await self._chat_completion(
+            task="long_message_summary",
+            route_name="memory",
+            request={
+                "temperature": 0.1,
+                "max_tokens": 180,
+                "response_format": {"type": "json_object"},
+                "messages": [
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user},
+                ],
+            },
+        )
+        return _parse_long_message_summary(response.choices[0].message.content or "")
+
     async def summarize_member_profile(
         self,
         *,
@@ -826,6 +859,15 @@ def _parse_member_profile_draft(content: str) -> MemberProfileDraft:
         speaking_style[:260],
         tuple(representative_texts),
     )
+
+
+def _parse_long_message_summary(content: str) -> str:
+    try:
+        raw = _loads_json_object(content)
+    except json.JSONDecodeError:
+        return ""
+    summary = re.sub(r"\s+", " ", str(raw.get("summary", ""))).strip()
+    return summary[:180]
 
 
 def _parse_string_list(value: object, *, limit: int, item_limit: int) -> list[str]:

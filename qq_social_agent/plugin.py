@@ -122,6 +122,10 @@ MEMBER_IMPRESSION_CONTEXT_LIMIT = 8
 RAW_CORPUS_CONTEXT_LIMIT = 6
 RAW_CORPUS_CANDIDATE_LIMIT = 240
 RAW_CORPUS_CONTEXT_RADIUS = 2
+LONG_MESSAGE_SUMMARY_THRESHOLD = 100
+LONG_MESSAGE_SUMMARY_SOURCE_LIMIT = 1800
+LONG_MESSAGE_SUMMARY_FALLBACK_HEAD = 72
+LONG_MESSAGE_SUMMARY_FALLBACK_TAIL = 28
 JARGON_CONTEXT_LOOKBACK = 4
 CUSTOM_JARGON_CONTEXT_LIMIT = 10
 GROUP_BUFFER_SECONDS = 6.0
@@ -1113,38 +1117,46 @@ async def handle_jargon_command(event: Event, matcher: Matcher) -> None:
 @group_message.handle()
 async def handle_group_message(bot: Bot, event: GroupMessageEvent) -> None:
     group_id = int(event.group_id)
-    text = _plain_text(event)
+    raw_text = _plain_text(event)
     addressed_bot = _mentioned_bot(event, bot) or _replied_to_bot(event, bot)
+    group_allowed = app_config.group_allowed(group_id)
+    text = raw_text
+    if raw_text and group_allowed and not _is_low_value_group_text(raw_text):
+        text = await _message_text_for_context(
+            raw_text,
+            nickname=_nickname(event),
+            chat_label=f"QQ 群聊 {group_id}",
+        )
     if (
-        text
-        and app_config.group_allowed(group_id)
+        raw_text
+        and group_allowed
         and not addressed_bot
-        and _is_low_value_group_text(text)
+        and _is_low_value_group_text(raw_text)
     ):
-        memory.add_message(group_id, int(event.user_id), _nickname(event), text, is_bot=False)
+        memory.add_message(group_id, int(event.user_id), _nickname(event), raw_text, is_bot=False)
         logger.info(
             "qq_social_agent ignored group low value text: "
-            f"group={group_id} user={int(event.user_id)} text={text!r}"
+            f"group={group_id} user={int(event.user_id)} text={raw_text!r}"
         )
         await _send_approval_suppression_notice(
             bot,
             group_id=group_id,
             user_id=int(event.user_id),
             nickname=_nickname(event),
-            text=text,
+            text=raw_text,
             stage="backend_low_value",
             reason="后端低价值硬拦截：纯表情/单字/短笑声，不进入 buffer 和 LLM decision。",
         )
         return
     if (
         text
-        and app_config.group_allowed(group_id)
+        and group_allowed
         and not addressed_bot
     ):
         _buffer_group_message(bot, event, text)
         return
     async with _group_processing_lock(group_id):
-        await _handle_group_message_locked(bot, event)
+        await _handle_group_message_locked(bot, event, preprocessed_text=text)
 
 
 async def _handle_group_message_locked(
@@ -1154,8 +1166,11 @@ async def _handle_group_message_locked(
     buffered_messages: list[BufferedGroupMessage] | None = None,
     force_passive_decision: bool = False,
     skip_memory_record: bool = False,
+    preprocessed_text: str | None = None,
 ) -> None:
-    text = _buffered_current_text(buffered_messages) if buffered_messages else _plain_text(event)
+    text = _buffered_current_text(buffered_messages) if buffered_messages else (
+        preprocessed_text if preprocessed_text is not None else _plain_text(event)
+    )
     group_id = int(event.group_id)
     if not app_config.group_allowed(group_id):
         logger.info(f"qq_social_agent ignored group={group_id}: not_allowed")
@@ -1736,6 +1751,11 @@ async def handle_private_message(bot: Bot, event: PrivateMessageEvent) -> None:
         text = forced_once_text
         forced_once_context = _private_force_obey_context(user_id, one_shot=True)
 
+    text = await _message_text_for_context(
+        text,
+        nickname=_private_nickname(event),
+        chat_label="QQ 私聊",
+    )
     logger.info(f"qq_social_agent private start: user={user_id} text={text!r}")
     chat_id = _private_chat_id(user_id)
     nickname = _private_nickname(event)
@@ -2322,6 +2342,49 @@ def _format_fresh_context_hint(intent: object | None) -> str:
         f"后端检测到这句话可能涉及最新背景，候选查询：{query}，类型：{kind}。"
         "是否真的需要搜索由你判断；非必要不要搜索。"
     )
+
+
+async def _message_text_for_context(text: str, *, nickname: str, chat_label: str) -> str:
+    clean = text.strip()
+    if len(clean) <= LONG_MESSAGE_SUMMARY_THRESHOLD:
+        return text
+    fallback = _compact_long_message_fallback(clean)
+    if deepseek_client is None:
+        return fallback
+    try:
+        summary = await deepseek_client.summarize_long_message(
+            text=clean[:LONG_MESSAGE_SUMMARY_SOURCE_LIMIT],
+            speaker_label=nickname,
+            chat_label=chat_label,
+            original_chars=len(clean),
+        )
+    except Exception as exc:
+        logger.warning(
+            "qq_social_agent long message summary failed: "
+            f"chat={chat_label} nickname={nickname!r} chars={len(clean)} error={exc}"
+        )
+        return fallback
+    summary = re.sub(r"\s+", " ", summary).strip()
+    if not summary:
+        return fallback
+    if len(summary) > 160:
+        summary = summary[:157].rstrip() + "..."
+    logger.info(
+        "qq_social_agent compacted long message: "
+        f"chat={chat_label} nickname={nickname!r} raw_chars={len(clean)} summary_chars={len(summary)}"
+    )
+    return f"[长消息{len(clean)}字摘要] {summary}"
+
+
+def _compact_long_message_fallback(text: str) -> str:
+    clean = re.sub(r"\s+", " ", text).strip()
+    if len(clean) <= LONG_MESSAGE_SUMMARY_THRESHOLD:
+        return clean
+    head = clean[:LONG_MESSAGE_SUMMARY_FALLBACK_HEAD].rstrip()
+    tail = clean[-LONG_MESSAGE_SUMMARY_FALLBACK_TAIL:].lstrip()
+    if tail and tail not in head:
+        return f"{head} ... [长消息{len(clean)}字，已省略] ... {tail}"
+    return f"{head} ... [长消息{len(clean)}字，已省略]"
 
 
 async def _private_fresh_context_for(text: str) -> str:

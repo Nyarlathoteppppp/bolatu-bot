@@ -7,6 +7,7 @@ from qq_social_agent.deepseek_client import (
     DeepSeekClient,
     _log_llm_usage,
     _parse_jargon_terms,
+    _parse_long_message_summary,
     _parse_member_profile_draft,
     _parse_reply_candidates,
     _parse_reply_decision,
@@ -234,6 +235,7 @@ def test_client_methods_use_expected_model_routes() -> None:
         "reply_candidates": '{"candidates":[{"text":"候选一句话","style":"自然","action":"reply"}]}',
         "daily_review": "今天群里聊得挺热闹，我也算接上了几句。",
         "member_profile": '{"summary":"爱聊行情和代码","interests":["股票","代码"],"speaking_style":"短句吐槽","representative_texts":["股票又亏了"]}',
+        "long_message_summary": '{"summary":"长消息主要是在吐槽股票亏钱和风险控制。"}',
         "mid_memory": '{"summary":"按人：A[#11111]说了事","recall_cues":["A[#11111]"]}',
         "style_learning": '{"rules":[{"situation":"聊亏钱","style":"短句吐槽","source_id":1}]}',
     }
@@ -307,6 +309,11 @@ def test_client_methods_use_expected_model_routes() -> None:
             messages=messages,
             member_label="A[#11111]",
         )
+        await client.summarize_long_message(
+            text="这是一条很长的群友消息，主要在说股票亏钱和风险控制。",
+            speaker_label="A",
+            original_chars=120,
+        )
         await client.summarize_mid_memory(messages=messages)
         await client.learn_style_rules(messages=messages)
 
@@ -319,9 +326,17 @@ def test_client_methods_use_expected_model_routes() -> None:
         ("reply_candidates", "reply"),
         ("daily_review", "reply"),
         ("member_profile", "member_profile"),
+        ("long_message_summary", "memory"),
         ("mid_memory", "memory"),
         ("style_learning", "style"),
     ]
+
+
+def test_parse_long_message_summary() -> None:
+    assert _parse_long_message_summary('{"summary":"  长消息说的是股票亏钱和风险控制。  "}') == (
+        "长消息说的是股票亏钱和风险控制。"
+    )
+    assert _parse_long_message_summary("bad") == ""
 
 
 def test_parse_member_profile_draft() -> None:
