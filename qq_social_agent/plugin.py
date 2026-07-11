@@ -167,6 +167,8 @@ TOOL_ADMIN_USER_IDS = tuple(sorted({PRIVATE_DEBUG_OWNER_ID, *OWNER_USER_IDS}))
 DEFAULT_BASIC_APPROVAL_USER_IDS = (3370998238,)
 GROUP_APPROVAL_USER_IDS = tuple(sorted({*OWNER_USER_IDS, *DEFAULT_BASIC_APPROVAL_USER_IDS}))
 JARGON_COMMAND_USER_IDS = TOOL_ADMIN_USER_IDS
+LIMITED_APPROVAL_PERCENT_USER_IDS = (3370998238,)
+LIMITED_APPROVAL_PERCENT_MIN = 60
 APPROVAL_USER_IDS_KEY = "group_approval_basic_user_ids"
 APPROVAL_STALE_CHOICE_COOLDOWN_SECONDS = 8
 RECALL_FEEDBACK_CONTEXT_LIMIT = 3
@@ -977,6 +979,14 @@ def _approval_auto_send_selected(percent: int) -> bool:
     return random.random() < max(0, min(100, percent)) / 100.0
 
 
+def _approval_direct_single_reply_enabled() -> bool:
+    return not _approval_review_enabled() or _approval_auto_send_percent() >= 100
+
+
+def _can_manage_approval_auto_send_percent(user_id: int) -> bool:
+    return _is_tool_admin_user(user_id) or _is_owner_user(user_id) or user_id in LIMITED_APPROVAL_PERCENT_USER_IDS
+
+
 def _ai_work_intensity_percent() -> int:
     raw = memory.app_kv_get(AI_WORK_INTENSITY_PERCENT_KEY)
     try:
@@ -1021,7 +1031,7 @@ def _format_approval_review_status() -> str:
     auto_send_percent = _approval_auto_send_percent()
     return (
         f"审查状态：{mode}\n"
-        f"免审自动发送概率：{auto_send_percent}%（审查开启时生效，命中后直接发第 1 候选）。\n"
+        f"免审自动发送概率：{auto_send_percent}%（审查开启时生效，命中后直接发第 1 候选；100% 时只生成 1 条直发回复）。\n"
         f"当前待审候选：{pending_count} 条。"
     )
 
@@ -1923,6 +1933,8 @@ async def _handle_group_message_locked(
         self_id=int(event.self_id),
         suppress_user_id=suppress_mention_user_id,
     )
+    direct_single_reply = _approval_direct_single_reply_enabled()
+    reply_candidate_limit = 1 if direct_single_reply else 3
     try:
         reply_candidates = await deepseek_client.reply_candidates(
             persona=persona,
@@ -1947,6 +1959,9 @@ async def _handle_group_message_locked(
             mention_targets=_format_mention_targets(mention_targets),
             priority_context=_focused_user_tone_context(user_id),
             include_bot_history=False,
+            candidate_count=reply_candidate_limit,
+            prompt_flow="reply_direct" if direct_single_reply else "reply_candidates",
+            task_name="reply_direct" if direct_single_reply else "reply_candidates",
         )
     except Exception as exc:
         logger.warning(
@@ -1997,22 +2012,22 @@ async def _handle_group_message_locked(
                 style=draft.style,
             )
         )
-        if len(approval_candidates) >= 3:
+        if len(approval_candidates) >= reply_candidate_limit:
             break
     if not approval_candidates:
         logger.info(f"qq_social_agent skipped group={group_id}: empty_candidate_after_guard")
         return
-    if len(approval_candidates) < 3:
-        _pad_approval_candidates(approval_candidates, action=decision.action, limit=3)
+    if len(approval_candidates) < reply_candidate_limit:
+        _pad_approval_candidates(approval_candidates, action=decision.action, limit=reply_candidate_limit)
     logger.info(
         "qq_social_agent pending group reply candidates approval: "
-        f"group={group_id} candidates={len(approval_candidates)}"
+        f"group={group_id} candidates={len(approval_candidates)} direct_single_reply={direct_single_reply}"
     )
     _record_metric_event(
         "candidate_generated",
         group_id=group_id,
         user_id=user_id,
-        stage="reply_candidates",
+        stage="reply_direct" if direct_single_reply else "reply_candidates",
         action=decision.action,
         candidate_count=len(approval_candidates),
     )
@@ -4361,6 +4376,10 @@ async def _handle_group_approval_private(bot: Bot, user_id: int, text: str) -> b
         return False
     compact_text = text.strip()
     is_admin = _is_tool_admin_user(user_id) or _is_owner_user(user_id)
+    auto_send_match = APPROVAL_AUTO_SEND_PERCENT_RE.match(compact_text)
+    can_manage_auto_send_percent = (
+        auto_send_match is not None and _can_manage_approval_auto_send_percent(user_id)
+    )
     pending_approval_control = _latest_group_approval() is not None and _is_approval_control_text(compact_text)
     if not pending_approval_control:
         shortcut_command = _bot_tool_shortcut_command(compact_text)
@@ -4390,7 +4409,12 @@ async def _handle_group_approval_private(bot: Bot, user_id: int, text: str) -> b
             return True
     if await _handle_approver_management_command(bot, user_id, compact_text):
         return True
-    if not pending_approval_control and _is_private_tool_text(compact_text) and not is_admin:
+    if (
+        not pending_approval_control
+        and _is_private_tool_text(compact_text)
+        and not is_admin
+        and not can_manage_auto_send_percent
+    ):
         await _send_private_text(bot, user_id, BASIC_APPROVAL_DENIED_MESSAGE)
         return True
     if await _handle_private_whitelist_command(bot, user_id, compact_text):
@@ -4462,22 +4486,30 @@ async def _handle_group_approval_private(bot: Bot, user_id: int, text: str) -> b
             return True
         await _send_private_text(bot, user_id, _format_suppression_report(suppression_report_limit))
         return True
-    auto_send_match = APPROVAL_AUTO_SEND_PERCENT_RE.match(compact_text)
     if auto_send_match is not None:
-        if not is_admin:
+        if not _can_manage_approval_auto_send_percent(user_id):
             await _send_private_text(bot, user_id, BASIC_APPROVAL_DENIED_MESSAGE)
             return True
         raw_percent = auto_send_match.group("percent")
         if raw_percent is None:
             await _send_private_text(bot, user_id, _format_approval_review_status())
             return True
-        percent = _set_approval_auto_send_percent(int(raw_percent))
+        requested_percent = int(raw_percent)
+        if not is_admin and requested_percent < LIMITED_APPROVAL_PERCENT_MIN:
+            await _send_private_text(
+                bot,
+                user_id,
+                f"你只能把免审自动发送概率设置为 {LIMITED_APPROVAL_PERCENT_MIN}% 到 100%。",
+            )
+            return True
+        percent = _set_approval_auto_send_percent(requested_percent)
         await _send_private_text(
             bot,
             user_id,
             (
                 f"已设置免审自动发送概率：{percent}%。\n"
-                "审查开启时，命中概率的候选会直接发送第 1 条；未命中仍发审批单。"
+                "审查开启时，命中概率的候选会直接发送第 1 条；未命中仍发审批单。\n"
+                "设置为 100% 时改用单条直发 prompt，不再生成三候选。"
             ),
         )
         return True
@@ -4531,7 +4563,7 @@ async def _handle_group_approval_private(bot: Bot, user_id: int, text: str) -> b
         await _set_approval_group_decision_enabled(bot, user_id, False)
         return True
     if not _is_approval_control_text(compact_text):
-        if _is_private_tool_text(compact_text) and not is_admin:
+        if _is_private_tool_text(compact_text) and not is_admin and not can_manage_auto_send_percent:
             await _send_private_text(bot, user_id, BASIC_APPROVAL_DENIED_MESSAGE)
             return True
         return False

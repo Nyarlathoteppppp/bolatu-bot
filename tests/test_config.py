@@ -147,6 +147,7 @@ def test_prompt_registry_loads_central_prompt_file() -> None:
         persona_decision_prompt="人格摘要",
     )
     assert "群聊三候选生成" in prompts.raw["flows"]["reply_candidates"]["flow"]
+    assert "群聊免审直发单条生成" in prompts.raw["flows"]["reply_direct"]["flow"]
     assert "温柔接话" in prompts.action_guide("reply")
     assert "关心/承接" in prompts.action_guide("care")
 
@@ -158,6 +159,7 @@ def test_central_prompt_file_contains_all_runtime_flows() -> None:
         "jargon_select",
         "reply",
         "reply_candidates",
+        "reply_direct",
         "daily_review",
         "member_profile",
         "long_message_summary",

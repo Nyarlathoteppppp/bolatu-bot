@@ -539,3 +539,59 @@ def test_reply_candidates_includes_priority_context() -> None:
     user_prompt = captured_requests[0]["messages"][1]["content"]
     assert "最高优先级语气要求" in user_prompt
     assert "回复小鸟时必须超级温柔" in user_prompt
+
+
+def test_reply_direct_uses_direct_prompt_and_one_candidate() -> None:
+    client = DeepSeekClient.__new__(DeepSeekClient)
+    client.config = SimpleNamespace(
+        max_tokens=900,
+        thinking="disabled",
+        reasoning_effort="low",
+        temperature=0.6,
+    )
+    client.prompts = PromptRegistry()
+    captured_calls: list[tuple[str, str, dict[str, object]]] = []
+
+    async def fake_chat_completion(*, task: str, route_name: str, request: dict[str, object]) -> object:
+        captured_calls.append((task, route_name, request))
+        return SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(
+                        content='{"candidates":[{"text":"风雪觉得这句可以接一下","style":"单条直发","action":"reply"}]}'
+                    ),
+                )
+            ]
+        )
+
+    client._chat_completion = fake_chat_completion
+    persona = Persona(
+        id="test",
+        name="张风雪",
+        description="",
+        prompt="人格",
+        decision_prompt="决策人格",
+        keywords=(),
+        max_reply_chars=120,
+        passive_reply_probability=0.5,
+    )
+
+    candidates = asyncio.run(
+        client.reply_candidates(
+            persona=persona,
+            recent_messages=[],
+            current_text="有人吗",
+            current_nickname="A[#11111]",
+            mentioned=False,
+            candidate_count=1,
+            prompt_flow="reply_direct",
+            task_name="reply_direct",
+        )
+    )
+
+    assert [candidate.text for candidate in candidates] == ["风雪觉得这句可以接一下"]
+    assert captured_calls[0][0:2] == ("reply_direct", "reply")
+    system_prompt = captured_calls[0][2]["messages"][0]["content"]
+    user_prompt = captured_calls[0][2]["messages"][1]["content"]
+    assert "只生成 1 条" in system_prompt
+    assert "输出 1 条最终要直接发送的回复 JSON" in user_prompt

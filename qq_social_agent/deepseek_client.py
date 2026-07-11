@@ -478,6 +478,8 @@ class DeepSeekClient:
         priority_context: str = "",
         include_bot_history: bool = True,
         candidate_count: int = 3,
+        prompt_flow: str = "reply_candidates",
+        task_name: str = "reply_candidates",
     ) -> tuple[ReplyCandidateDraft, ...]:
         context_messages = _reply_context_messages(
             recent_messages,
@@ -500,7 +502,7 @@ class DeepSeekClient:
             self.prompts.action_guide("reply", "行动：普通接话。结合群友聊天内容接一句话。"),
         )
         system = self.prompts.render(
-            "reply_candidates",
+            prompt_flow,
             "system",
             persona_prompt=persona.prompt,
             chat_label=chat_label,
@@ -513,7 +515,7 @@ class DeepSeekClient:
         market_section = f"\n\n{market_context}" if market_context else ""
         fresh_section = f"\n\n{fresh_context}" if fresh_context else ""
         user = self.prompts.render(
-            "reply_candidates",
+            prompt_flow,
             "user",
             context=context,
             memory_context_section=_optional_section("中期聊天回想", memory_context),
@@ -545,7 +547,7 @@ class DeepSeekClient:
         else:
             request["temperature"] = self.config.temperature
 
-        response = await self._chat_completion(task="reply_candidates", route_name="reply", request=request)
+        response = await self._chat_completion(task=task_name, route_name="reply", request=request)
         content = response.choices[0].message.content or ""
         candidates = _parse_reply_candidates(
             content,
@@ -564,7 +566,7 @@ class DeepSeekClient:
         )
         try:
             retry_response = await self._chat_completion(
-                task="reply_candidates",
+                task=task_name,
                 route_name="reply",
                 request=retry_request,
             )

@@ -1597,7 +1597,7 @@ def test_owner_can_set_approval_auto_send_percent(monkeypatch, tmp_path) -> None
     assert "免审自动发送概率：30%" in bot.private_messages[-1][1]
 
 
-def test_basic_approver_cannot_set_approval_auto_send_percent(monkeypatch, tmp_path) -> None:
+def test_limited_approver_can_set_approval_auto_send_percent_with_floor(monkeypatch, tmp_path) -> None:
     _use_temp_plugin_memory(monkeypatch, tmp_path)
     bot = FakeApprovalBot()
 
@@ -1605,7 +1605,30 @@ def test_basic_approver_cannot_set_approval_auto_send_percent(monkeypatch, tmp_p
 
     assert handled
     assert plugin._approval_auto_send_percent() == 0
-    assert bot.private_messages[-1] == (3370998238, "你只有基础审批权限：A/B/C/D/X/1/2/3/取消 处理审批单。")
+    assert "60% 到 100%" in bot.private_messages[-1][1]
+
+    handled = asyncio.run(plugin._handle_group_approval_private(bot, 3370998238, "审批概率 60"))
+
+    assert handled
+    assert plugin._approval_auto_send_percent() == 60
+    assert "60%" in bot.private_messages[-1][1]
+
+    handled = asyncio.run(plugin._handle_group_approval_private(bot, 3370998238, "审批概率"))
+
+    assert handled
+    assert "免审自动发送概率：60%" in bot.private_messages[-1][1]
+
+
+def test_regular_basic_approver_cannot_set_approval_auto_send_percent(monkeypatch, tmp_path) -> None:
+    _use_temp_plugin_memory(monkeypatch, tmp_path)
+    plugin._save_basic_approval_user_ids({123456789})
+    bot = FakeApprovalBot()
+
+    handled = asyncio.run(plugin._handle_group_approval_private(bot, 123456789, "审批概率 80"))
+
+    assert handled
+    assert plugin._approval_auto_send_percent() == 0
+    assert bot.private_messages[-1] == (123456789, "你只有基础审批权限：A/B/C/D/X/1/2/3/取消 处理审批单。")
 
 
 def test_ai_work_intensity_defaults_to_full(monkeypatch, tmp_path) -> None:
@@ -1670,6 +1693,21 @@ def test_request_group_approval_auto_sends_by_probability(monkeypatch, tmp_path)
     assert bot.private_messages == []
     sent_messages = store.recent_messages(1026813421, 3)
     assert sent_messages[-1].text == "第一条回复"
+
+
+def test_approval_direct_single_reply_enabled_only_when_deterministic(monkeypatch, tmp_path) -> None:
+    store = _use_temp_plugin_memory(monkeypatch, tmp_path)
+
+    assert not plugin._approval_direct_single_reply_enabled()
+
+    plugin._set_approval_auto_send_percent(100)
+    assert plugin._approval_direct_single_reply_enabled()
+
+    plugin._set_approval_auto_send_percent(60)
+    assert not plugin._approval_direct_single_reply_enabled()
+
+    store.app_kv_set(plugin.APPROVAL_REVIEW_ENABLED_KEY, "false")
+    assert plugin._approval_direct_single_reply_enabled()
 
 
 def test_changelog_notice_sent_once(monkeypatch, tmp_path) -> None:
