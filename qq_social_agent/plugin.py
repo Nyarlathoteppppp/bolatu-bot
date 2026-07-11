@@ -1001,12 +1001,16 @@ def _ai_work_intensity_selected(percent: int | None = None) -> bool:
     return random.random() < cleaned / 100.0
 
 
+def _ai_work_intensity_applies(*, addressed_bot: bool) -> bool:
+    return not addressed_bot
+
+
 def _format_ai_work_intensity_status() -> str:
     percent = _ai_work_intensity_percent()
     return (
         f"AI工作强度：{percent}%\n"
         "作用：控制群聊触发批次进入硬筛选、decision、搜索/行情和生成的概率。\n"
-        "不影响：消息照常写入数据库、短期上下文、原文语料、画像素材和学习素材。\n"
+        "不影响：消息照常写入数据库、短期上下文、原文语料、画像素材和学习素材；艾特/回复/点名风雪不受概率影响。\n"
         "命令：工作强度 60；AI强度 30%；触发概率 100。0% 等同只记忆不主动插话。"
     )
 
@@ -1439,7 +1443,10 @@ async def _handle_group_message_locked(
         return
 
     work_intensity_percent = _ai_work_intensity_percent()
-    if not _ai_work_intensity_selected(work_intensity_percent):
+    if (
+        _ai_work_intensity_applies(addressed_bot=addressed_bot)
+        and not _ai_work_intensity_selected(work_intensity_percent)
+    ):
         logger.info(
             "qq_social_agent skipped by ai work intensity: "
             f"group={group_id} percent={work_intensity_percent} user={user_id} text={text!r}"
@@ -1453,7 +1460,8 @@ async def _handle_group_message_locked(
             stage="ai_work_intensity",
             reason=(
                 f"AI工作强度抽样未命中：当前 {work_intensity_percent}%。"
-                "消息已写入上下文和学习素材，但本轮不进入硬筛选、decision、搜索/行情和生成。"
+                "普通群聊消息已写入上下文和学习素材，但本轮不进入硬筛选、decision、搜索/行情和生成；"
+                "艾特/回复/点名风雪不受这个概率影响。"
             ),
         )
         _schedule_group_learning(group_id)

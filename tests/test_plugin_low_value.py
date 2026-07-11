@@ -1652,6 +1652,11 @@ def test_ai_work_intensity_selection_respects_bounds(monkeypatch, tmp_path) -> N
     assert plugin._ai_work_intensity_selected()
 
 
+def test_ai_work_intensity_only_applies_to_unaddressed_messages() -> None:
+    assert plugin._ai_work_intensity_applies(addressed_bot=False)
+    assert not plugin._ai_work_intensity_applies(addressed_bot=True)
+
+
 def test_request_group_approval_auto_sends_by_probability(monkeypatch, tmp_path) -> None:
     store = _use_temp_plugin_memory(monkeypatch, tmp_path)
     plugin._set_approval_auto_send_percent(100)
