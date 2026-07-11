@@ -137,6 +137,9 @@ LONG_MESSAGE_SUMMARY_THRESHOLD = 100
 LONG_MESSAGE_SUMMARY_SOURCE_LIMIT = 1800
 LONG_MESSAGE_SUMMARY_FALLBACK_HEAD = 72
 LONG_MESSAGE_SUMMARY_FALLBACK_TAIL = 28
+FORWARD_CONTEXT_MAX_RECORDS = 16
+FORWARD_CONTEXT_SUMMARY_THRESHOLD = 120
+UNREADABLE_MEDIA_SEGMENT_TYPES = {"image", "mface", "face", "record", "video"}
 JARGON_CONTEXT_LOOKBACK = 4
 CUSTOM_JARGON_CONTEXT_LIMIT = 10
 GROUP_BUFFER_SECONDS = 6.0
@@ -1231,6 +1234,11 @@ async def handle_group_message(bot: Bot, event: GroupMessageEvent) -> None:
     raw_text = _message_context_text(event)
     addressed_bot = _mentioned_bot(event, bot) or _replied_to_bot(event, bot)
     group_allowed = app_config.group_allowed(group_id)
+    forward_context = ""
+    if group_allowed and _message_has_forward_context(event):
+        forward_context = await _forward_context_text(bot, event, nickname=_nickname(event))
+        if forward_context:
+            raw_text = _join_context_parts(plain_text, forward_context)
     _record_metric_event(
         "message_received",
         group_id=group_id,
@@ -1241,6 +1249,22 @@ async def handle_group_message(bot: Bot, event: GroupMessageEvent) -> None:
         has_media=_message_has_context_media(event),
     )
     text = raw_text
+    if group_allowed and not addressed_bot and _should_ignore_unreadable_media_event(event, forward_context=forward_context):
+        memory.add_message(group_id, int(event.user_id), _nickname(event), raw_text or plain_text or "[不可见媒体]", is_bot=False)
+        logger.info(
+            "qq_social_agent ignored unreadable media group message: "
+            f"group={group_id} user={int(event.user_id)} text={raw_text!r}"
+        )
+        await _send_approval_suppression_notice(
+            bot,
+            group_id=group_id,
+            user_id=int(event.user_id),
+            nickname=_nickname(event),
+            text=raw_text,
+            stage="backend_unreadable_media",
+            reason="后端拦截：这条主要是图片/语音/视频或无法读取的转发记录，bot 看不到内容，不进入 buffer 和 LLM decision。",
+        )
+        return
     if raw_text and group_allowed and plain_text and not _is_low_value_group_text(plain_text):
         text = await _message_text_for_context(
             raw_text,
@@ -2484,6 +2508,68 @@ def _message_has_non_reply_media(event: GroupMessageEvent | PrivateMessageEvent)
     return False
 
 
+def _message_has_forward_context(event: GroupMessageEvent | PrivateMessageEvent) -> bool:
+    for segment in event.message:
+        segment_type = str(getattr(segment, "type", "") or "")
+        data = getattr(segment, "data", {}) or {}
+        if segment_type == "forward":
+            return True
+        if segment_type in {"json", "xml"}:
+            payload = str(data.get("data", "") or "")
+            if "forward" in payload.casefold() or "聊天记录" in payload:
+                return True
+    return False
+
+
+def _message_has_unreadable_media(event: GroupMessageEvent | PrivateMessageEvent) -> bool:
+    for segment in event.message:
+        segment_type = str(getattr(segment, "type", "") or "")
+        if segment_type in UNREADABLE_MEDIA_SEGMENT_TYPES:
+            return True
+    return False
+
+
+def _should_ignore_unreadable_media_event(
+    event: GroupMessageEvent | PrivateMessageEvent,
+    *,
+    forward_context: str,
+) -> bool:
+    if forward_context:
+        return False
+    plain_text = _plain_text(event) if isinstance(event, GroupMessageEvent) else _event_plain_text(event)
+    if _message_has_forward_context(event):
+        return _is_weak_media_caption(plain_text)
+    if _message_has_unreadable_media(event):
+        return _is_weak_media_caption(plain_text)
+    return False
+
+
+def _is_weak_media_caption(text: str) -> bool:
+    compact = re.sub(r"[^\w\u4e00-\u9fff]+", "", text).casefold()
+    if not compact:
+        return True
+    if _is_low_value_group_text(text):
+        return True
+    weak_captions = {
+        "图",
+        "图片",
+        "看图",
+        "看这个",
+        "看看",
+        "看看这个",
+        "这个",
+        "这个图",
+        "这图",
+        "截图",
+        "转发",
+        "聊天记录",
+        "笑死",
+        "绷不住",
+        "太典了",
+    }
+    return compact in weak_captions
+
+
 def _is_low_value_reply_to_bot_event(event: GroupMessageEvent | PrivateMessageEvent) -> bool:
     plain_text = _plain_text(event) if isinstance(event, GroupMessageEvent) else _event_plain_text(event)
     if plain_text and not _is_low_value_group_text(plain_text):
@@ -2757,6 +2843,170 @@ async def _message_text_for_context(text: str, *, nickname: str, chat_label: str
         f"chat={chat_label} nickname={nickname!r} raw_chars={len(clean)} summary_chars={len(summary)}"
     )
     return f"[长消息{len(clean)}字摘要] {summary}"
+
+
+async def _forward_context_text(
+    bot: Bot,
+    event: GroupMessageEvent | PrivateMessageEvent,
+    *,
+    nickname: str,
+) -> str:
+    forward_ids = _forward_message_ids(event)
+    if not forward_ids:
+        return ""
+    records: list[str] = []
+    for forward_id in forward_ids[:2]:
+        try:
+            payload = await bot.call_api("get_forward_msg", id=forward_id)
+        except ActionFailed as exc:
+            logger.warning(
+                "qq_social_agent forward context fetch failed: "
+                f"forward_id={forward_id} {_action_failed_summary(exc)}"
+            )
+            continue
+        except Exception as exc:
+            logger.warning(
+                "qq_social_agent forward context fetch failed: "
+                f"forward_id={forward_id} error={exc}"
+            )
+            continue
+        records.extend(_extract_forward_record_lines(payload, limit=FORWARD_CONTEXT_MAX_RECORDS - len(records)))
+        if len(records) >= FORWARD_CONTEXT_MAX_RECORDS:
+            break
+    if not records:
+        return ""
+    raw = "\n".join(records)
+    summary = await _summarize_forward_records(raw, nickname=nickname)
+    if not summary:
+        return ""
+    return f"{nickname}传了聊天记录，大致内容如下：{summary}"
+
+
+def _forward_message_ids(event: GroupMessageEvent | PrivateMessageEvent) -> list[str]:
+    ids: list[str] = []
+    for segment in event.message:
+        segment_type = str(getattr(segment, "type", "") or "")
+        if segment_type != "forward":
+            continue
+        data = getattr(segment, "data", {}) or {}
+        for key in ("id", "forward_id", "resid"):
+            value = str(data.get(key, "") or "").strip()
+            if value:
+                ids.append(value)
+                break
+    return ids
+
+
+def _extract_forward_record_lines(payload: object, *, limit: int) -> list[str]:
+    if limit <= 0:
+        return []
+    messages = _forward_messages_from_payload(payload)
+    lines: list[str] = []
+    for item in messages:
+        if len(lines) >= limit:
+            break
+        if not isinstance(item, dict):
+            continue
+        sender = item.get("sender") if isinstance(item.get("sender"), dict) else {}
+        sender_name = _forward_sender_label(sender, item)
+        content = item.get("content", item.get("message", ""))
+        text = _forward_content_plain_text(content)
+        if not text:
+            continue
+        lines.append(f"{sender_name}: {_short_notice_text(text, 180)}")
+    return lines
+
+
+def _forward_messages_from_payload(payload: object) -> list[object]:
+    if isinstance(payload, list):
+        return payload
+    if not isinstance(payload, dict):
+        return []
+    for key in ("messages", "message"):
+        value = payload.get(key)
+        if isinstance(value, list):
+            return value
+    data = payload.get("data")
+    if isinstance(data, dict):
+        for key in ("messages", "message"):
+            value = data.get(key)
+            if isinstance(value, list):
+                return value
+    return []
+
+
+def _forward_sender_label(sender: object, item: dict[str, object]) -> str:
+    if isinstance(sender, dict):
+        name = str(sender.get("card") or sender.get("nickname") or sender.get("name") or "").strip()
+        user_id = str(sender.get("user_id") or sender.get("uin") or "").strip()
+        if name and user_id:
+            return _member_label(int(user_id), name) if user_id.isdigit() else name
+        if name:
+            return name
+        if user_id:
+            return f"QQ{user_id}"
+    fallback = str(item.get("sender_name") or item.get("nickname") or item.get("user_id") or "某人").strip()
+    return fallback or "某人"
+
+
+def _forward_content_plain_text(content: object) -> str:
+    if hasattr(content, "extract_plain_text"):
+        try:
+            return re.sub(r"\s+", " ", content.extract_plain_text().strip())
+        except Exception:
+            pass
+    if isinstance(content, str):
+        clean = re.sub(r"\[CQ:[^\]]+\]", " ", content)
+        return re.sub(r"\s+", " ", clean).strip()
+    if isinstance(content, dict):
+        segment_type = str(content.get("type", "") or "")
+        data = content.get("data") if isinstance(content.get("data"), dict) else {}
+        if segment_type == "text":
+            return re.sub(r"\s+", " ", str(data.get("text", "") or "").strip())
+        return _message_segment_placeholder(segment_type, data)
+    if isinstance(content, list):
+        parts: list[str] = []
+        for segment in content:
+            text = _forward_content_plain_text(segment)
+            if text:
+                parts.append(text)
+        return re.sub(r"\s+", " ", " ".join(parts)).strip()
+    return ""
+
+
+async def _summarize_forward_records(raw: str, *, nickname: str) -> str:
+    clean = re.sub(r"\s+", " ", raw).strip()
+    if not clean:
+        return ""
+    if len(clean) <= FORWARD_CONTEXT_SUMMARY_THRESHOLD:
+        return clean
+    fallback = _compact_forward_fallback(clean)
+    if deepseek_client is None:
+        return fallback
+    try:
+        summary = await deepseek_client.summarize_long_message(
+            text=raw[:LONG_MESSAGE_SUMMARY_SOURCE_LIMIT],
+            speaker_label=nickname,
+            chat_label="QQ 转发聊天记录",
+            original_chars=len(raw),
+        )
+    except Exception as exc:
+        logger.warning(
+            "qq_social_agent forward context summary failed: "
+            f"nickname={nickname!r} chars={len(raw)} error={exc}"
+        )
+        return fallback
+    summary = re.sub(r"\s+", " ", summary).strip()
+    return _short_notice_text(summary, 180) if summary else fallback
+
+
+def _compact_forward_fallback(text: str) -> str:
+    clean = re.sub(r"\s+", " ", text).strip()
+    return _short_notice_text(clean, 220)
+
+
+def _join_context_parts(*parts: str) -> str:
+    return re.sub(r"\s+", " ", " ".join(part.strip() for part in parts if part and part.strip())).strip()
 
 
 def _compact_long_message_fallback(text: str) -> str:

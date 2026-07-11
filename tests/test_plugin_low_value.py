@@ -362,6 +362,83 @@ def test_low_value_reply_to_bot_event_allows_media_reply() -> None:
     assert not plugin._is_low_value_reply_to_bot_event(event)
 
 
+def test_unreadable_image_only_event_should_not_enter_passive_buffer() -> None:
+    event = SimpleNamespace(
+        message=[SimpleNamespace(type="image", data={"summary": "截图"})],
+        get_plaintext=lambda: "",
+    )
+
+    assert plugin._should_ignore_unreadable_media_event(event, forward_context="")
+
+
+def test_weak_image_caption_should_not_enter_passive_buffer() -> None:
+    event = SimpleNamespace(
+        message=[
+            SimpleNamespace(type="text", data={"text": "看看这个"}),
+            SimpleNamespace(type="image", data={"summary": "截图"}),
+        ],
+        get_plaintext=lambda: "看看这个",
+    )
+
+    assert plugin._should_ignore_unreadable_media_event(event, forward_context="")
+
+
+def test_meaningful_image_caption_can_enter_passive_buffer() -> None:
+    event = SimpleNamespace(
+        message=[
+            SimpleNamespace(type="text", data={"text": "这个图是雷军发布会截图，重点是价格太离谱"}),
+            SimpleNamespace(type="image", data={"summary": "截图"}),
+        ],
+        get_plaintext=lambda: "这个图是雷军发布会截图，重点是价格太离谱",
+    )
+
+    assert not plugin._should_ignore_unreadable_media_event(event, forward_context="")
+
+
+def test_forward_record_extraction_formats_sender_and_text() -> None:
+    payload = {
+        "messages": [
+            {
+                "sender": {"user_id": 123456514, "nickname": "血火"},
+                "content": [{"type": "text", "data": {"text": "这个学校不太值"}}],
+            },
+            {
+                "sender": {"user_id": 184589072, "nickname": "小鸟"},
+                "content": [{"type": "image", "data": {"summary": "截图"}}],
+            },
+        ]
+    }
+
+    lines = plugin._extract_forward_record_lines(payload, limit=5)
+
+    assert lines[0] == "血火[#56514]: 这个学校不太值"
+    assert lines[1] == "小鸟[#89072]: [图片:截图]"
+
+
+def test_forward_context_text_uses_get_forward_msg(monkeypatch) -> None:
+    class FakeForwardBot:
+        async def call_api(self, api: str, **data):
+            assert api == "get_forward_msg"
+            assert data == {"id": "forward-1"}
+            return {
+                "messages": [
+                    {
+                        "sender": {"user_id": 123456514, "nickname": "血火"},
+                        "content": [{"type": "text", "data": {"text": "这个学校不太值"}}],
+                    }
+                ]
+            }
+
+    monkeypatch.setattr(plugin, "deepseek_client", None)
+    event = SimpleNamespace(
+        message=[SimpleNamespace(type="forward", data={"id": "forward-1"})],
+    )
+
+    context = asyncio.run(plugin._forward_context_text(FakeForwardBot(), event, nickname="血火"))
+
+    assert context == "血火传了聊天记录，大致内容如下：血火[#56514]: 这个学校不太值"
+
+
 def test_parse_token_report_date_window() -> None:
     window = plugin._parse_token_report_window("2026-07-10")
 
