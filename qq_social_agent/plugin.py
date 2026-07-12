@@ -17,7 +17,7 @@ from nonebot.adapters.onebot.v11.exception import ActionFailed
 from nonebot.matcher import Matcher
 from nonebot.params import CommandArg
 from nonebot.rule import Rule
-from starlette.responses import JSONResponse
+from starlette.responses import HTMLResponse, JSONResponse
 
 from . import onebot_gateway
 
@@ -88,6 +88,7 @@ from .memory import (
 )
 from .memory_learning import persist_daily_review_learning, persist_mid_memory_learning
 from .observability import (
+    build_trace_snapshot,
     correlation_scope,
     current_correlation_id,
     event_correlation_id,
@@ -95,6 +96,7 @@ from .observability import (
     mark_bot_disconnected,
     mark_bot_seen,
     onebot_status_snapshot,
+    render_trace_html,
 )
 from .persona import PersonaRegistry
 from .political_guard import has_political_redline, political_safe_reply, sanitize_political_output
@@ -167,6 +169,15 @@ if hasattr(_driver, "server_app"):
     async def _http_ready_endpoint() -> JSONResponse:
         payload = _http_ready_payload()
         return JSONResponse(payload, status_code=200 if payload["ok"] else 503)
+
+    @_driver.server_app.get("/traces")
+    async def _http_traces_endpoint(trace_id: str = "", limit: int = 50) -> dict[str, object]:
+        return _http_trace_payload(trace_id=trace_id, limit=limit)
+
+    @_driver.server_app.get("/trace")
+    async def _http_trace_endpoint(trace_id: str = "", limit: int = 50) -> HTMLResponse:
+        snapshot = _http_trace_payload(trace_id=trace_id, limit=limit)
+        return HTMLResponse(render_trace_html(snapshot, title="张风雪消息链路 Trace"))
 
 MID_MEMORY_KEEP_SUMMARIES = 4
 MID_MEMORY_BATCH_SIZE = 60
@@ -1639,7 +1650,46 @@ def _http_status_payload() -> dict[str, object]:
         "recent_errors": _status_recent_errors(limit=10),
         "recent_rejections": _status_recent_rejections(limit=5),
         "recent_metrics_1h": _status_metric_summary(window_seconds=60 * 60, limit=16),
+        "trace": {
+            "json_endpoint": "/traces",
+            "html_endpoint": "/trace",
+            "lookup": "使用 ?trace_id=<correlation_id或message_id> 查询",
+        },
     }
+
+
+def _http_trace_payload(*, trace_id: str = "", limit: int = 50) -> dict[str, object]:
+    try:
+        bounded_limit = max(1, min(200, int(limit)))
+    except (TypeError, ValueError):
+        bounded_limit = 50
+    rows = memory.conn.execute(
+        """
+        select event_type, group_id, user_id, stage, action, metadata_json, created_at
+        from bot_metric_events
+        order by created_at desc, id desc
+        limit 5000
+        """
+    ).fetchall()
+    snapshot = build_trace_snapshot(rows, limit=200 if trace_id.strip() else bounded_limit)
+    query = trace_id.strip()
+    if not query:
+        return snapshot
+    traces = snapshot.get("traces", [])
+    filtered = [
+        trace
+        for trace in traces if isinstance(trace, dict)
+        and (
+            str(trace.get("trace_id") or "") == query
+            or str(trace.get("message_id") or "") == query
+        )
+    ][:bounded_limit]
+    result = dict(snapshot)
+    result["query_matched"] = bool(filtered)
+    result["traces"] = filtered
+    result["trace_count"] = len(filtered)
+    result["available_trace_count"] = len(filtered)
+    return result
 
 
 def _http_health_payload() -> dict[str, object]:
@@ -2001,6 +2051,15 @@ async def _handle_group_message_scoped(
     plain_text = _plain_text(event)
     group_allowed = app_config.group_allowed(group_id)
     source_message_id = event_message_source_id(event)
+    _record_metric_event(
+        "pipeline_receive",
+        group_id=group_id,
+        user_id=int(event.user_id),
+        stage="receive",
+        action="start",
+        source_message_id=source_message_id,
+        correlation_id=correlation_id,
+    )
     if group_allowed and not memory.claim_inbound_message(
         group_id,
         source_message_id,
@@ -2021,7 +2080,17 @@ async def _handle_group_message_scoped(
             correlation_id=correlation_id,
         )
         return
+    history_started_at = time.monotonic()
     reply_reference = await _resolve_reply_reference_for_event(bot, event, group_allowed=group_allowed)
+    _record_metric_event(
+        "reply_reference",
+        group_id=group_id,
+        user_id=int(event.user_id),
+        stage="history",
+        action="resolved" if reply_reference is not None else "not_present",
+        elapsed_ms=int((time.monotonic() - history_started_at) * 1000),
+        source_message_id=source_message_id,
+    )
     addressed_bot = (
         _mentioned_bot(event, bot)
         or _replied_to_bot(event, bot)
@@ -2520,6 +2589,11 @@ async def _handle_group_message_locked(
                 group_id,
                 context_query,
                 subject_user_ids=_related_member_user_ids(context_recent, current_user_id=user_id),
+                speaker_user_id=user_id,
+                relationship_user_ids=_related_member_user_ids(
+                    context_recent,
+                    current_user_id=user_id,
+                ),
                 limit=MEMORY_ATOM_CONTEXT_LIMIT,
             )
         )
@@ -2692,6 +2766,11 @@ async def _handle_group_message_locked(
                 group_id,
                 context_query,
                 subject_user_ids=_related_member_user_ids(context_recent, current_user_id=user_id),
+                speaker_user_id=user_id,
+                relationship_user_ids=_related_member_user_ids(
+                    context_recent,
+                    current_user_id=user_id,
+                ),
                 limit=MEMORY_ATOM_CONTEXT_LIMIT,
             )
         )
@@ -3619,6 +3698,7 @@ async def _image_ocr_context_for_event(
 ) -> ImageOcrContext:
     if not group_allowed:
         return ImageOcrContext("", 0, 0, "group_not_allowed")
+    started_at = time.monotonic()
     context = await image_ocr_service.context_for_event(bot, event)
     if context.image_count:
         _record_metric_event(
@@ -3631,6 +3711,7 @@ async def _image_ocr_context_for_event(
             ocr_count=context.ocr_count,
             skipped_reason=context.skipped_reason,
             correlation_id=correlation_id,
+            elapsed_ms=int((time.monotonic() - started_at) * 1000),
         )
         logger.info(
             "qq_social_agent image ocr: "

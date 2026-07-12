@@ -5,6 +5,7 @@ import nonebot
 nonebot.init()
 
 import qq_social_agent.plugin as plugin
+from qq_social_agent.memory import MemoryStore
 
 
 def test_health_payload_only_depends_on_process_and_database(monkeypatch) -> None:
@@ -46,3 +47,33 @@ def test_ready_payload_accepts_initialized_provider_and_onebot(monkeypatch) -> N
     assert payload["ok"] is True
     assert payload["reasons"] == []
     assert payload["connected_bot_count"] == 1
+
+
+def test_trace_payload_supports_correlation_and_message_lookup(monkeypatch, tmp_path) -> None:
+    store = MemoryStore(tmp_path / "bot.sqlite3")
+    monkeypatch.setattr(plugin, "memory", store)
+    store.add_metric_event(
+        event_type="message_received",
+        group_id=100,
+        user_id=200,
+        stage="group",
+        action="received",
+        metadata={"correlation_id": "group:100:42", "source_message_id": "42"},
+        created_at=1000.0,
+    )
+    store.add_metric_event(
+        event_type="decision_result",
+        group_id=100,
+        user_id=200,
+        stage="llm",
+        action="reply",
+        metadata={"correlation_id": "group:100:42", "should_reply": True, "elapsed_ms": 50},
+        created_at=1001.0,
+    )
+
+    by_correlation = plugin._http_trace_payload(trace_id="group:100:42")
+    by_message = plugin._http_trace_payload(trace_id="42")
+
+    assert by_correlation["trace_count"] == 1
+    assert by_message["trace_count"] == 1
+    assert by_message["traces"][0]["trace_id"] == "group:100:42"
