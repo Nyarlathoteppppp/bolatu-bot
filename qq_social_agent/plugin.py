@@ -86,6 +86,7 @@ from .memory import (
     RecalledReplyFeedback,
     StyleRule,
 )
+from .memory_learning import persist_daily_review_learning, persist_mid_memory_learning
 from .observability import (
     correlation_scope,
     current_correlation_id,
@@ -866,16 +867,49 @@ async def _send_daily_review_for_group(
         end_at=end_at,
         limit=DAILY_REVIEW_MESSAGE_LIMIT,
     )
+    review_draft = None
     try:
-        review = await deepseek_client.daily_review(
+        review_draft = await deepseek_client.daily_review_draft(
             persona=persona,
             messages=messages,
             chat_label=f"QQ 群 {group_id}",
             today_label=review_label,
-        ) if deepseek_client is not None else ""
+            feedback_context=_daily_review_feedback_context(
+                group_id,
+                start_at=start_at,
+                end_at=end_at,
+            ),
+        ) if deepseek_client is not None else None
+        review = review_draft.public_reply if review_draft is not None else ""
     except Exception as exc:
         logger.warning(f"qq_social_agent daily review generation failed: group={group_id} error={exc}")
         return
+    if review_draft is not None:
+        try:
+            learned_atom_ids = persist_daily_review_learning(
+                memory,
+                group_id=group_id,
+                review_label=review_label,
+                draft=review_draft,
+                messages=messages,
+            )
+            _record_metric_event(
+                "daily_review_learning",
+                group_id=group_id,
+                stage="memory",
+                action="persisted",
+                atom_count=len(learned_atom_ids),
+                event_count=len(review_draft.events),
+                member_change_count=len(review_draft.member_changes),
+                jargon_count=len(review_draft.jargon_candidates),
+                feedback_lesson_count=len(review_draft.feedback_lessons),
+                style_observation_count=len(review_draft.style_observations),
+            )
+        except Exception as exc:
+            logger.warning(
+                "qq_social_agent daily review learning persist failed: "
+                f"group={group_id} date={review_label} error={exc}"
+            )
     if not review:
         review = "今天群里没怎么留给我发挥，我先记一笔：大家还是挺能聊的。"
     review, guarded = sanitize_political_output(review)
@@ -911,6 +945,30 @@ async def _send_daily_review_for_group(
         "qq_social_agent daily review sent: "
         f"group={group_id} date={review_label} messages={len(messages)} parts={len(parts)}"
     )
+
+
+def _daily_review_feedback_context(
+    group_id: int,
+    *,
+    start_at: float,
+    end_at: float,
+) -> str:
+    lines: list[str] = []
+    for item in memory.recent_recalled_reply_feedback(group_id, 24):
+        if not start_at <= item.reason_at < end_at:
+            continue
+        lines.append(
+            f"- 否决：触发={_short_notice_text(item.trigger_text, 70)}；"
+            f"问题={_short_notice_text(item.owner_reason or item.avoid_rule, 100)}"
+        )
+    for item in memory.recent_approved_reply_feedback(group_id, 24):
+        if not start_at <= item.created_at < end_at:
+            continue
+        lines.append(
+            f"- 优质：action={item.action}；style={_short_notice_text(item.style, 80)}；"
+            f"触发={_short_notice_text(item.trigger_text, 70)}"
+        )
+    return "\n".join(lines[:20]) or "（当天无审批反馈）"
 
 
 def _daily_review_target_groups() -> tuple[int, ...]:
@@ -4663,9 +4721,27 @@ async def _maintain_group_learning(group_id: int) -> None:
                     summary=draft.summary,
                     recall_cues=list(draft.recall_cues),
                 )
+                learned_atom_ids = persist_mid_memory_learning(
+                    memory,
+                    group_id=group_id,
+                    draft=draft,
+                    messages=summary_messages,
+                )
                 logger.info(
                     "qq_social_agent mid memory summarized: "
-                    f"group={group_id} messages={len(mid_messages)} cues={len(draft.recall_cues)}"
+                    f"group={group_id} messages={len(mid_messages)} cues={len(draft.recall_cues)} "
+                    f"atoms={len(learned_atom_ids)}"
+                )
+                _record_metric_event(
+                    "mid_memory_learning",
+                    group_id=group_id,
+                    stage="memory",
+                    action="persisted",
+                    atom_count=len(learned_atom_ids),
+                    fact_count=len(draft.facts),
+                    member_delta_count=len(draft.member_deltas),
+                    jargon_count=len(draft.jargon_candidates),
+                    open_thread_count=len(draft.open_threads),
                 )
         except Exception as exc:
             logger.warning(f"qq_social_agent mid memory skipped: group={group_id} error={exc}")
