@@ -73,9 +73,9 @@ rate_control:
 
 social_actions:
   enabled: true
-  per_user_cooldown_seconds: 120
-  per_group_cooldown_seconds: 18
-  max_per_group_hour: 24
+  per_user_cooldown_seconds: 45
+  per_group_cooldown_seconds: 6
+  max_per_group_hour: 60
   emoji_ids:
     agree: "76"
     care: "49"
