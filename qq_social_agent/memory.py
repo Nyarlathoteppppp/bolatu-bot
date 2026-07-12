@@ -9,6 +9,16 @@ from dataclasses import dataclass
 from pathlib import Path
 
 
+MEMORY_ATOM_EVIDENCE_TYPES = frozenset({"message", "event", "manual"})
+MEMORY_ATOM_STATUSES = frozenset({"active", "superseded", "disputed", "expired"})
+_MEMORY_ATOM_SELECT_COLUMNS = """
+    id, atom_type, group_id, subject_user_id, object_user_id, content,
+    source, evidence_type, source_message_id, observed_at,
+    valid_from, valid_to, confidence, importance, status,
+    supersedes_id, expires_at, created_at, updated_at
+"""
+
+
 @dataclass(frozen=True)
 class ChatMessage:
     group_id: int
@@ -224,6 +234,32 @@ class MemoryAtom:
     expires_at: float | None
     created_at: float
     updated_at: float
+    evidence_type: str = "manual"
+    source_message_id: str | None = None
+    observed_at: float = 0.0
+    valid_from: float | None = None
+    valid_to: float | None = None
+    status: str = "active"
+    supersedes_id: int | None = None
+
+    @property
+    def evidence_source(self) -> str:
+        return self.evidence_type
+
+
+@dataclass(frozen=True)
+class MemoryAtomAuditEvent:
+    id: int
+    atom_id: int
+    action: str
+    evidence_type: str
+    source: str
+    source_message_id: str | None
+    actor_user_id: int | None
+    detail: str
+    observed_at: float
+    created_at: float
+    metadata: dict[str, object]
 
 
 class MemoryStore:
@@ -476,8 +512,15 @@ class MemoryStore:
               object_user_id integer,
               content text not null,
               source text not null,
+              evidence_type text not null default 'manual',
+              source_message_id text,
+              observed_at real,
+              valid_from real,
+              valid_to real,
               confidence real not null default 0.7,
               importance real not null default 0.5,
+              status text not null default 'active',
+              supersedes_id integer,
               expires_at real,
               created_at real not null,
               updated_at real not null
@@ -522,6 +565,8 @@ class MemoryStore:
         self._ensure_group_directory_tables()
         self._ensure_approved_feedback_tags()
         self._ensure_llm_usage_source_key()
+        self._ensure_memory_atom_v2()
+        self.expire_due_memory_atoms()
         self._backfill_member_profiles()
         self._backfill_member_impressions()
         self.conn.execute("pragma optimize")
@@ -607,6 +652,139 @@ class MemoryStore:
             create unique index if not exists idx_llm_usage_events_source_key
               on llm_usage_events(source_key)
               where source_key is not null
+            """
+        )
+
+    def _ensure_memory_atom_v2(self) -> None:
+        savepoint = "memory_atom_v2_migration"
+        self.conn.execute(f"savepoint {savepoint}")
+        try:
+            self._ensure_memory_atom_v2_schema()
+            self.conn.execute(f"release savepoint {savepoint}")
+        except Exception:
+            self.conn.execute(f"rollback to savepoint {savepoint}")
+            self.conn.execute(f"release savepoint {savepoint}")
+            raise
+
+    def _ensure_memory_atom_v2_schema(self) -> None:
+        columns = {
+            str(row["name"])
+            for row in self.conn.execute("pragma table_info(memory_atoms)").fetchall()
+        }
+        additions = (
+            ("evidence_type", "text not null default 'manual'"),
+            ("source_message_id", "text"),
+            ("observed_at", "real"),
+            ("valid_from", "real"),
+            ("valid_to", "real"),
+            ("status", "text not null default 'active'"),
+            ("supersedes_id", "integer"),
+        )
+        evidence_type_added = "evidence_type" not in columns
+        for name, declaration in additions:
+            if name not in columns:
+                self.conn.execute(f"alter table memory_atoms add column {name} {declaration}")
+
+        if evidence_type_added:
+            self.conn.execute(
+                """
+                update memory_atoms
+                set evidence_type = case
+                  when source_message_id is not null and source_message_id != '' then 'message'
+                  when source like 'message:%' then 'message'
+                  when source = 'manual'
+                    or source like 'manual:%'
+                    or source like 'manual_%'
+                    or source like 'builtin%'
+                    then 'manual'
+                  else 'event'
+                end
+                """
+            )
+        else:
+            self.conn.execute(
+                """
+                update memory_atoms
+                set evidence_type = 'manual'
+                where evidence_type not in ('message', 'event', 'manual')
+                   or evidence_type is null
+                   or evidence_type = ''
+                """
+            )
+        self.conn.execute(
+            """
+            update memory_atoms
+            set observed_at = coalesce(observed_at, created_at),
+                valid_from = coalesce(valid_from, created_at),
+                valid_to = coalesce(valid_to, expires_at),
+                status = case
+                  when status is null or status = '' then 'active'
+                  when status not in ('active', 'superseded', 'disputed', 'expired') then 'active'
+                  else status
+                end
+            where observed_at is null
+               or valid_from is null
+               or (valid_to is null and expires_at is not null)
+               or status not in ('active', 'superseded', 'disputed', 'expired')
+               or status is null
+            """
+        )
+        statements = (
+            """
+            create index if not exists idx_memory_atoms_group_status_validity
+              on memory_atoms(group_id, status, valid_from, valid_to, updated_at)
+            """,
+            """
+            create index if not exists idx_memory_atoms_source_message
+              on memory_atoms(group_id, source_message_id)
+              where source_message_id is not null and source_message_id != ''
+            """,
+            """
+            create index if not exists idx_memory_atoms_status_expiry
+              on memory_atoms(status, valid_to, expires_at)
+            """,
+            "create index if not exists idx_memory_atoms_supersedes on memory_atoms(supersedes_id)",
+            """
+            create table if not exists memory_atom_audit_events (
+              id integer primary key autoincrement,
+              atom_id integer not null,
+              action text not null,
+              evidence_type text not null,
+              source text not null,
+              source_message_id text,
+              actor_user_id integer,
+              detail text not null default '',
+              observed_at real not null,
+              created_at real not null,
+              metadata_json text not null default '{}'
+            )
+            """,
+            """
+            create index if not exists idx_memory_atom_audit_atom_time
+              on memory_atom_audit_events(atom_id, created_at, id)
+            """,
+            """
+            create index if not exists idx_memory_atom_audit_source_message
+              on memory_atom_audit_events(source_message_id)
+              where source_message_id is not null and source_message_id != ''
+            """,
+        )
+        for statement in statements:
+            self.conn.execute(statement)
+        self.conn.execute(
+            """
+            insert into memory_atom_audit_events(
+              atom_id, action, evidence_type, source, source_message_id,
+              actor_user_id, detail, observed_at, created_at, metadata_json
+            )
+            select atom.id, 'migrated', atom.evidence_type, atom.source,
+                   atom.source_message_id, null, 'legacy memory atom',
+                   coalesce(atom.observed_at, atom.created_at), atom.created_at, '{}'
+            from memory_atoms as atom
+            where not exists (
+              select 1 from memory_atom_audit_events as audit
+              where audit.atom_id = atom.id
+            )
             """
         )
 
@@ -1911,88 +2089,581 @@ class MemoryStore:
         confidence: float = 0.7,
         importance: float = 0.5,
         expires_at: float | None = None,
+        evidence_type: str | None = None,
+        source_message_id: int | str | None = None,
+        observed_at: float | None = None,
+        valid_from: float | None = None,
+        valid_to: float | None = None,
+        status: str = "active",
+        supersedes_id: int | None = None,
     ) -> int:
         clean_content = re.sub(r"\s+", " ", content).strip()
         if not clean_content:
             return 0
         clean_type = atom_type.strip()[:32] or "note"
         clean_source = source.strip()[:80] or "manual"
+        source_key = _source_message_key(source_message_id)
+        clean_evidence_type = _normalize_memory_evidence_type(
+            evidence_type or _infer_memory_evidence_type(clean_source, source_key)
+        )
+        clean_status = _normalize_memory_atom_status(status)
+        effective_valid_to = valid_to if valid_to is not None else expires_at
         now = time.time()
-        existing = self.conn.execute(
-            """
-            select id from memory_atoms
-            where group_id = ?
-              and atom_type = ?
-              and coalesce(subject_user_id, -1) = coalesce(?, -1)
-              and coalesce(object_user_id, -1) = coalesce(?, -1)
-              and content = ?
-            order by updated_at desc
-            limit 1
-            """,
-            (group_id, clean_type, subject_user_id, object_user_id, clean_content[:420]),
-        ).fetchone()
+        existing = None
+        if supersedes_id is None:
+            existing = self.conn.execute(
+                """
+                select id, source, confidence, importance, expires_at,
+                       evidence_type, source_message_id, observed_at,
+                       valid_from, valid_to, status, supersedes_id
+                from memory_atoms
+                where group_id = ?
+                  and atom_type = ?
+                  and coalesce(subject_user_id, -1) = coalesce(?, -1)
+                  and coalesce(object_user_id, -1) = coalesce(?, -1)
+                  and content = ?
+                  and status = 'active'
+                order by updated_at desc
+                limit 1
+                """,
+                (group_id, clean_type, subject_user_id, object_user_id, clean_content[:420]),
+            ).fetchone()
         if existing:
             atom_id = int(existing["id"])
-            self.conn.execute(
-                """
-                update memory_atoms
-                set source = ?, confidence = ?, importance = ?,
-                    expires_at = ?, updated_at = ?
-                where id = ?
-                """,
-                (
-                    clean_source,
-                    _clamp_float(confidence, 0.0, 1.0),
-                    _clamp_float(importance, 0.0, 1.0),
-                    expires_at,
-                    now,
-                    atom_id,
-                ),
+            before = {
+                "source": str(existing["source"]),
+                "confidence": float(existing["confidence"]),
+                "importance": float(existing["importance"]),
+                "expires_at": existing["expires_at"],
+                "evidence_type": str(existing["evidence_type"]),
+                "source_message_id": existing["source_message_id"],
+                "observed_at": existing["observed_at"],
+                "valid_from": existing["valid_from"],
+                "valid_to": existing["valid_to"],
+                "status": str(existing["status"]),
+                "supersedes_id": existing["supersedes_id"],
+            }
+            after = {
+                "source": clean_source,
+                "confidence": _clamp_float(confidence, 0.0, 1.0),
+                "importance": _clamp_float(importance, 0.0, 1.0),
+                "expires_at": effective_valid_to,
+                "evidence_type": clean_evidence_type,
+                "source_message_id": source_key,
+                "observed_at": observed_at if observed_at is not None else existing["observed_at"],
+                "valid_from": valid_from if valid_from is not None else existing["valid_from"],
+                "valid_to": effective_valid_to,
+                "status": clean_status,
+                "supersedes_id": supersedes_id if supersedes_id is not None else existing["supersedes_id"],
+            }
+            resulting_valid_from = after["valid_from"]
+            resulting_valid_to = after["valid_to"]
+            if (
+                resulting_valid_from is not None
+                and resulting_valid_to is not None
+                and float(resulting_valid_to) < float(resulting_valid_from)
+            ):
+                raise ValueError("memory atom valid_to cannot be earlier than valid_from")
+            if before == after:
+                return atom_id
+            try:
+                self.conn.execute(
+                    """
+                    update memory_atoms
+                    set source = ?, confidence = ?, importance = ?,
+                        expires_at = ?, evidence_type = ?, source_message_id = ?,
+                        observed_at = coalesce(?, observed_at),
+                        valid_from = coalesce(?, valid_from), valid_to = ?,
+                        status = ?, supersedes_id = coalesce(?, supersedes_id),
+                        updated_at = ?
+                    where id = ?
+                    """,
+                    (
+                        clean_source,
+                        _clamp_float(confidence, 0.0, 1.0),
+                        _clamp_float(importance, 0.0, 1.0),
+                        effective_valid_to,
+                        clean_evidence_type,
+                        source_key,
+                        observed_at,
+                        valid_from,
+                        effective_valid_to,
+                        clean_status,
+                        supersedes_id,
+                        now,
+                        atom_id,
+                    ),
+                )
+                self._insert_memory_atom_audit_event(
+                    atom_id=atom_id,
+                    action="refreshed",
+                    evidence_type=clean_evidence_type,
+                    source=clean_source,
+                    source_message_id=source_key,
+                    actor_user_id=None,
+                    detail="legacy upsert refreshed existing atom",
+                    observed_at=observed_at if observed_at is not None else now,
+                    metadata={"before": before, "after": after},
+                )
+                self.conn.commit()
+                return atom_id
+            except Exception:
+                self.conn.rollback()
+                raise
+        return self.add_memory_atom(
+            atom_type=clean_type,
+            group_id=group_id,
+            content=clean_content,
+            source=clean_source,
+            subject_user_id=subject_user_id,
+            object_user_id=object_user_id,
+            evidence_type=clean_evidence_type,
+            source_message_id=source_key,
+            observed_at=observed_at,
+            valid_from=valid_from,
+            valid_to=effective_valid_to,
+            confidence=confidence,
+            importance=importance,
+            status=clean_status,
+            supersedes_id=supersedes_id,
+        )
+
+    def add_memory_atom(
+        self,
+        *,
+        atom_type: str,
+        group_id: int,
+        content: str,
+        source: str = "manual",
+        evidence_type: str | None = None,
+        source_message_id: int | str | None = None,
+        observed_at: float | None = None,
+        valid_from: float | None = None,
+        valid_to: float | None = None,
+        subject_user_id: int | None = None,
+        object_user_id: int | None = None,
+        confidence: float = 0.7,
+        importance: float = 0.5,
+        status: str = "active",
+        supersedes_id: int | None = None,
+        actor_user_id: int | None = None,
+        audit_detail: str = "",
+    ) -> int:
+        clean_content = re.sub(r"\s+", " ", content).strip()
+        if not clean_content:
+            return 0
+        source_key = _source_message_key(source_message_id)
+        clean_evidence_type = _normalize_memory_evidence_type(
+            evidence_type or _infer_memory_evidence_type(source, source_key)
+        )
+        clean_status = _normalize_memory_atom_status(status)
+        now = time.time()
+        observed = float(observed_at) if observed_at is not None else now
+        starts = float(valid_from) if valid_from is not None else observed
+        ends = float(valid_to) if valid_to is not None else None
+        if clean_status == "expired" and ends is None:
+            ends = observed
+        if ends is not None and ends < starts:
+            raise ValueError("memory atom valid_to cannot be earlier than valid_from")
+        try:
+            superseded_event_id = 0
+            if supersedes_id is not None:
+                target = self.memory_atom(supersedes_id)
+                if target is None:
+                    raise ValueError(f"superseded memory atom does not exist: {supersedes_id}")
+                if target.group_id != group_id:
+                    raise ValueError("superseded memory atom must belong to the same group")
+                if target.status not in {"active", "disputed"}:
+                    raise ValueError(f"memory atom {supersedes_id} is already {target.status}")
+                if clean_status != "active":
+                    raise ValueError("a replacement memory atom must start as active")
+                if target.valid_from is not None and observed < target.valid_from:
+                    raise ValueError("replacement cannot predate the superseded atom's valid_from")
+                self.conn.execute(
+                    """
+                    update memory_atoms
+                    set status = 'superseded', valid_to = ?, expires_at = ?, updated_at = ?
+                    where id = ?
+                    """,
+                    (observed, observed, now, supersedes_id),
+                )
+                superseded_event_id = self._insert_memory_atom_audit_event(
+                    atom_id=supersedes_id,
+                    action="superseded",
+                    evidence_type=clean_evidence_type,
+                    source=source,
+                    source_message_id=source_key,
+                    actor_user_id=actor_user_id,
+                    detail=audit_detail or "superseded by replacement atom",
+                    observed_at=observed,
+                )
+            atom_id = self._insert_memory_atom_record(
+                atom_type=atom_type,
+                group_id=group_id,
+                content=clean_content,
+                source=source,
+                evidence_type=clean_evidence_type,
+                source_message_id=source_key,
+                observed_at=observed,
+                valid_from=starts,
+                valid_to=ends,
+                subject_user_id=subject_user_id,
+                object_user_id=object_user_id,
+                confidence=confidence,
+                importance=importance,
+                status=clean_status,
+                supersedes_id=supersedes_id,
+                actor_user_id=actor_user_id,
+                audit_action="created",
+                audit_detail=audit_detail or "memory atom created",
+                now=now,
             )
+            if superseded_event_id:
+                self.conn.execute(
+                    "update memory_atom_audit_events set metadata_json = ? where id = ?",
+                    (json.dumps({"replacement_atom_id": atom_id}), superseded_event_id),
+                )
             self.conn.commit()
             return atom_id
+        except Exception:
+            self.conn.rollback()
+            raise
+
+    def _insert_memory_atom_record(
+        self,
+        *,
+        atom_type: str,
+        group_id: int,
+        content: str,
+        source: str,
+        evidence_type: str,
+        source_message_id: str | None,
+        observed_at: float,
+        valid_from: float,
+        valid_to: float | None,
+        subject_user_id: int | None,
+        object_user_id: int | None,
+        confidence: float,
+        importance: float,
+        status: str,
+        supersedes_id: int | None,
+        actor_user_id: int | None,
+        audit_action: str,
+        audit_detail: str,
+        now: float,
+    ) -> int:
+        clean_type = atom_type.strip()[:32] or "note"
+        clean_source = source.strip()[:80] or evidence_type
         cursor = self.conn.execute(
             """
             insert into memory_atoms(
               atom_type, group_id, subject_user_id, object_user_id, content,
-              source, confidence, importance, expires_at, created_at, updated_at
+              source, evidence_type, source_message_id, observed_at,
+              valid_from, valid_to, confidence, importance, status,
+              supersedes_id, expires_at, created_at, updated_at
             )
-            values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 clean_type,
                 group_id,
                 subject_user_id,
                 object_user_id,
-                clean_content[:420],
+                content[:420],
                 clean_source,
+                evidence_type,
+                source_message_id,
+                observed_at,
+                valid_from,
+                valid_to,
                 _clamp_float(confidence, 0.0, 1.0),
                 _clamp_float(importance, 0.0, 1.0),
-                expires_at,
+                status,
+                supersedes_id,
+                valid_to,
                 now,
                 now,
             ),
         )
-        self.conn.commit()
+        atom_id = int(cursor.lastrowid or 0)
+        self._insert_memory_atom_audit_event(
+            atom_id=atom_id,
+            action=audit_action,
+            evidence_type=evidence_type,
+            source=clean_source,
+            source_message_id=source_message_id,
+            actor_user_id=actor_user_id,
+            detail=audit_detail,
+            observed_at=observed_at,
+        )
+        return atom_id
+
+    def add_memory_counter_evidence(
+        self,
+        atom_id: int,
+        *,
+        content: str,
+        source: str,
+        evidence_type: str = "message",
+        source_message_id: int | str | None = None,
+        observed_at: float | None = None,
+        actor_user_id: int | None = None,
+        confidence: float = 0.8,
+        mark_disputed: bool = True,
+    ) -> int:
+        atom = self.memory_atom(atom_id)
+        clean_content = re.sub(r"\s+", " ", content).strip()
+        if atom is None or not clean_content:
+            return 0
+        clean_evidence_type = _normalize_memory_evidence_type(evidence_type)
+        observed = float(observed_at) if observed_at is not None else time.time()
+        try:
+            if mark_disputed and atom.status == "active":
+                self.conn.execute(
+                    "update memory_atoms set status = 'disputed', updated_at = ? where id = ?",
+                    (time.time(), atom_id),
+                )
+            event_id = self._insert_memory_atom_audit_event(
+                atom_id=atom_id,
+                action="counter_evidence",
+                evidence_type=clean_evidence_type,
+                source=source,
+                source_message_id=_source_message_key(source_message_id),
+                actor_user_id=actor_user_id,
+                detail=clean_content[:420],
+                observed_at=observed,
+                metadata={"confidence": _clamp_float(confidence, 0.0, 1.0)},
+            )
+            self.conn.commit()
+            return event_id
+        except Exception:
+            self.conn.rollback()
+            raise
+
+    def dispute_memory_atom(
+        self,
+        atom_id: int,
+        *,
+        content: str,
+        source: str,
+        evidence_type: str = "message",
+        source_message_id: int | str | None = None,
+        observed_at: float | None = None,
+        actor_user_id: int | None = None,
+        confidence: float = 0.8,
+    ) -> bool:
+        return bool(
+            self.add_memory_counter_evidence(
+                atom_id,
+                content=content,
+                source=source,
+                evidence_type=evidence_type,
+                source_message_id=source_message_id,
+                observed_at=observed_at,
+                actor_user_id=actor_user_id,
+                confidence=confidence,
+                mark_disputed=True,
+            )
+        )
+
+    def expire_memory_atom(
+        self,
+        atom_id: int,
+        *,
+        reason: str = "",
+        source: str = "manual",
+        observed_at: float | None = None,
+        actor_user_id: int | None = None,
+    ) -> bool:
+        atom = self.memory_atom(atom_id)
+        if atom is None or atom.status not in {"active", "disputed"}:
+            return False
+        observed = float(observed_at) if observed_at is not None else time.time()
+        if atom.valid_from is not None and observed < atom.valid_from:
+            raise ValueError("expiry cannot predate the memory atom's valid_from")
+        try:
+            self.conn.execute(
+                """
+                update memory_atoms
+                set status = 'expired', valid_to = ?, expires_at = ?, updated_at = ?
+                where id = ?
+                """,
+                (observed, observed, time.time(), atom_id),
+            )
+            self._insert_memory_atom_audit_event(
+                atom_id=atom_id,
+                action="expired",
+                evidence_type="manual",
+                source=source,
+                source_message_id=None,
+                actor_user_id=actor_user_id,
+                detail=(reason.strip() or "memory atom expired")[:420],
+                observed_at=observed,
+            )
+            self.conn.commit()
+            return True
+        except Exception:
+            self.conn.rollback()
+            raise
+
+    def correct_memory_atom(
+        self,
+        atom_id: int,
+        *,
+        content: str,
+        source: str = "manual_correction",
+        source_message_id: int | str | None = None,
+        observed_at: float | None = None,
+        actor_user_id: int | None = None,
+        reason: str = "",
+        confidence: float | None = None,
+        importance: float | None = None,
+        valid_to: float | None = None,
+        atom_type: str | None = None,
+        subject_user_id: int | None = None,
+        object_user_id: int | None = None,
+    ) -> int:
+        old = self.memory_atom(atom_id)
+        clean_content = re.sub(r"\s+", " ", content).strip()
+        if old is None or old.status not in {"active", "disputed"} or not clean_content:
+            return 0
+        observed = float(observed_at) if observed_at is not None else time.time()
+        if old.valid_from is not None and observed < old.valid_from:
+            raise ValueError("correction cannot predate the memory atom's valid_from")
+        if valid_to is not None and float(valid_to) < observed:
+            raise ValueError("corrected memory valid_to cannot be earlier than observed_at")
+        now = time.time()
+        try:
+            self.conn.execute(
+                """
+                update memory_atoms
+                set status = 'superseded', valid_to = ?, expires_at = ?, updated_at = ?
+                where id = ?
+                """,
+                (observed, observed, now, atom_id),
+            )
+            superseded_event_id = self._insert_memory_atom_audit_event(
+                atom_id=atom_id,
+                action="superseded",
+                evidence_type="manual",
+                source=source,
+                source_message_id=_source_message_key(source_message_id),
+                actor_user_id=actor_user_id,
+                detail=(reason.strip() or "replaced by manual correction")[:420],
+                observed_at=observed,
+            )
+            new_atom_id = self._insert_memory_atom_record(
+                atom_type=atom_type or old.atom_type,
+                group_id=old.group_id,
+                content=clean_content,
+                source=source,
+                evidence_type="manual",
+                source_message_id=_source_message_key(source_message_id),
+                observed_at=observed,
+                valid_from=observed,
+                valid_to=valid_to,
+                subject_user_id=old.subject_user_id if subject_user_id is None else subject_user_id,
+                object_user_id=old.object_user_id if object_user_id is None else object_user_id,
+                confidence=old.confidence if confidence is None else confidence,
+                importance=old.importance if importance is None else importance,
+                status="active",
+                supersedes_id=old.id,
+                actor_user_id=actor_user_id,
+                audit_action="manual_correction",
+                audit_detail=(reason.strip() or f"manual correction of atom {old.id}")[:420],
+                now=now,
+            )
+            self.conn.execute(
+                "update memory_atom_audit_events set metadata_json = ? where id = ?",
+                (json.dumps({"replacement_atom_id": new_atom_id}), superseded_event_id),
+            )
+            self.conn.commit()
+            return new_atom_id
+        except Exception:
+            self.conn.rollback()
+            raise
+
+    def memory_atom(self, atom_id: int) -> MemoryAtom | None:
+        row = self.conn.execute(
+            f"select {_MEMORY_ATOM_SELECT_COLUMNS} from memory_atoms where id = ?",
+            (atom_id,),
+        ).fetchone()
+        return _memory_atom_from_row(row) if row is not None else None
+
+    def memory_atom_audit_trail(self, atom_id: int, *, limit: int = 100) -> list[MemoryAtomAuditEvent]:
+        rows = self.conn.execute(
+            """
+            select * from (
+              select id, atom_id, action, evidence_type, source, source_message_id,
+                     actor_user_id, detail, observed_at, created_at, metadata_json
+              from memory_atom_audit_events
+              where atom_id = ?
+              order by created_at desc, id desc
+              limit ?
+            )
+            order by created_at asc, id asc
+            """,
+            (atom_id, max(1, int(limit))),
+        ).fetchall()
+        return [_memory_atom_audit_event_from_row(row) for row in rows]
+
+    def memory_atom_events(self, atom_id: int, *, limit: int = 100) -> list[MemoryAtomAuditEvent]:
+        return self.memory_atom_audit_trail(atom_id, limit=limit)
+
+    def _insert_memory_atom_audit_event(
+        self,
+        *,
+        atom_id: int,
+        action: str,
+        evidence_type: str,
+        source: str,
+        source_message_id: str | None,
+        actor_user_id: int | None,
+        detail: str,
+        observed_at: float,
+        metadata: dict[str, object] | None = None,
+    ) -> int:
+        cursor = self.conn.execute(
+            """
+            insert into memory_atom_audit_events(
+              atom_id, action, evidence_type, source, source_message_id,
+              actor_user_id, detail, observed_at, created_at, metadata_json
+            )
+            values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                atom_id,
+                action.strip()[:32] or "updated",
+                _normalize_memory_evidence_type(evidence_type),
+                source.strip()[:80] or evidence_type,
+                source_message_id,
+                actor_user_id,
+                detail.strip()[:420],
+                observed_at,
+                time.time(),
+                json.dumps(metadata or {}, ensure_ascii=False),
+            ),
+        )
         return int(cursor.lastrowid or 0)
 
     def delete_memory_atom(self, atom_id: int) -> bool:
-        cursor = self.conn.execute("delete from memory_atoms where id = ?", (atom_id,))
-        self.conn.commit()
-        return cursor.rowcount > 0
+        return self.expire_memory_atom(atom_id, reason="legacy delete_memory_atom")
 
     def recent_memory_atoms(self, group_id: int, limit: int) -> list[MemoryAtom]:
+        now = time.time()
         rows = self.conn.execute(
-            """
-            select id, atom_type, group_id, subject_user_id, object_user_id,
-                   content, source, confidence, importance, expires_at, created_at, updated_at
+            f"""
+            select {_MEMORY_ATOM_SELECT_COLUMNS}
             from memory_atoms
             where group_id = ?
+              and status = 'active'
+              and (valid_from is null or valid_from <= ?)
+              and (valid_to is null or valid_to > ?)
               and (expires_at is null or expires_at > ?)
             order by importance desc, updated_at desc, id desc
             limit ?
             """,
-            (group_id, time.time(), limit),
+            (group_id, now, now, now, limit),
         ).fetchall()
         return [_memory_atom_from_row(row) for row in rows]
 
@@ -2002,36 +2673,115 @@ class MemoryStore:
         query: str,
         *,
         subject_user_ids: list[int] | None = None,
+        speaker_user_id: int | None = None,
+        relationship_user_ids: list[int] | None = None,
         limit: int = 6,
         candidate_limit: int = 120,
+        now: float | None = None,
     ) -> list[MemoryAtom]:
+        current = time.time() if now is None else float(now)
         rows = self.conn.execute(
-            """
-            select id, atom_type, group_id, subject_user_id, object_user_id,
-                   content, source, confidence, importance, expires_at, created_at, updated_at
+            f"""
+            select {_MEMORY_ATOM_SELECT_COLUMNS}
             from memory_atoms
             where group_id = ?
+              and status = 'active'
+              and (valid_from is null or valid_from <= ?)
+              and (valid_to is null or valid_to > ?)
               and (expires_at is null or expires_at > ?)
-            order by updated_at desc, id desc
-            limit ?
             """,
-            (group_id, time.time(), candidate_limit),
+            (group_id, current, current, current),
         ).fetchall()
-        subject_set = set(subject_user_ids or [])
+        subject_set = set(subject_user_ids or []) | set(relationship_user_ids or [])
+        if speaker_user_id is not None:
+            subject_set.add(int(speaker_user_id))
+        has_query_terms = bool(_relevance_terms(query))
         scored: list[tuple[float, float, sqlite3.Row]] = []
         for row in rows:
             content = str(row["content"])
-            score = float(_text_relevance_score(query, content))
+            lexical_score = float(_text_relevance_score(query, content))
+            score = lexical_score
             subject = row["subject_user_id"]
             obj = row["object_user_id"]
-            if subject_set and (subject in subject_set or obj in subject_set):
+            person_match = bool(subject_set and (subject in subject_set or obj in subject_set))
+            if has_query_terms and lexical_score <= 0 and not person_match:
+                continue
+            if subject_set and subject in subject_set:
                 score += 3.0
-            score += float(row["importance"] or 0.0)
+            if subject_set and obj in subject_set:
+                score += 2.25
+            if speaker_user_id is not None and subject == int(speaker_user_id):
+                score += 1.5
+            elif speaker_user_id is not None and obj == int(speaker_user_id):
+                score += 0.75
+            if str(row["atom_type"]).casefold() == "relation" and subject_set:
+                if subject in subject_set or obj in subject_set:
+                    score += 0.75
+            score += float(row["importance"] or 0.0) * 2.0
+            score += float(row["confidence"] or 0.0) * 0.75
+            score += _memory_atom_recency_score(row, now=current)
+            score += _memory_atom_feedback_score(row)
             if score <= 0:
                 continue
             scored.append((score, float(row["updated_at"]), row))
         scored.sort(key=lambda item: (item[0], item[1]), reverse=True)
+        if candidate_limit > 0:
+            scored = scored[:candidate_limit]
         return [_memory_atom_from_row(row) for _, _, row in scored[:limit]]
+
+    def expire_due_memory_atoms(
+        self,
+        *,
+        now: float | None = None,
+        group_id: int | None = None,
+    ) -> int:
+        current = time.time() if now is None else float(now)
+        return self._expire_due_memory_atoms(current, group_id=group_id)
+
+    def _expire_due_memory_atoms(self, now: float, *, group_id: int | None = None) -> int:
+        group_clause = " and group_id = ?" if group_id is not None else ""
+        params: tuple[object, ...] = (now, group_id) if group_id is not None else (now,)
+        rows = self.conn.execute(
+            f"""
+            select id, evidence_type, source, source_message_id
+            from memory_atoms
+            where status = 'active'
+              and coalesce(valid_to, expires_at) is not null
+              and coalesce(valid_to, expires_at) <= ?
+              {group_clause}
+            """,
+            params,
+        ).fetchall()
+        try:
+            for row in rows:
+                atom_id = int(row["id"])
+                self.conn.execute(
+                    """
+                    update memory_atoms
+                    set status = 'expired',
+                        valid_to = coalesce(valid_to, expires_at, ?),
+                        expires_at = coalesce(expires_at, valid_to, ?),
+                        updated_at = ?
+                    where id = ?
+                    """,
+                    (now, now, now, atom_id),
+                )
+                self._insert_memory_atom_audit_event(
+                    atom_id=atom_id,
+                    action="expired",
+                    evidence_type=str(row["evidence_type"] or "event"),
+                    source="validity_window",
+                    source_message_id=_source_message_key(row["source_message_id"]),
+                    actor_user_id=None,
+                    detail="validity window elapsed",
+                    observed_at=now,
+                )
+            if rows:
+                self.conn.commit()
+            return len(rows)
+        except Exception:
+            self.conn.rollback()
+            raise
 
     def upsert_custom_jargon(
         self,
@@ -2320,9 +3070,15 @@ def _metric_event_from_row(row: sqlite3.Row) -> BotMetricEvent:
 
 
 def _memory_atom_from_row(row: sqlite3.Row) -> MemoryAtom:
+    columns = set(row.keys())
     subject = row["subject_user_id"]
     obj = row["object_user_id"]
     expires_at = row["expires_at"]
+    source_message_id = row["source_message_id"] if "source_message_id" in columns else None
+    observed_at = row["observed_at"] if "observed_at" in columns else row["created_at"]
+    valid_from = row["valid_from"] if "valid_from" in columns else row["created_at"]
+    valid_to = row["valid_to"] if "valid_to" in columns else expires_at
+    supersedes_id = row["supersedes_id"] if "supersedes_id" in columns else None
     return MemoryAtom(
         id=int(row["id"]),
         atom_type=str(row["atom_type"]),
@@ -2336,6 +3092,36 @@ def _memory_atom_from_row(row: sqlite3.Row) -> MemoryAtom:
         expires_at=float(expires_at) if expires_at is not None else None,
         created_at=float(row["created_at"]),
         updated_at=float(row["updated_at"]),
+        evidence_type=str(row["evidence_type"] or "manual") if "evidence_type" in columns else "manual",
+        source_message_id=str(source_message_id) if source_message_id is not None else None,
+        observed_at=float(observed_at) if observed_at is not None else float(row["created_at"]),
+        valid_from=float(valid_from) if valid_from is not None else None,
+        valid_to=float(valid_to) if valid_to is not None else None,
+        status=str(row["status"] or "active") if "status" in columns else "active",
+        supersedes_id=int(supersedes_id) if supersedes_id is not None else None,
+    )
+
+
+def _memory_atom_audit_event_from_row(row: sqlite3.Row) -> MemoryAtomAuditEvent:
+    try:
+        raw_metadata = json.loads(str(row["metadata_json"] or "{}"))
+    except (TypeError, json.JSONDecodeError):
+        raw_metadata = {}
+    metadata = raw_metadata if isinstance(raw_metadata, dict) else {}
+    source_message_id = row["source_message_id"]
+    actor_user_id = row["actor_user_id"]
+    return MemoryAtomAuditEvent(
+        id=int(row["id"]),
+        atom_id=int(row["atom_id"]),
+        action=str(row["action"]),
+        evidence_type=str(row["evidence_type"]),
+        source=str(row["source"]),
+        source_message_id=str(source_message_id) if source_message_id is not None else None,
+        actor_user_id=int(actor_user_id) if actor_user_id is not None else None,
+        detail=str(row["detail"]),
+        observed_at=float(row["observed_at"]),
+        created_at=float(row["created_at"]),
+        metadata=metadata,
     )
 
 
@@ -2367,6 +3153,58 @@ def _clamp_float(value: float, low: float, high: float) -> float:
     except (TypeError, ValueError):
         number = low
     return max(low, min(high, number))
+
+
+def _normalize_memory_evidence_type(value: str) -> str:
+    normalized = str(value or "").strip().casefold()
+    if normalized not in MEMORY_ATOM_EVIDENCE_TYPES:
+        raise ValueError(
+            f"unsupported memory evidence type: {value!r}; "
+            f"expected one of {sorted(MEMORY_ATOM_EVIDENCE_TYPES)}"
+        )
+    return normalized
+
+
+def _infer_memory_evidence_type(source: str, source_message_id: str | None) -> str:
+    if source_message_id:
+        return "message"
+    normalized = str(source or "").strip().casefold()
+    if normalized.startswith("message:"):
+        return "message"
+    if normalized == "manual" or normalized.startswith(("manual:", "manual_", "builtin")):
+        return "manual"
+    return "event"
+
+
+def _normalize_memory_atom_status(value: str) -> str:
+    normalized = str(value or "").strip().casefold()
+    if normalized not in MEMORY_ATOM_STATUSES:
+        raise ValueError(
+            f"unsupported memory atom status: {value!r}; "
+            f"expected one of {sorted(MEMORY_ATOM_STATUSES)}"
+        )
+    return normalized
+
+
+def _memory_atom_recency_score(row: sqlite3.Row, *, now: float) -> float:
+    observed_at = row["observed_at"]
+    timestamp = float(observed_at) if observed_at is not None else float(row["updated_at"] or 0.0)
+    age_seconds = max(0.0, now - timestamp)
+    return 1.5 / (1.0 + age_seconds / (7 * 24 * 60 * 60))
+
+
+def _memory_atom_feedback_score(row: sqlite3.Row) -> float:
+    atom_type = str(row["atom_type"] or "").casefold()
+    source = str(row["source"] or "").casefold()
+    content = str(row["content"] or "")
+    score = 0.0
+    if atom_type == "feedback":
+        score += 1.5
+    if source.startswith(("approval_", "recall_", "owner_feedback")):
+        score += 0.75
+    if "不准奏反馈" in content or "优质反馈" in content:
+        score += 0.5
+    return score
 
 
 def _text_relevance_score(query: str, haystack: str) -> int:
