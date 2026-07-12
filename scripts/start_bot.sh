@@ -1,12 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-cd /Users/ywbw/qq-social-agent
+project_dir="/opt/qq-social-agent"
+compose=(docker compose -p qq-social-agent -f docker-compose.server.yml)
 
-if [ ! -d ".venv" ]; then
-  echo "Missing .venv. Run: python3 -m venv .venv && source .venv/bin/activate && python -m pip install -e '.[dev]'"
-  exit 1
-fi
-
-source .venv/bin/activate
-exec python bot.py
+cd "$project_dir"
+exec "${compose[@]}" up --no-deps bot

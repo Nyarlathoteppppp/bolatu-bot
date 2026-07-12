@@ -940,6 +940,33 @@ def test_fresh_lookup_goes_to_llm_decision() -> None:
     assert result.decision is None
 
 
+def test_backend_tool_decision_forces_explicit_search_without_clobbering_action() -> None:
+    decision = _apply_backend_tool_decision(
+        ReplyDecision(True, 0.78, "正常回答", mode="chat", action="answer"),
+        text="搜一下 NoneBot 插件文档",
+        market_intents=[],
+        fresh_intent=FreshIntent(query="NoneBot 插件文档", kind="web", explicit=True),
+    )
+
+    assert decision.action == "answer"
+    assert decision.need_fresh_context
+    assert decision.fresh_query == "NoneBot 插件文档"
+    assert decision.fresh_kind == "web"
+
+
+def test_backend_tool_decision_does_not_force_implicit_fresh_hint() -> None:
+    original = ReplyDecision(True, 0.68, "顺手接话", mode="chat", action="tease")
+
+    decision = _apply_backend_tool_decision(
+        original,
+        text="美国现在怎么了",
+        market_intents=[],
+        fresh_intent=FreshIntent(query="美国", kind="news", explicit=False),
+    )
+
+    assert decision == original
+
+
 def test_pre_decision_gate_handles_repeated_addressed_cue_locally() -> None:
     result = _pre_decision_gate(
         text="c 罗和梅西谁厉害",

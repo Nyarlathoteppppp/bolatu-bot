@@ -73,8 +73,21 @@ def test_parse_reply_decision_action_fresh_sets_context() -> None:
     )
 
     assert decision.should_reply
-    assert decision.action == "fresh_context"
+    assert decision.action == "answer"
     assert decision.need_fresh_context
+
+
+def test_parse_reply_decision_search_keeps_social_action() -> None:
+    decision = _parse_reply_decision(
+        '{"should_reply": true, "confidence": 0.8, "action": "tease", '
+        '"need_fresh_context": true, "fresh_query": "美国最新消息", "fresh_kind": "news", '
+        '"reason": "先查再吐槽"}'
+    )
+
+    assert decision.should_reply
+    assert decision.action == "tease"
+    assert decision.need_fresh_context
+    assert decision.fresh_query == "美国最新消息"
 
 
 def test_parse_reply_decision_action_agree() -> None:

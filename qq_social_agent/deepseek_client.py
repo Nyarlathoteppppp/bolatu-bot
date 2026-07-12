@@ -36,6 +36,7 @@ class ReplyDecision:
     need_fresh_context: bool = False
     fresh_query: str = ""
     fresh_kind: str = "news"
+    reaction: str = ""
 
 
 @dataclass(frozen=True)
@@ -83,6 +84,7 @@ SOCIAL_ACTIONS = {
     "relationship_reply",
     "market_check",
     "fresh_context",
+    "react",
 }
 
 LLMUsageRecorder = Callable[[str, str, Optional[int], Optional[int], Optional[int]], None]
@@ -752,6 +754,7 @@ def _parse_reply_decision(content: str) -> ReplyDecision:
     need_fresh_context = bool(raw.get("need_fresh_context", False))
     fresh_query = str(raw.get("fresh_query", "") or "").strip()
     fresh_kind = str(raw.get("fresh_kind", "news") or "news").strip().lower()
+    reaction = _normalize_reaction_name(str(raw.get("reaction", "") or ""))
     if fresh_kind not in {"news", "sports", "web"}:
         fresh_kind = "news"
     if action == "market_check":
@@ -759,12 +762,11 @@ def _parse_reply_decision(content: str) -> ReplyDecision:
         tool = "market"
     if action == "fresh_context":
         need_fresh_context = True
+        action = "answer"
     if action == "ignore":
         should_reply = False
     if need_tool and tool == "market":
         action = "market_check"
-    if need_fresh_context:
-        action = "fresh_context"
     if not should_reply:
         action = "ignore"
     return ReplyDecision(
@@ -780,6 +782,7 @@ def _parse_reply_decision(content: str) -> ReplyDecision:
         need_fresh_context,
         fresh_query[:120],
         fresh_kind,
+        reaction,
     )
 
 
@@ -875,6 +878,12 @@ def _normalize_action(value: str, *, should_reply: bool) -> str:
         "relationship_reply": "relationship_reply",
         "relation": "relationship_reply",
         "关系回应": "relationship_reply",
+        "react": "react",
+        "reaction": "react",
+        "emoji": "react",
+        "emoji_like": "react",
+        "表情回应": "react",
+        "点表情": "react",
         "at": "at_someone",
         "mention": "at_someone",
         "at_someone": "at_someone",
@@ -886,6 +895,43 @@ def _normalize_action(value: str, *, should_reply: bool) -> str:
     if normalized not in SOCIAL_ACTIONS:
         return "reply"
     return normalized
+
+
+def _normalize_reaction_name(value: str) -> str:
+    key = value.strip().lower()
+    aliases = {
+        "": "",
+        "thumb": "agree",
+        "thumbsup": "agree",
+        "thumbs_up": "agree",
+        "like": "agree",
+        "赞": "agree",
+        "hug": "care",
+        "抱抱": "care",
+        "comfort": "care",
+        "哈哈": "laugh",
+        "笑": "laugh",
+        "laughing": "laugh",
+        "bad_laugh": "tease",
+        "坏笑": "tease",
+        "surprised": "surprise",
+        "问号": "question",
+        "clap": "applause",
+        "鼓掌": "applause",
+        "heart": "heart",
+        "爱心": "heart",
+    }
+    normalized = aliases.get(key, key)
+    return normalized if normalized in {
+        "agree",
+        "care",
+        "laugh",
+        "tease",
+        "surprise",
+        "question",
+        "applause",
+        "heart",
+    } else ""
 
 
 def _parse_mid_memory(content: str) -> MidMemoryDraft:

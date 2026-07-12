@@ -1,7 +1,7 @@
 [project]
 name = "qq-social-agent"
 version = "0.1.0"
-description = "A QQ group social agent with persona skills, passive reply scoring, and DeepSeek chat."
+description = "A multi-provider QQ group social agent with persona, memory, search, and approval workflows."
 requires-python = ">=3.9"
 dependencies = [
   "nonebot2[fastapi,httpx,websockets]>=2.4.0,<3.0.0",

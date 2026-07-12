@@ -156,8 +156,8 @@ BOT_TOOL_SECTION_MESSAGES = {
 11. 生成回复时只注入相关片段，不会把所有记忆、风格、画像和记忆单元全塞进 prompt。
 12. 学习规则只当策略参考，prompt 已要求禁止照搬原文。""",
     "prompt": """bot工具 prompt：
-用法：这里只告诉你该改哪个文件；真正改 prompt 需要在本机编辑 yaml 后重启后端。
-1. 集中 prompt 文件：/Users/ywbw/qq-social-agent/prompts/zhangfengxue.yaml。
+用法：这里只告诉你该改哪个文件；真正改 prompt 需要在服务器工作区编辑 yaml 后重启后端。
+1. 集中 prompt 文件：/opt/qq-social-agent/prompts/zhangfengxue.yaml。
 2. persona：人格、自我认知、说话方式。
 3. flows.decision：群聊是否插嘴、action、是否需要最新背景。
 4. flows.jargon_select：黑话词典注入选择。

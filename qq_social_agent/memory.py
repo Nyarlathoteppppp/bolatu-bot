@@ -58,6 +58,29 @@ class MemberProfile:
 
 
 @dataclass(frozen=True)
+class GroupInfo:
+    group_id: int
+    group_name: str
+    member_count: int
+    max_member_count: int
+    last_synced_at: float
+
+
+@dataclass(frozen=True)
+class GroupMember:
+    group_id: int
+    user_id: int
+    nickname: str
+    card: str
+    role: str
+    title: str
+    joined_at: float
+    last_sent_at: float
+    last_synced_at: float
+    active: bool
+
+
+@dataclass(frozen=True)
 class MemberImpression:
     group_id: int
     user_id: int
@@ -228,7 +251,10 @@ class MemoryStore:
               nickname text not null,
               text text not null,
               is_bot integer not null default 0,
-              created_at real not null
+              created_at real not null,
+              source_message_id text,
+              source_kind text not null default 'live',
+              correlation_id text
             );
 
             create index if not exists idx_messages_group_time
@@ -249,6 +275,14 @@ class MemoryStore:
 
             create index if not exists idx_messages_group_user_id
               on messages(group_id, user_id, id);
+
+            create table if not exists inbound_message_events (
+              group_id integer not null,
+              source_message_id text not null,
+              first_seen_at real not null,
+              correlation_id text,
+              primary key(group_id, source_message_id)
+            );
 
             create table if not exists memory_summaries (
               id integer primary key autoincrement,
@@ -306,6 +340,31 @@ class MemoryStore:
 
             create index if not exists idx_member_profiles_group_seen
               on member_profiles(group_id, last_seen_at);
+
+            create table if not exists group_info (
+              group_id integer primary key,
+              group_name text not null,
+              member_count integer not null default 0,
+              max_member_count integer not null default 0,
+              last_synced_at real not null
+            );
+
+            create table if not exists group_members (
+              group_id integer not null,
+              user_id integer not null,
+              nickname text not null,
+              card text not null default '',
+              role text not null default '',
+              title text not null default '',
+              joined_at real not null default 0,
+              last_sent_at real not null default 0,
+              last_synced_at real not null,
+              active integer not null default 1,
+              primary key(group_id, user_id)
+            );
+
+            create index if not exists idx_group_members_group_active
+              on group_members(group_id, active, user_id);
 
             create table if not exists member_impressions (
               group_id integer not null,
@@ -459,6 +518,8 @@ class MemoryStore:
 
             """
         )
+        self._ensure_message_source_columns()
+        self._ensure_group_directory_tables()
         self._ensure_approved_feedback_tags()
         self._ensure_llm_usage_source_key()
         self._backfill_member_profiles()
@@ -473,6 +534,66 @@ class MemoryStore:
         }
         if "tags_json" not in columns:
             self.conn.execute("alter table approved_reply_feedback add column tags_json text not null default '[]'")
+
+    def _ensure_message_source_columns(self) -> None:
+        columns = {
+            str(row["name"])
+            for row in self.conn.execute("pragma table_info(messages)").fetchall()
+        }
+        if "source_message_id" not in columns:
+            self.conn.execute("alter table messages add column source_message_id text")
+        if "source_kind" not in columns:
+            self.conn.execute("alter table messages add column source_kind text not null default 'live'")
+        if "correlation_id" not in columns:
+            self.conn.execute("alter table messages add column correlation_id text")
+        self.conn.execute(
+            """
+            create unique index if not exists idx_messages_group_source_message
+              on messages(group_id, source_message_id)
+              where source_message_id is not null and source_message_id != ''
+            """
+        )
+        self.conn.execute(
+            """
+            create table if not exists inbound_message_events (
+              group_id integer not null,
+              source_message_id text not null,
+              first_seen_at real not null,
+              correlation_id text,
+              primary key(group_id, source_message_id)
+            )
+            """
+        )
+
+    def _ensure_group_directory_tables(self) -> None:
+        self.conn.executescript(
+            """
+            create table if not exists group_info (
+              group_id integer primary key,
+              group_name text not null,
+              member_count integer not null default 0,
+              max_member_count integer not null default 0,
+              last_synced_at real not null
+            );
+
+            create table if not exists group_members (
+              group_id integer not null,
+              user_id integer not null,
+              nickname text not null,
+              card text not null default '',
+              role text not null default '',
+              title text not null default '',
+              joined_at real not null default 0,
+              last_sent_at real not null default 0,
+              last_synced_at real not null,
+              active integer not null default 1,
+              primary key(group_id, user_id)
+            );
+
+            create index if not exists idx_group_members_group_active
+              on group_members(group_id, active, user_id);
+            """
+        )
 
     def _ensure_llm_usage_source_key(self) -> None:
         columns = {
@@ -539,15 +660,35 @@ class MemoryStore:
         *,
         is_bot: bool = False,
         created_at: float | None = None,
-    ) -> None:
+        source_message_id: int | str | None = None,
+        source_kind: str = "live",
+        correlation_id: str | None = None,
+    ) -> bool:
         created = created_at or time.time()
-        self.conn.execute(
+        source_key = _source_message_key(source_message_id)
+        cursor = self.conn.execute(
             """
-            insert into messages(group_id, user_id, nickname, text, is_bot, created_at)
-            values (?, ?, ?, ?, ?, ?)
+            insert or ignore into messages(
+              group_id, user_id, nickname, text, is_bot, created_at,
+              source_message_id, source_kind, correlation_id
+            )
+            values (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (group_id, user_id, nickname, text, int(is_bot), created),
+            (
+                group_id,
+                user_id,
+                nickname,
+                text,
+                int(is_bot),
+                created,
+                source_key,
+                source_kind.strip()[:32] or "live",
+                correlation_id.strip()[:160] if correlation_id else None,
+            ),
         )
+        if cursor.rowcount <= 0:
+            self.conn.commit()
+            return False
         if not is_bot:
             self._upsert_member_profile(group_id, user_id, nickname, last_seen_at=created)
             self._update_member_impression(
@@ -558,6 +699,151 @@ class MemoryStore:
                 created_at=created,
             )
         self.conn.commit()
+        return True
+
+    def message_source_exists(self, group_id: int, source_message_id: int | str | None) -> bool:
+        source_key = _source_message_key(source_message_id)
+        if not source_key:
+            return False
+        row = self.conn.execute(
+            """
+            select 1 from messages
+            where group_id = ? and source_message_id = ?
+            limit 1
+            """,
+            (group_id, source_key),
+        ).fetchone()
+        return row is not None
+
+    def claim_inbound_message(
+        self,
+        group_id: int,
+        source_message_id: int | str | None,
+        *,
+        correlation_id: str | None = None,
+        created_at: float | None = None,
+    ) -> bool:
+        source_key = _source_message_key(source_message_id)
+        if not source_key:
+            return True
+        if self.message_source_exists(group_id, source_key):
+            return False
+        cursor = self.conn.execute(
+            """
+            insert or ignore into inbound_message_events(
+              group_id, source_message_id, first_seen_at, correlation_id
+            )
+            values (?, ?, ?, ?)
+            """,
+            (
+                group_id,
+                source_key,
+                created_at or time.time(),
+                correlation_id.strip()[:160] if correlation_id else None,
+            ),
+        )
+        self.conn.commit()
+        return cursor.rowcount > 0
+
+    def upsert_group_info(
+        self,
+        *,
+        group_id: int,
+        group_name: str,
+        member_count: int,
+        max_member_count: int,
+        last_synced_at: float | None = None,
+    ) -> None:
+        synced = last_synced_at or time.time()
+        self.conn.execute(
+            """
+            insert into group_info(group_id, group_name, member_count, max_member_count, last_synced_at)
+            values (?, ?, ?, ?, ?)
+            on conflict(group_id) do update set
+              group_name = excluded.group_name,
+              member_count = excluded.member_count,
+              max_member_count = excluded.max_member_count,
+              last_synced_at = excluded.last_synced_at
+            """,
+            (group_id, group_name.strip()[:120], max(0, member_count), max(0, max_member_count), synced),
+        )
+        self.conn.commit()
+
+    def group_info(self, group_id: int) -> GroupInfo | None:
+        row = self.conn.execute(
+            """
+            select group_id, group_name, member_count, max_member_count, last_synced_at
+            from group_info
+            where group_id = ?
+            """,
+            (group_id,),
+        ).fetchone()
+        return _group_info_from_row(row) if row else None
+
+    def replace_group_members(
+        self,
+        group_id: int,
+        members: list[dict[str, object]],
+        *,
+        synced_at: float | None = None,
+    ) -> int:
+        synced = synced_at or time.time()
+        self.conn.execute(
+            "update group_members set active = 0, last_synced_at = ? where group_id = ?",
+            (synced, group_id),
+        )
+        clean_members: list[tuple[object, ...]] = []
+        for member in members:
+            user_id = int(member.get("user_id") or 0)
+            if user_id <= 0:
+                continue
+            clean_members.append(
+                (
+                    group_id,
+                    user_id,
+                    str(member.get("nickname") or user_id).strip()[:120],
+                    str(member.get("card") or "").strip()[:120],
+                    str(member.get("role") or "").strip()[:32],
+                    str(member.get("title") or "").strip()[:120],
+                    float(member.get("joined_at") or 0.0),
+                    float(member.get("last_sent_at") or 0.0),
+                    synced,
+                    1,
+                )
+            )
+        self.conn.executemany(
+            """
+            insert into group_members(
+              group_id, user_id, nickname, card, role, title,
+              joined_at, last_sent_at, last_synced_at, active
+            )
+            values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            on conflict(group_id, user_id) do update set
+              nickname = excluded.nickname,
+              card = excluded.card,
+              role = excluded.role,
+              title = excluded.title,
+              joined_at = excluded.joined_at,
+              last_sent_at = excluded.last_sent_at,
+              last_synced_at = excluded.last_synced_at,
+              active = excluded.active
+            """,
+            clean_members,
+        )
+        self.conn.commit()
+        return len(clean_members)
+
+    def group_member(self, group_id: int, user_id: int) -> GroupMember | None:
+        row = self.conn.execute(
+            """
+            select group_id, user_id, nickname, card, role, title,
+                   joined_at, last_sent_at, last_synced_at, active
+            from group_members
+            where group_id = ? and user_id = ?
+            """,
+            (group_id, user_id),
+        ).fetchone()
+        return _group_member_from_row(row) if row else None
 
     def _upsert_member_profile(
         self,
@@ -1045,9 +1331,16 @@ class MemoryStore:
         placeholders = ",".join("?" for _ in ordered_user_ids)
         rows = self.conn.execute(
             f"""
-            select group_id, user_id, display_name, aliases_json, last_seen_at
-            from member_profiles
-            where group_id = ? and user_id in ({placeholders})
+            select
+              p.group_id,
+              p.user_id,
+              coalesce(nullif(g.card, ''), nullif(g.nickname, ''), p.display_name) as display_name,
+              p.aliases_json,
+              coalesce(nullif(g.last_synced_at, 0), p.last_seen_at) as last_seen_at
+            from member_profiles p
+            left join group_members g
+              on g.group_id = p.group_id and g.user_id = p.user_id and g.active = 1
+            where p.group_id = ? and p.user_id in ({placeholders})
             """,
             (group_id, *ordered_user_ids),
         ).fetchall()
@@ -1070,9 +1363,9 @@ class MemoryStore:
             select
               p.group_id,
               p.user_id,
-              p.display_name,
+              coalesce(nullif(g.card, ''), nullif(g.nickname, ''), p.display_name) as display_name,
               p.aliases_json,
-              p.last_seen_at,
+              coalesce(nullif(g.last_synced_at, 0), p.last_seen_at) as last_seen_at,
               coalesce(i.message_count, 0) as message_count,
               coalesce(i.tag_counts_json, '{{}}') as tag_counts_json,
               coalesce(i.keyword_counts_json, '{{}}') as keyword_counts_json,
@@ -1084,6 +1377,8 @@ class MemoryStore:
               coalesce(s.representative_texts_json, '[]') as ai_representative_texts_json,
               coalesce(s.created_at, 0) as ai_summary_at
             from member_profiles p
+            left join group_members g
+              on g.group_id = p.group_id and g.user_id = p.user_id and g.active = 1
             left join member_impressions i
               on i.group_id = p.group_id and i.user_id = p.user_id
             left join member_profile_summaries s
@@ -1107,9 +1402,9 @@ class MemoryStore:
             select
               p.group_id,
               p.user_id,
-              p.display_name,
+              coalesce(nullif(g.card, ''), nullif(g.nickname, ''), p.display_name) as display_name,
               p.aliases_json,
-              p.last_seen_at,
+              coalesce(nullif(g.last_synced_at, 0), p.last_seen_at) as last_seen_at,
               coalesce(i.message_count, 0) as message_count,
               coalesce(i.tag_counts_json, '{}') as tag_counts_json,
               coalesce(i.keyword_counts_json, '{}') as keyword_counts_json,
@@ -1121,6 +1416,8 @@ class MemoryStore:
               coalesce(s.representative_texts_json, '[]') as ai_representative_texts_json,
               coalesce(s.created_at, 0) as ai_summary_at
             from member_profiles p
+            left join group_members g
+              on g.group_id = p.group_id and g.user_id = p.user_id and g.active = 1
             left join member_impressions i
               on i.group_id = p.group_id and i.user_id = p.user_id
             left join member_profile_summaries s
@@ -1914,6 +2211,7 @@ class MemoryStore:
 
     def reset_group_messages(self, group_id: int) -> None:
         self.conn.execute("delete from messages where group_id = ?", (group_id,))
+        self.conn.execute("delete from inbound_message_events where group_id = ?", (group_id,))
         self.conn.commit()
 
     def group_state(self, group_id: int) -> dict[str, object]:
@@ -1958,6 +2256,31 @@ def _message_from_row(row: sqlite3.Row) -> ChatMessage:
         is_bot=bool(row["is_bot"]),
         created_at=float(row["created_at"]),
         id=int(row["id"]),
+    )
+
+
+def _group_info_from_row(row: sqlite3.Row) -> GroupInfo:
+    return GroupInfo(
+        group_id=int(row["group_id"]),
+        group_name=str(row["group_name"]),
+        member_count=int(row["member_count"] or 0),
+        max_member_count=int(row["max_member_count"] or 0),
+        last_synced_at=float(row["last_synced_at"] or 0.0),
+    )
+
+
+def _group_member_from_row(row: sqlite3.Row) -> GroupMember:
+    return GroupMember(
+        group_id=int(row["group_id"]),
+        user_id=int(row["user_id"]),
+        nickname=str(row["nickname"]),
+        card=str(row["card"] or ""),
+        role=str(row["role"] or ""),
+        title=str(row["title"] or ""),
+        joined_at=float(row["joined_at"] or 0.0),
+        last_sent_at=float(row["last_sent_at"] or 0.0),
+        last_synced_at=float(row["last_synced_at"] or 0.0),
+        active=bool(row["active"]),
     )
 
 
@@ -2459,3 +2782,10 @@ def _dedupe_ints(values: list[int]) -> list[int]:
         seen.add(value)
         result.append(value)
     return result
+
+
+def _source_message_key(source_message_id: int | str | None) -> str | None:
+    if source_message_id is None:
+        return None
+    key = str(source_message_id).strip()
+    return key or None

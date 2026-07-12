@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from .cue_patterns import CueRepeatState
 from .deepseek_client import ReplyDecision, ToolSymbol
@@ -66,15 +66,25 @@ def apply_backend_tool_decision(
 ) -> ReplyDecision:
     if not decision.should_reply:
         return decision
+    result = decision
     if market_intents and is_explicit_market_lookup(text):
-        return _market_decision(
+        result = _market_decision(
             text=text,
             market_intents=market_intents,
             reason=decision.reason or "backend_market_lookup",
             confidence=decision.confidence,
             mode=decision.mode,
         )
-    return decision
+    if fresh_intent is not None and fresh_intent.explicit:
+        action = "answer" if result.action == "fresh_context" else result.action
+        result = replace(
+            result,
+            action=action,
+            need_fresh_context=True,
+            fresh_query=result.fresh_query.strip() or fresh_intent.query,
+            fresh_kind=fresh_intent.kind,
+        )
+    return result
 
 
 def is_low_value_group_text(text: str) -> bool:

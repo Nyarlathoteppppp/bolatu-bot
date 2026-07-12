@@ -14,9 +14,20 @@ services:
       - ./data:/app/data
       - ./logs:/app/logs
       - ./prompts:/app/prompts
+      - ./server-data/ntqq:/app/.config/QQ:ro
       - ./config.yaml:/app/config.yaml:ro
     ports:
       - "127.0.0.1:8080:8080"
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/healthz', timeout=3).read()"
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
 
   napcat:
     image: mlikiowa/napcat-docker:latest

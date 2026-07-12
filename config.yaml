@@ -64,6 +64,60 @@ rate_control:
     start: "01:00"
     end: "08:00"
 
+social_actions:
+  enabled: true
+  per_user_cooldown_seconds: 120
+  per_group_cooldown_seconds: 18
+  max_per_group_hour: 24
+  emoji_ids:
+    agree: "76"
+    care: "49"
+    laugh: "28"
+    tease: "101"
+    surprise: "32"
+    applause: "99"
+    heart: "66"
+
+image_ocr:
+  enabled: true
+  napcat_ocr_enabled: false
+  max_images_per_message: 2
+  max_text_chars_per_image: 220
+  max_calls_per_minute: 18
+  cache_ttl_seconds: 86400
+  api_timeout_seconds: 8
+  siliconflow_fallback_enabled: true
+  siliconflow_api_key_env: SILICONFLOW_API_KEY
+  siliconflow_base_url: https://api.siliconflow.cn/v1
+  siliconflow_model: deepseek-ai/DeepSeek-OCR
+  siliconflow_timeout_seconds: 20
+  siliconflow_max_tokens: 512
+  siliconflow_detail: high
+  siliconflow_prompt: 请帮群聊机器人理解这张图：1. 用一句话说图里大概是什么；2. 转写图中能看清的文字；3. 如果像表情包/梗图，说明它大概在表达什么。简短输出。
+
+fresh_search:
+  enabled: true
+  provider: auto
+  max_external_queries_per_minute: 4
+  timeout_seconds: 8
+  max_results: 5
+  cache_max_entries: 256
+  cache_ttl_seconds: 300
+  news_cache_ttl_seconds: 300
+  sports_cache_ttl_seconds: 60
+  web_cache_ttl_seconds: 1800
+  failure_ttl_seconds: 30
+  query_max_chars: 120
+  tavily:
+    api_key_env: TAVILY_API_KEY
+
+group_directory:
+  sync_interval_seconds: 21600
+
+history_sync:
+  enabled: true
+  backfill_count: 80
+
 groups:
   default:
     enabled: true

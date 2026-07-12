@@ -2,7 +2,7 @@
 
 本文档给未来接手本项目的 AI / 开发者使用。目标是快速理解：这个 QQ 机器人怎么跑、消息怎么流动、Prompt 在哪里、哪些模块能改、哪些地方不要乱动。
 
-最后更新：2026-07-11
+最后更新：2026-07-12
 
 ## 1. 项目定位
 
@@ -82,14 +82,22 @@ Docker / Docker Compose
 ## 3. 目录结构
 
 ```text
-/Users/ywbw/qq-social-agent
+/opt/qq-social-agent
 ├── bot.py                         # NoneBot 入口
 ├── config.yaml                    # 运行配置、模型路由、群/私聊白名单、频控
 ├── prompts/zhangfengxue.yaml      # 集中 Prompt：人格、决策、回复、记忆、风格学习
 ├── qq_social_agent/
 │   ├── plugin.py                  # 主插件：事件入口、群聊流程、审批、工具单、学习调度
+│   ├── onebot_gateway.py          # NapCat / OneBot API 薄封装
+│   ├── group_directory.py         # 群资料和群成员同步
+│   ├── history_sync.py            # 群历史补全、引用消息 get_msg 补全
+│   ├── social_actions.py          # 表情回应等非文字社交动作和限频
+│   ├── message_segments.py        # OneBot 消息段统一解析、文件/卡片安全元数据
+│   ├── media_context.py           # 图片理解/OCR、文件元数据补全
+│   ├── notice_events.py           # notice 事件归一化和结构化事件记忆
+│   ├── observability.py           # correlation id、OneBot 活跃/错误状态
 │   ├── deepseek_client.py         # LLM 客户端：多 provider 路由、JSON 解析、各流程调用
-│   ├── memory.py                  # SQLite 存储：消息、记忆、画像、反馈、指标、用量
+│   ├── memory.py                  # SQLite 存储：消息、去重、群目录、记忆、画像、反馈、指标、用量
 │   ├── config.py                  # 读取 config.yaml，构造模型 route/provider
 │   ├── persona.py                 # 从 prompt yaml 读取 persona
 │   ├── prompts.py                 # 从 prompt yaml 读取 flows/action_guides
@@ -103,7 +111,7 @@ Docker / Docker Compose
 │   └── tools/
 │       ├── market_intent.py       # 股票/加密货币意图识别
 │       ├── market.py              # Yahoo Finance / CoinGecko 行情工具
-│       └── fresh_context.py       # Tavily / Google News RSS 最新背景
+│       └── fresh_context.py       # Tavily / Google News / Bing Web 搜索与事实包
 ├── scripts/
 │   ├── start_bot_daemon.sh        # 后台启动 bot
 │   ├── stop_bot.sh                # 停止 bot
@@ -117,50 +125,51 @@ Docker / Docker Compose
 
 ## 4. 启动和运行
 
-本机虚拟环境：
+主要开发和生产环境均位于服务器：
 
 ```bash
-cd /Users/ywbw/qq-social-agent
-source .venv/bin/activate
-```
-
-启动 QQ/NapCat：
-
-```bash
-/Users/ywbw/qq-social-agent/scripts/start_napcat.sh
-```
-
-启动 bot 后端：
-
-```bash
-/Users/ywbw/qq-social-agent/scripts/start_bot_daemon.sh
-```
-
-停止 bot 后端：
-
-```bash
-/Users/ywbw/qq-social-agent/scripts/stop_bot.sh
+cd /opt/qq-social-agent
 ```
 
 查看状态：
 
 ```bash
-/Users/ywbw/qq-social-agent/scripts/status.sh
+scripts/status.sh
+docker compose -p qq-social-agent -f docker-compose.server.yml ps
 ```
 
-重启后端：
+修改 Python 代码后，重新构建并启动 bot，不动 NapCat：
 
 ```bash
-/Users/ywbw/qq-social-agent/scripts/stop_bot.sh
-/Users/ywbw/qq-social-agent/scripts/start_bot_daemon.sh
-/Users/ywbw/qq-social-agent/scripts/status.sh
+scripts/restart_bot.sh
 ```
 
-日志：
+只修改挂载的 Prompt 文件时，不需要重新构建镜像，但要重启 bot 让进程重新读取：
 
-```text
-/Users/ywbw/qq-social-agent/logs/bot-runtime.log
+```bash
+docker compose -p qq-social-agent -f docker-compose.server.yml restart bot
 ```
+
+只启动现有 bot 镜像：
+
+```bash
+scripts/start_bot_daemon.sh
+```
+
+停止 bot：
+
+```bash
+scripts/stop_bot.sh
+```
+
+查看日志：
+
+```bash
+docker compose -p qq-social-agent -f docker-compose.server.yml logs -f bot
+docker compose -p qq-social-agent -f docker-compose.server.yml logs -f napcat
+```
+
+除非 QQ 登录或连接损坏，不要重启 NapCat。重启 NapCat 可能要求重新扫码并触发 QQ 风控；确需启动时才显式运行 `scripts/start_napcat.sh`。
 
 ## 5. 环境变量和密钥
 
@@ -221,7 +230,7 @@ deepseek:
 集中 Prompt 文件：
 
 ```text
-/Users/ywbw/qq-social-agent/prompts/zhangfengxue.yaml
+/opt/qq-social-agent/prompts/zhangfengxue.yaml
 ```
 
 重要区域：
@@ -274,9 +283,12 @@ _handle_group_message_locked()
 flowchart TD
   A["QQ 群消息"] --> B["NapCat OneBot v11"]
   B --> C["NoneBot group_message"]
-  C --> D{"群是否允许"}
+  C --> C1{"source_message_id 去重"}
+  C1 -- 重复 --> Z
+  C1 -- 新消息 --> D{"群是否允许"}
   D -- 否 --> Z["忽略"]
-  D -- 是 --> E{"图片/语音/视频/不可读转发?"}
+  D -- 是 --> D1["引用 get_msg / 转发内嵌节点或 get_forward_msg 补全"]
+  D1 --> E{"图片/语音/视频/不可读转发?"}
   E -- 是且非点名 --> Z
   E -- 否 --> F{"低价值文本?"}
   F -- 是且非点名 --> Z
@@ -295,7 +307,8 @@ flowchart TD
   P --> R{"should_reply?"}
   Q --> R
   R -- 否 --> Z
-  R -- 是 --> S["取记忆/画像/黑话/原文语料/反馈"]
+  R -- react --> RE["set_msg_emoji_like 表情回应"]
+  R -- 文字回复 --> S["取记忆/画像/黑话/原文语料/反馈"]
   S --> T{"需要工具?"}
   T -- 行情 --> U["MarketTool"]
   T -- 最新背景 --> V["FreshContextTool"]
@@ -315,9 +328,20 @@ flowchart TD
 
 文件：`decision_gate.py` 和 `plugin.py`
 
+OneBot 扩展入口：
+
+- `onebot_gateway.py`：集中调用 OneBot API，统一超时和耗时/错误统计；包含群目录、历史、引用、转发、`get_file` 和表情回应。
+- `group_directory.py`：bot 连接后同步群信息和群成员，写入 `group_info` / `group_members`。
+- `history_sync.py`：bot 连接后补最近群历史；引用消息缺正文时用 `get_msg` 补原消息。
+- `social_actions.py`：`action=react` 时只点表情，不发文字，并做群/用户/小时限频。
+- `message_segments.py` 统一解析图片/商城表情、文件、音乐、分享、位置、小程序、语音和视频；文件只补安全元数据，不自动下载正文。
+- `media_context.py` 使用 SiliconFlow `deepseek-ai/DeepSeek-OCR` 做图片文字与画面简述；商城动画表情默认不烧 OCR。
+- notice 会结构化写入指标库；进退群、群名片等变更会触发群目录刷新。
+- `/healthz` 检查进程/数据库，`/readyz` 检查数据库/LLM/OneBot，`/status` 提供搜索、网关、OCR、审批和错误摘要。
+
 不进 LLM 的典型情况：
 
-- 非点名的纯图片、语音、视频、不可读转发。
+- 非点名且 OCR 没识别出文字的纯图片、语音、视频、不可读转发。
 - 非点名低价值文本：`6`、`哈哈`、`嗯`、`好好好`、`绷`、`没绷住` 等。
 - 群未启用。
 - 频控/单用户限频。
@@ -596,13 +620,15 @@ qq_social_agent/tools/fresh_context.py
 
 支持：
 
-- Tavily，优先级由 `.env` 的 `TAVILY_API_KEY` 和 `FRESH_SEARCH_PROVIDER` 控制。
-- Google News RSS fallback。
-- 每分钟最多 2 次外部查询。
+- Tavily 主搜索；失败后新闻/体育回退 Google News RSS，普通网页回退 Bing RSS。
+- `web/news/sports` 三种查询，明确“搜/查/联网看看”在 decision 决定回复后由后端保证真正调用搜索。
+- 搜索前会清理 key/token/长 QQ 号；结果带 `[S1]` 编号、来源、日期和 URL，并作为不可信外部数据注入。
+- 限频、超时、结果数和各类型缓存 TTL 在 `config.yaml -> fresh_search` 配置；当前每分钟最多 4 次。
+- `/status` 可查看 provider、缓存、剩余限额、最近状态、耗时和失败原因，不显示 API key。
 
 原则：
 
-- 搜索必须由 LLM decision 判断需要，或者后端 fresh intent 给出候选提示。
+- 普通实时话题仍由 LLM decision 判断是否需要；明确搜索请求只要决定回复，后端会强制联网。
 - 搜索结果会压成事实包再给回复模型。
 - 回复不能说“我没联网”，只能说“没拿到可靠新消息”。
 
@@ -610,15 +636,13 @@ qq_social_agent/tools/fresh_context.py
 
 当前能力：
 
-- 图片/语音/视频等不可读媒体会变成占位或被拦截。
+- 普通图片会用 DeepSeek-OCR 输出一句画面概括、可见文字和表情包含义，再并入上下文。
+- 商城动画表情与普通图片分开，默认只保留表情摘要，避免逐个消耗 OCR。
+- 文件、语音、视频、音乐、分享、位置、小程序会保留安全元数据占位；文件正文尚不自动下载或解析。
 - 非点名且主要是不可读媒体时，不进入 buffer 和 LLM decision。
-- 转发聊天记录会尝试抽取/总结，成功后以“某人传了聊天记录，大致内容如下”的形式进入上下文。
+- 转发优先读取消息段内嵌 `content/node`，没有内容时再调用 `get_forward_msg`，随后抽取/总结。
 
-当前还没有真正视觉模型。若以后加视觉：
-
-- 在 `_message_segment_placeholder()` / `_message_text_for_context()` 附近接入图片摘要。
-- 摘要先入上下文，不要把图片二进制传给普通 LLM。
-- 视觉摘要要带来源：`[图片摘要：...]`，避免模型以为是群友原话。
+当前图片理解依赖外部 DeepSeek-OCR，不做历史图片批量回填；语音还没有转写，PDF/docx/txt 也还没有正文解析。
 
 ## 13. 政治兜底
 
@@ -706,7 +730,8 @@ prompts/zhangfengxue.yaml
 改完跑：
 
 ```bash
-/Users/ywbw/qq-social-agent/.venv/bin/python -m pytest tests/test_config.py tests/test_deepseek_client.py -q
+cd /opt/qq-social-agent
+.venv/bin/python -m pytest tests/test_config.py tests/test_deepseek_client.py -q
 ```
 
 然后重启后端。
@@ -795,43 +820,43 @@ qq_social_agent/tools/market.py
 qq_social_agent/tools/market_intent.py
 ```
 
-搜索不要无脑前置触发。最好仍由 decision 判断是否需要最新背景，避免高频浪费额度和把闲聊变成新闻播报。
+普通话题不要无脑前置搜索；明确搜索命令由后端保证执行，其他最新背景仍交给 decision，避免浪费额度和把闲聊变成新闻播报。
 
 ## 16. 测试
 
 全量测试：
 
 ```bash
-cd /Users/ywbw/qq-social-agent
-/Users/ywbw/qq-social-agent/.venv/bin/python -m pytest -q
+cd /opt/qq-social-agent
+.venv/bin/python -m pytest -q
 ```
 
 常用局部测试：
 
 ```bash
-/Users/ywbw/qq-social-agent/.venv/bin/python -m pytest tests/test_config.py -q
-/Users/ywbw/qq-social-agent/.venv/bin/python -m pytest tests/test_deepseek_client.py -q
-/Users/ywbw/qq-social-agent/.venv/bin/python -m pytest tests/test_plugin_low_value.py -q
-/Users/ywbw/qq-social-agent/.venv/bin/python -m pytest tests/test_memory_store.py -q
-/Users/ywbw/qq-social-agent/.venv/bin/python -m pytest tests/test_market_tool.py tests/test_fresh_context.py -q
+.venv/bin/python -m pytest tests/test_config.py -q
+.venv/bin/python -m pytest tests/test_deepseek_client.py -q
+.venv/bin/python -m pytest tests/test_plugin_low_value.py -q
+.venv/bin/python -m pytest tests/test_memory_store.py -q
+.venv/bin/python -m pytest tests/test_market_tool.py tests/test_fresh_context.py -q
 ```
 
 改 prompt 后至少跑：
 
 ```bash
-/Users/ywbw/qq-social-agent/.venv/bin/python -m pytest tests/test_config.py tests/test_deepseek_client.py -q
+.venv/bin/python -m pytest tests/test_config.py tests/test_deepseek_client.py -q
 ```
 
 改拦截/频率后至少跑：
 
 ```bash
-/Users/ywbw/qq-social-agent/.venv/bin/python -m pytest tests/test_plugin_low_value.py tests/test_scorer.py tests/test_rate_limiter.py -q
+.venv/bin/python -m pytest tests/test_plugin_low_value.py tests/test_scorer.py tests/test_rate_limiter.py -q
 ```
 
 改工具后至少跑：
 
 ```bash
-/Users/ywbw/qq-social-agent/.venv/bin/python -m pytest tests/test_market_tool.py tests/test_market_intent.py tests/test_fresh_context.py -q
+.venv/bin/python -m pytest tests/test_market_tool.py tests/test_market_intent.py tests/test_fresh_context.py -q
 ```
 
 ## 17. Git 和数据
@@ -882,7 +907,7 @@ git push origin main
 
 4. 审批流程依赖私聊，NapCat 私聊失败时群聊候选不会发出去。
 
-5. 图片没有视觉理解，只能占位/拦截。不要让普通 LLM 假装看懂图片。
+5. 图片理解来自 DeepSeek-OCR 的简短画面/OCR输出；它仍可能看错，回复不能把模糊图像细节说成确定事实。
 
 6. Prompt 里例子越具体，模型越可能照搬。优质发言和原文语料只能作为“节奏参考”，不能当模板。
 
@@ -896,6 +921,5 @@ git push origin main
 - 改代码后跑相关测试。
 - 不要泄露或写入真实 API key。
 - 不要随便删除或重建 `data/bot.sqlite3`。
-- 修改本机环境、重启服务、安装依赖前要向用户汇报。
+- 修改服务器环境、重启服务、安装依赖前要向用户汇报。
 - 如果有无关 dirty git 文件，不要回滚。
-

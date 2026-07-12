@@ -10,13 +10,16 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from dotenv import load_dotenv
-from nonebot import get_driver, logger, on_command, on_message
+from nonebot import get_driver, logger, on_command, on_message, on_notice
 from nonebot.adapters import Event
 from nonebot.adapters.onebot.v11 import Bot, GroupMessageEvent, Message, MessageSegment, PrivateMessageEvent
 from nonebot.adapters.onebot.v11.exception import ActionFailed
 from nonebot.matcher import Matcher
 from nonebot.params import CommandArg
 from nonebot.rule import Rule
+from starlette.responses import JSONResponse
+
+from . import onebot_gateway
 
 from .approval_rules import (
     APPROVAL_CHOICE_RE,
@@ -50,6 +53,20 @@ from .group_jargon import (
     group_jargon_catalog,
     group_jargon_context,
 )
+from .group_directory import sync_group_directory
+from .history_sync import (
+    ReplyReference,
+    backfill_group_history,
+    event_message_source_id,
+    resolve_reply_reference,
+)
+from .media_context import ImageOcrContext, ImageOcrService, file_metadata_context_for_event
+from .message_segments import (
+    CONTEXT_MEDIA_SEGMENT_TYPES,
+    segment_placeholder as normalized_segment_placeholder,
+    segment_type_and_data,
+)
+from .notice_events import notice_snapshot
 from .memory import (
     ApprovedReplyFeedback,
     BotMetricEvent,
@@ -68,10 +85,20 @@ from .memory import (
     RecalledReplyFeedback,
     StyleRule,
 )
+from .observability import (
+    correlation_scope,
+    current_correlation_id,
+    event_correlation_id,
+    mark_bot_connected,
+    mark_bot_disconnected,
+    mark_bot_seen,
+    onebot_status_snapshot,
+)
 from .persona import PersonaRegistry
 from .political_guard import has_political_redline, political_safe_reply, sanitize_political_output
 from .rate_limiter import RateLimiter
 from .reply_splitter import split_reply_messages
+from .social_actions import SocialActionService, reaction_from_action
 from .tools.fresh_context import (
     FreshContextTool,
     detect_fresh_intent,
@@ -87,7 +114,9 @@ memory = MemoryStore(app_config.data_path)
 personas = PersonaRegistry(app_config.persona_dir)
 rate_limiter = RateLimiter(memory, app_config.rate)
 market_tool = MarketTool(max_external_queries_per_minute=2)
-fresh_context_tool = FreshContextTool(max_external_queries_per_minute=2)
+fresh_context_tool = FreshContextTool.from_config(app_config.raw.get("fresh_search", {}))
+social_action_service = SocialActionService.from_config(app_config.raw.get("social_actions", {}))
+image_ocr_service = ImageOcrService.from_config(app_config.raw.get("image_ocr", {}))
 cue_pattern_tracker = CuePatternTracker(window_seconds=10 * 60)
 deepseek_client: DeepSeekClient | None = None
 last_mid_memory_attempt: dict[int, float] = {}
@@ -103,11 +132,31 @@ group_generation_inflight: set[int] = set()
 group_passive_retry_buffers: dict[int, list["BufferedGroupMessage"]] = {}
 group_passive_retry_tasks: dict[int, asyncio.Task[None]] = {}
 group_passive_decision_state: dict[int, "PassiveDecisionState"] = {}
+group_directory_tasks: dict[str, asyncio.Task[None]] = {}
+history_backfill_tasks: dict[str, asyncio.Task[None]] = {}
+notice_directory_refresh_tasks: dict[int, asyncio.Task[None]] = {}
 pending_group_approvals: dict[int, "PendingGroupApproval"] = {}
 recent_suppression_events: list["SuppressionEvent"] = []
 daily_review_tasks: dict[str, asyncio.Task[None]] = {}
 approval_processing_lock = asyncio.Lock()
 approval_choice_cooldowns: dict[int, float] = {}
+PROCESS_STARTED_AT = time.time()
+
+_driver = get_driver()
+if hasattr(_driver, "server_app"):
+    @_driver.server_app.get("/status")
+    async def _http_status_endpoint() -> dict[str, object]:
+        return _http_status_payload()
+
+    @_driver.server_app.get("/healthz")
+    async def _http_health_endpoint() -> JSONResponse:
+        payload = _http_health_payload()
+        return JSONResponse(payload, status_code=200 if payload["ok"] else 503)
+
+    @_driver.server_app.get("/readyz")
+    async def _http_ready_endpoint() -> JSONResponse:
+        payload = _http_ready_payload()
+        return JSONResponse(payload, status_code=200 if payload["ok"] else 503)
 
 MID_MEMORY_KEEP_SUMMARIES = 4
 MID_MEMORY_BATCH_SIZE = 60
@@ -153,6 +202,10 @@ GROUP_BUFFER_SECONDS = 6.0
 GROUP_INFLIGHT_BUFFER_RETRY_SECONDS = 1.0
 GROUP_PASSIVE_DECISION_GAP_SECONDS = 30
 GROUP_PASSIVE_DECISION_EVERY_MESSAGES = 3
+GROUP_DIRECTORY_SYNC_INTERVAL_SECONDS = int(app_config.raw.get("group_directory", {}).get("sync_interval_seconds", 6 * 60 * 60))
+GROUP_HISTORY_BACKFILL_COUNT = int(app_config.raw.get("history_sync", {}).get("backfill_count", 80))
+GROUP_HISTORY_BACKFILL_ENABLED = bool(app_config.raw.get("history_sync", {}).get("enabled", True))
+IMAGE_OCR_CONTEXT_PREFIX = "[图片OCR:"
 SUPPRESSION_EVENTS_LIMIT = 80
 DAILY_REVIEW_HOUR = 0
 DAILY_REVIEW_MINUTE = 0
@@ -332,6 +385,8 @@ class BufferedGroupMessage:
     user_id: int
     nickname: str
     created_at: float
+    source_message_id: str = ""
+    correlation_id: str = ""
 
 
 @dataclass(frozen=True)
@@ -354,6 +409,8 @@ class PendingGroupApproval:
     candidates: tuple[PendingApprovalCandidate, ...]
     mention_targets: dict[int, str]
     created_at: float
+    correlation_id: str = ""
+    tool_evidence: str = ""
 
 
 @dataclass(frozen=True)
@@ -442,22 +499,241 @@ def _ensure_builtin_memory_atoms() -> None:
 
 @get_driver().on_bot_connect
 async def _send_approval_rules_on_connect(bot: Bot) -> None:
+    mark_bot_connected(int(bot.self_id))
+    _record_metric_event(
+        "onebot_connection",
+        stage="onebot",
+        action="connected",
+        bot_id=str(bot.self_id),
+    )
     await _send_approval_rules_to_approvers(bot, reason="bot_connect")
     await _send_changelog_notice_to_approvers(bot)
     _ensure_daily_review_task(bot)
+    _ensure_group_directory_task(bot)
+    _ensure_history_backfill_task(bot)
+
+
+@get_driver().on_bot_disconnect
+async def _mark_onebot_disconnected(bot: Bot) -> None:
+    mark_bot_disconnected(int(bot.self_id))
+    _record_metric_event(
+        "onebot_connection",
+        stage="onebot",
+        action="disconnected",
+        bot_id=str(bot.self_id),
+    )
+    await _cancel_bot_lifecycle_tasks(str(bot.self_id))
 
 
 @get_driver().on_shutdown
-async def _cancel_daily_review_tasks() -> None:
-    for task in daily_review_tasks.values():
-        task.cancel()
-    daily_review_tasks.clear()
+async def _shutdown_background_tasks() -> None:
+    await _cancel_task_registries(
+        daily_review_tasks,
+        group_directory_tasks,
+        history_backfill_tasks,
+        notice_directory_refresh_tasks,
+        group_buffer_tasks,
+        group_passive_retry_tasks,
+        group_learning_tasks,
+    )
+    closers: list[object] = []
+    if deepseek_client is not None:
+        closers.extend(client.close() for client in deepseek_client.clients.values())
+    closers.append(image_ocr_service.aclose())
+    await asyncio.gather(*closers, return_exceptions=True)
+
+
+async def _cancel_bot_lifecycle_tasks(bot_key: str) -> None:
+    tasks: list[asyncio.Task[object]] = []
+    for registry in (daily_review_tasks, group_directory_tasks, history_backfill_tasks):
+        task = registry.pop(bot_key, None)
+        if task is not None and not task.done():
+            task.cancel()
+            tasks.append(task)
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+
+async def _cancel_task_registries(*registries: dict[object, asyncio.Task[object]]) -> None:
+    tasks: list[asyncio.Task[object]] = []
+    for registry in registries:
+        for task in registry.values():
+            if not task.done():
+                task.cancel()
+                tasks.append(task)
+        registry.clear()
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+
+def _notice_needs_directory_refresh(notice_type: str, sub_type: str) -> bool:
+    tokens = {str(notice_type or "").casefold(), str(sub_type or "").casefold()}
+    return bool(
+        tokens
+        & {
+            "group_increase",
+            "group_decrease",
+            "group_admin",
+            "group_card",
+            "group_name",
+            "increase",
+            "decrease",
+            "admin",
+            "card",
+        }
+    )
+
+
+def _schedule_notice_directory_refresh(bot: Bot, group_id: int) -> None:
+    task = notice_directory_refresh_tasks.get(group_id)
+    if task is not None and not task.done():
+        return
+    notice_directory_refresh_tasks[group_id] = asyncio.create_task(
+        _refresh_group_directory_after_notice(bot, group_id)
+    )
+
+
+async def _refresh_group_directory_after_notice(bot: Bot, group_id: int) -> None:
+    try:
+        await asyncio.sleep(2)
+        result = await sync_group_directory(bot, memory, group_id)
+        _record_metric_event(
+            "group_directory_sync",
+            group_id=group_id,
+            stage="notice",
+            action="synced",
+            member_count=result.member_count,
+            group_name=result.group_name,
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        logger.warning(f"qq_social_agent notice directory refresh failed: group={group_id} error={exc}")
+        _record_metric_event(
+            "group_directory_sync",
+            group_id=group_id,
+            stage="notice",
+            action="failed",
+            error=str(exc)[:200],
+        )
+    finally:
+        task = asyncio.current_task()
+        if notice_directory_refresh_tasks.get(group_id) is task:
+            notice_directory_refresh_tasks.pop(group_id, None)
+
+
+def _ensure_group_directory_task(bot: Bot) -> None:
+    bot_key = str(bot.self_id)
+    task = group_directory_tasks.get(bot_key)
+    if task is not None and not task.done():
+        return
+    group_directory_tasks[bot_key] = asyncio.create_task(_run_group_directory_sync_loop(bot, bot_key))
+    logger.info(f"qq_social_agent group directory sync started: bot={bot_key}")
+
+
+def _ensure_history_backfill_task(bot: Bot) -> None:
+    if not GROUP_HISTORY_BACKFILL_ENABLED or GROUP_HISTORY_BACKFILL_COUNT <= 0:
+        return
+    bot_key = str(bot.self_id)
+    task = history_backfill_tasks.get(bot_key)
+    if task is not None and not task.done():
+        return
+    history_backfill_tasks[bot_key] = asyncio.create_task(_run_group_history_backfill(bot, bot_key))
+    logger.info(f"qq_social_agent group history backfill scheduled: bot={bot_key}")
+
+
+async def _run_group_directory_sync_loop(bot: Bot, bot_key: str) -> None:
+    interval = max(10 * 60, GROUP_DIRECTORY_SYNC_INTERVAL_SECONDS)
+    try:
+        while True:
+            await _sync_group_directory_once(bot)
+            await asyncio.sleep(interval)
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        logger.warning(f"qq_social_agent group directory sync stopped: bot={bot_key} error={exc}")
+    finally:
+        if group_directory_tasks.get(bot_key) is asyncio.current_task():
+            group_directory_tasks.pop(bot_key, None)
+
+
+async def _sync_group_directory_once(bot: Bot) -> None:
+    for group_id in _runtime_target_groups():
+        try:
+            result = await sync_group_directory(bot, memory, group_id)
+        except Exception as exc:
+            logger.warning(f"qq_social_agent group directory sync failed: group={group_id} error={exc}")
+            _record_metric_event(
+                "group_directory_sync",
+                group_id=group_id,
+                stage="onebot",
+                action="failed",
+                error=str(exc)[:160],
+            )
+            continue
+        logger.info(
+            "qq_social_agent group directory synced: "
+            f"group={group_id} members={result.member_count} name={result.group_name!r}"
+        )
+        _record_metric_event(
+            "group_directory_sync",
+            group_id=group_id,
+            stage="onebot",
+            action="synced",
+            member_count=result.member_count,
+            group_name=result.group_name,
+        )
+        await asyncio.sleep(0.2)
+
+
+async def _run_group_history_backfill(bot: Bot, bot_key: str) -> None:
+    try:
+        for group_id in _runtime_target_groups():
+            try:
+                inserted = await backfill_group_history(
+                    bot,
+                    memory,
+                    group_id,
+                    count=GROUP_HISTORY_BACKFILL_COUNT,
+                    self_id=int(bot.self_id),
+                )
+            except Exception as exc:
+                logger.warning(f"qq_social_agent history backfill failed: group={group_id} error={exc}")
+                _record_metric_event(
+                    "history_backfill",
+                    group_id=group_id,
+                    stage="onebot",
+                    action="failed",
+                    error=str(exc)[:160],
+                )
+                continue
+            logger.info(
+                "qq_social_agent history backfill finished: "
+                f"group={group_id} inserted={inserted} count={GROUP_HISTORY_BACKFILL_COUNT}"
+            )
+            _record_metric_event(
+                "history_backfill",
+                group_id=group_id,
+                stage="onebot",
+                action="inserted",
+                inserted=inserted,
+                requested=GROUP_HISTORY_BACKFILL_COUNT,
+            )
+            await asyncio.sleep(0.2)
+    finally:
+        if history_backfill_tasks.get(bot_key) is asyncio.current_task():
+            history_backfill_tasks.pop(bot_key, None)
+
+
+def _runtime_target_groups() -> tuple[int, ...]:
+    groups = _daily_review_target_groups()
+    return tuple(group_id for group_id in groups if app_config.group_allowed(group_id))
 
 
 async def _send_approval_rules_to_approvers(bot: Bot, *, reason: str) -> None:
     for approver_id in _approval_user_ids():
         try:
-            await bot.send_private_msg(user_id=approver_id, message=Message(APPROVAL_RULES_MESSAGE))
+            await _send_private_message(bot, user_id=approver_id, message=Message(APPROVAL_RULES_MESSAGE))
         except ActionFailed as exc:
             logger.warning(
                 "qq_social_agent failed sending approval rules: "
@@ -472,7 +748,7 @@ async def _send_changelog_notice_to_approvers(bot: Bot) -> None:
         if _changelog_notice_sent(marker_key, approver_id):
             continue
         try:
-            await bot.send_private_msg(user_id=approver_id, message=Message(CHANGELOG_NOTICE_MESSAGE))
+            await _send_private_message(bot, user_id=approver_id, message=Message(CHANGELOG_NOTICE_MESSAGE))
         except ActionFailed as exc:
             logger.warning(
                 "qq_social_agent failed sending changelog notice: "
@@ -1058,7 +1334,7 @@ def _format_model_route_status() -> str:
         provider = app_config.deepseek.providers[route.provider]
         lines.append(f"- {route.label}（{_provider_key_source(provider.name)} / {provider.api_key_env}）")
     lines.append("")
-    lines.append("命令示例：切回复模型 siliconflow/MiniMaxAI/MiniMax-M2.5；切画像模型 siliconflow/MiniMaxAI/MiniMax-M2.5；切决策模型 deepseek/deepseek-v4-pro；清模型覆盖。")
+    lines.append("命令示例：切回复模型 siliconflow/MiniMaxAI/MiniMax-M2.5；切画像模型 siliconflow/MiniMaxAI/MiniMax-M2.5；切决策模型 siliconflow/Qwen/Qwen3.5-35B-A3B；清模型覆盖。")
     return "\n".join(lines)
 
 
@@ -1242,16 +1518,283 @@ def _record_metric_event(
     **metadata: object,
 ) -> None:
     try:
+        payload = {key: value for key, value in metadata.items() if value is not None}
+        correlation_id = current_correlation_id()
+        if correlation_id and "correlation_id" not in payload:
+            payload["correlation_id"] = correlation_id
         memory.add_metric_event(
             event_type=event_type,
             group_id=group_id,
             user_id=user_id,
             stage=stage,
             action=action,
-            metadata={key: value for key, value in metadata.items() if value is not None},
+            metadata=payload,
         )
     except Exception as exc:
         logger.warning(f"qq_social_agent failed recording metric: type={event_type} error={exc}")
+
+
+def _http_status_payload() -> dict[str, object]:
+    now = time.time()
+    db_ok, db_error = _status_db_health()
+    onebot = onebot_status_snapshot()
+    deepseek_ready = _status_llm_ready()
+    return {
+        "ok": bool(db_ok and deepseek_ready and onebot.get("connected_bots")),
+        "process": {
+            "started_at": PROCESS_STARTED_AT,
+            "uptime_seconds": int(now - PROCESS_STARTED_AT),
+        },
+        "database": {
+            "ok": db_ok,
+            "path": str(memory.db_path),
+            "error": db_error,
+        },
+        "onebot": onebot,
+        "onebot_api": onebot_gateway.status_snapshot(),
+        "llm": {
+            "ready": deepseek_ready,
+            "routes": _status_model_routes(),
+        },
+        "search": fresh_context_tool.status_snapshot(),
+        "ocr": _status_image_ocr(),
+        "groups": _status_groups(),
+        "last_message": _status_latest_message(),
+        "approvals": _status_approvals(),
+        "buffers": _status_buffers(),
+        "recent_errors": _status_recent_errors(limit=10),
+        "recent_rejections": _status_recent_rejections(limit=5),
+        "recent_metrics_1h": _status_metric_summary(window_seconds=60 * 60, limit=16),
+    }
+
+
+def _http_health_payload() -> dict[str, object]:
+    db_ok, db_error = _status_db_health()
+    return {
+        "ok": db_ok,
+        "process": {
+            "started_at": PROCESS_STARTED_AT,
+            "uptime_seconds": max(0, int(time.time() - PROCESS_STARTED_AT)),
+        },
+        "database": {"ok": db_ok, "error": db_error},
+    }
+
+
+def _http_ready_payload() -> dict[str, object]:
+    health = _http_health_payload()
+    onebot = onebot_status_snapshot()
+    llm_ready = _status_llm_ready()
+    onebot_ready = bool(onebot.get("connected_bots"))
+    reasons: list[str] = []
+    if not health["ok"]:
+        reasons.append("database_unavailable")
+    if not llm_ready:
+        reasons.append("llm_client_unavailable")
+    if not onebot_ready:
+        reasons.append("onebot_disconnected")
+    return {
+        "ok": not reasons,
+        "database_ready": bool(health["ok"]),
+        "llm_ready": llm_ready,
+        "onebot_ready": onebot_ready,
+        "connected_bot_count": len(onebot.get("connected_bots", [])),
+        "reasons": reasons,
+    }
+
+
+def _status_llm_ready() -> bool:
+    return bool(deepseek_client is not None and getattr(deepseek_client, "clients", {}))
+
+
+def _status_db_health() -> tuple[bool, str]:
+    try:
+        memory.conn.execute("select 1").fetchone()
+        return True, ""
+    except Exception as exc:
+        return False, str(exc)[:200]
+
+
+def _status_model_routes() -> dict[str, str]:
+    routes: dict[str, str] = {}
+    for route_name in MODEL_ROUTE_STORAGE_NAMES:
+        if route_name == "utility_group":
+            continue
+        try:
+            route = (
+                deepseek_client.current_route(route_name)
+                if deepseek_client is not None
+                else app_config.deepseek.routes.get(route_name)
+            )
+        except Exception:
+            route = app_config.deepseek.routes.get(route_name)
+        if route is not None:
+            routes[route_name] = route.label
+    return routes
+
+
+def _status_image_ocr() -> dict[str, object]:
+    cfg = app_config.raw.get("image_ocr", {})
+    cfg = cfg if isinstance(cfg, dict) else {}
+    return {
+        "enabled": bool(cfg.get("enabled", True)),
+        "napcat_ocr_enabled": bool(cfg.get("napcat_ocr_enabled", True)),
+        "siliconflow_fallback_enabled": bool(cfg.get("siliconflow_fallback_enabled", False)),
+        "siliconflow_model": str(cfg.get("siliconflow_model", "deepseek-ai/DeepSeek-OCR")),
+        "siliconflow_api_key_env": str(cfg.get("siliconflow_api_key_env", "SILICONFLOW_API_KEY")),
+        "max_images_per_message": int(cfg.get("max_images_per_message", 2)),
+        "max_calls_per_minute": int(cfg.get("max_calls_per_minute", 18)),
+    }
+
+
+def _status_groups() -> list[dict[str, object]]:
+    groups: list[dict[str, object]] = []
+    for group_id in _runtime_target_groups():
+        state = memory.group_state(group_id)
+        cfg = app_config.group_config(group_id)
+        info = memory.group_info(group_id)
+        groups.append(
+            {
+                "group_id": group_id,
+                "enabled": bool(cfg.get("enabled", True)) and bool(state["enabled"]),
+                "persona": str(state["persona"] or cfg.get("persona") or app_config.default_persona),
+                "muted_until": float(state["muted_until"] or 0),
+                "muted_left_seconds": max(0, int(float(state["muted_until"] or 0) - time.time())),
+                "group_name": info.group_name if info else "",
+                "member_count": info.member_count if info else 0,
+                "last_directory_synced_at": info.last_synced_at if info else 0,
+            }
+        )
+    return groups
+
+
+def _status_latest_message() -> dict[str, object] | None:
+    row = memory.conn.execute(
+        """
+        select id, group_id, user_id, nickname, text, is_bot, created_at,
+               source_message_id, source_kind, correlation_id
+        from messages
+        order by created_at desc, id desc
+        limit 1
+        """
+    ).fetchone()
+    if row is None:
+        return None
+    return {
+        "id": int(row["id"]),
+        "group_id": int(row["group_id"]),
+        "user_id": int(row["user_id"]),
+        "nickname": str(row["nickname"]),
+        "text": _short_notice_text(str(row["text"]), 160),
+        "is_bot": bool(row["is_bot"]),
+        "created_at": float(row["created_at"]),
+        "age_seconds": max(0, int(time.time() - float(row["created_at"]))),
+        "source_message_id": str(row["source_message_id"] or ""),
+        "source_kind": str(row["source_kind"] or ""),
+        "correlation_id": str(row["correlation_id"] or ""),
+    }
+
+
+def _status_approvals() -> dict[str, object]:
+    pending = []
+    now = time.time()
+    for approval in sorted(pending_group_approvals.values(), key=lambda item: item.created_at, reverse=True):
+        pending.append(
+            {
+                "approval_id": approval.approval_id,
+                "group_id": approval.group_id,
+                "trigger_user_id": approval.trigger_user_id,
+                "trigger_nickname": approval.trigger_nickname,
+                "trigger_text": _short_notice_text(approval.trigger_text, 160),
+                "candidate_count": len(approval.candidates),
+                "has_tool_evidence": bool(approval.tool_evidence),
+                "created_at": approval.created_at,
+                "age_seconds": max(0, int(now - approval.created_at)),
+                "correlation_id": approval.correlation_id,
+            }
+        )
+    return {
+        "review_enabled": _approval_review_enabled(),
+        "auto_send_percent": _approval_auto_send_percent(),
+        "pending_count": len(pending_group_approvals),
+        "pending": pending[:10],
+    }
+
+
+def _status_buffers() -> dict[str, object]:
+    return {
+        "group_buffers": {str(group_id): len(items) for group_id, items in sorted(group_message_buffers.items())},
+        "passive_retry_buffers": {
+            str(group_id): len(items) for group_id, items in sorted(group_passive_retry_buffers.items())
+        },
+        "generation_inflight_groups": sorted(group_generation_inflight),
+        "buffer_tasks": sorted(str(group_id) for group_id, task in group_buffer_tasks.items() if not task.done()),
+    }
+
+
+def _status_recent_errors(*, limit: int) -> list[dict[str, object]]:
+    rows = memory.conn.execute(
+        """
+        select event_type, group_id, user_id, stage, action, metadata_json, created_at
+        from bot_metric_events
+        where action in ('failed', 'error', 'timeout')
+           or (
+                json_valid(metadata_json)
+                and length(trim(coalesce(json_extract(metadata_json, '$.error'), ''))) > 0
+              )
+           or event_type like '%failed%'
+           or event_type like '%timeout%'
+        order by created_at desc, id desc
+        limit ?
+        """,
+        (limit,),
+    ).fetchall()
+    return [_status_metric_row(row) for row in rows]
+
+
+def _status_recent_rejections(*, limit: int) -> list[dict[str, object]]:
+    rows = memory.conn.execute(
+        """
+        select event_type, group_id, user_id, stage, action, metadata_json, created_at
+        from bot_metric_events
+        where action = 'reject' or event_type = 'approval_canceled'
+        order by created_at desc, id desc
+        limit ?
+        """,
+        (limit,),
+    ).fetchall()
+    return [_status_metric_row(row) for row in rows]
+
+
+def _status_metric_summary(*, window_seconds: int, limit: int) -> list[dict[str, object]]:
+    summary = memory.metric_summary(start_at=time.time() - window_seconds, limit=limit)
+    return [
+        {
+            "event_type": item.event_type,
+            "stage": item.stage,
+            "action": item.action,
+            "count": item.count,
+        }
+        for item in summary
+    ]
+
+
+def _status_metric_row(row: object) -> dict[str, object]:
+    metadata: dict[str, object]
+    try:
+        raw_metadata = json.loads(str(row["metadata_json"] or "{}"))  # type: ignore[index]
+        metadata = raw_metadata if isinstance(raw_metadata, dict) else {}
+    except Exception:
+        metadata = {}
+    return {
+        "event_type": str(row["event_type"]),  # type: ignore[index]
+        "group_id": row["group_id"],  # type: ignore[index]
+        "user_id": row["user_id"],  # type: ignore[index]
+        "stage": str(row["stage"]),  # type: ignore[index]
+        "action": str(row["action"]),  # type: ignore[index]
+        "metadata": metadata,
+        "created_at": float(row["created_at"]),  # type: ignore[index]
+        "age_seconds": max(0, int(time.time() - float(row["created_at"]))),  # type: ignore[index]
+    }
 
 
 def _short_notice_text(text: str, limit: int) -> str:
@@ -1282,6 +1825,7 @@ def _is_jargon_command_event(event: Event) -> bool:
 jargon_command = on_message(rule=Rule(_is_jargon_command_event), priority=9, block=True)
 group_message = on_message(rule=Rule(_is_group_event), priority=50, block=False)
 private_message = on_message(rule=Rule(_is_private_event), priority=50, block=False)
+notice_event = on_notice(priority=50, block=False)
 
 
 @jargon_command.handle()
@@ -1297,18 +1841,91 @@ async def handle_jargon_command(event: Event, matcher: Matcher) -> None:
     )
 
 
+@notice_event.handle()
+async def handle_notice_event(bot: Bot, event: Event) -> None:
+    snapshot = notice_snapshot(event)
+    if snapshot.group_id is not None and not app_config.group_allowed(snapshot.group_id):
+        return
+    correlation_id = event_correlation_id(event, scope="notice")
+    mark_bot_seen(int(bot.self_id))
+    with correlation_scope(correlation_id):
+        _record_metric_event(
+            "notice_event",
+            group_id=snapshot.group_id,
+            user_id=snapshot.user_id,
+            stage="notice",
+            action=snapshot.sub_type or snapshot.notice_type,
+            **snapshot.metric_metadata(),
+        )
+        if snapshot.group_id is not None and _notice_needs_directory_refresh(snapshot.notice_type, snapshot.sub_type):
+            _schedule_notice_directory_refresh(bot, snapshot.group_id)
+
+
 @group_message.handle()
 async def handle_group_message(bot: Bot, event: GroupMessageEvent) -> None:
+    correlation_id = event_correlation_id(event, scope="group")
+    mark_bot_seen(int(bot.self_id))
+    with correlation_scope(correlation_id):
+        await _handle_group_message_scoped(bot, event, correlation_id=correlation_id)
+
+
+async def _handle_group_message_scoped(
+    bot: Bot,
+    event: GroupMessageEvent,
+    *,
+    correlation_id: str,
+) -> None:
     group_id = int(event.group_id)
     plain_text = _plain_text(event)
-    raw_text = _message_context_text(event, bot_id=int(bot.self_id))
-    addressed_bot = _mentioned_bot(event, bot) or _replied_to_bot(event, bot)
     group_allowed = app_config.group_allowed(group_id)
+    source_message_id = event_message_source_id(event)
+    if group_allowed and not memory.claim_inbound_message(
+        group_id,
+        source_message_id,
+        correlation_id=correlation_id,
+        created_at=float(getattr(event, "time", 0) or time.time()),
+    ):
+        logger.info(
+            "qq_social_agent ignored duplicate group message: "
+            f"group={group_id} source_message_id={source_message_id}"
+        )
+        _record_metric_event(
+            "message_duplicate",
+            group_id=group_id,
+            user_id=int(event.user_id),
+            stage="group",
+            action="duplicate",
+            source_message_id=source_message_id,
+            correlation_id=correlation_id,
+        )
+        return
+    reply_reference = await _resolve_reply_reference_for_event(bot, event, group_allowed=group_allowed)
+    addressed_bot = (
+        _mentioned_bot(event, bot)
+        or _replied_to_bot(event, bot)
+        or _reply_reference_to_bot(reply_reference, bot)
+    )
+    raw_text = _message_context_text(event, bot_id=int(bot.self_id), resolved_reply=reply_reference)
+    file_context = ""
+    if group_allowed:
+        file_context = await file_metadata_context_for_event(bot, event)
+        if file_context and file_context not in raw_text:
+            raw_text = _join_context_parts(raw_text, file_context)
+    ocr_context = await _image_ocr_context_for_event(
+        bot,
+        event,
+        group_allowed=group_allowed,
+        group_id=group_id,
+        user_id=int(event.user_id),
+        correlation_id=correlation_id,
+    )
+    if ocr_context.text:
+        raw_text = _join_context_parts(raw_text, _format_image_ocr_context(ocr_context))
     forward_context = ""
     if group_allowed and _message_has_forward_context(event):
         forward_context = await _forward_context_text(bot, event, nickname=_nickname(event))
         if forward_context:
-            raw_text = _join_context_parts(plain_text, forward_context)
+            raw_text = _join_context_parts(raw_text or plain_text, forward_context)
     _record_metric_event(
         "message_received",
         group_id=group_id,
@@ -1317,10 +1934,27 @@ async def handle_group_message(bot: Bot, event: GroupMessageEvent) -> None:
         action="received",
         addressed=addressed_bot,
         has_media=_message_has_context_media(event),
+        has_file_context=bool(file_context),
+        has_ocr=bool(ocr_context.text),
+        ocr_count=ocr_context.ocr_count,
+        source_message_id=source_message_id,
+        correlation_id=correlation_id,
     )
     text = raw_text
-    if group_allowed and not addressed_bot and _should_ignore_unreadable_media_event(event, forward_context=forward_context):
-        memory.add_message(group_id, int(event.user_id), _nickname(event), raw_text or plain_text or "[不可见媒体]", is_bot=False)
+    if group_allowed and not addressed_bot and _should_ignore_unreadable_media_event(
+        event,
+        forward_context=forward_context,
+        readable_media_context=ocr_context.text,
+    ):
+        memory.add_message(
+            group_id,
+            int(event.user_id),
+            _nickname(event),
+            raw_text or plain_text or "[不可见媒体]",
+            is_bot=False,
+            source_message_id=source_message_id,
+            correlation_id=correlation_id,
+        )
         logger.info(
             "qq_social_agent ignored unreadable media group message: "
             f"group={group_id} user={int(event.user_id)} text={raw_text!r}"
@@ -1354,7 +1988,15 @@ async def handle_group_message(bot: Bot, event: GroupMessageEvent) -> None:
         and raw_text == plain_text
         and _is_low_value_group_text(plain_text)
     ):
-        memory.add_message(group_id, int(event.user_id), _nickname(event), plain_text, is_bot=False)
+        memory.add_message(
+            group_id,
+            int(event.user_id),
+            _nickname(event),
+            plain_text,
+            is_bot=False,
+            source_message_id=source_message_id,
+            correlation_id=correlation_id,
+        )
         logger.info(
             "qq_social_agent ignored group low value text: "
             f"group={group_id} user={int(event.user_id)} text={plain_text!r}"
@@ -1374,10 +2016,23 @@ async def handle_group_message(bot: Bot, event: GroupMessageEvent) -> None:
         and group_allowed
         and not addressed_bot
     ):
-        _buffer_group_message(bot, event, text)
+        _buffer_group_message(
+            bot,
+            event,
+            text,
+            source_message_id=source_message_id,
+            correlation_id=correlation_id,
+        )
         return
     async with _group_processing_lock(group_id):
-        await _handle_group_message_locked(bot, event, preprocessed_text=text)
+        await _handle_group_message_locked(
+            bot,
+            event,
+            preprocessed_text=text,
+            source_message_id=source_message_id,
+            correlation_id=correlation_id,
+            addressed_bot_hint=addressed_bot,
+        )
 
 
 async def _handle_group_message_locked(
@@ -1388,7 +2043,11 @@ async def _handle_group_message_locked(
     force_passive_decision: bool = False,
     skip_memory_record: bool = False,
     preprocessed_text: str | None = None,
+    source_message_id: str = "",
+    correlation_id: str = "",
+    addressed_bot_hint: bool | None = None,
 ) -> None:
+    flow_started_at = time.monotonic()
     text = _buffered_current_text(buffered_messages) if buffered_messages else (
         preprocessed_text if preprocessed_text is not None else _plain_text(event)
     )
@@ -1401,13 +2060,23 @@ async def _handle_group_message_locked(
     nickname = _buffered_current_nickname(buffered_messages) if buffered_messages else _nickname(event)
     mentioned = False if buffered_messages else _mentioned_bot(event, bot)
     replied_to_bot = False if buffered_messages else _replied_to_bot(event, bot)
-    addressed_bot = mentioned or replied_to_bot
+    if not buffered_messages and addressed_bot_hint and _event_has_reply_context(event):
+        replied_to_bot = True
+    addressed_bot = mentioned or replied_to_bot or (False if buffered_messages else bool(addressed_bot_hint))
     addressed_repeat_count = _record_addressed_event(group_id, user_id, addressed_bot)
 
     if not buffered_messages and replied_to_bot and _is_low_value_reply_to_bot_event(event):
         plain_reply_text = _plain_text(event)
         if not skip_memory_record:
-            memory.add_message(group_id, user_id, nickname, plain_reply_text or text, is_bot=False)
+            memory.add_message(
+                group_id,
+                user_id,
+                nickname,
+                plain_reply_text or text,
+                is_bot=False,
+                source_message_id=source_message_id or event_message_source_id(event),
+                correlation_id=correlation_id,
+            )
         logger.info(
             "qq_social_agent ignored low value reply to bot: "
             f"group={group_id} user={user_id} text={plain_reply_text!r}"
@@ -1432,9 +2101,25 @@ async def _handle_group_message_locked(
     if not skip_memory_record:
         if buffered_messages:
             for item in buffered_messages:
-                memory.add_message(group_id, item.user_id, item.nickname, item.text, is_bot=False)
+                memory.add_message(
+                    group_id,
+                    item.user_id,
+                    item.nickname,
+                    item.text,
+                    is_bot=False,
+                    source_message_id=item.source_message_id,
+                    correlation_id=item.correlation_id,
+                )
         else:
-            memory.add_message(group_id, user_id, nickname, text, is_bot=False)
+            memory.add_message(
+                group_id,
+                user_id,
+                nickname,
+                text,
+                is_bot=False,
+                source_message_id=source_message_id or event_message_source_id(event),
+                correlation_id=correlation_id,
+            )
     _record_metric_event(
         "message_buffered",
         group_id=group_id,
@@ -1526,6 +2211,7 @@ async def _handle_group_message_locked(
         text=text,
         addressed=addressed_bot,
     )
+    decision_started_at = time.monotonic()
     logger.info(
         "qq_social_agent group decision start: "
         f"group={group_id} user={user_id} mentioned={mentioned} replied_to_bot={replied_to_bot} text={text!r}"
@@ -1589,6 +2275,7 @@ async def _handle_group_message_locked(
                 candidates=(PendingApprovalCandidate(1, reply, "political_guard", "政治红线兜底"),),
                 mention_targets={},
                 created_at=time.time(),
+                correlation_id=current_correlation_id(),
             ),
         )
         return
@@ -1800,6 +2487,8 @@ async def _handle_group_message_locked(
         confidence=round(decision.confidence, 3),
         decision_reason=decision.reason,
         need_fresh=decision.need_fresh_context,
+        elapsed_ms=int((time.monotonic() - decision_started_at) * 1000),
+        flow_elapsed_ms=int((time.monotonic() - flow_started_at) * 1000),
     )
     _schedule_group_learning(group_id)
     if not decision.should_reply:
@@ -1814,6 +2503,20 @@ async def _handle_group_message_locked(
                 f"LLM 判断不发：action={decision.action} mode={decision.mode} "
                 f"confidence={decision.confidence:.2f} reason={decision.reason}"
             ),
+        )
+        return
+
+    if decision.action == "react":
+        await _execute_reaction_action(
+            bot,
+            event,
+            group_id=group_id,
+            user_id=user_id,
+            nickname=nickname,
+            text=text,
+            decision=decision,
+            buffered_messages=buffered_messages,
+            source_message_id=source_message_id,
         )
         return
 
@@ -1917,6 +2620,7 @@ async def _handle_group_message_locked(
                         ),
                         mention_targets={},
                         created_at=time.time(),
+                        correlation_id=current_correlation_id(),
                     ),
                 )
                 return
@@ -1935,6 +2639,7 @@ async def _handle_group_message_locked(
     )
     direct_single_reply = _approval_direct_single_reply_enabled()
     reply_candidate_limit = 1 if direct_single_reply else 3
+    generation_started_at = time.monotonic()
     try:
         reply_candidates = await deepseek_client.reply_candidates(
             persona=persona,
@@ -2030,6 +2735,8 @@ async def _handle_group_message_locked(
         stage="reply_direct" if direct_single_reply else "reply_candidates",
         action=decision.action,
         candidate_count=len(approval_candidates),
+        elapsed_ms=int((time.monotonic() - generation_started_at) * 1000),
+        flow_elapsed_ms=int((time.monotonic() - flow_started_at) * 1000),
     )
     await _request_group_approval(
         bot,
@@ -2044,18 +2751,54 @@ async def _handle_group_message_locked(
             candidates=tuple(approval_candidates),
             mention_targets=mention_targets,
             created_at=time.time(),
+            correlation_id=current_correlation_id(),
+            tool_evidence=_approval_evidence_from_context(fresh_context),
         ),
     )
 
 
 @private_message.handle()
 async def handle_private_message(bot: Bot, event: PrivateMessageEvent) -> None:
-    text = _plain_text(event)
+    correlation_id = event_correlation_id(event, scope="private")
+    mark_bot_seen(int(bot.self_id))
+    with correlation_scope(correlation_id):
+        await _handle_private_message_scoped(bot, event, correlation_id=correlation_id)
+
+
+async def _handle_private_message_scoped(
+    bot: Bot,
+    event: PrivateMessageEvent,
+    *,
+    correlation_id: str,
+) -> None:
+    text = _message_context_text(event, bot_id=int(bot.self_id))
     if not text:
         logger.info("qq_social_agent ignored private: empty_text")
         return
 
     user_id = int(event.user_id)
+    chat_id = _private_chat_id(user_id)
+    source_message_id = event_message_source_id(event)
+    if not memory.claim_inbound_message(
+        chat_id,
+        source_message_id,
+        correlation_id=correlation_id,
+        created_at=float(getattr(event, "time", 0) or time.time()),
+    ):
+        logger.info(
+            "qq_social_agent ignored duplicate private message: "
+            f"user={user_id} source_message_id={source_message_id}"
+        )
+        _record_metric_event(
+            "message_duplicate",
+            group_id=chat_id,
+            user_id=user_id,
+            stage="private",
+            action="duplicate",
+            source_message_id=source_message_id,
+            correlation_id=correlation_id,
+        )
+        return
     if await _handle_group_approval_private(bot, user_id, text):
         return
 
@@ -2067,16 +2810,29 @@ async def handle_private_message(bot: Bot, event: PrivateMessageEvent) -> None:
         logger.info(f"qq_social_agent ignored private: user={user_id} not_allowed")
         return
 
+    file_context = await file_metadata_context_for_event(bot, event)
+    if file_context and file_context not in text:
+        text = _join_context_parts(text, file_context)
+    ocr_context = await _image_ocr_context_for_event(
+        bot,
+        event,
+        group_allowed=True,
+        group_id=chat_id,
+        user_id=user_id,
+        correlation_id=correlation_id,
+    )
+    if ocr_context.text:
+        text = _join_context_parts(text, _format_image_ocr_context(ocr_context))
+
     force_obey_response = _private_force_obey_command_response(user_id, text)
     if force_obey_response is not None:
-        await bot.send_private_msg(user_id=user_id, message=Message(force_obey_response))
+        await _send_private_message(bot, user_id=user_id, message=Message(force_obey_response))
         logger.info(f"qq_social_agent private force obey command: user={user_id} text={text!r}")
         return
 
     if text in PRIVATE_CONTEXT_RESET_COMMANDS:
-        chat_id = _private_chat_id(user_id)
         memory.reset_group_messages(chat_id)
-        await bot.send_private_msg(user_id=user_id, message=Message("私聊上下文已清空，重新开始。"))
+        await _send_private_message(bot, user_id=user_id, message=Message("私聊上下文已清空，重新开始。"))
         logger.info(f"qq_social_agent private context reset: user={user_id}")
         return
 
@@ -2092,9 +2848,16 @@ async def handle_private_message(bot: Bot, event: PrivateMessageEvent) -> None:
         chat_label="QQ 私聊",
     )
     logger.info(f"qq_social_agent private start: user={user_id} text={text!r}")
-    chat_id = _private_chat_id(user_id)
     nickname = _private_nickname(event)
-    memory.add_message(chat_id, user_id, nickname, text, is_bot=False)
+    memory.add_message(
+        chat_id,
+        user_id,
+        nickname,
+        text,
+        is_bot=False,
+        source_message_id=source_message_id,
+        correlation_id=correlation_id,
+    )
 
     state = memory.group_state(chat_id)
     if not bool(state["enabled"]):
@@ -2115,7 +2878,7 @@ async def handle_private_message(bot: Bot, event: PrivateMessageEvent) -> None:
         logger.info(f"qq_social_agent political guard private input: user={user_id} text={text!r}")
         reply = political_safe_reply()
         try:
-            await bot.send_private_msg(user_id=user_id, message=Message(reply))
+            await _send_private_message(bot, user_id=user_id, message=Message(reply))
         except ActionFailed as exc:
             logger.warning(
                 "qq_social_agent failed sending political guard private reply: "
@@ -2165,7 +2928,7 @@ async def handle_private_message(bot: Bot, event: PrivateMessageEvent) -> None:
     )
     for index, part in enumerate(reply_parts):
         try:
-            await bot.send_private_msg(user_id=user_id, message=Message(part))
+            await _send_private_message(bot, user_id=user_id, message=Message(part))
             memory.add_message(chat_id, int(event.self_id), persona.name, part, is_bot=True)
         except ActionFailed as exc:
             logger.warning(
@@ -2584,12 +3347,16 @@ def _event_plain_text(event: GroupMessageEvent | PrivateMessageEvent) -> str:
     return re.sub(r"\s+", " ", text)
 
 
-def _message_context_text(event: GroupMessageEvent | PrivateMessageEvent, *, bot_id: int | None = None) -> str:
+def _message_context_text(
+    event: GroupMessageEvent | PrivateMessageEvent,
+    *,
+    bot_id: int | None = None,
+    resolved_reply: ReplyReference | None = None,
+) -> str:
     parts: list[str] = []
-    has_structured_reply_context = bool(_event_reply_context(event, bot_id=bot_id))
+    has_structured_reply_context = bool(_event_reply_context(event, bot_id=bot_id, resolved_reply=resolved_reply))
     for segment in event.message:
-        segment_type = str(getattr(segment, "type", "") or "")
-        data = getattr(segment, "data", {}) or {}
+        segment_type, data = segment_type_and_data(segment)
         if segment_type == "reply" and has_structured_reply_context:
             continue
         if segment_type == "text":
@@ -2600,7 +3367,12 @@ def _message_context_text(event: GroupMessageEvent | PrivateMessageEvent, *, bot
         placeholder = _message_segment_placeholder(segment_type, data)
         if placeholder:
             parts.append(placeholder)
-    reply_context = _event_reply_context(event, reply_text=" ".join(parts).strip(), bot_id=bot_id)
+    reply_context = _event_reply_context(
+        event,
+        reply_text=" ".join(parts).strip(),
+        bot_id=bot_id,
+        resolved_reply=resolved_reply,
+    )
     if reply_context:
         parts = [reply_context]
     elif bot_id is not None and _mentions_bot_self_name(" ".join(parts)):
@@ -2611,24 +3383,23 @@ def _message_context_text(event: GroupMessageEvent | PrivateMessageEvent, *, bot
 
 def _message_has_context_media(event: GroupMessageEvent | PrivateMessageEvent) -> bool:
     for segment in event.message:
-        segment_type = str(getattr(segment, "type", "") or "")
-        if segment_type in {"image", "mface", "face", "record", "video", "forward", "json", "xml", "reply"}:
+        segment_type, _ = segment_type_and_data(segment)
+        if segment_type in CONTEXT_MEDIA_SEGMENT_TYPES or segment_type == "reply":
             return True
     return False
 
 
 def _message_has_non_reply_media(event: GroupMessageEvent | PrivateMessageEvent) -> bool:
     for segment in event.message:
-        segment_type = str(getattr(segment, "type", "") or "")
-        if segment_type in {"image", "mface", "face", "record", "video", "forward", "json", "xml"}:
+        segment_type, _ = segment_type_and_data(segment)
+        if segment_type in CONTEXT_MEDIA_SEGMENT_TYPES:
             return True
     return False
 
 
 def _message_has_forward_context(event: GroupMessageEvent | PrivateMessageEvent) -> bool:
     for segment in event.message:
-        segment_type = str(getattr(segment, "type", "") or "")
-        data = getattr(segment, "data", {}) or {}
+        segment_type, data = segment_type_and_data(segment)
         if segment_type == "forward":
             return True
         if segment_type in {"json", "xml"}:
@@ -2640,7 +3411,7 @@ def _message_has_forward_context(event: GroupMessageEvent | PrivateMessageEvent)
 
 def _message_has_unreadable_media(event: GroupMessageEvent | PrivateMessageEvent) -> bool:
     for segment in event.message:
-        segment_type = str(getattr(segment, "type", "") or "")
+        segment_type, _ = segment_type_and_data(segment)
         if segment_type in UNREADABLE_MEDIA_SEGMENT_TYPES:
             return True
     return False
@@ -2650,8 +3421,11 @@ def _should_ignore_unreadable_media_event(
     event: GroupMessageEvent | PrivateMessageEvent,
     *,
     forward_context: str,
+    readable_media_context: str = "",
 ) -> bool:
     if forward_context:
+        return False
+    if readable_media_context.strip():
         return False
     plain_text = _plain_text(event) if isinstance(event, GroupMessageEvent) else _event_plain_text(event)
     if _message_has_forward_context(event):
@@ -2661,6 +3435,43 @@ def _should_ignore_unreadable_media_event(
     return False
 
 
+async def _image_ocr_context_for_event(
+    bot: Bot,
+    event: GroupMessageEvent | PrivateMessageEvent,
+    *,
+    group_allowed: bool,
+    group_id: int,
+    user_id: int,
+    correlation_id: str,
+) -> ImageOcrContext:
+    if not group_allowed:
+        return ImageOcrContext("", 0, 0, "group_not_allowed")
+    context = await image_ocr_service.context_for_event(bot, event)
+    if context.image_count:
+        _record_metric_event(
+            "image_ocr",
+            group_id=group_id,
+            user_id=user_id,
+            stage="media_context",
+            action="recognized" if context.text else "empty",
+            image_count=context.image_count,
+            ocr_count=context.ocr_count,
+            skipped_reason=context.skipped_reason,
+            correlation_id=correlation_id,
+        )
+        logger.info(
+            "qq_social_agent image ocr: "
+            f"group={group_id} user={user_id} images={context.image_count} "
+            f"ocr={context.ocr_count} has_text={bool(context.text)} reason={context.skipped_reason}"
+        )
+    return context
+
+
+def _format_image_ocr_context(context: ImageOcrContext) -> str:
+    text = _short_notice_text(context.text, 360)
+    return f"{IMAGE_OCR_CONTEXT_PREFIX} {text}]" if text else ""
+
+
 def _event_has_reply_context(event: GroupMessageEvent | PrivateMessageEvent) -> bool:
     if getattr(event, "reply", None) is not None:
         return True
@@ -2668,6 +3479,35 @@ def _event_has_reply_context(event: GroupMessageEvent | PrivateMessageEvent) -> 
         if str(getattr(segment, "type", "") or "") == "reply":
             return True
     return False
+
+
+async def _resolve_reply_reference_for_event(
+    bot: Bot,
+    event: GroupMessageEvent | PrivateMessageEvent,
+    *,
+    group_allowed: bool,
+) -> ReplyReference | None:
+    if not group_allowed or not _event_has_reply_context(event):
+        return None
+    try:
+        return await resolve_reply_reference(bot, event)
+    except ActionFailed as exc:
+        logger.warning(
+            "qq_social_agent reply reference fetch failed: "
+            f"{_action_failed_summary(exc)}"
+        )
+        return None
+    except Exception as exc:
+        logger.warning(f"qq_social_agent reply reference fetch failed: error={exc}")
+        return None
+
+
+def _reply_reference_to_bot(reply_reference: ReplyReference | None, bot: Bot) -> bool:
+    return bool(
+        reply_reference is not None
+        and reply_reference.user_id is not None
+        and int(reply_reference.user_id) == int(bot.self_id)
+    )
 
 
 def _is_weak_media_caption(text: str) -> bool:
@@ -2704,29 +3544,7 @@ def _is_low_value_reply_to_bot_event(event: GroupMessageEvent | PrivateMessageEv
 
 
 def _message_segment_placeholder(segment_type: str, data: dict[str, object]) -> str:
-    if segment_type == "at":
-        qq = str(data.get("qq", "") or "").strip()
-        return f"[@{qq}]" if qq else "[@群友]"
-    if segment_type == "reply":
-        message_id = str(data.get("id", "") or "").strip()
-        return f"[回复消息:{message_id}]" if message_id else "[回复消息]"
-    if segment_type in {"image", "mface"}:
-        summary = str(data.get("summary", "") or "").strip()
-        return f"[图片:{summary}]" if summary else "[图片]"
-    if segment_type == "face":
-        face_id = str(data.get("id", "") or "").strip()
-        return f"[表情:{face_id}]" if face_id else "[表情]"
-    if segment_type == "record":
-        return "[语音]"
-    if segment_type == "video":
-        return "[视频]"
-    if segment_type == "forward":
-        return "[转发消息]"
-    if segment_type in {"json", "xml"}:
-        payload = str(data.get("data", "") or "")
-        forward_hint = "转发消息" if "forward" in payload.lower() or "聊天记录" in payload else segment_type
-        return f"[{forward_hint}]"
-    return ""
+    return normalized_segment_placeholder(segment_type, data, language="zh")
 
 
 def _event_reply_context(
@@ -2734,22 +3552,30 @@ def _event_reply_context(
     *,
     reply_text: str = "",
     bot_id: int | None = None,
+    resolved_reply: ReplyReference | None = None,
 ) -> str:
     reply = getattr(event, "reply", None)
-    if reply is None:
+    if reply is None and resolved_reply is None:
         return ""
-    raw_message = getattr(reply, "message", None)
+    raw_message = getattr(reply, "message", None) if reply is not None else None
     message_text = ""
     if raw_message is not None:
         try:
             message_text = raw_message.extract_plain_text().strip()
         except Exception:
             message_text = str(raw_message).strip()
-    sender = getattr(reply, "sender", None)
+    if not message_text and resolved_reply is not None:
+        message_text = resolved_reply.text.strip()
+    sender = getattr(reply, "sender", None) if reply is not None else None
     nickname = ""
-    user_id = getattr(reply, "user_id", None)
+    user_id = getattr(reply, "user_id", None) if reply is not None else None
     if sender is not None:
         nickname = str(getattr(sender, "card", "") or getattr(sender, "nickname", "") or "").strip()
+    if resolved_reply is not None:
+        if user_id is None and resolved_reply.user_id is not None:
+            user_id = resolved_reply.user_id
+        if not nickname:
+            nickname = resolved_reply.nickname
     replied_label = _member_label(int(user_id), nickname or str(user_id)) if user_id else (nickname or "某人")
     current_user_id = getattr(event, "user_id", None)
     current_sender = getattr(event, "sender", None)
@@ -2777,7 +3603,9 @@ def _event_reply_context(
             f"{replied_label}说：{original_text}；"
             f"{current_label}回复{replied_label}：{current_reply}】"
         )
-    message_id = getattr(reply, "message_id", None)
+    message_id = getattr(reply, "message_id", None) if reply is not None else None
+    if not message_id and resolved_reply is not None:
+        message_id = resolved_reply.message_id
     original_hint = f"{replied_label}原消息内容未知"
     if message_id:
         original_hint = f"{replied_label}原消息内容未知，消息ID：{message_id}"
@@ -2949,18 +3777,142 @@ async def _fresh_context_for(decision: ReplyDecision, *, fallback_text: str) -> 
         )
         return ""
     context = await fresh_context_tool.context_for(query, kind=decision.fresh_kind)
+    search_status = fresh_context_tool.status_snapshot().get("last_request", {})
+    search_status = search_status if isinstance(search_status, dict) else {}
     logger.info(
         "qq_social_agent fresh context: "
-        f"kind={decision.fresh_kind} query={query!r} has_context={bool(context)}"
+        f"kind={decision.fresh_kind} query={search_status.get('query_preview', '')!r} "
+        f"status={search_status.get('status', '')} provider={search_status.get('provider', '')}"
     )
     _record_metric_event(
         "tool_call",
         stage="fresh_context",
         action=decision.fresh_kind,
-        has_context=bool(context),
-        query=query,
+        success=search_status.get("status") == "ok",
+        status=search_status.get("status", ""),
+        provider=search_status.get("provider", ""),
+        attempted_providers=search_status.get("attempted_providers", []),
+        result_count=search_status.get("result_count", 0),
+        cached=search_status.get("cached", False),
+        latency_ms=search_status.get("latency_ms", 0),
+        error=search_status.get("error", ""),
+        query_preview=search_status.get("query_preview", ""),
     )
     return context
+
+
+async def _execute_reaction_action(
+    bot: Bot,
+    event: GroupMessageEvent,
+    *,
+    group_id: int,
+    user_id: int,
+    nickname: str,
+    text: str,
+    decision: ReplyDecision,
+    buffered_messages: list[BufferedGroupMessage] | None,
+    source_message_id: str,
+) -> None:
+    target_message_id = _reaction_target_message_id(event, buffered_messages, source_message_id=source_message_id)
+    reaction = reaction_from_action(decision.action, decision.reaction)
+    if not target_message_id or not target_message_id.isdigit():
+        logger.info(
+            "qq_social_agent reaction skipped: "
+            f"group={group_id} user={user_id} reason=missing_message_id reaction={reaction}"
+        )
+        await _send_approval_suppression_notice(
+            bot,
+            group_id=group_id,
+            user_id=user_id,
+            nickname=nickname,
+            text=text,
+            stage="social_action_react",
+            reason="表情回应未执行：当前消息没有可用 message_id。",
+        )
+        return
+    try:
+        result = await social_action_service.react_to_message(
+            bot,
+            group_id=group_id,
+            user_id=user_id,
+            message_id=target_message_id,
+            reaction=reaction,
+        )
+    except ActionFailed as exc:
+        logger.warning(
+            "qq_social_agent reaction failed: "
+            f"group={group_id} message_id={target_message_id} {_action_failed_summary(exc)}"
+        )
+        _record_metric_event(
+            "social_action",
+            group_id=group_id,
+            user_id=user_id,
+            stage="react",
+            action="failed",
+            message_id=target_message_id,
+            reaction=reaction,
+            error=_action_failed_summary(exc),
+        )
+        return
+    except Exception as exc:
+        logger.warning(
+            "qq_social_agent reaction failed: "
+            f"group={group_id} message_id={target_message_id} error={exc}"
+        )
+        _record_metric_event(
+            "social_action",
+            group_id=group_id,
+            user_id=user_id,
+            stage="react",
+            action="failed",
+            message_id=target_message_id,
+            reaction=reaction,
+            error=str(exc)[:160],
+        )
+        return
+    _record_metric_event(
+        "social_action",
+        group_id=group_id,
+        user_id=user_id,
+        stage="react",
+        action="sent" if result.sent else "skipped",
+        message_id=target_message_id,
+        reaction=result.reaction,
+        emoji_id=result.emoji_id,
+        reason=result.reason,
+    )
+    if result.sent:
+        logger.info(
+            "qq_social_agent reaction sent: "
+            f"group={group_id} message_id={target_message_id} reaction={result.reaction} emoji_id={result.emoji_id}"
+        )
+        return
+    logger.info(
+        "qq_social_agent reaction skipped: "
+        f"group={group_id} message_id={target_message_id} reason={result.reason}"
+    )
+    await _send_approval_suppression_notice(
+        bot,
+        group_id=group_id,
+        user_id=user_id,
+        nickname=nickname,
+        text=text,
+        stage="social_action_react",
+        reason=f"表情回应未执行：{result.reason}",
+    )
+
+
+def _reaction_target_message_id(
+    event: GroupMessageEvent,
+    buffered_messages: list[BufferedGroupMessage] | None,
+    *,
+    source_message_id: str,
+) -> str:
+    if buffered_messages:
+        for item in reversed(buffered_messages):
+            if item.source_message_id:
+                return item.source_message_id
+    return source_message_id or event_message_source_id(event)
 
 
 def _format_fresh_context_hint(intent: object | None) -> str:
@@ -2968,11 +3920,17 @@ def _format_fresh_context_hint(intent: object | None) -> str:
         return ""
     query = str(getattr(intent, "query", "") or "").strip()
     kind = str(getattr(intent, "kind", "news") or "news").strip()
+    explicit = bool(getattr(intent, "explicit", False))
     if not query:
         return ""
+    instruction = (
+        "这是对方明确提出的搜索请求；如果 should_reply=true，后端会强制联网并保留你选择的社交 action。"
+        if explicit
+        else "是否真的需要搜索由你判断；非必要不要搜索。"
+    )
     return (
         f"后端检测到这句话可能涉及最新背景，候选查询：{query}，类型：{kind}。"
-        "是否真的需要搜索由你判断；非必要不要搜索。"
+        f"{instruction}"
     )
 
 
@@ -3033,28 +3991,30 @@ async def _forward_context_text(
     *,
     nickname: str,
 ) -> str:
-    forward_ids = _forward_message_ids(event)
-    if not forward_ids:
-        return ""
     records: list[str] = []
-    for forward_id in forward_ids[:2]:
-        try:
-            payload = await bot.call_api("get_forward_msg", id=forward_id)
-        except ActionFailed as exc:
-            logger.warning(
-                "qq_social_agent forward context fetch failed: "
-                f"forward_id={forward_id} {_action_failed_summary(exc)}"
-            )
-            continue
-        except Exception as exc:
-            logger.warning(
-                "qq_social_agent forward context fetch failed: "
-                f"forward_id={forward_id} error={exc}"
-            )
-            continue
+    for payload in _inline_forward_payloads(event):
         records.extend(_extract_forward_record_lines(payload, limit=FORWARD_CONTEXT_MAX_RECORDS - len(records)))
         if len(records) >= FORWARD_CONTEXT_MAX_RECORDS:
             break
+    if not records:
+        for forward_id in _forward_message_ids(event)[:2]:
+            try:
+                payload = await onebot_gateway.get_forward_msg(bot, forward_id)
+            except ActionFailed as exc:
+                logger.warning(
+                    "qq_social_agent forward context fetch failed: "
+                    f"forward_id={forward_id} {_action_failed_summary(exc)}"
+                )
+                continue
+            except Exception as exc:
+                logger.warning(
+                    "qq_social_agent forward context fetch failed: "
+                    f"forward_id={forward_id} error={exc}"
+                )
+                continue
+            records.extend(_extract_forward_record_lines(payload, limit=FORWARD_CONTEXT_MAX_RECORDS - len(records)))
+            if len(records) >= FORWARD_CONTEXT_MAX_RECORDS:
+                break
     if not records:
         return ""
     raw = "\n".join(records)
@@ -3067,16 +4027,29 @@ async def _forward_context_text(
 def _forward_message_ids(event: GroupMessageEvent | PrivateMessageEvent) -> list[str]:
     ids: list[str] = []
     for segment in event.message:
-        segment_type = str(getattr(segment, "type", "") or "")
+        segment_type, data = segment_type_and_data(segment)
         if segment_type != "forward":
             continue
-        data = getattr(segment, "data", {}) or {}
         for key in ("id", "forward_id", "resid"):
             value = str(data.get(key, "") or "").strip()
             if value:
                 ids.append(value)
                 break
     return ids
+
+
+def _inline_forward_payloads(event: GroupMessageEvent | PrivateMessageEvent) -> list[object]:
+    payloads: list[object] = []
+    for segment in event.message:
+        segment_type, data = segment_type_and_data(segment)
+        if segment_type != "forward":
+            continue
+        for key in ("content", "messages", "message"):
+            value = data.get(key)
+            if isinstance(value, (list, dict)) and value:
+                payloads.append(value)
+                break
+    return payloads
 
 
 def _extract_forward_record_lines(payload: object, *, limit: int) -> list[str]:
@@ -3089,9 +4062,11 @@ def _extract_forward_record_lines(payload: object, *, limit: int) -> list[str]:
             break
         if not isinstance(item, dict):
             continue
-        sender = item.get("sender") if isinstance(item.get("sender"), dict) else {}
-        sender_name = _forward_sender_label(sender, item)
-        content = item.get("content", item.get("message", ""))
+        node = item.get("data") if str(item.get("type", "") or "").casefold() == "node" else None
+        normalized = node if isinstance(node, dict) else item
+        sender = normalized.get("sender") if isinstance(normalized.get("sender"), dict) else {}
+        sender_name = _forward_sender_label(sender, normalized)
+        content = normalized.get("content", normalized.get("message", ""))
         text = _forward_content_plain_text(content)
         if not text:
             continue
@@ -3104,13 +4079,15 @@ def _forward_messages_from_payload(payload: object) -> list[object]:
         return payload
     if not isinstance(payload, dict):
         return []
-    for key in ("messages", "message"):
+    if str(payload.get("type", "") or "").casefold() == "node":
+        return [payload]
+    for key in ("messages", "message", "content"):
         value = payload.get(key)
         if isinstance(value, list):
             return value
     data = payload.get("data")
     if isinstance(data, dict):
-        for key in ("messages", "message"):
+        for key in ("messages", "message", "content"):
             value = data.get(key)
             if isinstance(value, list):
                 return value
@@ -3207,16 +4184,26 @@ async def _private_fresh_context_for(text: str) -> str:
     if intent is None:
         return ""
     context = await fresh_context_tool.context_for(intent.query, kind=intent.kind)
+    search_status = fresh_context_tool.status_snapshot().get("last_request", {})
+    search_status = search_status if isinstance(search_status, dict) else {}
     logger.info(
         "qq_social_agent private fresh context: "
-        f"kind={intent.kind} query={intent.query!r} has_context={bool(context)}"
+        f"kind={intent.kind} query={search_status.get('query_preview', '')!r} "
+        f"status={search_status.get('status', '')} provider={search_status.get('provider', '')}"
     )
     _record_metric_event(
         "tool_call",
         stage="fresh_context_private",
         action=intent.kind,
-        has_context=bool(context),
-        query=intent.query,
+        success=search_status.get("status") == "ok",
+        status=search_status.get("status", ""),
+        provider=search_status.get("provider", ""),
+        attempted_providers=search_status.get("attempted_providers", []),
+        result_count=search_status.get("result_count", 0),
+        cached=search_status.get("cached", False),
+        latency_ms=search_status.get("latency_ms", 0),
+        error=search_status.get("error", ""),
+        query_preview=search_status.get("query_preview", ""),
     )
     return context
 
@@ -3264,7 +4251,14 @@ def _append_market_intent(
     intents.append(intent)
 
 
-def _buffer_group_message(bot: Bot, event: GroupMessageEvent, text: str) -> None:
+def _buffer_group_message(
+    bot: Bot,
+    event: GroupMessageEvent,
+    text: str,
+    *,
+    source_message_id: str = "",
+    correlation_id: str = "",
+) -> None:
     group_id = int(event.group_id)
     _cancel_passive_decision_retry(group_id)
     item = BufferedGroupMessage(
@@ -3274,6 +4268,8 @@ def _buffer_group_message(bot: Bot, event: GroupMessageEvent, text: str) -> None
         user_id=int(event.user_id),
         nickname=_nickname(event),
         created_at=float(getattr(event, "time", 0) or time.time()),
+        source_message_id=source_message_id or event_message_source_id(event),
+        correlation_id=correlation_id,
     )
     group_message_buffers.setdefault(group_id, []).append(item)
     _schedule_group_buffer_flush(group_id)
@@ -3311,7 +4307,8 @@ async def _flush_group_buffer_after_delay(group_id: int, *, delay: float = GROUP
             latest = items[-1]
             group_generation_inflight.add(group_id)
             try:
-                await _handle_group_message_locked(latest.bot, latest.event, buffered_messages=items)
+                with correlation_scope(latest.correlation_id):
+                    await _handle_group_message_locked(latest.bot, latest.event, buffered_messages=items)
             finally:
                 group_generation_inflight.discard(group_id)
                 pending_size = len(group_message_buffers.get(group_id, []))
@@ -3362,13 +4359,14 @@ async def _run_passive_decision_retry(group_id: int) -> None:
                 "qq_social_agent passive decision retry flushing: "
                 f"group={group_id} size={len(items)}"
             )
-            await _handle_group_message_locked(
-                latest.bot,
-                latest.event,
-                buffered_messages=items,
-                force_passive_decision=True,
-                skip_memory_record=True,
-            )
+            with correlation_scope(latest.correlation_id):
+                await _handle_group_message_locked(
+                    latest.bot,
+                    latest.event,
+                    buffered_messages=items,
+                    force_passive_decision=True,
+                    skip_memory_record=True,
+                )
     finally:
         task = asyncio.current_task()
         if group_passive_retry_tasks.get(group_id) is task:
@@ -3966,6 +4964,27 @@ def _custom_jargon_entry_to_group_jargon(entry: CustomJargonEntry) -> GroupJargo
     return GroupJargonEntry(key, (entry.term,), entry.explanation)
 
 
+def _approval_evidence_from_context(context: str) -> str:
+    if not context.strip():
+        return ""
+    selected: list[str] = []
+    for raw_line in context.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        if (
+            line.startswith("状态：")
+            or (line.startswith("- [S") and "URL " in line)
+            or "没有拿到可靠结果" in line
+            or "查询已达上限" in line
+            or "搜索功能当前关闭" in line
+        ):
+            selected.append(_short_notice_text(line, 240))
+        if len(selected) >= 6:
+            break
+    return "\n".join(selected)[:900]
+
+
 async def _request_group_approval(bot: Bot, approval: PendingGroupApproval) -> None:
     if not _approval_review_enabled():
         pending_group_approvals.pop(approval.group_id, None)
@@ -4032,19 +5051,24 @@ async def _request_group_approval(bot: Bot, approval: PendingGroupApproval) -> N
         return
     pending_group_approvals[approval.group_id] = approval
     preview = _format_approval_candidates(approval)
+    evidence_section = (
+        f"\n\n联网依据（仅供审批核对）：\n{approval.tool_evidence}"
+        if approval.tool_evidence
+        else ""
+    )
     message = (
         f"待发群：{approval.group_id}\n"
         f"审批ID：{approval.approval_id}\n"
         f"触发人：{_member_label(approval.trigger_user_id, approval.trigger_nickname)}\n"
         f"触发消息：{approval.trigger_text}\n\n"
-        f"候选：\n{preview}\n\n"
+        f"候选：\n{preview}{evidence_section}\n\n"
         "回复：A/B/C 或 1/2/3 发送；D/X/取消 不发；T 工具单。"
     )
     delivered = 0
     approval_user_ids = _approval_user_ids()
     for approver_id in approval_user_ids:
         try:
-            await bot.send_private_msg(user_id=approver_id, message=Message(message))
+            await _send_private_message(bot, user_id=approver_id, message=Message(message))
             delivered += 1
         except ActionFailed as exc:
             logger.warning(
@@ -4188,7 +5212,7 @@ async def _set_approval_group_decision_enabled(bot: Bot, user_id: int, enabled: 
         pending_group_approvals.clear()
     response_text = "已开启，群聊恢复进入决策。" if enabled else "已关闭，群聊不再进入决策，待审候选已清空。"
     try:
-        await bot.send_private_msg(user_id=user_id, message=Message(response_text))
+        await _send_private_message(bot, user_id=user_id, message=Message(response_text))
     except ActionFailed:
         pass
     await _send_approval_rules_to_approvers(bot, reason="decision_switch")
@@ -4206,7 +5230,7 @@ async def _set_approval_review_enabled(bot: Bot, user_id: int, enabled: bool) ->
         pending_group_approvals.clear()
         response_text = "已关闭审查，后续 bot 会直接发送第 1 候选；当前待审候选已清空。"
     try:
-        await bot.send_private_msg(user_id=user_id, message=Message(response_text))
+        await _send_private_message(bot, user_id=user_id, message=Message(response_text))
     except ActionFailed:
         pass
     await _send_approval_rules_to_approvers(bot, reason="review_switch")
@@ -4624,9 +5648,10 @@ async def _handle_group_approval_private(bot: Bot, user_id: int, text: str) -> b
                 action="reject" if candidate is None else candidate.action,
                 approver_id=user_id,
                 reason=_short_notice_text(compact_text, 120),
+                correlation_id=approval.correlation_id,
             )
             try:
-                await bot.send_private_msg(user_id=user_id, message=Message(response_text))
+                await _send_private_message(bot, user_id=user_id, message=Message(response_text))
             except ActionFailed:
                 pass
             return True
@@ -4776,6 +5801,28 @@ async def _send_approved_group_reply(
     high_quality: bool,
     notify_success: bool = True,
 ) -> None:
+    correlation_id = approval.correlation_id or current_correlation_id()
+    with correlation_scope(correlation_id):
+        await _send_approved_group_reply_scoped(
+            bot,
+            approval,
+            candidate,
+            approver_id=approver_id,
+            high_quality=high_quality,
+            notify_success=notify_success,
+        )
+
+
+async def _send_approved_group_reply_scoped(
+    bot: Bot,
+    approval: PendingGroupApproval,
+    candidate: PendingApprovalCandidate,
+    *,
+    approver_id: int | None,
+    high_quality: bool,
+    notify_success: bool = True,
+) -> None:
+    send_started_at = time.monotonic()
     logger.info(
         "qq_social_agent group approval accepted: "
         f"approver={approver_id} group={approval.group_id} candidate={candidate.index} high_quality={high_quality}"
@@ -4789,6 +5836,7 @@ async def _send_approved_group_reply(
         approver_id=approver_id,
         high_quality=high_quality,
         candidate_index=candidate.index,
+        approval_wait_ms=max(0, int((time.time() - approval.created_at) * 1000)),
     )
     reply_parts = split_reply_messages(candidate.text, max_messages=3)
     sent_mention_user_id: int | None = None
@@ -4822,6 +5870,7 @@ async def _send_approved_group_reply(
                 approval.persona_name,
                 memory_text,
                 is_bot=True,
+                correlation_id=approval.correlation_id,
             )
         except ActionFailed as exc:
             logger.warning(
@@ -4830,7 +5879,8 @@ async def _send_approved_group_reply(
             )
             try:
                 if approver_id is not None:
-                    await bot.send_private_msg(
+                    await _send_private_message(
+                        bot,
                         user_id=approver_id,
                         message=Message(f"发送失败：{_action_failed_summary(exc)}"),
                     )
@@ -4843,24 +5893,53 @@ async def _send_approved_group_reply(
         last_group_mention_targets[approval.group_id] = (sent_mention_user_id, time.time())
     else:
         last_group_mention_targets.pop(approval.group_id, None)
+    _record_metric_event(
+        "message_sent",
+        group_id=approval.group_id,
+        user_id=approval.trigger_user_id,
+        stage="send",
+        action=candidate.action,
+        message_count=len(reply_parts),
+        elapsed_ms=int((time.monotonic() - send_started_at) * 1000),
+        approval_id=approval.approval_id,
+    )
     if high_quality:
         _save_approved_reply_feedback(approval, candidate, approver_id=approver_id or 0)
     if not notify_success or approver_id is None:
         return
     try:
-        await bot.send_private_msg(user_id=approver_id, message=Message("已发。"))
+        await _send_private_message(bot, user_id=approver_id, message=Message("已发。"))
     except ActionFailed:
         pass
 
 
 async def _send_group_message(bot: Bot, group_id: int, message: Message) -> int | None:
-    result = await bot.send_group_msg(group_id=group_id, message=message)
+    if hasattr(bot, "call_api"):
+        result = await onebot_gateway.call_api(
+            bot,
+            "send_group_msg",
+            group_id=group_id,
+            message=message,
+        )
+    else:
+        result = await bot.send_group_msg(group_id=group_id, message=message)
     return _extract_message_id(result)
+
+
+async def _send_private_message(bot: Bot, *, user_id: int, message: Message) -> object:
+    if hasattr(bot, "call_api"):
+        return await onebot_gateway.call_api(
+            bot,
+            "send_private_msg",
+            user_id=user_id,
+            message=message,
+        )
+    return await bot.send_private_msg(user_id=user_id, message=message)
 
 
 async def _send_private_text(bot: Bot, user_id: int, text: str) -> None:
     try:
-        await bot.send_private_msg(user_id=user_id, message=Message(text))
+        await _send_private_message(bot, user_id=user_id, message=Message(text))
     except ActionFailed as exc:
         logger.warning(
             "qq_social_agent failed sending private text: "
