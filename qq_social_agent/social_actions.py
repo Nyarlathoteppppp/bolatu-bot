@@ -30,6 +30,21 @@ class ReactionResult:
     emoji_id: str
 
 
+@dataclass(frozen=True)
+class PokeContext:
+    was_poked: bool = False
+    directly_cued: bool = False
+    familiar_user: bool = False
+    playful_banter: bool = False
+
+
+@dataclass(frozen=True)
+class PokeResult:
+    sent: bool
+    reason: str
+    policy_reason: str = ""
+
+
 class SocialActionService:
     def __init__(
         self,
@@ -39,6 +54,12 @@ class SocialActionService:
         per_user_cooldown_seconds: int = 120,
         per_group_cooldown_seconds: int = 18,
         max_per_group_hour: int = 24,
+        poke_enabled: bool = False,
+        poke_familiar_user_ids: set[int] | None = None,
+        poke_per_user_cooldown_seconds: int = 7200,
+        poke_per_group_cooldown_seconds: int = 1800,
+        poke_global_cooldown_seconds: int = 300,
+        poke_max_per_group_day: int = 4,
     ) -> None:
         self.enabled = enabled
         self.emoji_ids = dict(DEFAULT_REACTION_EMOJI_IDS)
@@ -51,18 +72,102 @@ class SocialActionService:
         self._last_group_reaction_at: dict[int, float] = {}
         self._group_reaction_times: dict[int, deque[float]] = {}
         self._reacted_messages: set[tuple[int, str]] = set()
+        self.poke_enabled = bool(poke_enabled)
+        self.poke_familiar_user_ids = set(poke_familiar_user_ids or set())
+        self.poke_per_user_cooldown_seconds = max(0, int(poke_per_user_cooldown_seconds))
+        self.poke_per_group_cooldown_seconds = max(0, int(poke_per_group_cooldown_seconds))
+        self.poke_global_cooldown_seconds = max(0, int(poke_global_cooldown_seconds))
+        self.poke_max_per_group_day = max(0, int(poke_max_per_group_day))
+        self._last_user_poke_at: dict[tuple[int, int], float] = {}
+        self._last_group_poke_at: dict[int, float] = {}
+        self._last_global_poke_at = 0.0
+        self._group_poke_times: dict[int, deque[float]] = {}
 
     @classmethod
     def from_config(cls, raw: object) -> "SocialActionService":
         cfg = raw if isinstance(raw, dict) else {}
         emoji_ids = cfg.get("emoji_ids") if isinstance(cfg.get("emoji_ids"), dict) else None
+        poke = cfg.get("poke") if isinstance(cfg.get("poke"), dict) else {}
         return cls(
             enabled=bool(cfg.get("enabled", True)),
             emoji_ids=emoji_ids,
             per_user_cooldown_seconds=int(cfg.get("per_user_cooldown_seconds", 120)),
             per_group_cooldown_seconds=int(cfg.get("per_group_cooldown_seconds", 18)),
             max_per_group_hour=int(cfg.get("max_per_group_hour", 24)),
+            poke_enabled=bool(poke.get("enabled", False)),
+            poke_familiar_user_ids=_int_set(poke.get("familiar_user_ids", [])),
+            poke_per_user_cooldown_seconds=int(poke.get("per_user_cooldown_seconds", 7200)),
+            poke_per_group_cooldown_seconds=int(poke.get("per_group_cooldown_seconds", 1800)),
+            poke_global_cooldown_seconds=int(poke.get("global_cooldown_seconds", 300)),
+            poke_max_per_group_day=int(poke.get("max_per_group_day", 4)),
         )
+
+    async def poke_user(
+        self,
+        bot: onebot_gateway.OneBotGateway,
+        *,
+        group_id: int,
+        user_id: int,
+        context: PokeContext,
+        now: float | None = None,
+    ) -> PokeResult:
+        current = time.time() if now is None else now
+        policy_reason = self._poke_policy_reason(user_id, context)
+        if policy_reason.startswith("deny_"):
+            return PokeResult(False, policy_reason, policy_reason)
+        cooldown_reason = self._poke_cooldown_reason(group_id, user_id, now=current)
+        if cooldown_reason:
+            return PokeResult(False, cooldown_reason, policy_reason)
+        await onebot_gateway.send_poke(bot, user_id, group_id=group_id)
+        self._remember_poke(group_id, user_id, now=current)
+        return PokeResult(True, "sent", policy_reason)
+
+    def _poke_policy_reason(self, user_id: int, context: PokeContext) -> str:
+        if not self.poke_enabled:
+            return "deny_disabled"
+        familiar = bool(context.familiar_user or user_id in self.poke_familiar_user_ids)
+        if context.was_poked:
+            return "reciprocal_poke"
+        if familiar and context.directly_cued:
+            return "familiar_direct_cue"
+        if familiar and context.playful_banter:
+            return "familiar_banter"
+        if not familiar:
+            return "deny_unfamiliar_user"
+        return "deny_missing_social_signal"
+
+    def _poke_cooldown_reason(self, group_id: int, user_id: int, *, now: float) -> str:
+        if self.poke_global_cooldown_seconds and now - self._last_global_poke_at < self.poke_global_cooldown_seconds:
+            return "poke_global_cooldown"
+        last_group = self._last_group_poke_at.get(group_id, 0.0)
+        if self.poke_per_group_cooldown_seconds and now - last_group < self.poke_per_group_cooldown_seconds:
+            return "poke_group_cooldown"
+        last_user = self._last_user_poke_at.get((group_id, user_id), 0.0)
+        if self.poke_per_user_cooldown_seconds and now - last_user < self.poke_per_user_cooldown_seconds:
+            return "poke_user_cooldown"
+        bucket = self._group_poke_times.setdefault(group_id, deque())
+        while bucket and now - bucket[0] > 24 * 60 * 60:
+            bucket.popleft()
+        if self.poke_max_per_group_day and len(bucket) >= self.poke_max_per_group_day:
+            return "poke_group_daily_limit"
+        return ""
+
+    def _remember_poke(self, group_id: int, user_id: int, *, now: float) -> None:
+        self._last_global_poke_at = now
+        self._last_group_poke_at[group_id] = now
+        self._last_user_poke_at[(group_id, user_id)] = now
+        self._group_poke_times.setdefault(group_id, deque()).append(now)
+
+    def status_snapshot(self) -> dict[str, object]:
+        return {
+            "reactions_enabled": self.enabled,
+            "poke_enabled": self.poke_enabled,
+            "poke_familiar_user_count": len(self.poke_familiar_user_ids),
+            "poke_global_cooldown_seconds": self.poke_global_cooldown_seconds,
+            "poke_per_group_cooldown_seconds": self.poke_per_group_cooldown_seconds,
+            "poke_per_user_cooldown_seconds": self.poke_per_user_cooldown_seconds,
+            "poke_max_per_group_day": self.poke_max_per_group_day,
+        }
 
     async def react_to_message(
         self,
@@ -155,3 +260,17 @@ def normalize_reaction(value: str) -> str:
     }
     normalized = aliases.get(key, key)
     return normalized if normalized in DEFAULT_REACTION_EMOJI_IDS else "agree"
+
+
+def _int_set(value: object) -> set[int]:
+    if not isinstance(value, (list, tuple, set)):
+        return set()
+    result: set[int] = set()
+    for item in value:
+        try:
+            parsed = int(item)
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if parsed > 0:
+            result.add(parsed)
+    return result

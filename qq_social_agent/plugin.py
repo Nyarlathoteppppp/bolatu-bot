@@ -98,7 +98,7 @@ from .persona import PersonaRegistry
 from .political_guard import has_political_redline, political_safe_reply, sanitize_political_output
 from .rate_limiter import RateLimiter
 from .reply_splitter import split_reply_messages
-from .social_actions import SocialActionService, reaction_from_action
+from .social_actions import PokeContext, SocialActionService, reaction_from_action
 from .tools.fresh_context import (
     FreshContextTool,
     detect_fresh_intent,
@@ -1558,6 +1558,7 @@ def _http_status_payload() -> dict[str, object]:
         },
         "search": fresh_context_tool.status_snapshot(),
         "ocr": _status_image_ocr(),
+        "social_actions": social_action_service.status_snapshot(),
         "groups": _status_groups(),
         "last_message": _status_latest_message(),
         "approvals": _status_approvals(),
@@ -1859,6 +1860,54 @@ async def handle_notice_event(bot: Bot, event: Event) -> None:
         )
         if snapshot.group_id is not None and _notice_needs_directory_refresh(snapshot.notice_type, snapshot.sub_type):
             _schedule_notice_directory_refresh(bot, snapshot.group_id)
+        await _handle_notice_social_action(bot, snapshot)
+
+
+async def _handle_notice_social_action(bot: Bot, snapshot: object) -> None:
+    notice_type = str(getattr(snapshot, "notice_type", "") or "").casefold()
+    sub_type = str(getattr(snapshot, "sub_type", "") or "").casefold()
+    group_id = getattr(snapshot, "group_id", None)
+    user_id = getattr(snapshot, "user_id", None)
+    target_id = getattr(snapshot, "target_id", None)
+    self_id = int(getattr(bot, "self_id", 0) or 0)
+    if (
+        group_id is None
+        or user_id is None
+        or int(user_id) == self_id
+        or int(target_id or 0) != self_id
+        or (sub_type != "poke" and notice_type != "poke")
+    ):
+        return
+    try:
+        result = await social_action_service.poke_user(
+            bot,
+            group_id=int(group_id),
+            user_id=int(user_id),
+            context=PokeContext(was_poked=True),
+        )
+    except Exception as exc:
+        logger.warning(
+            "qq_social_agent reciprocal poke failed: "
+            f"group={group_id} user={user_id} error={exc}"
+        )
+        _record_metric_event(
+            "social_action",
+            group_id=int(group_id),
+            user_id=int(user_id),
+            stage="notice",
+            action="poke_failed",
+            error=str(exc)[:180],
+        )
+        return
+    _record_metric_event(
+        "social_action",
+        group_id=int(group_id),
+        user_id=int(user_id),
+        stage="notice",
+        action="poke" if result.sent else "poke_skipped",
+        reason=result.reason,
+        policy_reason=result.policy_reason,
+    )
 
 
 @group_message.handle()

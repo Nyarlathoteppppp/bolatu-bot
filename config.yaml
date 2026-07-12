@@ -77,6 +77,15 @@ social_actions:
     surprise: "32"
     applause: "99"
     heart: "66"
+  poke:
+    enabled: false
+    familiar_user_ids:
+      - 1535071184
+      - 184589072
+    global_cooldown_seconds: 300
+    per_group_cooldown_seconds: 1800
+    per_user_cooldown_seconds: 7200
+    max_per_group_day: 4
 
 image_ocr:
   enabled: true

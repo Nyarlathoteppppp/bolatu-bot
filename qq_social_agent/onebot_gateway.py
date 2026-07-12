@@ -226,6 +226,33 @@ async def set_msg_emoji_like(
     )
 
 
+async def send_poke(
+    bot: OneBotGateway,
+    user_id: int | str,
+    *,
+    group_id: int | str | None = None,
+    timeout_seconds: float | None = DEFAULT_API_TIMEOUT_SECONDS,
+) -> Any:
+    request: dict[str, Any] = {"user_id": int(user_id)}
+    if group_id is not None:
+        request["group_id"] = int(group_id)
+    return await call_api(bot, "send_poke", timeout_seconds=timeout_seconds, **request)
+
+
+async def mark_group_msg_as_read(
+    bot: OneBotGateway,
+    group_id: int | str,
+    *,
+    timeout_seconds: float | None = DEFAULT_API_TIMEOUT_SECONDS,
+) -> Any:
+    return await call_api(
+        bot,
+        "mark_group_msg_as_read",
+        timeout_seconds=timeout_seconds,
+        group_id=int(group_id),
+    )
+
+
 def status_snapshot() -> dict[str, Any]:
     return {
         **_stats_payload(_gateway_stats),
