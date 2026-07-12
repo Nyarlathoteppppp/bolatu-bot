@@ -5395,7 +5395,39 @@ async def _handle_model_route_command(bot: Bot, user_id: int, text: str) -> bool
     return True
 
 
+def _private_tool_reply_delay_seconds() -> float:
+    raw = app_config.raw.get("private_tools", {})
+    config = raw if isinstance(raw, dict) else {}
+    if not bool(config.get("reply_delay_enabled", True)):
+        return 0.0
+    try:
+        minimum = float(config.get("reply_delay_min_seconds", 0.15))
+        maximum = float(config.get("reply_delay_max_seconds", 0.95))
+    except (TypeError, ValueError):
+        minimum, maximum = 0.15, 0.95
+    minimum = max(0.0, min(1.0, minimum))
+    maximum = max(minimum, min(1.0, maximum))
+    return random.uniform(minimum, maximum)
+
+
+def _is_delayed_private_tool_request(text: str) -> bool:
+    compact_text = text.strip()
+    if _latest_group_approval() is not None and _is_approval_control_text(compact_text):
+        return False
+    return _bot_tool_shortcut_command(compact_text) is not None or _is_private_tool_text(compact_text)
+
+
 async def _handle_group_approval_private(bot: Bot, user_id: int, text: str) -> bool:
+    if not _is_approval_user(user_id) and not _is_tool_admin_user(user_id):
+        return False
+    if _is_delayed_private_tool_request(text):
+        delay = _private_tool_reply_delay_seconds()
+        if delay > 0:
+            await asyncio.sleep(delay)
+    return await _handle_group_approval_private_impl(bot, user_id, text)
+
+
+async def _handle_group_approval_private_impl(bot: Bot, user_id: int, text: str) -> bool:
     if not _is_approval_user(user_id) and not _is_tool_admin_user(user_id):
         return False
     compact_text = text.strip()

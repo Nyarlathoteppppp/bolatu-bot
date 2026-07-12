@@ -93,6 +93,7 @@ def _use_temp_plugin_memory(monkeypatch, tmp_path) -> MemoryStore:
     plugin.group_message_buffers.clear()
     plugin.group_buffer_tasks.clear()
     plugin.group_generation_inflight.clear()
+    monkeypatch.setattr(plugin, "_private_tool_reply_delay_seconds", lambda: 0.0)
     return store
 
 
@@ -1215,6 +1216,46 @@ def test_tool_letter_menu_when_no_pending_approval(monkeypatch, tmp_path) -> Non
 
     assert handled
     assert "bot工具 查看" in bot.private_messages[-1][1]
+
+
+def test_private_tool_menu_uses_subsecond_random_delay(monkeypatch, tmp_path) -> None:
+    _use_temp_plugin_memory(monkeypatch, tmp_path)
+    bot = FakeApprovalBot()
+    sleeps: list[float] = []
+
+    monkeypatch.setattr(plugin, "_private_tool_reply_delay_seconds", lambda: 0.73)
+
+    async def fake_sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+
+    monkeypatch.setattr(plugin.asyncio, "sleep", fake_sleep)
+
+    handled = asyncio.run(plugin._handle_group_approval_private(bot, 1535071184, "工具单"))
+
+    assert handled
+    assert sleeps == [0.73]
+    assert "张风雪 bot工具目录" in bot.private_messages[-1][1]
+
+
+def test_pending_approval_choice_is_not_delayed_as_tool_shortcut(monkeypatch, tmp_path) -> None:
+    _use_temp_plugin_memory(monkeypatch, tmp_path)
+    approval = _pending_approval()
+    plugin.pending_group_approvals[approval.group_id] = approval
+    bot = FakeApprovalBot()
+    sleeps: list[float] = []
+
+    monkeypatch.setattr(plugin, "_private_tool_reply_delay_seconds", lambda: 0.73)
+
+    async def fake_sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+
+    monkeypatch.setattr(plugin.asyncio, "sleep", fake_sleep)
+
+    handled = asyncio.run(plugin._handle_group_approval_private(bot, 3370998238, "A"))
+
+    assert handled
+    assert sleeps == []
+    assert bot.group_messages == [(1026813421, "第一条回复")]
 
 
 def test_tool_shortcut_member_profile_report(monkeypatch, tmp_path) -> None:

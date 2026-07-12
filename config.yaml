@@ -118,6 +118,11 @@ history_sync:
   enabled: true
   backfill_count: 80
 
+private_tools:
+  reply_delay_enabled: true
+  reply_delay_min_seconds: 0.15
+  reply_delay_max_seconds: 0.95
+
 groups:
   default:
     enabled: true
