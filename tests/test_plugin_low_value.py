@@ -39,7 +39,7 @@ from qq_social_agent.plugin import (
     _pre_decision_gate,
     _record_user_reply,
     _sanitize_generated_text,
-    _style_learning_messages_with_focus,
+    _balanced_style_learning_messages,
     _user_reply_cooling_down,
 )
 from qq_social_agent.cue_patterns import CueRepeatState
@@ -190,18 +190,18 @@ def test_long_plain_reply_context_still_compacts() -> None:
     assert plugin._should_compact_group_context_message(event, raw_text=raw_text, plain_text=plain_text)
 
 
-def test_style_learning_messages_with_focus_adds_xiaoniao(monkeypatch, tmp_path) -> None:
-    store = _use_temp_plugin_memory(monkeypatch, tmp_path)
-    store.add_message(1026813421, 100, "A", "普通群友一句话", created_at=100)
-    store.add_message(1026813421, 184589072, "小鸟", "小鸟的表达应该额外混入", created_at=120)
-    base = [
-        ChatMessage(1026813421, 100, "A", "普通群友一句话", False, 100.0, id=1),
+def test_style_learning_messages_are_balanced_per_user() -> None:
+    messages = [
+        ChatMessage(1, 100, "高频", f"高频发言{i}", False, float(i), id=i)
+        for i in range(12)
+    ] + [
+        ChatMessage(1, 200, "低频", "低频但有代表性", False, 20.0, id=20),
     ]
 
-    boosted = _style_learning_messages_with_focus(1026813421, base, now=180)
+    balanced = _balanced_style_learning_messages(messages)
 
-    assert [message.user_id for message in boosted] == [100, 184589072]
-    assert boosted[-1].text == "小鸟的表达应该额外混入"
+    assert sum(message.user_id == 100 for message in balanced) == 5
+    assert any(message.user_id == 200 for message in balanced)
 
 
 def _buffered_item(group_id: int, text: str, *, user_id: int = 184589072) -> plugin.BufferedGroupMessage:
@@ -1546,15 +1546,20 @@ def test_owner_can_query_review_status(monkeypatch, tmp_path) -> None:
     assert "关闭审查" in bot.private_messages[-1][1]
 
 
-def test_basic_approver_cannot_disable_review(monkeypatch, tmp_path) -> None:
+def test_delegated_approver_can_disable_and_enable_review(monkeypatch, tmp_path) -> None:
     _use_temp_plugin_memory(monkeypatch, tmp_path)
     bot = FakeApprovalBot()
 
     handled = asyncio.run(plugin._handle_group_approval_private(bot, 3370998238, "关闭审查"))
 
     assert handled
+    assert not plugin._approval_review_enabled()
+    assert any("已关闭审查" in message for _, message in bot.private_messages)
+
+    handled = asyncio.run(plugin._handle_group_approval_private(bot, 3370998238, "开启审查"))
+    assert handled
     assert plugin._approval_review_enabled()
-    assert bot.private_messages[-1] == (3370998238, "你只有基础审批权限：A/B/C/D/X/1/2/3/取消 处理审批单。")
+    assert any("已开启审查" in message for _, message in bot.private_messages)
 
 
 def test_owner_can_query_model_status(monkeypatch, tmp_path) -> None:
@@ -1733,15 +1738,15 @@ def test_owner_can_set_approval_auto_send_percent(monkeypatch, tmp_path) -> None
     assert "免审自动发送概率：30%" in bot.private_messages[-1][1]
 
 
-def test_limited_approver_can_set_approval_auto_send_percent_with_floor(monkeypatch, tmp_path) -> None:
+def test_delegated_approver_can_set_full_auto_send_range(monkeypatch, tmp_path) -> None:
     _use_temp_plugin_memory(monkeypatch, tmp_path)
     bot = FakeApprovalBot()
 
     handled = asyncio.run(plugin._handle_group_approval_private(bot, 3370998238, "审批概率 30"))
 
     assert handled
-    assert plugin._approval_auto_send_percent() == 0
-    assert "60% 到 100%" in bot.private_messages[-1][1]
+    assert plugin._approval_auto_send_percent() == 30
+    assert "30%" in bot.private_messages[-1][1]
 
     handled = asyncio.run(plugin._handle_group_approval_private(bot, 3370998238, "审批概率 60"))
 

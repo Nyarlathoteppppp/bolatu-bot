@@ -85,6 +85,36 @@ def test_relevant_style_rules_match_current_text(tmp_path) -> None:
     assert rules[0].situation == "聊亏钱"
 
 
+def test_personal_style_only_applies_to_source_speaker(tmp_path) -> None:
+    memory = MemoryStore(tmp_path / "bot.sqlite3")
+    memory.add_style_rules(
+        1,
+        [("被说中时", "用目移装傻", "（目移）", (184589072,), (11,))],
+    )
+
+    assert memory.relevant_style_rules(1, "被说中了", limit=3, speaker_user_id=100) == []
+    rules = memory.relevant_style_rules(1, "被说中了", limit=3, speaker_user_id=184589072)
+    assert len(rules) == 1
+    assert rules[0].scope == "personal"
+
+
+def test_focused_style_migration_preserves_muyi_as_group(tmp_path) -> None:
+    memory = MemoryStore(tmp_path / "bot.sqlite3")
+    memory.add_message(1, 184589072, "小鸟", "（目移）", created_at=1)
+    memory.conn.execute(
+        "insert into style_rules(group_id,situation,style,source_text,created_at,scope) values(1,?,?,?,?, 'legacy')",
+        ("被说中时", "用目移装傻", "（目移）", 2.0),
+    )
+    memory.conn.commit()
+
+    stats = memory.migrate_focused_style_rules(1, 184589072)
+    rules = memory.relevant_style_rules(1, "被说中", limit=3, speaker_user_id=100)
+
+    assert stats["kept_group"] == 1
+    assert len(rules) == 1
+    assert rules[0].scope == "group"
+
+
 def test_relevant_raw_corpus_examples_include_original_and_neighbors(tmp_path) -> None:
     memory = MemoryStore(tmp_path / "bot.sqlite3")
     memory.add_message(1, 100, "A", "今天午饭吃什么", created_at=100)

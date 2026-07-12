@@ -193,6 +193,8 @@ MID_MEMORY_MIN_BATCH = 24
 MID_MEMORY_RETRY_INTERVAL_SECONDS = 10 * 60
 STYLE_LEARN_INTERVAL_SECONDS = 60 * 60
 STYLE_LEARN_MESSAGE_LIMIT = 40
+STYLE_LEARN_CANDIDATE_LIMIT = 160
+STYLE_LEARN_PER_USER_LIMIT = 5
 STYLE_LEARN_MIN_MESSAGES = 12
 STYLE_RULE_CONTEXT_LIMIT = 12
 MEMBER_PROFILE_SUMMARY_INTERVAL_SECONDS = 24 * 60 * 60
@@ -211,11 +213,6 @@ FOCUSED_USER_TONE_CONTEXT = (
     "像很偏心地哄熟人妹妹一样接她的话。不要对小鸟本人嘴损、冷嘲热讽、压迫式反问或攻击；"
     "即使 action=tease，也只能轻轻逗她、顺毛式吐槽场景，不能怼她。"
 )
-FOCUSED_STYLE_EXTRA_LIMIT = 12
-FOCUSED_STYLE_LOOKBACK_SECONDS = 7 * 24 * 60 * 60
-FOCUSED_RAW_CORPUS_LIMIT = 2
-FOCUSED_RAW_CORPUS_SCORE_MULTIPLIER = 1.25
-FOCUSED_RAW_CORPUS_SCORE_BONUS = 2.0
 LONG_MESSAGE_SUMMARY_THRESHOLD = 100
 REPLY_CONTEXT_SUMMARY_THRESHOLD = 180
 LONG_MESSAGE_SUMMARY_SOURCE_LIMIT = 1800
@@ -260,7 +257,7 @@ DEFAULT_BASIC_APPROVAL_USER_IDS = (3370998238,)
 GROUP_APPROVAL_USER_IDS = tuple(sorted({*OWNER_USER_IDS, *DEFAULT_BASIC_APPROVAL_USER_IDS}))
 JARGON_COMMAND_USER_IDS = TOOL_ADMIN_USER_IDS
 LIMITED_APPROVAL_PERCENT_USER_IDS = (3370998238,)
-LIMITED_APPROVAL_PERCENT_MIN = 60
+APPROVAL_REVIEW_MANAGER_USER_IDS = (3370998238,)
 APPROVAL_USER_IDS_KEY = "group_approval_basic_user_ids"
 APPROVAL_STALE_CHOICE_COOLDOWN_SECONDS = 8
 RECALL_FEEDBACK_CONTEXT_LIMIT = 3
@@ -540,11 +537,14 @@ def _ensure_builtin_memory_atoms() -> None:
             group_id=group_id,
             subject_user_id=FOCUSED_STYLE_USER_ID,
             object_user_id=None,
-            content="小鸟/184589072 是高权重学习对象；参考她的表达节奏、情绪承接、玩梗方式和说话尺度，但禁止照搬原句。",
+            content="小鸟/184589072 是重要关系对象；回复她本人时更温柔亲近，但她的个人口吻不应自动成为张风雪面向全群的通用风格。",
             source="builtin_focused_style_user",
             confidence=1.0,
             importance=0.9,
         )
+        migration = memory.migrate_focused_style_rules(group_id, FOCUSED_STYLE_USER_ID)
+        if any(migration.values()):
+            logger.info(f"qq_social_agent focused style migration: group={group_id} {migration}")
 
 
 @get_driver().on_bot_connect
@@ -1380,6 +1380,10 @@ def _can_manage_approval_auto_send_percent(user_id: int) -> bool:
     return _is_tool_admin_user(user_id) or _is_owner_user(user_id) or user_id in LIMITED_APPROVAL_PERCENT_USER_IDS
 
 
+def _can_manage_approval_review(user_id: int) -> bool:
+    return _is_tool_admin_user(user_id) or _is_owner_user(user_id) or user_id in APPROVAL_REVIEW_MANAGER_USER_IDS
+
+
 def _ai_work_intensity_percent() -> int:
     raw = memory.app_kv_get(AI_WORK_INTENSITY_PERCENT_KEY)
     try:
@@ -1491,6 +1495,11 @@ def _format_recent_style_report(group_id: int | None, limit: int) -> str:
         source = rule.source_text.strip().replace("\n", " ")[:80] or "无"
         created_at = _format_local_time(rule.created_at)
         lines.append(f"{index}. 当{rule.situation}时，可以{rule.style}")
+        sources = "、".join(str(user_id) for user_id in rule.source_user_ids) or "历史规则"
+        lines.append(
+            f"   范围：{rule.scope}；来源用户：{sources}；"
+            f"支持人数：{rule.support_user_count}；置信：{rule.confidence:.2f}"
+        )
         lines.append(f"   来源：{source}")
         lines.append(f"   生成：{created_at}")
     return "\n".join(lines)
@@ -2648,6 +2657,7 @@ async def _handle_group_message_locked(
                 group_id,
                 context_query,
                 limit=STYLE_RULE_CONTEXT_LIMIT,
+                speaker_user_id=user_id,
             )
         )
         jargon_context = await _selected_group_jargon_context(
@@ -2841,6 +2851,7 @@ async def _handle_group_message_locked(
                 group_id,
                 context_query,
                 limit=STYLE_RULE_CONTEXT_LIMIT,
+                speaker_user_id=user_id,
             )
         )
     raw_corpus_context = _format_raw_corpus_context(
@@ -2852,10 +2863,11 @@ async def _handle_group_message_locked(
             context_radius=RAW_CORPUS_CONTEXT_RADIUS,
             exclude_user_id=user_id,
             exclude_text=text,
-            preferred_user_id=FOCUSED_STYLE_USER_ID,
-            preferred_limit=FOCUSED_RAW_CORPUS_LIMIT,
-            preferred_score_multiplier=FOCUSED_RAW_CORPUS_SCORE_MULTIPLIER,
-            preferred_score_bonus=FOCUSED_RAW_CORPUS_SCORE_BONUS,
+            preferred_user_id=user_id,
+            preferred_limit=2,
+            preferred_score_multiplier=1.1,
+            preferred_score_bonus=0.5,
+            per_user_limit=1,
         )
     )
     if not jargon_context:
@@ -4965,9 +4977,9 @@ async def _maintain_group_learning(group_id: int) -> None:
         return
     style_messages = memory.messages_for_style_learning(
         group_id,
-        limit=STYLE_LEARN_MESSAGE_LIMIT,
+        limit=STYLE_LEARN_CANDIDATE_LIMIT,
     )
-    style_messages = _style_learning_messages_with_focus(group_id, style_messages)
+    style_messages = _balanced_style_learning_messages(style_messages)
     if len(style_messages) < STYLE_LEARN_MIN_MESSAGES:
         return
     last_style_learn_attempt[group_id] = time.time()
@@ -4984,7 +4996,13 @@ async def _maintain_group_learning(group_id: int) -> None:
         memory.add_style_rules(
             group_id,
             [
-                (rule.situation, rule.style, rule.source_text)
+                (
+                    rule.situation,
+                    rule.style,
+                    rule.source_text,
+                    rule.source_user_ids,
+                    rule.source_message_ids,
+                )
                 for rule in useful_rules
             ],
         )
@@ -4997,34 +5015,26 @@ async def _maintain_group_learning(group_id: int) -> None:
         logger.warning(f"qq_social_agent style learning skipped: group={group_id} error={exc}")
 
 
-def _style_learning_messages_with_focus(
-    group_id: int,
-    messages: list[ChatMessage],
-    *,
-    now: float | None = None,
-) -> list[ChatMessage]:
-    current_time = now or time.time()
-    focused_messages = memory.member_messages_between(
-        group_id,
-        FOCUSED_STYLE_USER_ID,
-        start_at=current_time - FOCUSED_STYLE_LOOKBACK_SECONDS,
-        end_at=current_time + 1,
-        limit=FOCUSED_STYLE_EXTRA_LIMIT,
-    )
-    if not focused_messages:
-        return messages
-
-    by_key: dict[tuple[int, int, float, str], ChatMessage] = {}
-    for message in (*messages, *focused_messages):
-        key = (message.id, message.user_id, message.created_at, message.text)
-        by_key[key] = message
-    merged = sorted(by_key.values(), key=lambda item: (item.created_at, item.id))
+def _balanced_style_learning_messages(messages: list[ChatMessage]) -> list[ChatMessage]:
+    selected: list[ChatMessage] = []
+    user_counts: dict[int, int] = {}
+    seen_texts: set[tuple[int, str]] = set()
+    for message in reversed(messages):
+        text_key = (message.user_id, re.sub(r"\s+", "", message.text).casefold())
+        if text_key in seen_texts or user_counts.get(message.user_id, 0) >= STYLE_LEARN_PER_USER_LIMIT:
+            continue
+        seen_texts.add(text_key)
+        user_counts[message.user_id] = user_counts.get(message.user_id, 0) + 1
+        selected.append(message)
+        if len(selected) >= STYLE_LEARN_MESSAGE_LIMIT:
+            break
+    balanced = sorted(selected, key=lambda item: (item.created_at, item.id))
     logger.info(
-        "qq_social_agent style learning focus boosted: "
-        f"group={group_id} user={FOCUSED_STYLE_USER_ID} base={len(messages)} "
-        f"focused={len(focused_messages)} merged={len(merged)}"
+        "qq_social_agent style learning balanced sample: "
+        f"candidates={len(messages)} selected={len(balanced)} users={len(user_counts)} "
+        f"max_per_user={STYLE_LEARN_PER_USER_LIMIT}"
     )
-    return merged
+    return balanced
 
 
 async def _maintain_member_profile_summaries(group_id: int, *, force: bool = False) -> None:
@@ -5927,11 +5937,17 @@ async def _handle_group_approval_private_impl(bot: Bot, user_id: int, text: str)
     can_manage_auto_send_percent = (
         auto_send_match is not None and _can_manage_approval_auto_send_percent(user_id)
     )
+    can_manage_review = _can_manage_approval_review(user_id) and compact_text in (
+        APPROVAL_REVIEW_STATUS_COMMANDS | APPROVAL_REVIEW_ON_COMMANDS | APPROVAL_REVIEW_OFF_COMMANDS
+    )
     pending_approval_control = _latest_group_approval() is not None and _is_approval_control_text(compact_text)
     if not pending_approval_control:
         shortcut_command = _bot_tool_shortcut_command(compact_text)
         if shortcut_command is not None:
             compact_text = shortcut_command
+            can_manage_review = _can_manage_approval_review(user_id) and compact_text in (
+                APPROVAL_REVIEW_STATUS_COMMANDS | APPROVAL_REVIEW_ON_COMMANDS | APPROVAL_REVIEW_OFF_COMMANDS
+            )
     if _is_jargon_command_text(compact_text):
         if not is_admin:
             await _send_private_text(bot, user_id, BASIC_APPROVAL_DENIED_MESSAGE)
@@ -5961,6 +5977,7 @@ async def _handle_group_approval_private_impl(bot: Bot, user_id: int, text: str)
         and _is_private_tool_text(compact_text)
         and not is_admin
         and not can_manage_auto_send_percent
+        and not can_manage_review
     ):
         await _send_private_text(bot, user_id, BASIC_APPROVAL_DENIED_MESSAGE)
         return True
@@ -6042,13 +6059,6 @@ async def _handle_group_approval_private_impl(bot: Bot, user_id: int, text: str)
             await _send_private_text(bot, user_id, _format_approval_review_status())
             return True
         requested_percent = int(raw_percent)
-        if not is_admin and requested_percent < LIMITED_APPROVAL_PERCENT_MIN:
-            await _send_private_text(
-                bot,
-                user_id,
-                f"你只能把免审自动发送概率设置为 {LIMITED_APPROVAL_PERCENT_MIN}% 到 100%。",
-            )
-            return True
         percent = _set_approval_auto_send_percent(requested_percent)
         await _send_private_text(
             bot,
@@ -6080,19 +6090,19 @@ async def _handle_group_approval_private_impl(bot: Bot, user_id: int, text: str)
         )
         return True
     if compact_text in APPROVAL_REVIEW_STATUS_COMMANDS:
-        if not is_admin:
+        if not _can_manage_approval_review(user_id):
             await _send_private_text(bot, user_id, BASIC_APPROVAL_DENIED_MESSAGE)
             return True
         await _send_private_text(bot, user_id, _format_approval_review_status())
         return True
     if compact_text in APPROVAL_REVIEW_ON_COMMANDS:
-        if not is_admin:
+        if not _can_manage_approval_review(user_id):
             await _send_private_text(bot, user_id, BASIC_APPROVAL_DENIED_MESSAGE)
             return True
         await _set_approval_review_enabled(bot, user_id, True)
         return True
     if compact_text in APPROVAL_REVIEW_OFF_COMMANDS:
-        if not is_admin:
+        if not _can_manage_approval_review(user_id):
             await _send_private_text(bot, user_id, BASIC_APPROVAL_DENIED_MESSAGE)
             return True
         await _set_approval_review_enabled(bot, user_id, False)
@@ -6110,7 +6120,7 @@ async def _handle_group_approval_private_impl(bot: Bot, user_id: int, text: str)
         await _set_approval_group_decision_enabled(bot, user_id, False)
         return True
     if not _is_approval_control_text(compact_text):
-        if _is_private_tool_text(compact_text) and not is_admin and not can_manage_auto_send_percent:
+        if _is_private_tool_text(compact_text) and not is_admin and not can_manage_auto_send_percent and not can_manage_review:
             await _send_private_text(bot, user_id, BASIC_APPROVAL_DENIED_MESSAGE)
             return True
         return False

@@ -56,6 +56,14 @@ class StyleRule:
     style: str
     source_text: str
     created_at: float
+    scope: str = "group"
+    source_user_ids: tuple[int, ...] = ()
+    source_message_ids: tuple[int, ...] = ()
+    support_user_count: int = 1
+    evidence_count: int = 1
+    confidence: float = 0.6
+    status: str = "active"
+    valid_to: float | None = None
 
 
 @dataclass(frozen=True)
@@ -566,6 +574,7 @@ class MemoryStore:
         self._ensure_approved_feedback_tags()
         self._ensure_llm_usage_source_key()
         self._ensure_memory_atom_v2()
+        self._ensure_style_rule_v2()
         self.expire_due_memory_atoms()
         self._backfill_member_profiles()
         self._backfill_member_impressions()
@@ -653,6 +662,28 @@ class MemoryStore:
               on llm_usage_events(source_key)
               where source_key is not null
             """
+        )
+
+    def _ensure_style_rule_v2(self) -> None:
+        columns = {
+            str(row["name"])
+            for row in self.conn.execute("pragma table_info(style_rules)").fetchall()
+        }
+        additions = (
+            ("scope", "text not null default 'legacy'"),
+            ("source_user_ids_json", "text not null default '[]'"),
+            ("source_message_ids_json", "text not null default '[]'"),
+            ("support_user_count", "integer not null default 1"),
+            ("evidence_count", "integer not null default 1"),
+            ("confidence", "real not null default 0.6"),
+            ("status", "text not null default 'active'"),
+            ("valid_to", "real"),
+        )
+        for name, declaration in additions:
+            if name not in columns:
+                self.conn.execute(f"alter table style_rules add column {name} {declaration}")
+        self.conn.execute(
+            "create index if not exists idx_style_rules_scope_status on style_rules(group_id, scope, status, created_at)"
         )
 
     def _ensure_memory_atom_v2(self) -> None:
@@ -1131,6 +1162,7 @@ class MemoryStore:
         preferred_limit: int = 0,
         preferred_score_multiplier: float = 1.0,
         preferred_score_bonus: float = 0.0,
+        per_user_limit: int = 1,
     ) -> list[RawCorpusExample]:
         rows = self.conn.execute(
             """
@@ -1164,11 +1196,16 @@ class MemoryStore:
         preferred_examples: list[RawCorpusExample] = []
         regular_examples: list[RawCorpusExample] = []
         seen_texts: set[str] = set()
+        user_counts: dict[int, int] = {}
         for score, _, _, message, tags in scored:
             text_key = _compact_text(message.text)
             if text_key in seen_texts:
                 continue
+            allowed_for_user = preferred_limit if message.user_id == preferred_user_id else per_user_limit
+            if allowed_for_user > 0 and user_counts.get(message.user_id, 0) >= allowed_for_user:
+                continue
             seen_texts.add(text_key)
+            user_counts[message.user_id] = user_counts.get(message.user_id, 0) + 1
             before, after = self._message_neighbors(
                 group_id,
                 message.id,
@@ -1401,26 +1438,41 @@ class MemoryStore:
     def add_style_rules(
         self,
         group_id: int,
-        rules: list[tuple[str, str, str]],
+        rules: list[tuple],
         *,
         keep: int = 80,
     ) -> None:
         now = time.time()
-        clean_rules = [
-            (situation.strip(), style.strip(), source_text.strip())
-            for situation, style, source_text in rules
-            if situation.strip() and style.strip()
-        ]
+        clean_rules: list[tuple[str, str, str, tuple[int, ...], tuple[int, ...]]] = []
+        for raw_rule in rules:
+            if len(raw_rule) < 3:
+                continue
+            situation, style, source_text = (str(raw_rule[0]), str(raw_rule[1]), str(raw_rule[2]))
+            source_user_ids = tuple(int(value) for value in (raw_rule[3] if len(raw_rule) > 3 else ()) if int(value) > 0)
+            source_message_ids = tuple(int(value) for value in (raw_rule[4] if len(raw_rule) > 4 else ()) if int(value) > 0)
+            if situation.strip() and style.strip():
+                clean_rules.append((situation.strip(), style.strip(), source_text.strip(), source_user_ids, source_message_ids))
         if not clean_rules:
             return
         self.conn.executemany(
             """
-            insert into style_rules(group_id, situation, style, source_text, created_at)
-            values (?, ?, ?, ?, ?)
+            insert into style_rules(
+              group_id, situation, style, source_text, created_at, scope,
+              source_user_ids_json, source_message_ids_json, support_user_count,
+              evidence_count, confidence, status, valid_to
+            ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?)
             """,
             [
-                (group_id, situation[:60], style[:80], source_text[:200], now)
-                for situation, style, source_text in clean_rules
+                (
+                    group_id, situation[:60], style[:80], source_text[:200], now,
+                    "group" if not user_ids or len(set(user_ids)) >= 2 else "personal",
+                    json.dumps(list(dict.fromkeys(user_ids)), ensure_ascii=False),
+                    json.dumps(list(dict.fromkeys(message_ids)), ensure_ascii=False),
+                    max(1, len(set(user_ids))), max(1, len(set(message_ids))),
+                    0.82 if len(set(user_ids)) >= 2 else (0.65 if not user_ids else 0.58),
+                    now + (90 if len(set(user_ids)) >= 2 or not user_ids else 30) * 24 * 60 * 60,
+                )
+                for situation, style, source_text, user_ids, message_ids in clean_rules
             ],
         )
         self.conn.execute(
@@ -1441,13 +1493,15 @@ class MemoryStore:
     def recent_style_rules(self, group_id: int, limit: int) -> list[StyleRule]:
         rows = self.conn.execute(
             """
-            select group_id, situation, style, source_text, created_at
+            select group_id, situation, style, source_text, created_at, scope,
+                   source_user_ids_json, source_message_ids_json, support_user_count,
+                   evidence_count, confidence, status, valid_to
             from style_rules
-            where group_id = ?
+            where group_id = ? and status = 'active' and (valid_to is null or valid_to > ?)
             order by created_at desc, id desc
             limit ?
             """,
-            (group_id, limit),
+            (group_id, time.time(), limit),
         ).fetchall()
         return [
             StyleRule(
@@ -1456,6 +1510,14 @@ class MemoryStore:
                 style=str(row["style"]),
                 source_text=str(row["source_text"]),
                 created_at=float(row["created_at"]),
+                scope=str(row["scope"]),
+                source_user_ids=tuple(_loads_int_list(row["source_user_ids_json"])),
+                source_message_ids=tuple(_loads_int_list(row["source_message_ids_json"])),
+                support_user_count=int(row["support_user_count"]),
+                evidence_count=int(row["evidence_count"]),
+                confidence=float(row["confidence"]),
+                status=str(row["status"]),
+                valid_to=float(row["valid_to"]) if row["valid_to"] is not None else None,
             )
             for row in reversed(rows)
         ]
@@ -1467,22 +1529,30 @@ class MemoryStore:
         *,
         limit: int,
         candidate_limit: int = 80,
+        speaker_user_id: int | None = None,
     ) -> list[StyleRule]:
         rows = self.conn.execute(
             """
-            select group_id, situation, style, source_text, created_at
+            select group_id, situation, style, source_text, created_at, scope,
+                   source_user_ids_json, source_message_ids_json, support_user_count,
+                   evidence_count, confidence, status, valid_to
             from style_rules
-            where group_id = ?
+            where group_id = ? and status = 'active' and (valid_to is null or valid_to > ?)
             order by created_at desc, id desc
             limit ?
             """,
-            (group_id, candidate_limit),
+            (group_id, time.time(), candidate_limit),
         ).fetchall()
-        scored: list[tuple[int, float, sqlite3.Row]] = []
+        scored: list[tuple[float, float, sqlite3.Row]] = []
         for row in rows:
+            source_user_ids = tuple(_loads_int_list(row["source_user_ids_json"]))
+            if str(row["scope"]) == "personal" and speaker_user_id not in source_user_ids:
+                continue
             haystack = f"{row['situation']} {row['style']} {row['source_text']}"
             score = _text_relevance_score(query, haystack)
             if score > 0:
+                confidence = max(0.1, min(1.0, float(row["confidence"])))
+                score = score * (0.5 + 0.5 * confidence) + min(2, max(0, int(row["support_user_count"]) - 1)) * 0.5
                 scored.append((score, float(row["created_at"]), row))
         scored.sort(key=lambda item: (item[0], item[1]), reverse=True)
         return [
@@ -1492,9 +1562,97 @@ class MemoryStore:
                 style=str(row["style"]),
                 source_text=str(row["source_text"]),
                 created_at=float(row["created_at"]),
+                scope=str(row["scope"]),
+                source_user_ids=tuple(_loads_int_list(row["source_user_ids_json"])),
+                source_message_ids=tuple(_loads_int_list(row["source_message_ids_json"])),
+                support_user_count=int(row["support_user_count"]),
+                evidence_count=int(row["evidence_count"]),
+                confidence=float(row["confidence"]),
+                status=str(row["status"]),
+                valid_to=float(row["valid_to"]) if row["valid_to"] is not None else None,
             )
             for _, _, row in scored[:limit]
         ]
+
+    def migrate_focused_style_rules(self, group_id: int, focused_user_id: int) -> dict[str, int]:
+        """Conservatively scope legacy rules from one prolific speaker without deleting useful group style."""
+        rows = self.conn.execute(
+            """
+            select id, situation, style, source_text
+            from style_rules
+            where group_id = ? and scope = 'legacy' and status = 'active'
+            order by id desc
+            """,
+            (group_id,),
+        ).fetchall()
+        personal = kept_group = expired_duplicates = expired_literal = 0
+        seen_focused: set[tuple[str, str]] = set()
+        marker = f"[#{str(focused_user_id)[-5:]}]"
+        for row in rows:
+            source_text = str(row["source_text"])
+            exact = self.conn.execute(
+                """
+                select id, user_id from messages
+                where group_id = ? and is_bot = 0 and text = ?
+                order by id desc limit 1
+                """,
+                (group_id, source_text),
+            ).fetchone()
+            is_focused = bool(exact and int(exact["user_id"]) == focused_user_id) or source_text.startswith(marker) or marker in source_text[:80]
+            if not is_focused:
+                continue
+            message_ids = [int(exact["id"])] if exact else []
+            key = (_compact_text(str(row["situation"])), _compact_text(str(row["style"])))
+            preserve_as_group = "目移" in f"{row['situation']} {row['style']} {source_text}"
+            if preserve_as_group:
+                self.conn.execute(
+                    """
+                    update style_rules
+                    set scope = 'group', source_user_ids_json = ?, source_message_ids_json = ?,
+                        confidence = 0.78, support_user_count = 1, evidence_count = 1
+                    where id = ?
+                    """,
+                    (json.dumps([focused_user_id]), json.dumps(message_ids), int(row["id"])),
+                )
+                kept_group += 1
+                continue
+            literal_personal = any(token in str(row["style"]).casefold() for token in ("xhn", "扶她"))
+            if literal_personal:
+                self.conn.execute(
+                    "update style_rules set status = 'expired', valid_to = ? where id = ?",
+                    (time.time(), int(row["id"])),
+                )
+                expired_literal += 1
+                continue
+            if key in seen_focused:
+                self.conn.execute(
+                    "update style_rules set status = 'expired', valid_to = ? where id = ?",
+                    (time.time(), int(row["id"])),
+                )
+                expired_duplicates += 1
+                continue
+            seen_focused.add(key)
+            self.conn.execute(
+                """
+                    update style_rules
+                    set scope = 'personal', source_user_ids_json = ?, source_message_ids_json = ?,
+                    confidence = 0.55, support_user_count = 1, evidence_count = 1,
+                    valid_to = ?
+                    where id = ?
+                """,
+                (
+                    json.dumps([focused_user_id]), json.dumps(message_ids),
+                    time.time() + 60 * 24 * 60 * 60, int(row["id"]),
+                ),
+            )
+            personal += 1
+        self.conn.commit()
+        return {
+            "personal": personal,
+            "kept_group": kept_group,
+            "expired_duplicates": expired_duplicates,
+            "expired_literal": expired_literal,
+        }
 
     def member_profiles_for_context(
         self,
@@ -3250,6 +3408,24 @@ def _relevance_terms(text: str) -> set[str]:
         "时候",
     }
     return {term for term in terms if term not in stop_terms}
+
+
+def _loads_int_list(value: object) -> list[int]:
+    try:
+        raw = json.loads(str(value or "[]"))
+    except (json.JSONDecodeError, TypeError):
+        return []
+    if not isinstance(raw, list):
+        return []
+    result: list[int] = []
+    for item in raw:
+        try:
+            parsed = int(item)
+        except (TypeError, ValueError):
+            continue
+        if parsed > 0 and parsed not in result:
+            result.append(parsed)
+    return result
 
 
 def _raw_corpus_tags(text: str) -> tuple[str, ...]:

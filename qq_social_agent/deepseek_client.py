@@ -78,6 +78,8 @@ class StyleRuleDraft:
     situation: str
     style: str
     source_text: str = ""
+    source_user_ids: tuple[int, ...] = ()
+    source_message_ids: tuple[int, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -1228,12 +1230,15 @@ def _parse_style_rules(
         if key in seen:
             continue
         seen.add(key)
-        source_text = _source_text_for_style_rule(item, source_messages)
+        evidence_messages = _source_messages_for_style_rule(item, source_messages)
+        source_text = evidence_messages[0].text if evidence_messages else ""
         parsed.append(
             StyleRuleDraft(
                 situation=situation[:60],
                 style=style[:80],
                 source_text=source_text,
+                source_user_ids=tuple(dict.fromkeys(msg.user_id for msg in evidence_messages)),
+                source_message_ids=tuple(dict.fromkeys(msg.id for msg in evidence_messages if msg.id)),
             )
         )
         if len(parsed) >= 8:
@@ -1241,18 +1246,24 @@ def _parse_style_rules(
     return tuple(parsed)
 
 
-def _source_text_for_style_rule(
+def _source_messages_for_style_rule(
     raw_rule: dict[str, object],
     source_messages: list[ChatMessage],
-) -> str:
-    raw_source_id = str(raw_rule.get("source_id", "")).strip()
-    try:
-        source_index = int(raw_source_id) - 1
-    except ValueError:
-        return ""
-    if 0 <= source_index < len(source_messages):
-        return source_messages[source_index].text
-    return ""
+) -> list[ChatMessage]:
+    raw_ids = raw_rule.get("support_source_ids", raw_rule.get("source_ids", []))
+    if not raw_ids:
+        raw_ids = [raw_rule.get("source_id", "")]
+    if not isinstance(raw_ids, list):
+        raw_ids = [raw_rule.get("source_id", "")]
+    result: list[ChatMessage] = []
+    for raw_source_id in raw_ids[:8]:
+        try:
+            source_index = int(str(raw_source_id).strip()) - 1
+        except ValueError:
+            continue
+        if 0 <= source_index < len(source_messages):
+            result.append(source_messages[source_index])
+    return result
 
 
 def _log_llm_usage(task: str, response: object, *, model: str) -> None:
