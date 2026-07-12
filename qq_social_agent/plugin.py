@@ -38,6 +38,7 @@ from .approval_rules import (
     TOKEN_REPORT_COMMAND_ALIASES,
 )
 from .config import load_config
+from .content_ingestion import ContentIngestionService, explicit_file_read_requested
 from .cue_patterns import CuePatternTracker, CueRepeatState
 from .decision_gate import (
     apply_backend_tool_decision as _apply_backend_tool_decision,
@@ -103,8 +104,10 @@ from .tools.fresh_context import (
     FreshContextTool,
     detect_fresh_intent,
 )
+from .tools.deep_content import DeepContentTool
 from .tools.market import MarketTool
 from .tools.market_intent import MarketIntent, detect_market_intents, is_market_topic
+from .tools.voice_transcript import VoiceTranscriptContext
 
 
 load_dotenv()
@@ -117,6 +120,12 @@ market_tool = MarketTool(max_external_queries_per_minute=2)
 fresh_context_tool = FreshContextTool.from_config(app_config.raw.get("fresh_search", {}))
 social_action_service = SocialActionService.from_config(app_config.raw.get("social_actions", {}))
 image_ocr_service = ImageOcrService.from_config(app_config.raw.get("image_ocr", {}))
+content_ingestion_service = ContentIngestionService.from_config(app_config.raw.get("content_tools", {}))
+deep_content_tool = DeepContentTool.from_config(
+    (app_config.raw.get("content_tools", {}) or {}).get("deep_url_reader", {})
+    if isinstance(app_config.raw.get("content_tools", {}), dict)
+    else {}
+)
 cue_pattern_tracker = CuePatternTracker(window_seconds=10 * 60)
 deepseek_client: DeepSeekClient | None = None
 last_mid_memory_attempt: dict[int, float] = {}
@@ -540,6 +549,8 @@ async def _shutdown_background_tasks() -> None:
     if deepseek_client is not None:
         closers.extend(client.close() for client in deepseek_client.clients.values())
     closers.append(image_ocr_service.aclose())
+    closers.append(content_ingestion_service.aclose())
+    closers.append(deep_content_tool.aclose())
     await asyncio.gather(*closers, return_exceptions=True)
 
 
@@ -1559,6 +1570,10 @@ def _http_status_payload() -> dict[str, object]:
         "search": fresh_context_tool.status_snapshot(),
         "ocr": _status_image_ocr(),
         "social_actions": social_action_service.status_snapshot(),
+        "content_tools": {
+            "ingestion": content_ingestion_service.status_snapshot(),
+            "deep_url_reader": deep_content_tool.status_snapshot(),
+        },
         "groups": _status_groups(),
         "last_message": _status_latest_message(),
         "approvals": _status_approvals(),
@@ -1960,6 +1975,31 @@ async def _handle_group_message_scoped(
         file_context = await file_metadata_context_for_event(bot, event)
         if file_context and file_context not in raw_text:
             raw_text = _join_context_parts(raw_text, file_context)
+    content_context = await content_ingestion_service.context_for_event(
+        bot,
+        event,
+        allow_file_content=bool(
+            group_allowed and (addressed_bot or explicit_file_read_requested(plain_text))
+        ),
+        voice_context=VoiceTranscriptContext(
+            mentioned=addressed_bot,
+            replied_to_bot=_event_has_reply_context(event) and addressed_bot,
+        ),
+    ) if group_allowed else None
+    if content_context is not None and content_context.text:
+        raw_text = _join_context_parts(raw_text, content_context.text)
+    if content_context is not None and (content_context.file_count or content_context.voice_count):
+        _record_metric_event(
+            "content_ingestion",
+            group_id=group_id,
+            user_id=int(event.user_id),
+            stage="media_context",
+            action="recognized" if content_context.text else "skipped",
+            file_count=content_context.file_count,
+            voice_count=content_context.voice_count,
+            file_status=content_context.file_status,
+            voice_status=content_context.voice_status,
+        )
     ocr_context = await _image_ocr_context_for_event(
         bot,
         event,
@@ -1993,7 +2033,10 @@ async def _handle_group_message_scoped(
     if group_allowed and not addressed_bot and _should_ignore_unreadable_media_event(
         event,
         forward_context=forward_context,
-        readable_media_context=ocr_context.text,
+        readable_media_context=_join_context_parts(
+            ocr_context.text,
+            content_context.text if content_context is not None else "",
+        ),
     ):
         memory.add_message(
             group_id,
@@ -2677,6 +2720,9 @@ async def _handle_group_message_locked(
     fresh_context = ""
     if decision.need_fresh_context:
         fresh_context = await _fresh_context_for(decision, fallback_text=text)
+    deep_url_context = await _deep_url_context_for(text, addressed_bot=addressed_bot)
+    if deep_url_context:
+        fresh_context = _combine_text_sections(fresh_context, deep_url_context)
 
     suppress_mention_user_id = _repeat_mention_suppressed_user(group_id, user_id)
     mention_targets = _mention_targets(
@@ -2862,6 +2908,26 @@ async def _handle_private_message_scoped(
     file_context = await file_metadata_context_for_event(bot, event)
     if file_context and file_context not in text:
         text = _join_context_parts(text, file_context)
+    content_context = await content_ingestion_service.context_for_event(
+        bot,
+        event,
+        allow_file_content=True,
+        voice_context=VoiceTranscriptContext(mentioned=True),
+    )
+    if content_context.text:
+        text = _join_context_parts(text, content_context.text)
+    if content_context.file_count or content_context.voice_count:
+        _record_metric_event(
+            "content_ingestion",
+            group_id=chat_id,
+            user_id=user_id,
+            stage="private_media_context",
+            action="recognized" if content_context.text else "skipped",
+            file_count=content_context.file_count,
+            voice_count=content_context.voice_count,
+            file_status=content_context.file_status,
+            voice_status=content_context.voice_status,
+        )
     ocr_context = await _image_ocr_context_for_event(
         bot,
         event,
@@ -3850,6 +3916,26 @@ async def _fresh_context_for(decision: ReplyDecision, *, fallback_text: str) -> 
     return context
 
 
+async def _deep_url_context_for(text: str, *, addressed_bot: bool) -> str:
+    result = await deep_content_tool.context_for_text(text, addressed_bot=addressed_bot)
+    if not result.requested:
+        return ""
+    read = result.read
+    _record_metric_event(
+        "tool_call",
+        stage="deep_url_reader",
+        action="read",
+        success=bool(read and read.ok),
+        status=read.status if read is not None else result.reason,
+        bytes_read=read.bytes_read if read is not None else 0,
+        redirects=read.redirects if read is not None else 0,
+        truncated=read.truncated if read is not None else False,
+        latency_ms=read.latency_ms if read is not None else 0,
+        error=read.error if read is not None else result.reason,
+    )
+    return result.context
+
+
 async def _execute_reaction_action(
     bot: Bot,
     event: GroupMessageEvent,
@@ -4229,9 +4315,13 @@ def _compact_long_message_fallback(text: str) -> str:
 
 
 async def _private_fresh_context_for(text: str) -> str:
+    parts: list[str] = []
+    deep_context = await _deep_url_context_for(text, addressed_bot=True)
+    if deep_context:
+        parts.append(deep_context)
     intent = detect_fresh_intent(text)
     if intent is None:
-        return ""
+        return _combine_text_sections(*parts)
     context = await fresh_context_tool.context_for(intent.query, kind=intent.kind)
     search_status = fresh_context_tool.status_snapshot().get("last_request", {})
     search_status = search_status if isinstance(search_status, dict) else {}
@@ -4254,7 +4344,9 @@ async def _private_fresh_context_for(text: str) -> str:
         error=search_status.get("error", ""),
         query_preview=search_status.get("query_preview", ""),
     )
-    return context
+    if context:
+        parts.append(context)
+    return _combine_text_sections(*parts)
 
 
 def _market_intents_from_decision(

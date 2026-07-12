@@ -190,13 +190,45 @@ async def get_image(
 
 async def get_file(
     bot: OneBotGateway,
-    file_id: str,
+    file_id: str | None = None,
     *,
+    file: str | None = None,
     timeout_seconds: float | None = DEFAULT_API_TIMEOUT_SECONDS,
 ) -> dict[str, Any]:
-    payload = await call_api(bot, "get_file", timeout_seconds=timeout_seconds, file_id=str(file_id))
+    request: dict[str, Any] = {}
+    if file_id:
+        request["file_id"] = str(file_id)
+    if file:
+        request["file"] = str(file)
+    if not request:
+        return {}
+    payload = await call_api(bot, "get_file", timeout_seconds=timeout_seconds, **request)
     data = unwrap_data(payload)
     return data if isinstance(data, dict) else {}
+
+
+async def get_record(
+    bot: OneBotGateway,
+    *,
+    file_id: str | None = None,
+    file: str | None = None,
+    out_format: str = "mp3",
+    timeout_seconds: float | None = DEFAULT_API_TIMEOUT_SECONDS,
+) -> dict[str, Any]:
+    request: dict[str, Any] = {"out_format": str(out_format or "mp3")}
+    if file_id:
+        request["file_id"] = str(file_id)
+    if file:
+        request["file"] = str(file)
+    if len(request) <= 1:
+        return {}
+    payload = await call_api(bot, "get_record", timeout_seconds=timeout_seconds, **request)
+    data = unwrap_data(payload)
+    if isinstance(data, dict):
+        return data
+    if isinstance(data, str):
+        return {"file": data}
+    return {}
 
 
 async def ocr_image(

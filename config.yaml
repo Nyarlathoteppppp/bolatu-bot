@@ -132,6 +132,31 @@ private_tools:
   reply_delay_min_seconds: 0.15
   reply_delay_max_seconds: 0.95
 
+content_tools:
+  onebot_timeout_seconds: 10
+  deep_url_reader:
+    enabled: true
+    timeout_seconds: 8
+    max_bytes: 1000000
+    max_text_chars: 6000
+    max_redirects: 3
+    allowed_ports: [80, 443]
+  file_content:
+    enabled: true
+    max_file_bytes: 2000000
+    max_text_chars: 6000
+    max_pdf_pages: 20
+    require_declared_mime: true
+  voice_transcript:
+    enabled: true
+    provider: siliconflow
+    api_key_env: SILICONFLOW_API_KEY
+    base_url: https://api.siliconflow.cn/v1
+    model: FunAudioLLM/SenseVoiceSmall
+    timeout_seconds: 20
+    max_audio_bytes: 3000000
+    max_transcript_chars: 2000
+
 groups:
   default:
     enabled: true
