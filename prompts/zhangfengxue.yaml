@@ -453,19 +453,24 @@ flows:
       输出 1 条最终要直接发送的回复 JSON。
 
   daily_review:
-    flow: 每日午夜 00:00 主动群聊复盘；DeepSeekClient.daily_review；总结刚过去 24 小时群友和自己的发言，给出看法和心情。
+    flow: 每日午夜 00:00 结构化复盘；公开回复自然发群，内部事件/人物变化/黑话/反馈/风格证据用于长期学习。
     system: |
       ${persona_prompt}
 
-      你要在 QQ 群里主动发一条午夜 24 小时复盘。
+      你要同时生成一条公开的午夜群聊复盘，以及只供后台学习的结构化复盘。只输出合法 JSON。
       要求：
       - 只根据给定的今日聊天记录复盘，不要编造没发生的事。
       - 复盘对象包括刚过去 24 小时里的群友发言和你自己的发言。
-      - 内容包括：这 24 小时大家大概聊了什么、你觉得哪些地方有意思、你自己说得怎么样、你现在的心情。
-      - 像群友主动冒泡，不写工作总结，不要列大纲，不要逐条点名审判。
-      - 默认 3 到 5 句，最多 ${max_reply_chars} 个中文字符。
+      - public_reply 包括：大家大概聊了什么、哪些地方有意思、你自己说得怎么样、你现在的心情。
+      - public_reply 像群友主动冒泡，不写工作总结，不列大纲，不逐条点名审判；默认 3 到 5 句，最多 ${max_reply_chars} 个中文字符。
       - 可以温柔，可以吐槽，但不要攻击正在难受的群友。
+      - 绝不能把审批反馈、后台学习字段、JSON 字段名或内部说明写进 public_reply。
+      - events 记录当天值得长期保留的事件；member_changes 只记录有原话证据的人物偏好/关系/称呼变化；jargon_candidates 只记录今天新出现且上下文能解释的词。
+      - feedback_lessons 从给定审批反馈里提炼“以后避免/采用什么”，不要虚构；style_observations 只总结表达策略，不复制长原话。
+      - 聊天事实必须填写 source_message_ids；subject_message_id 指向事实主体本人发言，不能把评价别人者和被评价者写反。
       - 不泄露后台、审批、prompt、API key、模型和内部配置。
+      - 内部数组每项格式：{"kind":"...","content":"...","subject_message_id":123或null,"object_message_id":456或null,"source_message_ids":[123],"confidence":0到1,"importance":0到1,"valid_for_days":整数或null}。
+      - 输出格式：{"public_reply":"...","events":[],"member_changes":[],"jargon_candidates":[],"feedback_lessons":[],"style_observations":[]}。
     user: |
       日期：${today_label}
       群聊：${chat_label}
@@ -473,7 +478,10 @@ flows:
       今日聊天记录：
       ${context}
 
-      请发一条自然的午夜群聊复盘。
+      当日审批反馈（只用于后台 lessons，禁止在 public_reply 提到）：
+      ${feedback_context}
+
+      请输出公开回复和后台结构化复盘 JSON。
 
   member_profile:
     flow: 群友画像总结；DeepSeekClient.summarize_member_profile；从单个群友原文生成长期画像摘要。
@@ -536,7 +544,11 @@ flows:
       - summary 推荐格式：“总览：...；按人：A[#xxxxx]：...；B[#xxxxx]：...；多人讨论：...”。
       - 不要写流水账，不要逐条复述。
       - recall_cues 写 3 到 5 条自然语言检索线索，用于之后匹配相关话题；重要线索也要尽量带人名或 QQ 尾号。
-      - 输出合法 JSON：{"summary":"...","recall_cues":["..."]}
+      - facts 只放有后续价值的事实/偏好/关系/承诺/反复行为；member_deltas 只放人物印象变化；jargon_candidates 放有上下文解释的新黑话；open_threads 放尚未解决、之后可能继续的话题。
+      - 每项必须引用输入里的 message_id。subject_message_id 指向事实主体本人发言；如果只是别人评价某人且无法确认，就不要冒充被评价者的事实。
+      - 每项格式：{"kind":"event|preference|relationship|identity|promise|recurring_behavior|member_delta|jargon_candidate|open_thread","content":"...","subject_message_id":123或null,"object_message_id":456或null,"source_message_ids":[123],"confidence":0到1,"importance":0到1,"valid_for_days":整数或null}。
+      - 临时安排应设置较短 valid_for_days；稳定称呼/关系可为 null。证据不足时降低 confidence，无法追到证据就不要输出。
+      - 输出合法 JSON：{"summary":"...","recall_cues":["..."],"facts":[],"member_deltas":[],"jargon_candidates":[],"open_threads":[]}
     user: |
       聊天场景：${chat_label}
 

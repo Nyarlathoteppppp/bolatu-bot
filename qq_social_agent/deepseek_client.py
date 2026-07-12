@@ -40,9 +40,35 @@ class ReplyDecision:
 
 
 @dataclass(frozen=True)
+class MemoryFactDraft:
+    kind: str
+    content: str
+    subject_user_id: int | None = None
+    object_user_id: int | None = None
+    evidence_message_ids: tuple[int, ...] = ()
+    confidence: float = 0.7
+    importance: float = 0.5
+    valid_for_days: int | None = None
+
+
+@dataclass(frozen=True)
 class MidMemoryDraft:
     summary: str
     recall_cues: tuple[str, ...]
+    facts: tuple[MemoryFactDraft, ...] = ()
+    member_deltas: tuple[MemoryFactDraft, ...] = ()
+    jargon_candidates: tuple[MemoryFactDraft, ...] = ()
+    open_threads: tuple[MemoryFactDraft, ...] = ()
+
+
+@dataclass(frozen=True)
+class DailyReviewDraft:
+    public_reply: str
+    events: tuple[MemoryFactDraft, ...] = ()
+    member_changes: tuple[MemoryFactDraft, ...] = ()
+    jargon_candidates: tuple[MemoryFactDraft, ...] = ()
+    feedback_lessons: tuple[MemoryFactDraft, ...] = ()
+    style_observations: tuple[MemoryFactDraft, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -600,9 +626,33 @@ class DeepSeekClient:
         chat_label: str,
         today_label: str,
         max_chars: int = 520,
+        feedback_context: str = "",
     ) -> str:
+        draft = await self.daily_review_draft(
+            persona=persona,
+            messages=messages,
+            chat_label=chat_label,
+            today_label=today_label,
+            max_chars=max_chars,
+            feedback_context=feedback_context,
+        )
+        return draft.public_reply
+
+    async def daily_review_draft(
+        self,
+        *,
+        persona: Persona,
+        messages: list[ChatMessage],
+        chat_label: str,
+        today_label: str,
+        max_chars: int = 520,
+        feedback_context: str = "",
+    ) -> DailyReviewDraft:
         context_messages = messages[-140:]
-        context = "\n".join(_format_message(msg) for msg in context_messages)
+        context = "\n".join(
+            f"[message_id:{msg.id}] {_format_message(msg)}"
+            for msg in context_messages
+        )
         if not context:
             context = "（今天还没有可复盘的聊天记录）"
         system = self.prompts.render(
@@ -617,9 +667,11 @@ class DeepSeekClient:
             chat_label=chat_label,
             today_label=today_label,
             context=context,
+            feedback_context=feedback_context.strip() or "（无审批反馈）",
         )
         request = {
             "max_tokens": max(self.config.max_tokens, 700),
+            "response_format": {"type": "json_object"},
             "messages": [
                 {"role": "system", "content": system},
                 {"role": "user", "content": user},
@@ -632,7 +684,7 @@ class DeepSeekClient:
 
         response = await self._chat_completion(task="daily_review", route_name="reply", request=request)
         content = response.choices[0].message.content or ""
-        return _sanitize_reply(content, max_chars)
+        return _parse_daily_review(content, messages=context_messages, max_chars=max_chars)
 
     async def summarize_mid_memory(
         self,
@@ -640,7 +692,10 @@ class DeepSeekClient:
         messages: list[ChatMessage],
         chat_label: str = "QQ 群聊",
     ) -> MidMemoryDraft:
-        context = "\n".join(_format_message(msg) for msg in messages)
+        context = "\n".join(
+            f"[message_id:{msg.id}] {_format_message(msg)}"
+            for msg in messages
+        )
         system = self.prompts.render("mid_memory", "system")
         user = self.prompts.render(
             "mid_memory",
@@ -661,7 +716,7 @@ class DeepSeekClient:
                 ],
             },
         )
-        return _parse_mid_memory(response.choices[0].message.content or "")
+        return _parse_mid_memory(response.choices[0].message.content or "", messages=messages)
 
     async def learn_style_rules(
         self,
@@ -934,17 +989,151 @@ def _normalize_reaction_name(value: str) -> str:
     } else ""
 
 
-def _parse_mid_memory(content: str) -> MidMemoryDraft:
+def _parse_mid_memory(
+    content: str,
+    *,
+    messages: list[ChatMessage] | None = None,
+) -> MidMemoryDraft:
     try:
-        raw = json.loads(content)
+        raw = _loads_json_object(content)
     except json.JSONDecodeError:
         return MidMemoryDraft("", ())
     summary = str(raw.get("summary", "")).strip()
     raw_cues = raw.get("recall_cues", [])
     if not isinstance(raw_cues, list):
         raw_cues = []
-    cues = tuple(str(cue).strip() for cue in raw_cues if str(cue).strip())[:5]
-    return MidMemoryDraft(summary, cues)
+    cues = tuple(str(cue).strip()[:100] for cue in raw_cues if str(cue).strip())[:5]
+    return MidMemoryDraft(
+        summary[:1200],
+        cues,
+        _parse_memory_fact_list(raw.get("facts"), messages=messages, default_kind="fact", limit=12),
+        _parse_memory_fact_list(
+            raw.get("member_deltas"), messages=messages, default_kind="member_delta", limit=10
+        ),
+        _parse_memory_fact_list(
+            raw.get("jargon_candidates"), messages=messages, default_kind="jargon_candidate", limit=6
+        ),
+        _parse_memory_fact_list(
+            raw.get("open_threads"), messages=messages, default_kind="open_thread", limit=6
+        ),
+    )
+
+
+def _parse_daily_review(
+    content: str,
+    *,
+    messages: list[ChatMessage] | None = None,
+    max_chars: int = 520,
+) -> DailyReviewDraft:
+    try:
+        raw = _loads_json_object(content)
+    except json.JSONDecodeError:
+        return DailyReviewDraft(_sanitize_reply(content, max_chars))
+    public_reply = _sanitize_reply(str(raw.get("public_reply", "")), max_chars)
+    if not public_reply:
+        public_reply = _sanitize_reply(str(raw.get("reply", "")), max_chars)
+    return DailyReviewDraft(
+        public_reply=public_reply,
+        events=_parse_memory_fact_list(raw.get("events"), messages=messages, default_kind="event", limit=12),
+        member_changes=_parse_memory_fact_list(
+            raw.get("member_changes"), messages=messages, default_kind="member_delta", limit=10
+        ),
+        jargon_candidates=_parse_memory_fact_list(
+            raw.get("jargon_candidates"), messages=messages, default_kind="jargon_candidate", limit=6
+        ),
+        feedback_lessons=_parse_memory_fact_list(
+            raw.get("feedback_lessons"), messages=messages, default_kind="feedback_lesson", limit=8
+        ),
+        style_observations=_parse_memory_fact_list(
+            raw.get("style_observations"), messages=messages, default_kind="style_observation", limit=8
+        ),
+    )
+
+
+def _parse_memory_fact_list(
+    value: object,
+    *,
+    messages: list[ChatMessage] | None,
+    default_kind: str,
+    limit: int,
+) -> tuple[MemoryFactDraft, ...]:
+    if not isinstance(value, list):
+        return ()
+    by_message_id = {message.id: message for message in (messages or []) if message.id > 0}
+    valid_ids = set(by_message_id)
+    facts: list[MemoryFactDraft] = []
+    seen: set[tuple[str, str, int | None, int | None]] = set()
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        content = re.sub(r"\s+", " ", str(item.get("content", ""))).strip()[:320]
+        if not content:
+            continue
+        kind = re.sub(r"[^a-z0-9_-]+", "_", str(item.get("kind", default_kind)).strip().lower())[:32]
+        kind = kind or default_kind
+        evidence_ids = _parse_positive_ints(item.get("source_message_ids"), limit=8)
+        if valid_ids:
+            evidence_ids = tuple(message_id for message_id in evidence_ids if message_id in valid_ids)
+        subject_message_id = _optional_positive_int(item.get("subject_message_id"))
+        object_message_id = _optional_positive_int(item.get("object_message_id"))
+        subject_user_id = by_message_id.get(subject_message_id).user_id if subject_message_id in by_message_id else None
+        object_user_id = by_message_id.get(object_message_id).user_id if object_message_id in by_message_id else None
+        if subject_message_id in valid_ids and subject_message_id not in evidence_ids:
+            evidence_ids = (subject_message_id, *evidence_ids)[:8]
+        confidence = _bounded_float(item.get("confidence"), default=0.7)
+        importance = _bounded_float(item.get("importance"), default=0.5)
+        valid_for_days = _optional_positive_int(item.get("valid_for_days"))
+        if valid_for_days is not None:
+            valid_for_days = min(valid_for_days, 3650)
+        key = (kind, content.casefold(), subject_user_id, object_user_id)
+        if key in seen:
+            continue
+        seen.add(key)
+        facts.append(
+            MemoryFactDraft(
+                kind=kind,
+                content=content,
+                subject_user_id=subject_user_id,
+                object_user_id=object_user_id,
+                evidence_message_ids=evidence_ids,
+                confidence=confidence,
+                importance=importance,
+                valid_for_days=valid_for_days,
+            )
+        )
+        if len(facts) >= limit:
+            break
+    return tuple(facts)
+
+
+def _parse_positive_ints(value: object, *, limit: int) -> tuple[int, ...]:
+    if not isinstance(value, list):
+        return ()
+    result: list[int] = []
+    for raw in value:
+        parsed = _optional_positive_int(raw)
+        if parsed is None or parsed in result:
+            continue
+        result.append(parsed)
+        if len(result) >= limit:
+            break
+    return tuple(result)
+
+
+def _optional_positive_int(value: object) -> int | None:
+    try:
+        parsed = int(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return parsed if parsed > 0 else None
+
+
+def _bounded_float(value: object, *, default: float) -> float:
+    try:
+        parsed = float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError, OverflowError):
+        return default
+    return max(0.0, min(1.0, parsed))
 
 
 def _parse_member_profile_draft(content: str) -> MemberProfileDraft:

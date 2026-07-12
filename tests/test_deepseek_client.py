@@ -7,8 +7,10 @@ from qq_social_agent.deepseek_client import (
     DeepSeekClient,
     _log_llm_usage,
     _parse_jargon_terms,
+    _parse_daily_review,
     _parse_long_message_summary,
     _parse_member_profile_draft,
+    _parse_mid_memory,
     _parse_reply_candidates,
     _parse_reply_decision,
     _sanitize_reply,
@@ -384,6 +386,40 @@ def test_parse_member_profile_draft() -> None:
     assert draft.interests == ("股票", "代码")
     assert draft.speaking_style == "短句吐槽"
     assert draft.representative_texts == ("股票又亏了",)
+
+
+def test_parse_mid_memory_keeps_evidence_and_maps_subject() -> None:
+    messages = [
+        ChatMessage(1, 123456, "小鸟", "我最近喜欢画画", False, 1000.0, id=41),
+        ChatMessage(1, 999999, "路人", "她还喜欢摄影", False, 1001.0, id=42),
+    ]
+    draft = _parse_mid_memory(
+        '{"summary":"小鸟聊爱好","recall_cues":["小鸟 画画"],"facts":['
+        '{"kind":"preference","content":"小鸟最近喜欢画画","subject_message_id":41,'
+        '"source_message_ids":[41,999],"confidence":1.5,"importance":0.8}]}' ,
+        messages=messages,
+    )
+
+    assert draft.summary == "小鸟聊爱好"
+    assert len(draft.facts) == 1
+    assert draft.facts[0].subject_user_id == 123456
+    assert draft.facts[0].evidence_message_ids == (41,)
+    assert draft.facts[0].confidence == 1.0
+
+
+def test_parse_daily_review_separates_public_reply_from_internal_learning() -> None:
+    messages = [ChatMessage(1, 123456, "小鸟", "把这个叫乌木", False, 1000.0, id=51)]
+    draft = _parse_daily_review(
+        '{"public_reply":"今天又学了个怪词。","events":[],"member_changes":[],'
+        '"jargon_candidates":[{"content":"乌木是群内称呼","subject_message_id":51,'
+        '"source_message_ids":[51],"confidence":0.8,"importance":0.6}],'
+        '"feedback_lessons":[{"content":"少说客服腔","confidence":0.9,"importance":0.9}]}' ,
+        messages=messages,
+    )
+
+    assert draft.public_reply == "今天又学了个怪词。"
+    assert draft.jargon_candidates[0].evidence_message_ids == (51,)
+    assert draft.feedback_lessons[0].kind == "feedback_lesson"
 
 
 def test_parse_reply_candidates_logs_diagnostic_when_short(monkeypatch) -> None:
