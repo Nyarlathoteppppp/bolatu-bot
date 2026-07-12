@@ -81,6 +81,25 @@ def test_familiar_direct_cue_can_poke() -> None:
     assert result.policy_reason == "familiar_direct_cue"
 
 
+def test_ai_selected_poke_can_target_unfamiliar_user_with_hard_limits_intact() -> None:
+    service = _service()
+    bot = FakeBot()
+
+    result = asyncio.run(
+        service.poke_user(
+            bot,
+            group_id=100,
+            user_id=99999,
+            context=PokeContext(ai_selected=True),
+            now=1000.0,
+        )
+    )
+
+    assert result.sent
+    assert result.policy_reason == "ai_selected_poke"
+    assert bot.calls == [("send_poke", {"user_id": 99999, "group_id": 100})]
+
+
 def test_unfamiliar_user_without_reciprocal_signal_is_denied() -> None:
     service = _service()
     bot = FakeBot()

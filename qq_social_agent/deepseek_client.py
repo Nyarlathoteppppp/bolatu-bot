@@ -112,6 +112,7 @@ SOCIAL_ACTIONS = {
     "market_check",
     "fresh_context",
     "react",
+    "poke",
 }
 
 LLMUsageRecorder = Callable[[str, str, Optional[int], Optional[int], Optional[int]], None]
@@ -936,6 +937,8 @@ def _normalize_action(value: str, *, should_reply: bool) -> str:
         "question": "ask_back",
         "mock_repeated_question": "reply",
         "repeat_mock": "reply",
+        "poke": "poke",
+        "戳一戳": "poke",
         "observe": "observe",
         "旁观": "observe",
         "冒泡": "observe",

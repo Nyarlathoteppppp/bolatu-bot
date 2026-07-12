@@ -33,6 +33,7 @@ class ReactionResult:
 @dataclass(frozen=True)
 class PokeContext:
     was_poked: bool = False
+    ai_selected: bool = False
     directly_cued: bool = False
     familiar_user: bool = False
     playful_banter: bool = False
@@ -128,6 +129,8 @@ class SocialActionService:
         familiar = bool(context.familiar_user or user_id in self.poke_familiar_user_ids)
         if context.was_poked:
             return "reciprocal_poke"
+        if context.ai_selected:
+            return "ai_selected_poke"
         if familiar and context.directly_cued:
             return "familiar_direct_cue"
         if familiar and context.playful_banter:

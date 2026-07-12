@@ -85,7 +85,7 @@ social_actions:
     applause: "99"
     heart: "66"
   poke:
-    enabled: false
+    enabled: true
     familiar_user_ids:
       - 1535071184
       - 184589072
@@ -93,6 +93,13 @@ social_actions:
     per_group_cooldown_seconds: 1800
     per_user_cooldown_seconds: 7200
     max_per_group_day: 4
+
+daily_review:
+  timezone: Asia/Shanghai
+  hour: 0
+  minute: 0
+  catch_up_hours: 12
+  message_limit: 140
 
 image_ocr:
   enabled: true

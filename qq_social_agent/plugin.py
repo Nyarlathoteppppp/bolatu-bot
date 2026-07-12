@@ -7,7 +7,9 @@ import random
 import re
 import time
 from dataclasses import dataclass, replace
+from datetime import datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
 from nonebot import get_driver, logger, on_command, on_message, on_notice
@@ -234,9 +236,19 @@ GROUP_HISTORY_BACKFILL_COUNT = int(app_config.raw.get("history_sync", {}).get("b
 GROUP_HISTORY_BACKFILL_ENABLED = bool(app_config.raw.get("history_sync", {}).get("enabled", True))
 IMAGE_OCR_CONTEXT_PREFIX = "[图片OCR:"
 SUPPRESSION_EVENTS_LIMIT = 80
-DAILY_REVIEW_HOUR = 0
-DAILY_REVIEW_MINUTE = 0
-DAILY_REVIEW_MESSAGE_LIMIT = 140
+_daily_review_config = app_config.raw.get("daily_review", {})
+if not isinstance(_daily_review_config, dict):
+    _daily_review_config = {}
+DAILY_REVIEW_TIMEZONE_NAME = str(_daily_review_config.get("timezone", "Asia/Shanghai"))
+try:
+    DAILY_REVIEW_TIMEZONE = ZoneInfo(DAILY_REVIEW_TIMEZONE_NAME)
+except Exception:
+    DAILY_REVIEW_TIMEZONE_NAME = "Asia/Shanghai"
+    DAILY_REVIEW_TIMEZONE = ZoneInfo(DAILY_REVIEW_TIMEZONE_NAME)
+DAILY_REVIEW_HOUR = int(_daily_review_config.get("hour", 0)) % 24
+DAILY_REVIEW_MINUTE = int(_daily_review_config.get("minute", 0)) % 60
+DAILY_REVIEW_CATCH_UP_SECONDS = max(0, int(float(_daily_review_config.get("catch_up_hours", 12)) * 3600))
+DAILY_REVIEW_MESSAGE_LIMIT = max(20, int(_daily_review_config.get("message_limit", 140)))
 ADDRESS_REPEAT_WINDOW_SECONDS = 10 * 60
 MENTION_TARGET_LIMIT = 8
 REPEAT_MENTION_SUPPRESS_SECONDS = 10 * 60
@@ -827,6 +839,8 @@ def _ensure_daily_review_task(bot: Bot) -> None:
 
 async def _run_daily_review_scheduler(bot: Bot, bot_key: str) -> None:
     try:
+        if _daily_review_within_catch_up_window():
+            await _send_due_daily_reviews(bot)
         while True:
             await asyncio.sleep(_seconds_until_next_daily_review())
             await _send_due_daily_reviews(bot)
@@ -848,6 +862,12 @@ def _seconds_until_next_daily_review(now: float | None = None) -> float:
     if current - target <= 90:
         return 1.0
     return max(1.0, target + 24 * 60 * 60 - current)
+
+
+def _daily_review_within_catch_up_window(now: float | None = None) -> bool:
+    current = time.time() if now is None else now
+    target = _local_timestamp_for_today(DAILY_REVIEW_HOUR, DAILY_REVIEW_MINUTE, now=current)
+    return 0 <= current - target <= DAILY_REVIEW_CATCH_UP_SECONDS
 
 
 async def _send_due_daily_reviews(bot: Bot) -> None:
@@ -1028,8 +1048,8 @@ def _daily_review_window(now: float) -> tuple[float, float, str]:
     if now < end_at:
         end_at -= 24 * 60 * 60
     start_at = end_at - 24 * 60 * 60
-    local_end = time.localtime(end_at - 1)
-    label = f"{local_end.tm_year:04d}-{local_end.tm_mon:02d}-{local_end.tm_mday:02d}"
+    local_end = datetime.fromtimestamp(end_at - 1, DAILY_REVIEW_TIMEZONE)
+    label = f"{local_end.year:04d}-{local_end.month:02d}-{local_end.day:02d}"
     return start_at, end_at, label
 
 
@@ -1041,8 +1061,8 @@ def _local_day_start_and_label(now: float) -> tuple[float, str]:
 
 
 def _local_timestamp_for_today(hour: int, minute: int, *, now: float) -> float:
-    local = time.localtime(now)
-    return time.mktime((local.tm_year, local.tm_mon, local.tm_mday, hour, minute, 0, -1, -1, -1))
+    local = datetime.fromtimestamp(now, DAILY_REVIEW_TIMEZONE)
+    return local.replace(hour=hour, minute=minute, second=0, microsecond=0).timestamp()
 
 
 def _is_owner_user(user_id: int) -> bool:
@@ -2775,6 +2795,16 @@ async def _handle_group_message_locked(
         )
         return
 
+    if decision.action == "poke":
+        await _execute_poke_action(
+            bot,
+            group_id=group_id,
+            user_id=user_id,
+            nickname=nickname,
+            text=text,
+        )
+        return
+
     if not memory_context:
         memory_context = _format_memory_context(
             memory.relevant_memory_summaries(
@@ -4104,6 +4134,75 @@ async def _deep_url_context_for(text: str, *, addressed_bot: bool) -> str:
         error=read.error if read is not None else result.reason,
     )
     return result.context
+
+
+async def _execute_poke_action(
+    bot: Bot,
+    *,
+    group_id: int,
+    user_id: int,
+    nickname: str,
+    text: str,
+) -> None:
+    try:
+        result = await social_action_service.poke_user(
+            bot,
+            group_id=group_id,
+            user_id=user_id,
+            context=PokeContext(ai_selected=True),
+        )
+    except ActionFailed as exc:
+        logger.warning(
+            "qq_social_agent AI poke failed: "
+            f"group={group_id} user={user_id} {_action_failed_summary(exc)}"
+        )
+        _record_metric_event(
+            "social_action",
+            group_id=group_id,
+            user_id=user_id,
+            stage="poke",
+            action="failed",
+            error=_action_failed_summary(exc),
+        )
+        return
+    except Exception as exc:
+        logger.warning(
+            "qq_social_agent AI poke failed: "
+            f"group={group_id} user={user_id} error={exc}"
+        )
+        _record_metric_event(
+            "social_action",
+            group_id=group_id,
+            user_id=user_id,
+            stage="poke",
+            action="failed",
+            error=str(exc)[:160],
+        )
+        return
+    _record_metric_event(
+        "social_action",
+        group_id=group_id,
+        user_id=user_id,
+        stage="poke",
+        action="sent" if result.sent else "skipped",
+        reason=result.reason,
+        policy_reason=result.policy_reason,
+    )
+    logger.info(
+        "qq_social_agent AI poke result: "
+        f"group={group_id} user={user_id} sent={result.sent} "
+        f"reason={result.reason} policy={result.policy_reason}"
+    )
+    if not result.sent:
+        await _send_approval_suppression_notice(
+            bot,
+            group_id=group_id,
+            user_id=user_id,
+            nickname=nickname,
+            text=text,
+            stage="social_action_poke",
+            reason=f"AI 选择戳一戳但后端限频未执行：{result.reason}",
+        )
 
 
 async def _execute_reaction_action(
@@ -6424,7 +6523,7 @@ def _enforce_addressed_reply_decision(
     )
     action = decision.action
     if action in {"", "ignore", "observe", "react", "mock_repeated_question"} or (
-        looks_like_question and action in {"tease", "ask_back"}
+        looks_like_question and action in {"tease", "ask_back", "poke"}
     ):
         action = "answer"
     if decision.should_reply and action == decision.action:

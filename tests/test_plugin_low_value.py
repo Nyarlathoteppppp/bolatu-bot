@@ -821,13 +821,21 @@ def test_passive_decision_gate_allows_after_thirty_second_gap() -> None:
 
 
 def test_daily_review_window_uses_previous_24h_at_midnight() -> None:
-    midnight = time.mktime((2026, 7, 11, 0, 0, 0, -1, -1, -1))
+    midnight = 1783699200.0  # 2026-07-11 00:00:00 Asia/Shanghai
 
     start_at, end_at, label = _daily_review_window(midnight + 1)
 
     assert start_at == midnight - 24 * 60 * 60
     assert end_at == midnight
     assert label == "2026-07-10"
+
+
+def test_daily_review_timezone_and_startup_catchup_use_shanghai_midnight() -> None:
+    midnight = 1783872000.0  # 2026-07-13 00:00:00 Asia/Shanghai
+
+    assert plugin._local_timestamp_for_today(0, 0, now=midnight + 3600) == midnight
+    assert plugin._daily_review_within_catch_up_window(midnight + 3600)
+    assert not plugin._daily_review_within_catch_up_window(midnight + 13 * 3600)
 
 
 def test_meaningful_group_text_not_low_value() -> None:

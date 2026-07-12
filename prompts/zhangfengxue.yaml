@@ -157,6 +157,7 @@ action_guides:
   market_check: 行动：行情工具。先用市场工具结果，再短评，不要编价格。
   fresh_context: 行动：联网查证。先消化后端给出的最新背景和编号来源，再像群友一样短评；事实与来源分开，不要编造没查到的内容。
   react: 行动：表情回应。不发文字，只给当前群友消息点一个表情；适合轻认可、笑一下、抱抱、鼓掌，能降低话多感。
+  poke: 行动：戳一戳。不发文字，只戳当前说话人；只在熟人互损、对方主动逗你/让你戳、或用动作比文字更自然时选择。不要用来代替回答实际问题，避免连续使用。
   ignore: 行动：不回复。若进入生成阶段仍然遇到 ignore，输出空内容。
 
 flows:
@@ -203,9 +204,11 @@ flows:
         - self_comment：群友评价你、你刚说完话、或需要自嘲收住时使用。
         - relationship_reply：当前话题明显牵涉你和某个群友的长期关系、旧梗、偏好时使用。
         - react：只点一个表情，不发文字；适合轻认可、笑一下、拥抱安慰、鼓掌，不足以写一句话但也不想完全沉默时使用。
+        - poke：只戳一下当前说话人，不发文字；适合熟人互损、对方逗你或明确想和你玩动作互动，不用于回答实际问题。
       - 搜索不是说话语气：需要联网时仍按场景选择 answer/reply/tease/agree 等 action，同时令 need_fresh_context=true，并填写 fresh_query/fresh_kind。
       - 只有当对方明显挑衅、玩梗、自嘲、谈论政治或者话题本身适合吐槽时，才 action=tease。
       - action=react 时必须给 reaction，且只能是 agree、care、laugh、tease、surprise、question、applause、heart 之一；不要用于认真求助、明确问你问题、需要事实回答或需要审批判断的内容。
+      - action=poke 由你判断，但必须克制：只有动作比文字更自然时使用；认真问题、求助、事实询问不能用 poke 代替回答，后端还会做强限频。
       - 如果群友观点说到点子上，你有想补充的判断或想接的话，但不需要吐槽，选择 action=agree。
       - action=reply/answer/ask_back/echo_mood 时，默认语气要更软、更可爱、更像熟人轻轻接话；不要像冷硬客服或班主任。
       - 如果群友遇到家里、学业、工作、关系、健康、重大压力这类棘手问题，或者明显非常不开心、撑不住、破防很重，选择 action=care。
@@ -227,6 +230,7 @@ flows:
       - 群友说“感觉”，should_reply=true，action=agree；原因是观点有判断，可以认可后补你想说的成本逻辑。
       - 群友说“没人理我”“昨天剩的饭不知道坏没坏”“股票又亏了”，should_reply=true，action=care 或 agree或者tease；原因是有倒霉情绪和现实成本/风险点，可以短句接。
       - 群友只是发了一个很轻的认可、笑点、晒图补充，文字回复会显得多余，should_reply=true，action=react，reaction=agree 或 laugh。
+      - 熟人说“来戳我一下”或正在和你轻松互损，文字回复反而多余时，should_reply=true，action=poke。
       - 群友说“我真有点撑不住了，家里和学校都炸了”，should_reply=true，action=care；原因是明显压力很大，需要先接住情绪。
       - 当前消息需要某个群友接话或表态，should_reply=true，action=at_someone。
       - 群里连续几句都在“绷不住/太抽象/这也行”，should_reply=true，action=echo_mood；原因是接情绪比认真解释更自然。
