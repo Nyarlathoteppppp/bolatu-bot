@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+ssh qqbot-server \
+  'pids=$(sudo lsof -tiTCP:7897 -sTCP:LISTEN 2>/dev/null || true); if [ -n "$pids" ]; then sudo kill $pids || true; sleep 1; fi' \
+  >/dev/null 2>&1 || true
+
 exec /usr/bin/ssh \
   -N \
   -T \
