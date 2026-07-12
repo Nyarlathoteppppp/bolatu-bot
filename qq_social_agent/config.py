@@ -44,6 +44,13 @@ class DeepSeekConfig:
     temperature: float
     max_tokens: int
     timeout_seconds: int
+    decision_timeout_seconds: float
+    decision_total_timeout_seconds: float
+    reply_timeout_seconds: float
+    reply_total_timeout_seconds: float
+    utility_timeout_seconds: float
+    utility_total_timeout_seconds: float
+    max_retries: int
     providers: dict[str, LLMProviderConfig]
     routes: dict[str, LLMModelRoute]
     fallback_routes: dict[str, LLMModelRoute]
@@ -160,6 +167,13 @@ class AppConfig:
             temperature=float(deepseek.get("temperature", 0.72)),
             max_tokens=int(deepseek.get("max_tokens", 220)),
             timeout_seconds=int(deepseek.get("timeout_seconds", 30)),
+            decision_timeout_seconds=float(deepseek.get("decision_timeout_seconds", 10)),
+            decision_total_timeout_seconds=float(deepseek.get("decision_total_timeout_seconds", 18)),
+            reply_timeout_seconds=float(deepseek.get("reply_timeout_seconds", 18)),
+            reply_total_timeout_seconds=float(deepseek.get("reply_total_timeout_seconds", 28)),
+            utility_timeout_seconds=float(deepseek.get("utility_timeout_seconds", 8)),
+            utility_total_timeout_seconds=float(deepseek.get("utility_total_timeout_seconds", 12)),
+            max_retries=max(0, min(2, int(deepseek.get("max_retries", 0)))),
             providers=providers,
             routes=routes,
             fallback_routes=fallback_routes,

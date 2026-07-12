@@ -6,7 +6,7 @@ import json
 import random
 import re
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -128,6 +128,12 @@ deep_content_tool = DeepContentTool.from_config(
     (app_config.raw.get("content_tools", {}) or {}).get("deep_url_reader", {})
     if isinstance(app_config.raw.get("content_tools", {}), dict)
     else {}
+)
+_jargon_selection_config = app_config.raw.get("jargon_selection", {})
+JARGON_LLM_SELECTOR_ENABLED = bool(
+    _jargon_selection_config.get("llm_selector_enabled", False)
+    if isinstance(_jargon_selection_config, dict)
+    else False
 )
 cue_pattern_tracker = CuePatternTracker(window_seconds=10 * 60)
 deepseek_client: DeepSeekClient | None = None
@@ -362,6 +368,17 @@ MEMORY_ATOM_ADD_RE = re.compile(
     re.DOTALL,
 )
 MEMORY_ATOM_DELETE_RE = re.compile(r"^(?:/)?(?:删记忆单元|删长期记忆|删记忆)\s*[:：]?\s*(?P<atom_id>\d+)$")
+MEMORY_ATOM_CORRECT_RE = re.compile(
+    r"^(?:/)?(?:纠正记忆单元|纠正长期记忆|纠正记忆)\s+(?P<atom_id>\d+)\s*[:：]\s*(?P<content>.+)$",
+    re.DOTALL,
+)
+MEMORY_ATOM_DISPUTE_RE = re.compile(
+    r"^(?:/)?(?:反证记忆单元|反证长期记忆|反证记忆)\s+(?P<atom_id>\d+)\s*[:：]\s*(?P<content>.+)$",
+    re.DOTALL,
+)
+MEMORY_ATOM_AUDIT_RE = re.compile(
+    r"^(?:/)?(?:记忆证据|记忆审计|记忆历史)\s+(?P<atom_id>\d+)$"
+)
 PRIVATE_CONTEXT_RESET_COMMANDS = {
     "清空上下文",
     "清空背景",
@@ -1635,6 +1652,15 @@ def _http_status_payload() -> dict[str, object]:
         "llm": {
             "ready": deepseek_ready,
             "routes": _status_model_routes(),
+            "latency_policy": {
+                "decision_attempt_seconds": app_config.deepseek.decision_timeout_seconds,
+                "decision_total_seconds": app_config.deepseek.decision_total_timeout_seconds,
+                "reply_attempt_seconds": app_config.deepseek.reply_timeout_seconds,
+                "reply_total_seconds": app_config.deepseek.reply_total_timeout_seconds,
+                "utility_attempt_seconds": app_config.deepseek.utility_timeout_seconds,
+                "utility_total_seconds": app_config.deepseek.utility_total_timeout_seconds,
+                "sdk_max_retries": app_config.deepseek.max_retries,
+            },
         },
         "search": fresh_context_tool.status_snapshot(),
         "ocr": _status_image_ocr(),
@@ -2282,7 +2308,7 @@ async def _handle_group_message_locked(
     if not buffered_messages and addressed_bot_hint and _event_has_reply_context(event):
         replied_to_bot = True
     addressed_bot = mentioned or replied_to_bot or (False if buffered_messages else bool(addressed_bot_hint))
-    addressed_repeat_count = _record_addressed_event(group_id, user_id, addressed_bot)
+    addressed_repeat_count = 1 if addressed_bot else 0
 
     if not buffered_messages and replied_to_bot and _is_low_value_reply_to_bot_event(event):
         plain_reply_text = _plain_text(event)
@@ -2424,12 +2450,7 @@ async def _handle_group_message_locked(
     else:
         _mark_passive_decision_forced(group_id)
 
-    cue_repeat_state = cue_pattern_tracker.record(
-        group_id=group_id,
-        user_id=user_id,
-        text=text,
-        addressed=addressed_bot,
-    )
+    cue_repeat_state = None
     decision_started_at = time.monotonic()
     logger.info(
         "qq_social_agent group decision start: "
@@ -2450,7 +2471,12 @@ async def _handle_group_message_locked(
 
     recent = memory.recent_messages(group_id, app_config.context_limit)
     context_recent = _without_current_message(recent, user_id=user_id, text=text)
-    rate = rate_limiter.allow(group_id, mentioned=addressed_bot)
+    event_at = (
+        _buffered_last_created_at(buffered_messages)
+        if buffered_messages
+        else float(getattr(event, "time", 0) or time.time())
+    )
+    rate = rate_limiter.allow(group_id, mentioned=addressed_bot, event_at=event_at)
     if not rate.allowed:
         logger.info(f"qq_social_agent suppressed by rate: group={group_id} reason={rate.reason}")
         await _send_approval_suppression_notice(
@@ -2688,6 +2714,11 @@ async def _handle_group_message_locked(
         text=text,
         market_intents=market_intents,
         fresh_intent=fresh_intent,
+    )
+    decision = _enforce_addressed_reply_decision(
+        decision,
+        addressed_bot=addressed_bot,
+        text=text,
     )
     if addressed_bot and "非点名" in decision.reason:
         logger.warning(
@@ -5134,14 +5165,24 @@ def _format_memory_atom_report(group_id: int | None, limit: int) -> str:
             f"{atom.id}. [{atom.atom_type}{subject}{obj}] "
             f"重要度{atom.importance:.1f}/置信{atom.confidence:.1f}：{_short_notice_text(atom.content, 120)}"
         )
-        lines.append(f"   来源：{atom.source}；更新：{_format_local_time(atom.updated_at)}")
+        evidence = atom.evidence_type
+        if atom.source_message_id:
+            evidence += f"/{atom.source_message_id}"
+        validity = "长期有效" if atom.valid_to is None else f"有效至 {_format_local_time(atom.valid_to)}"
+        lines.append(
+            f"   状态：{atom.status}；证据：{evidence}；{validity}；"
+            f"来源：{atom.source}；更新：{_format_local_time(atom.updated_at)}"
+        )
     return "\n".join(lines)
 
 
 def _handle_memory_atom_command_text(user_id: int, group_id: int | None, text: str) -> str | None:
     add_match = MEMORY_ATOM_ADD_RE.match(text)
     delete_match = MEMORY_ATOM_DELETE_RE.match(text)
-    if add_match is None and delete_match is None:
+    correct_match = MEMORY_ATOM_CORRECT_RE.match(text)
+    dispute_match = MEMORY_ATOM_DISPUTE_RE.match(text)
+    audit_match = MEMORY_ATOM_AUDIT_RE.match(text)
+    if all(match is None for match in (add_match, delete_match, correct_match, dispute_match, audit_match)):
         return None
     if group_id is None:
         return "没找到要写入的群。"
@@ -5159,10 +5200,55 @@ def _handle_memory_atom_command_text(user_id: int, group_id: int | None, text: s
             subject_user_id=user_id,
             confidence=0.9,
             importance=0.8,
+            evidence_type="manual",
+            observed_at=time.time(),
         )
         return f"已写入记忆单元：{atom_id}"
+    if audit_match is not None:
+        atom_id = int(audit_match.group("atom_id"))
+        atom = memory.memory_atom(atom_id)
+        if atom is None:
+            return "没找到这个记忆单元。"
+        events = memory.memory_atom_audit_trail(atom_id, limit=20)
+        lines = [f"记忆证据 #{atom.id}：[{atom.status}] {_short_notice_text(atom.content, 160)}"]
+        for event in events:
+            evidence = event.evidence_type
+            if event.source_message_id:
+                evidence += f"/{event.source_message_id}"
+            actor = f" operator={event.actor_user_id}" if event.actor_user_id is not None else ""
+            lines.append(
+                f"- {_format_local_time(event.created_at)} {event.action} "
+                f"evidence={evidence}{actor}：{_short_notice_text(event.detail, 120)}"
+            )
+        return "\n".join(lines)
+    if correct_match is not None:
+        atom_id = int(correct_match.group("atom_id"))
+        new_atom_id = memory.correct_memory_atom(
+            atom_id,
+            content=correct_match.group("content").strip(),
+            source=f"manual_correction:{user_id}",
+            actor_user_id=user_id,
+            reason="工具管理员手动纠正",
+            confidence=1.0,
+        )
+        return (
+            f"已纠正记忆：旧 #{atom_id} 已封存，新记忆 #{new_atom_id}。"
+            if new_atom_id
+            else "没找到可纠正的有效记忆，或它已被替换/过期。"
+        )
+    if dispute_match is not None:
+        atom_id = int(dispute_match.group("atom_id"))
+        disputed = memory.dispute_memory_atom(
+            atom_id,
+            content=dispute_match.group("content").strip(),
+            source=f"manual_counter_evidence:{user_id}",
+            evidence_type="manual",
+            actor_user_id=user_id,
+            confidence=1.0,
+        )
+        return "已记录反证，这条记忆暂停注入，等待纠正。" if disputed else "没找到这个记忆单元。"
     atom_id = int(delete_match.group("atom_id"))
-    return "已删除记忆单元。" if memory.delete_memory_atom(atom_id) else "没找到这个记忆单元。"
+    return "已将记忆软过期并保留审计记录。" if memory.delete_memory_atom(atom_id) else "没找到这个记忆单元。"
 
 
 def _member_label(user_id: int, nickname: str) -> str:
@@ -5211,8 +5297,13 @@ async def _selected_group_jargon_context(
             "heuristic=() selected=() injected=False skipped=no_current_hit"
         )
         return ""
-    if deepseek_client is None:
-        return group_jargon_context(heuristic_terms, extra_entries=custom_entries)
+    if deepseek_client is None or not JARGON_LLM_SELECTOR_ENABLED:
+        context = group_jargon_context(heuristic_terms, extra_entries=custom_entries)
+        logger.info(
+            "qq_social_agent jargon selector: "
+            f"heuristic={heuristic_terms} selected={heuristic_terms} injected={bool(context)} mode=local"
+        )
+        return context
     try:
         selected_terms = await deepseek_client.select_jargon_terms(
             recent_messages=recent_messages[-JARGON_CONTEXT_LOOKBACK:],
@@ -5452,7 +5543,7 @@ def _fallback_approval_candidate_texts(action: str) -> tuple[str, ...]:
             "简单说，这事要看成本和后果。",
             "先别绕，核心就是值不值。",
         )
-    if action in {"tease", "mock_repeated_question"}:
+    if action == "tease":
         return (
             "风雪觉得这事有点抽象。",
             "这也太会给自己加戏了。",
@@ -5570,6 +5661,9 @@ def _is_private_tool_text(text: str) -> bool:
         or MEMORY_ATOM_REPORT_COMMAND_RE.match(text) is not None
         or MEMORY_ATOM_ADD_RE.match(text) is not None
         or MEMORY_ATOM_DELETE_RE.match(text) is not None
+        or MEMORY_ATOM_CORRECT_RE.match(text) is not None
+        or MEMORY_ATOM_DISPUTE_RE.match(text) is not None
+        or MEMORY_ATOM_AUDIT_RE.match(text) is not None
         or APPROVER_ADD_RE.match(text) is not None
         or APPROVER_DELETE_RE.match(text) is not None
         or _parse_metric_report_command(text) is not None
@@ -6311,6 +6405,36 @@ def _record_bot_sent_message(
         trigger_user_id=trigger_user_id,
         trigger_nickname=trigger_nickname,
         trigger_text=trigger_text,
+        action=action,
+    )
+
+
+def _enforce_addressed_reply_decision(
+    decision: ReplyDecision,
+    *,
+    addressed_bot: bool,
+    text: str,
+) -> ReplyDecision:
+    clean_text = text.strip()
+    if not addressed_bot or not clean_text:
+        return decision
+    looks_like_question = bool(
+        re.search(r"[?？]", clean_text)
+        or any(token in clean_text for token in ("吗", "么", "什么", "怎么", "为什么", "为啥", "谁", "哪个", "哪种"))
+    )
+    action = decision.action
+    if action in {"", "ignore", "observe", "react", "mock_repeated_question"} or (
+        looks_like_question and action in {"tease", "ask_back"}
+    ):
+        action = "answer"
+    if decision.should_reply and action == decision.action:
+        return decision
+    return replace(
+        decision,
+        should_reply=True,
+        confidence=max(0.6, decision.confidence),
+        reason=f"addressed_reply_required:{decision.reason}",
+        mode="addressed",
         action=action,
     )
 

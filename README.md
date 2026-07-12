@@ -123,13 +123,15 @@ Prompt 在后端启动时加载。修改 Python 代码后使用 `scripts/restart
 
 ## 5. 群聊行为
 
-- 被 @、回复或点名时优先响应。
+- 被 @、回复或点名时优先响应；实际问题由后端保证进入回答流程，即使重复追问也不能用反问或调侃代替答案。
 - 普通群消息先做持久去重，再经过 buffer、工作强度抽样、本地筛选和 LLM decision。
 - bot 连接后会同步群资料/群成员，并补最近群历史；引用消息缺原文时会用 `get_msg` 补全上下文。
-- 行情工具支持美股和加密货币；联网搜索支持 Tavily，并按类型回退 Google News 或 Bing Web RSS，结果保留可核查来源。
+- 行情工具支持美股和加密货币；联网搜索支持 Tavily，并按类型回退 Google News 或 Bing Web RSS，结果保留可核查来源。需要细读时可受限抓取网页正文。
 - decision 可以选择 `react`：只给当前消息点 QQ 表情，不发文字，并受后端限频控制。
-- 普通图片由 SiliconFlow `deepseek-ai/DeepSeek-OCR` 做画面简述、文字转写和梗图含义；商城动画表情默认跳过 OCR。文件/音乐/分享/位置等会保留安全元数据。
-- `GET /healthz`、`GET /readyz` 和 `GET /status` 分别用于存活、就绪和详细运行诊断；服务只绑定本机端口。
+- 普通图片由 SiliconFlow `deepseek-ai/DeepSeek-OCR` 做画面简述、文字转写和梗图含义；商城动画表情默认跳过 OCR。受限读取小型 txt/PDF/docx，语音仅在明确相关时转写，其他富媒体保留安全元数据。
+- 长期记忆带来源、证据、时间、置信度和有效状态，可在私聊工具单中查看证据、纠正、反证或软删除。
+- `GET /healthz`、`GET /readyz` 和 `GET /status` 分别用于存活、就绪和详细运行诊断；`GET /traces` 和 `GET /trace` 用于查看消息链路。服务只绑定本机端口。
+- decision/reply/后台任务分别设置单次与总耗时预算，SDK 自动重试关闭，避免一次模型卡顿把群聊回复拖到近一分钟。
 - 群聊通常生成 3 条候选；审查开启时先私聊审批人。
 
 常用审批操作：

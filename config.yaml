@@ -51,6 +51,13 @@ deepseek:
   temperature: 0.72
   max_tokens: 260
   timeout_seconds: 30
+  decision_timeout_seconds: 10
+  decision_total_timeout_seconds: 18
+  reply_timeout_seconds: 18
+  reply_total_timeout_seconds: 28
+  utility_timeout_seconds: 8
+  utility_total_timeout_seconds: 12
+  max_retries: 0
 
 rate_control:
   min_interval_seconds: 3
@@ -119,6 +126,9 @@ fresh_search:
   query_max_chars: 120
   tavily:
     api_key_env: TAVILY_API_KEY
+
+jargon_selection:
+  llm_selector_enabled: false
 
 group_directory:
   sync_interval_seconds: 21600

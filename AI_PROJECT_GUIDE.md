@@ -104,7 +104,7 @@ Docker / Docker Compose
 │   ├── decision_gate.py           # LLM 前本地预决策、低价值文本、行情硬触发
 │   ├── approval_rules.py          # 审批单、工具单、命令正则和帮助文本
 │   ├── group_jargon.py            # 内置群黑话词典
-│   ├── cue_patterns.py            # 反复 cue/无聊问题识别
+│   ├── cue_patterns.py            # 旧 cue 分类器；不再用于拒答或改写 action
 │   ├── political_guard.py         # 中国政治红线兜底
 │   ├── rate_limiter.py            # 发言频控
 │   ├── reply_splitter.py          # 长回复拆成多条 QQ 消息
@@ -334,7 +334,7 @@ OneBot 扩展入口：
 - `group_directory.py`：bot 连接后同步群信息和群成员，写入 `group_info` / `group_members`。
 - `history_sync.py`：bot 连接后补最近群历史；引用消息缺正文时用 `get_msg` 补原消息。
 - `social_actions.py`：`action=react` 时只点表情，不发文字，并做群/用户/小时限频。
-- `message_segments.py` 统一解析图片/商城表情、文件、音乐、分享、位置、小程序、语音和视频；文件只补安全元数据，不自动下载正文。
+- `message_segments.py` 统一解析图片/商城表情、文件、音乐、分享、位置、小程序、语音和视频；`content_ingestion.py` 在点名/明确请求时受限读取文件正文和转写语音。
 - `media_context.py` 使用 SiliconFlow `deepseek-ai/DeepSeek-OCR` 做图片文字与画面简述；商城动画表情默认不烧 OCR。
 - notice 会结构化写入指标库；进退群、群名片等变更会触发群目录刷新。
 - `/healthz` 检查进程/数据库，`/readyz` 检查数据库/LLM/OneBot，`/status` 提供搜索、网关、OCR、审批和错误摘要。
@@ -638,11 +638,11 @@ qq_social_agent/tools/fresh_context.py
 
 - 普通图片会用 DeepSeek-OCR 输出一句画面概括、可见文字和表情包含义，再并入上下文。
 - 商城动画表情与普通图片分开，默认只保留表情摘要，避免逐个消耗 OCR。
-- 文件、语音、视频、音乐、分享、位置、小程序会保留安全元数据占位；文件正文尚不自动下载或解析。
+- 文件、语音、视频、音乐、分享、位置、小程序会保留安全元数据占位；小型 txt/pdf/docx 可受限读取，语音可经 NapCat 转 mp3 后调用硅基流动 ASR。
 - 非点名且主要是不可读媒体时，不进入 buffer 和 LLM decision。
 - 转发优先读取消息段内嵌 `content/node`，没有内容时再调用 `get_forward_msg`，随后抽取/总结。
 
-当前图片理解依赖外部 DeepSeek-OCR，不做历史图片批量回填；语音还没有转写，PDF/docx/txt 也还没有正文解析。
+当前图片理解依赖外部 DeepSeek-OCR，不做历史图片批量回填；文件/语音只在点名、回复或明确要求时读取，普通群消息不会自动烧接口。
 
 ## 13. 政治兜底
 

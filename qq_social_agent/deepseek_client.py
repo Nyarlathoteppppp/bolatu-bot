@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import re
+import time
 from dataclasses import dataclass
 from typing import Callable, Optional
 
@@ -101,7 +103,6 @@ SOCIAL_ACTIONS = {
     "care",
     "tease",
     "ask_back",
-    "mock_repeated_question",
     "at_someone",
     "observe",
     "echo_mood",
@@ -138,6 +139,7 @@ class DeepSeekClient:
                 api_key=api_key,
                 base_url=provider.base_url,
                 timeout=config.timeout_seconds,
+                max_retries=config.max_retries,
             )
         if not self.clients:
             raise RuntimeError("No LLM API key is configured. Put provider keys in .env.")
@@ -153,7 +155,15 @@ class DeepSeekClient:
     ) -> object:
         routes = self._candidate_routes(route_name)
         last_error: Exception | None = None
+        attempt_timeout, total_timeout = self._task_timeouts(task=task, route_name=route_name)
+        deadline = time.monotonic() + total_timeout
         for route in routes:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                last_error = asyncio.TimeoutError(
+                    f"LLM total timeout after {total_timeout:g}s for task={task}"
+                )
+                break
             client = self.clients.get(route.provider)
             if client is None:
                 logger.warning(
@@ -168,7 +178,12 @@ class DeepSeekClient:
             if extra_body:
                 provider_request["extra_body"] = extra_body
             try:
-                response = await client.chat.completions.create(**provider_request)
+                current_timeout = max(0.25, min(attempt_timeout, remaining))
+                operation = client.with_options(
+                    timeout=current_timeout,
+                    max_retries=0,
+                ).chat.completions.create(**provider_request)
+                response = await asyncio.wait_for(operation, timeout=current_timeout + 0.25)
             except Exception as exc:
                 last_error = exc
                 logger.warning(
@@ -182,6 +197,23 @@ class DeepSeekClient:
         if last_error is not None:
             raise last_error
         raise RuntimeError(f"No available LLM provider for route={route_name}")
+
+    def _task_timeouts(self, *, task: str, route_name: str) -> tuple[float, float]:
+        if route_name == "decision" or task == "decision":
+            attempt = self.config.decision_timeout_seconds
+            total = self.config.decision_total_timeout_seconds
+        elif route_name == "reply" or task in {"reply", "reply_direct", "reply_candidates", "daily_review"}:
+            attempt = self.config.reply_timeout_seconds
+            total = self.config.reply_total_timeout_seconds
+        elif route_name in {"utility", "jargon", "memory", "style", "member_profile"}:
+            attempt = self.config.utility_timeout_seconds
+            total = self.config.utility_total_timeout_seconds
+        else:
+            attempt = float(self.config.timeout_seconds)
+            total = float(self.config.timeout_seconds) * max(1, len(self._candidate_routes(route_name)))
+        attempt = max(1.0, float(attempt))
+        total = max(attempt, float(total))
+        return attempt, total
 
     def _candidate_routes(self, route_name: str) -> tuple[LLMModelRoute, ...]:
         primary = self.route_overrides.get(route_name, self.config.routes[route_name])
@@ -231,16 +263,9 @@ class DeepSeekClient:
         if not context:
             context = "（暂无更多上下文）"
         addressed = mentioned or replied_to_bot
-        interaction_state = "有人艾特或回复了你，这是强信号，但不是必须回复。"
+        interaction_state = "有人艾特或回复了你：必须回应当前实际问题，不得因为对方重复询问而拒答或只反问。"
         if not addressed:
             interaction_state = "当前没有艾特你，也不是回复你，你是在判断要不要自然插话。"
-        elif addressed_repeat_count >= 3:
-            interaction_state = (
-                f"同一个群友在 10 分钟内第 {addressed_repeat_count} 次艾特或回复你；"
-                "这是重复 cue，不要机械回答他问什么。"
-            )
-        if cue_repeat_context:
-            interaction_state = f"{interaction_state}\n反复题型状态：{cue_repeat_context}"
         system = self.prompts.render(
             "decision",
             "system",
@@ -350,14 +375,11 @@ class DeepSeekClient:
         context = "\n".join(_format_message(msg) for msg in context_messages)
         if not context:
             context = "（暂无更多上下文）"
-        mode = "你被直接点名或回复，需要回应。" if mentioned else "你是自然插话，只能在合适时短句接话。"
-        if mentioned and addressed_repeat_count >= 3:
-            mode = (
-                f"同一个群友在 10 分钟内第 {addressed_repeat_count} 次点名或回复你。"
-                "你可以像真人一样先吐槽他反复 cue 你，而不是直接回答问题。"
-            )
-        if mentioned and cue_repeat_context:
-            mode = f"{mode}\n反复题型状态：{cue_repeat_context}"
+        mode = (
+            "你被直接点名或回复，必须先回应当前实际问题；即使对方重复问，也不能只吐槽、拒答或反问。"
+            if mentioned
+            else "你是自然插话，只能在合适时短句接话。"
+        )
         normalized_action = _normalize_action(action, should_reply=True)
         action_guide = self.prompts.action_guide(
             normalized_action,
@@ -516,14 +538,11 @@ class DeepSeekClient:
         context = "\n".join(_format_message(msg) for msg in context_messages)
         if not context:
             context = "（暂无更多上下文）"
-        mode = "你被直接点名或回复，需要回应。" if mentioned else "你是自然插话，只能在合适时短句接话。"
-        if mentioned and addressed_repeat_count >= 3:
-            mode = (
-                f"同一个群友在 10 分钟内第 {addressed_repeat_count} 次点名或回复你。"
-                "你可以像真人一样先吐槽他反复 cue 你，而不是直接回答问题。"
-            )
-        if mentioned and cue_repeat_context:
-            mode = f"{mode}\n反复题型状态：{cue_repeat_context}"
+        mode = (
+            "你被直接点名或回复，必须先回应当前实际问题；即使对方重复问，也不能只吐槽、拒答或反问。"
+            if mentioned
+            else "你是自然插话，只能在合适时短句接话。"
+        )
         normalized_action = _normalize_action(action, should_reply=True)
         action_guide = self.prompts.action_guide(
             normalized_action,
@@ -915,8 +934,8 @@ def _normalize_action(value: str, *, should_reply: bool) -> str:
         "ask": "ask_back",
         "ask_back": "ask_back",
         "question": "ask_back",
-        "mock_repeated_question": "mock_repeated_question",
-        "repeat_mock": "mock_repeated_question",
+        "mock_repeated_question": "reply",
+        "repeat_mock": "reply",
         "observe": "observe",
         "旁观": "observe",
         "冒泡": "observe",
@@ -1483,7 +1502,7 @@ def _fallback_candidate_texts(action: str) -> tuple[str, ...]:
             "简单说，这事要看成本和后果。",
             "先别绕，核心就是值不值。",
         )
-    if action in {"tease", "mock_repeated_question"}:
+    if action == "tease":
         return (
             "风雪觉得这事有点抽象。",
             "这也太会给自己加戏了。",

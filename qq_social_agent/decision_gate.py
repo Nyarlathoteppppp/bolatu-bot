@@ -30,16 +30,6 @@ def pre_decision_gate(
     fresh_intent: FreshIntent | None,
 ) -> PreDecisionGateResult:
     if addressed_bot:
-        if cue_repeat_state is not None and cue_repeat_state.count >= 3:
-            return PreDecisionGateResult(
-                decision=ReplyDecision(
-                    should_reply=True,
-                    confidence=0.74,
-                    reason="local_repeated_cue",
-                    mode="local",
-                    action="mock_repeated_question",
-                )
-            )
         return PreDecisionGateResult()
 
     if is_low_value_group_text(text):

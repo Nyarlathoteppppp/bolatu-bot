@@ -968,7 +968,7 @@ def test_backend_tool_decision_does_not_force_implicit_fresh_hint() -> None:
     assert decision == original
 
 
-def test_pre_decision_gate_handles_repeated_addressed_cue_locally() -> None:
+def test_pre_decision_gate_does_not_replace_repeated_question_with_mocking() -> None:
     result = _pre_decision_gate(
         text="c 罗和梅西谁厉害",
         recent_messages=[],
@@ -981,8 +981,27 @@ def test_pre_decision_gate_handles_repeated_addressed_cue_locally() -> None:
         fresh_intent=None,
     )
 
-    assert result.decision is not None
-    assert result.decision.action == "mock_repeated_question"
+    assert result.decision is None
+    assert result.skip_reason == ""
+
+
+def test_addressed_question_cannot_be_silenced_by_llm_ignore() -> None:
+    decision = plugin._enforce_addressed_reply_decision(
+        ReplyDecision(False, 0.2, "模型不想回", mode="silent", action="ignore"),
+        addressed_bot=True,
+        text="你知道科代是什么吗",
+    )
+
+    assert decision.should_reply
+    assert decision.action == "answer"
+    assert decision.mode == "addressed"
+
+    repeated = plugin._enforce_addressed_reply_decision(
+        ReplyDecision(True, 0.8, "嫌他问太多", mode="chat", action="tease"),
+        addressed_bot=True,
+        text="你到底知道科代是什么吗",
+    )
+    assert repeated.action == "answer"
 
 
 def test_style_rule_filter_rejects_literal_examples() -> None:
@@ -1295,6 +1314,47 @@ def test_owner_can_query_metrics_and_memory_atoms(monkeypatch, tmp_path) -> None
     assert handled
     assert "记忆单元：group=1026813421 limit=20" in bot.private_messages[-1][1]
     assert "小鸟说话要更温柔一点" in bot.private_messages[-1][1]
+
+
+def test_owner_can_correct_dispute_and_audit_memory_atom(monkeypatch, tmp_path) -> None:
+    store = _use_temp_plugin_memory(monkeypatch, tmp_path)
+    bot = FakeApprovalBot()
+    atom_id = store.upsert_memory_atom(
+        atom_type="fact",
+        group_id=1026813421,
+        content="小鸟不吃辣",
+        source="manual:1535071184",
+    )
+
+    corrected = asyncio.run(
+        plugin._handle_group_approval_private(
+            bot,
+            1535071184,
+            f"纠正记忆 {atom_id}：小鸟现在能吃微辣",
+        )
+    )
+    assert corrected
+    assert "新记忆" in bot.private_messages[-1][1]
+    new_atom = store.recent_memory_atoms(1026813421, 1)[0]
+    assert new_atom.content == "小鸟现在能吃微辣"
+    assert new_atom.supersedes_id == atom_id
+
+    disputed = asyncio.run(
+        plugin._handle_group_approval_private(
+            bot,
+            1535071184,
+            f"反证记忆 {new_atom.id}：本人又说完全不能吃辣",
+        )
+    )
+    assert disputed
+    assert "暂停注入" in bot.private_messages[-1][1]
+    assert store.memory_atom(new_atom.id).status == "disputed"
+
+    audited = asyncio.run(
+        plugin._handle_group_approval_private(bot, 1535071184, f"记忆证据 {new_atom.id}")
+    )
+    assert audited
+    assert "counter_evidence" in bot.private_messages[-1][1]
 
 
 def test_approval_token_report_command_does_not_consume_pending(monkeypatch, tmp_path) -> None:

@@ -38,3 +38,14 @@ def test_rate_limiter_allows_mention_with_shorter_cooldown(tmp_path) -> None:
     memory.add_message(1, 999, "bot", "hello", is_bot=True, created_at=time.time() - 10)
     limiter = RateLimiter(memory, _config())
     assert limiter.allow(1, mentioned=True).allowed
+
+
+def test_queued_mention_ignores_reply_sent_after_event_arrived(tmp_path) -> None:
+    memory = MemoryStore(tmp_path / "bot.sqlite3")
+    arrived_at = time.time()
+    memory.add_message(1, 999, "bot", "later reply", is_bot=True, created_at=arrived_at + 5)
+    limiter = RateLimiter(memory, _config())
+
+    decision = limiter.allow(1, mentioned=True, now=arrived_at + 6, event_at=arrived_at)
+
+    assert decision.allowed

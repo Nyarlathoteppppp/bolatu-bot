@@ -225,7 +225,6 @@ def reaction_from_action(action: str, requested_reaction: str = "") -> str:
         "agree": "agree",
         "care": "care",
         "tease": "tease",
-        "mock_repeated_question": "tease",
         "echo_mood": "laugh",
         "observe": "like",
         "react": "agree",

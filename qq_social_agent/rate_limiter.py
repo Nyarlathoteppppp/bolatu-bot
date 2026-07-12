@@ -19,7 +19,14 @@ class RateLimiter:
         self.memory = memory
         self.config = config
 
-    def allow(self, group_id: int, *, mentioned: bool, now: float | None = None) -> RateDecision:
+    def allow(
+        self,
+        group_id: int,
+        *,
+        mentioned: bool,
+        now: float | None = None,
+        event_at: float | None = None,
+    ) -> RateDecision:
         now = now or time.time()
         state = self.memory.group_state(group_id)
         if not state["enabled"]:
@@ -37,14 +44,18 @@ class RateLimiter:
         if len(replies_10min) >= self.config.max_replies_per_10min:
             return RateDecision(False, "ten_min_limit")
 
-        last = replies_hour[0] if replies_hour else None
+        cooldown_reference = now if event_at is None else float(event_at)
+        last = next(
+            (reply for reply in replies_hour if reply.created_at <= cooldown_reference),
+            None,
+        )
         if last:
             min_interval = (
                 self.config.hard_mention_interval_seconds
                 if mentioned
                 else self.config.min_interval_seconds
             )
-            if now - last.created_at < min_interval:
+            if cooldown_reference - last.created_at < min_interval:
                 return RateDecision(False, "cooldown")
 
         if self._consecutive_bot_replies(group_id) >= self.config.max_consecutive_replies:

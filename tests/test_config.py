@@ -137,6 +137,16 @@ def test_usage_tracking_can_be_disabled() -> None:
     assert not config.usage_tracking_enabled
 
 
+def test_llm_latency_limits_default_to_fast_no_retry_policy() -> None:
+    config = AppConfig({"deepseek": {}}).deepseek
+
+    assert config.decision_timeout_seconds == 10
+    assert config.decision_total_timeout_seconds == 18
+    assert config.reply_timeout_seconds == 18
+    assert config.reply_total_timeout_seconds == 28
+    assert config.max_retries == 0
+
+
 def test_prompt_registry_loads_central_prompt_file() -> None:
     prompts = PromptRegistry()
 
