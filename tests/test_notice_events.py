@@ -75,3 +75,52 @@ def test_poke_notice_only_reciprocates_when_bot_is_target(monkeypatch) -> None:
 
     assert len(calls) == 1
     assert calls[0][:2] == (100, 200)
+
+
+def test_self_group_ban_pauses_group_and_notifies_approver(monkeypatch, tmp_path) -> None:
+    import nonebot
+
+    nonebot.init()
+    import qq_social_agent.plugin as plugin
+    from qq_social_agent.memory import MemoryStore
+
+    store = MemoryStore(tmp_path / "bot.sqlite3")
+    monkeypatch.setattr(plugin, "memory", store)
+    monkeypatch.setattr(plugin, "_approval_user_ids", lambda: (1535071184,))
+    sent: list[tuple[str, dict[str, object]]] = []
+
+    class FakeBot:
+        self_id = 1801507496
+
+        async def call_api(self, api: str, **data: object) -> dict[str, int]:
+            sent.append((api, data))
+            return {"message_id": 1}
+
+    snapshot = SimpleNamespace(
+        notice_type="group_ban",
+        sub_type="ban",
+        group_id=1026813421,
+        user_id=1801507496,
+        operator_id=2123506373,
+        duration_seconds=86400,
+    )
+
+    asyncio.run(plugin._handle_self_group_ban_notice(FakeBot(), snapshot))
+
+    assert store.group_state(1026813421)["muted_until"] > 0
+    assert sent[0][0] == "send_private_msg"
+    assert "后端已暂停" in str(sent[0][1]["message"])
+    assert "2123506373" in str(sent[0][1]["message"])
+
+
+def test_group_send_result_120_is_detected() -> None:
+    import nonebot
+
+    nonebot.init()
+    import qq_social_agent.plugin as plugin
+
+    class FakeError:
+        def __str__(self) -> str:
+            return 'EventRet: {"result": 120, "errMsg": ""}'
+
+    assert plugin._is_group_send_blocked_error(FakeError())  # type: ignore[arg-type]

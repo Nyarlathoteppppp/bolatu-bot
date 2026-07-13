@@ -558,9 +558,24 @@ async def _send_approval_rules_on_connect(bot: Bot) -> None:
     )
     await _send_approval_rules_to_approvers(bot, reason="bot_connect")
     await _send_changelog_notice_to_approvers(bot)
+    await _notify_active_group_mutes(bot)
     _ensure_daily_review_task(bot)
     _ensure_group_directory_task(bot)
     _ensure_history_backfill_task(bot)
+
+
+async def _notify_active_group_mutes(bot: Bot) -> None:
+    now = time.time()
+    for group_id in _runtime_target_groups():
+        muted_until = float(memory.group_state(group_id)["muted_until"] or 0)
+        if muted_until <= now:
+            continue
+        message = (
+            f"群 {group_id} 中张风雪仍处于禁言状态，后端暂停该群 decision 和回复生成。\n"
+            f"预计解禁：{datetime.fromtimestamp(muted_until, DAILY_REVIEW_TIMEZONE).strftime('%Y-%m-%d %H:%M:%S')}"
+        )
+        for approver_id in _approval_user_ids():
+            await _send_private_text(bot, approver_id, message)
 
 
 @get_driver().on_bot_disconnect
@@ -2038,7 +2053,48 @@ async def handle_notice_event(bot: Bot, event: Event) -> None:
         )
         if snapshot.group_id is not None and _notice_needs_directory_refresh(snapshot.notice_type, snapshot.sub_type):
             _schedule_notice_directory_refresh(bot, snapshot.group_id)
+        await _handle_self_group_ban_notice(bot, snapshot)
         await _handle_notice_social_action(bot, snapshot)
+
+
+async def _handle_self_group_ban_notice(bot: Bot, snapshot: object) -> None:
+    if str(getattr(snapshot, "notice_type", "") or "").casefold() != "group_ban":
+        return
+    group_id = int(getattr(snapshot, "group_id", 0) or 0)
+    target_user_id = int(getattr(snapshot, "user_id", 0) or 0)
+    self_id = int(getattr(bot, "self_id", 0) or 0)
+    if not group_id or target_user_id != self_id:
+        return
+    duration = max(0, int(getattr(snapshot, "duration_seconds", 0) or 0))
+    sub_type = str(getattr(snapshot, "sub_type", "") or "").casefold()
+    muted = sub_type == "ban" and duration > 0
+    muted_until = time.time() + duration if muted else 0.0
+    memory.mute_until(group_id, muted_until)
+    operator_id = int(getattr(snapshot, "operator_id", 0) or 0)
+    if muted:
+        message = (
+            f"群 {group_id} 中张风雪已被禁言，后端已暂停该群 decision 和回复生成。\n"
+            f"操作者：{operator_id or '未知'}\n"
+            f"禁言时长：{duration} 秒\n"
+            f"预计解禁：{datetime.fromtimestamp(muted_until, DAILY_REVIEW_TIMEZONE).strftime('%Y-%m-%d %H:%M:%S')}"
+        )
+        action = "self_muted"
+    else:
+        message = f"群 {group_id} 中张风雪已解除禁言，后端恢复正常生成和发送。"
+        action = "self_unmuted"
+    _record_metric_event(
+        "group_send_state",
+        group_id=group_id,
+        user_id=self_id,
+        stage="notice",
+        action=action,
+        operator_id=operator_id,
+        duration_seconds=duration,
+        muted_until=muted_until,
+    )
+    logger.warning(f"qq_social_agent {action}: group={group_id} operator={operator_id} until={muted_until}")
+    for approver_id in _approval_user_ids():
+        await _send_private_text(bot, approver_id, message)
 
 
 async def _handle_notice_social_action(bot: Bot, snapshot: object) -> None:
@@ -2409,6 +2465,22 @@ async def _handle_group_message_locked(
     enabled = bool(group_cfg.get("enabled", True)) and bool(state["enabled"])
     if not enabled:
         logger.info(f"qq_social_agent ignored group={group_id}: disabled")
+        return
+    muted_until = float(state["muted_until"] or 0)
+    if muted_until > time.time():
+        logger.info(
+            "qq_social_agent skipped while self muted: "
+            f"group={group_id} until={muted_until} addressed={addressed_bot}"
+        )
+        _record_metric_event(
+            "suppression",
+            group_id=group_id,
+            user_id=user_id,
+            stage="self_group_muted",
+            action="ignore",
+            muted_until=muted_until,
+            addressed=addressed_bot,
+        )
         return
 
     work_intensity_percent = _ai_work_intensity_percent()
@@ -6406,12 +6478,37 @@ async def _send_approved_group_reply_scoped(
                 correlation_id=approval.correlation_id,
             )
         except ActionFailed as exc:
+            blocked = _is_group_send_blocked_error(exc)
             logger.warning(
                 "qq_social_agent failed sending approved group reply: "
                 f"group={approval.group_id} {_action_failed_summary(exc)}"
             )
+            _record_metric_event(
+                "group_send_failed",
+                group_id=approval.group_id,
+                user_id=approval.trigger_user_id,
+                stage="send",
+                action="blocked_120" if blocked else "action_failed",
+                approval_id=approval.approval_id,
+                error=_action_failed_summary(exc),
+                candidate_index=candidate.index,
+            )
+            if blocked:
+                current_mute = float(memory.group_state(approval.group_id)["muted_until"] or 0)
+                if current_mute <= time.time():
+                    memory.mute_until(approval.group_id, time.time() + 10 * 60)
+                pending_group_approvals[approval.group_id] = approval
+                notice = (
+                    f"群 {approval.group_id} 发言失败：QQ 内核返回 result=120，"
+                    "通常是机器人被群禁言或发送受限。候选已保留，未计为成功发送。\n"
+                    f"审批ID：{approval.approval_id}\n"
+                    f"候选 {candidate.index}：{_short_notice_text(candidate.text, 180)}\n"
+                    "解除禁言后可再次回复对应候选编号发送。"
+                )
+                for target_id in _approval_user_ids():
+                    await _send_private_text(bot, target_id, notice)
             try:
-                if approver_id is not None:
+                if approver_id is not None and not blocked:
                     await _send_private_message(
                         bot,
                         user_id=approver_id,
@@ -6444,6 +6541,14 @@ async def _send_approved_group_reply_scoped(
         await _send_private_message(bot, user_id=approver_id, message=Message("已发。"))
     except ActionFailed:
         pass
+
+
+def _is_group_send_blocked_error(exc: ActionFailed) -> bool:
+    text = str(exc)
+    return bool(
+        re.search(r"(?:result|retcode)[\s'\":=]+120(?:\D|$)", text, re.IGNORECASE)
+        or "EventRet" in text and '"result": 120' in text
+    )
 
 
 async def _send_group_message(bot: Bot, group_id: int, message: Message) -> int | None:
