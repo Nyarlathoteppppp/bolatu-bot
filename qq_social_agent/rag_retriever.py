@@ -134,8 +134,11 @@ class RAGService:
             EmbeddingConfig.from_mapping(config_map.get("embedding", {}))
         )
         self._embedding_task: asyncio.Task[None] | None = None
+        self._source_sync_task: asyncio.Task[None] | None = None
+        self._source_sync_event: asyncio.Event | None = None
         self._query_cache: OrderedDict[str, list[float]] = OrderedDict()
         self._closed = False
+        self._started = False
         self.last_sync_at = 0.0
         self.last_sync_stats: dict[str, int] = {}
         self.last_error = ""
@@ -152,8 +155,57 @@ class RAGService:
     async def start(self) -> None:
         if not self.config.enabled or self._closed:
             return
-        self.sync_sources()
+        self._source_sync_event = asyncio.Event()
+        self._started = True
+        self._source_sync_event.set()
+        self._source_sync_task = asyncio.create_task(self._source_sync_loop())
         self._ensure_embedding_task()
+
+    def request_source_sync(self) -> None:
+        if self._source_sync_event is not None:
+            self._source_sync_event.set()
+
+    async def _source_sync_loop(self) -> None:
+        """Index sources off the reply path using an isolated SQLite connection."""
+
+        while not self._closed:
+            event = self._source_sync_event
+            if event is None:
+                return
+            try:
+                await asyncio.wait_for(
+                    event.wait(),
+                    timeout=self.config.source_sync_interval_seconds,
+                )
+            except asyncio.TimeoutError:
+                pass
+            event.clear()
+            if self._closed:
+                return
+            try:
+                stats = await asyncio.to_thread(self._sync_sources_isolated)
+                self.last_sync_stats = stats
+                self.last_sync_at = time.time()
+                self.last_error = ""
+                self._ensure_embedding_task()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                self.last_error = str(exc)[:240]
+                logger.warning(f"qq_social_agent rag source sync failed: error={exc}")
+
+    def _sync_sources_isolated(self) -> dict[str, int]:
+        isolated_store = RAGStore(self.store.db_path)
+        try:
+            indexer = RAGIndexer(
+                isolated_store,
+                episode_gap_seconds=self.indexer.episode_gap_seconds,
+                max_chunk_chars=self.indexer.max_chunk_chars,
+                max_chunk_messages=self.indexer.max_chunk_messages,
+            )
+            return indexer.sync_all(message_batch_limit=self.config.message_backfill_limit)
+        finally:
+            isolated_store.close()
 
     def _ensure_embedding_task(self) -> None:
         if (
@@ -165,9 +217,11 @@ class RAGService:
 
     async def close(self) -> None:
         self._closed = True
-        if self._embedding_task is not None and not self._embedding_task.done():
-            self._embedding_task.cancel()
-            await asyncio.gather(self._embedding_task, return_exceptions=True)
+        tasks = [self._embedding_task, self._source_sync_task]
+        for task in tasks:
+            if task is not None and not task.done():
+                task.cancel()
+        await asyncio.gather(*(task for task in tasks if task is not None), return_exceptions=True)
         await self.embedding.aclose()
         self.store.close()
 
@@ -214,8 +268,12 @@ class RAGService:
         cache_hit = False
         error = ""
         try:
-            if time.time() - self.last_sync_at >= self.config.source_sync_interval_seconds:
+            # Standalone callers/tests may retrieve without starting the service.
+            # Production always calls start(), where source sync is background-only.
+            if not self._started and self.last_sync_at <= 0:
                 self.sync_sources()
+            if time.time() - self.last_sync_at >= self.config.source_sync_interval_seconds:
+                self.request_source_sync()
             self._ensure_embedding_task()
             exclude_after = (
                 time.time() - self.config.exclude_recent_seconds
@@ -482,6 +540,8 @@ class RAGService:
             "last_sync_at": self.last_sync_at or None,
             "last_sync_stats": self.last_sync_stats,
             "last_error": self.last_error,
+            "source_syncing": bool(self._source_sync_task and not self._source_sync_task.done()),
+            "embedding_backfill": bool(self._embedding_task and not self._embedding_task.done()),
             "background_indexing": bool(self._embedding_task and not self._embedding_task.done()),
             "query_cache_entries": len(self._query_cache),
             "store": self.store.status_snapshot(),

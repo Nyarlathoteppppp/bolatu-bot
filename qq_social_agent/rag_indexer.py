@@ -158,12 +158,16 @@ class RAGIndexer:
     def _sync_summaries(self) -> int:
         if not _table_exists(self.store, "memory_summaries"):
             return 0
+        cursor = int(self.store.get_index_cursor("memory_summaries", "global") or 0)
         rows = self.store.conn.execute(
             """
             select id, group_id, start_message_id, end_message_id, summary,
                    recall_cues_json, start_at, end_at, created_at
             from memory_summaries
+            where id > ?
+            order by id asc
             """
+            , (cursor,)
         ).fetchall()
         for row in rows:
             cues = _json_list(row["recall_cues_json"])
@@ -183,18 +187,24 @@ class RAGIndexer:
                 importance=0.65,
                 confidence=0.65,
             )
+        if rows:
+            self.store.set_index_cursor("memory_summaries", "global", int(rows[-1]["id"]))
         return len(rows)
 
     def _sync_memory_atoms(self) -> int:
         if not _table_exists(self.store, "memory_atoms"):
             return 0
+        cursor = float(self.store.get_index_cursor("memory_atoms", "global") or 0.0)
         rows = self.store.conn.execute(
             """
             select id, atom_type, group_id, subject_user_id, object_user_id, content,
                    source, evidence_type, source_message_id, observed_at, valid_from,
                    valid_to, confidence, importance, status, created_at, updated_at
             from memory_atoms
+            where updated_at > ?
+            order by updated_at asc, id asc
             """
+            , (cursor,)
         ).fetchall()
         for row in rows:
             evidence = str(row["evidence_type"] or "manual")
@@ -222,13 +232,26 @@ class RAGIndexer:
                 confidence=float(row["confidence"] or 0.6),
                 status=str(row["status"] or "active"),
             )
+        if rows:
+            self.store.set_index_cursor(
+                "memory_atoms",
+                "global",
+                max(float(row["updated_at"] or 0.0) for row in rows),
+            )
         return len(rows)
 
     def _sync_member_profiles(self) -> int:
         total = 0
         if _table_exists(self.store, "member_profiles"):
+            cursor = float(self.store.get_index_cursor("member_profiles", "global") or 0.0)
             rows = self.store.conn.execute(
-                "select group_id, user_id, display_name, aliases_json, last_seen_at from member_profiles"
+                """
+                select group_id, user_id, display_name, aliases_json, last_seen_at
+                from member_profiles
+                where last_seen_at > ?
+                order by last_seen_at asc
+                """,
+                (cursor,),
             ).fetchall()
             for row in rows:
                 aliases = _json_list(row["aliases_json"])
@@ -248,14 +271,28 @@ class RAGIndexer:
                     importance=0.7,
                     confidence=0.9,
                 )
+            if rows:
+                self.store.set_index_cursor(
+                    "member_profiles",
+                    "global",
+                    max(float(row["last_seen_at"] or 0.0) for row in rows),
+                )
             total += len(rows)
         if _table_exists(self.store, "member_profile_summaries"):
+            cursor = int(self.store.get_index_cursor("member_profile_summaries", "global") or 0)
             rows = self.store.conn.execute(
                 """
                 select id, group_id, user_id, profile_summary, interests_json,
                        speaking_style, representative_texts_json, created_at
                 from member_profile_summaries
+                where id > ?
+                  and id in (
+                    select max(id) from member_profile_summaries
+                    group by group_id, user_id
+                  )
+                order by id asc
                 """
+                , (cursor,)
             ).fetchall()
             for row in rows:
                 interests = _json_list(row["interests_json"])
@@ -265,7 +302,7 @@ class RAGIndexer:
                 if row["speaking_style"]:
                     content += "\n说话习惯（仅作画像，不作为事实）：" + str(row["speaking_style"])
                 self.store.upsert_document(
-                    stable_key=f"member_summary:{row['id']}",
+                    stable_key=f"member_summary_current:{row['group_id']}:{row['user_id']}",
                     group_id=int(row["group_id"]),
                     doc_type="member",
                     content=content,
@@ -277,14 +314,28 @@ class RAGIndexer:
                     importance=0.62,
                     confidence=0.6,
                 )
+            if rows:
+                self.store.set_index_cursor(
+                    "member_profile_summaries", "global", int(rows[-1]["id"])
+                )
+            # Historical snapshots stay in the source table but only the current
+            # snapshot is eligible for retrieval.
+            self.store.conn.execute(
+                "update rag_documents set status = 'inactive' where stable_key like 'member_summary:%'"
+            )
             total += len(rows)
         return total
 
     def _sync_jargon(self) -> int:
         if not _table_exists(self.store, "custom_jargon_entries"):
             return 0
+        cursor = int(self.store.get_index_cursor("custom_jargon_entries", "global") or 0)
         rows = self.store.conn.execute(
-            "select id, group_id, term, explanation, created_by, created_at from custom_jargon_entries"
+            """
+            select id, group_id, term, explanation, created_by, created_at
+            from custom_jargon_entries where id > ? order by id asc
+            """,
+            (cursor,),
         ).fetchall()
         for row in rows:
             self.store.upsert_document(
@@ -299,17 +350,22 @@ class RAGIndexer:
                 importance=0.85,
                 confidence=0.9,
             )
+        if rows:
+            self.store.set_index_cursor("custom_jargon_entries", "global", int(rows[-1]["id"]))
         return len(rows)
 
     def _sync_feedback(self) -> int:
         total = 0
         if _table_exists(self.store, "recalled_reply_feedback"):
+            cursor = int(self.store.get_index_cursor("recalled_reply_feedback", "global") or 0)
             rows = self.store.conn.execute(
                 """
                 select id, group_id, trigger_user_id, trigger_nickname, trigger_text,
                        bot_reply, owner_reason, avoid_rule, better_direction, reason_at
                 from recalled_reply_feedback
+                where id > ? order by id asc
                 """
+                , (cursor,)
             ).fetchall()
             for row in rows:
                 self.store.upsert_document(
@@ -328,14 +384,21 @@ class RAGIndexer:
                     importance=0.8,
                     confidence=0.95,
                 )
+            if rows:
+                self.store.set_index_cursor(
+                    "recalled_reply_feedback", "global", int(rows[-1]["id"])
+                )
             total += len(rows)
         if _table_exists(self.store, "approved_reply_feedback"):
+            cursor = int(self.store.get_index_cursor("approved_reply_feedback", "global") or 0)
             rows = self.store.conn.execute(
                 """
                 select id, group_id, trigger_user_id, trigger_nickname, trigger_text,
                        candidate_text, style, created_at
                 from approved_reply_feedback
+                where id > ? order by id asc
                 """
+                , (cursor,)
             ).fetchall()
             for row in rows:
                 self.store.upsert_document(
@@ -352,6 +415,10 @@ class RAGIndexer:
                     created_at=float(row["created_at"]),
                     importance=0.72,
                     confidence=0.9,
+                )
+            if rows:
+                self.store.set_index_cursor(
+                    "approved_reply_feedback", "global", int(rows[-1]["id"])
                 )
             total += len(rows)
         return total

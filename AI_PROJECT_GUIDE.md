@@ -2,7 +2,7 @@
 
 本文档给未来接手本项目的 AI / 开发者使用。目标是快速理解：这个 QQ 机器人怎么跑、消息怎么流动、Prompt 在哪里、哪些模块能改、哪些地方不要乱动。
 
-最后更新：2026-07-12
+最后更新：2026-07-14
 
 ## 1. 项目定位
 
@@ -13,7 +13,7 @@
 - NapCat / OneBot v11 负责接入 QQ。
 - NoneBot2 接收群聊和私聊事件。
 - 本地后端先做硬拦截、buffer、频控、上下文整理。
-- LLM 决策是否插嘴、选择社交 action、判断是否需要搜索/行情工具。
+- 本地工具路由先识别搜索/行情/学术查询，轻量 Timing Gate 只判断是否冒泡以及基本社交意图。
 - LLM 生成 3 条候选回复。
 - 私聊审批人选择 A/B/C 后，后端再发到群里。
 - 记忆、画像、黑话、风格、审批反馈会写入 SQLite，后续生成时选择性注入。
@@ -103,6 +103,12 @@ Docker / Docker Compose
 │   ├── embedding_client.py        # 硅基流动 embedding 客户端
 │   ├── rag_router.py              # 判断何时只全文检索、何时追加语义检索
 │   ├── rag_retriever.py           # 混合召回、证据过滤、上下文预算和后台向量任务
+│   ├── pipeline_types.py          # PipelineState / ContextPacket / ToolRequest / ToolResult
+│   ├── context_assembler.py       # 生成阶段的分类型上下文组装与精确去重
+│   ├── timing_gate.py             # silent/text/react/poke 和五类基本社交意图
+│   ├── tool_router.py             # 确定性工具路由与 shadow 对比
+│   ├── tool_registry.py           # 统一工具注册和结构化执行结果
+│   ├── background_learning.py     # 单工作者后台学习调度，避开回复热路径
 │   ├── config.py                  # 读取 config.yaml，构造模型 route/provider
 │   ├── persona.py                 # 从 prompt yaml 读取 persona
 │   ├── prompts.py                 # 从 prompt yaml 读取 flows/action_guides
@@ -305,15 +311,15 @@ flowchart TD
   I -- 允许 --> J
   J --> L["写入 messages / member profile"]
   L --> M["频控 / 政治兜底 / 用户单独限频"]
-  M --> N["本地 pre_decision_gate"]
-  N --> O{"有本地决策?"}
-  O -- 否 --> P["LLM decision JSON"]
-  O -- 是 --> Q["使用本地决策"]
+  M --> N["本地 pre_decision_gate + tool_router"]
+  N --> O{"点名或明确工具?"}
+  O -- 否 --> P["Timing Gate: silent/text/react/poke"]
+  O -- 是 --> Q["本地强制继续"]
   P --> R{"should_reply?"}
   Q --> R
   R -- 否 --> Z
   R -- react --> RE["set_msg_emoji_like 表情回应"]
-  R -- 文字回复 --> S["取记忆/画像/黑话/原文语料/反馈"]
+  R -- 文字回复 --> S["ContextPacket: RAG/画像/记忆原子/风格/原文/反馈"]
   S --> T{"需要工具?"}
   T -- 行情 --> U["MarketTool"]
   T -- 最新背景 --> V["FreshContextTool"]
@@ -332,6 +338,13 @@ flowchart TD
 ### 8.1 前置硬拦截
 
 文件：`decision_gate.py` 和 `plugin.py`
+
+当前职责边界：
+
+- `decision_gate.py` 处理点名、低价值消息和明确行情等确定性规则。
+- `tool_router.py` 独立判断是否需要搜索、行情、网页等工具；明确工具意图不进入 Timing Gate。
+- `timing_gate.py` 不看长期记忆、不选择工具，只决定 `silent/text/react/poke` 和 `answer/care/play/agree/chat`。
+- 只有确定生成文字后，`context_assembler.py` 才组装 RAG、画像、记忆原子、风格、原文和审批反馈。
 
 OneBot 扩展入口：
 
@@ -406,6 +419,8 @@ B[#尾号]回复A[#尾号]消息【A说：...；B回复A：...】
 - Trace 的 `rag` 阶段展示 route、解析到的人物、命中文档 ID/类型/得分/排序原因/证据来源。
 - 私聊工具命令：`RAG状态`、`RAG测试 问题`、`RAG反馈 相关|不相关|错人|过期 序号`、`RAG评测`、`RAG评测列表`、`RAG评测添加 问题 | 关键词 | QQ`。
 - 评测用例是可重复运行的小型回归集，输出 Recall@K、平均延迟和 P95；反馈只调整后续排序，不删除原始证据。
+- 源数据同步由后台 worker 使用独立 SQLite 连接增量执行；消息回复中的 `retrieve()` 只发同步信号，不再内联重建索引。
+- 群友画像索引只保留每人的当前快照可检索，旧快照仍留在源表中用于审计。
 
 ## 9. 审批机制
 
@@ -526,7 +541,7 @@ bot:
   context_limit: 30
 ```
 
-LLM 决策和生成通常只取最近 30 条左右，不会全量塞历史。
+Timing Gate 只看最近约 14 条消息；回复生成通常取最近 30 条，并按需加入分类型记忆包，不会全量塞历史。
 
 ### 11.2 长消息压缩
 
@@ -541,7 +556,7 @@ LONG_MESSAGE_SUMMARY_SOURCE_LIMIT = 1800
 
 ### 11.3 中期记忆
 
-`mid_memory` 会把即将离开短期上下文的一批聊天压缩成回想。
+`mid_memory` 会把即将离开短期上下文的一批真人聊天压缩成回想。分页不再把 bot 自己的消息计入批次，避免真人消息不足阈值时游标永久停住。
 
 常量：
 
@@ -552,6 +567,8 @@ MID_MEMORY_KEEP_SUMMARIES = 4
 ```
 
 生成回复时只注入相关回想，不塞全部。
+
+学习由 `BackgroundLearningCoordinator` 单工作者执行；群聊发言关闭不等于学习关闭，已经入库的消息仍会按游标继续整理。回复/点名任务繁忙时，学习任务会延后。
 
 ### 11.4 原文语料库
 
@@ -904,7 +921,7 @@ git push origin main
 
 ## 18. 当前工程风险和注意点
 
-1. `plugin.py` 过大，承担事件入口、审批、学习、工具和发送，后续可以继续拆：
+1. `plugin.py` 仍然较大，但 Pipeline 类型、上下文组装、Timing Gate、工具路由/注册和学习调度已经拆出；后续继续拆：
    - `group_flow.py`
    - `private_flow.py`
    - `approval.py`
@@ -912,7 +929,7 @@ git push origin main
    - `message_format.py`
 
 2. LLM 成本主要来自：
-   - 每次 decision。
+   - 非点名消息的轻量 Timing Gate。
    - reply_candidates 三候选。
    - 长消息摘要。
    - 风格学习/画像/中期记忆。

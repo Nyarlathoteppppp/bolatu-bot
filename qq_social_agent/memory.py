@@ -1296,6 +1296,7 @@ class MemoryStore:
         *,
         keep_recent: int,
         batch_size: int,
+        include_bot: bool = True,
     ) -> list[ChatMessage]:
         cutoff = self.conn.execute(
             """
@@ -1314,11 +1315,12 @@ class MemoryStore:
             (group_id,),
         ).fetchone()
         last_message_id = int(state["last_message_id"]) if state else 0
+        bot_filter = "" if include_bot else "and is_bot = 0"
         rows = self.conn.execute(
-            """
+            f"""
             select id, group_id, user_id, nickname, text, is_bot, created_at
             from messages
-            where group_id = ? and id > ? and id <= ?
+            where group_id = ? and id > ? and id <= ? {bot_filter}
             order by id asc
             limit ?
             """,
@@ -2213,6 +2215,13 @@ class MemoryStore:
             )
             for row in rows
         ]
+
+    def metric_event_count(self, event_type: str) -> int:
+        row = self.conn.execute(
+            "select count(*) as count from bot_metric_events where event_type = ?",
+            (event_type.strip(),),
+        ).fetchone()
+        return int(row["count"] or 0) if row else 0
 
     def recent_metric_events(
         self,

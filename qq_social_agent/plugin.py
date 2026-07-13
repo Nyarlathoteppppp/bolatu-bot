@@ -39,7 +39,9 @@ from .approval_rules import (
     JARGON_LIST_RE,
     TOKEN_REPORT_COMMAND_ALIASES,
 )
+from .background_learning import BackgroundLearningCoordinator
 from .config import load_config
+from .context_assembler import assemble_generation_context
 from .content_ingestion import ContentIngestionService, explicit_file_read_requested
 from .cue_patterns import CuePatternTracker, CueRepeatState
 from .decision_gate import (
@@ -101,6 +103,7 @@ from .observability import (
     render_trace_html,
 )
 from .persona import PersonaRegistry
+from .pipeline_types import PipelineState, ToolKind, ToolRequest, ToolResult
 from .political_guard import has_political_redline, political_safe_reply, sanitize_political_output
 from .rate_limiter import RateLimiter
 from .rag_retriever import RAGRetrievalResult, RAGService
@@ -114,6 +117,13 @@ from .tools.deep_content import DeepContentTool
 from .tools.market import MarketTool
 from .tools.market_intent import MarketIntent, detect_market_intents, is_market_topic
 from .tools.voice_transcript import VoiceTranscriptContext
+from .tool_router import (
+    ToolRoutePlan,
+    apply_tool_plan as _apply_tool_plan,
+    compare_legacy_decision as _compare_legacy_tool_decision,
+    route_tools as _route_tools,
+)
+from .tool_registry import ToolRegistry, ToolSpec
 
 
 load_dotenv()
@@ -133,6 +143,9 @@ deep_content_tool = DeepContentTool.from_config(
     else {}
 )
 rag_service = RAGService(app_config.data_path, app_config.raw.get("rag", {}))
+tool_registry = ToolRegistry()
+TOOL_ROUTER_SHADOW_SAMPLE_LIMIT = 200
+tool_router_shadow_samples = memory.metric_event_count("tool_router_shadow")
 _jargon_selection_config = app_config.raw.get("jargon_selection", {})
 JARGON_LLM_SELECTOR_ENABLED = bool(
     _jargon_selection_config.get("llm_selector_enabled", False)
@@ -148,6 +161,7 @@ last_group_mention_targets: dict[int, tuple[int, float]] = {}
 last_user_reply_times: dict[tuple[int, int], float] = {}
 group_processing_locks: dict[int, asyncio.Lock] = {}
 group_learning_tasks: dict[int, asyncio.Task[None]] = {}
+learning_coordinator: BackgroundLearningCoordinator | None = None
 group_message_buffers: dict[int, list["BufferedGroupMessage"]] = {}
 group_buffer_tasks: dict[int, asyncio.Task[None]] = {}
 group_generation_inflight: set[int] = set()
@@ -505,12 +519,30 @@ class SuppressionEvent:
 
 @get_driver().on_startup
 async def _init_client() -> None:
-    global deepseek_client
+    global deepseek_client, learning_coordinator
     set_usage_recorder(_record_llm_usage if app_config.deepseek.usage_tracking_enabled else None)
     deepseek_client = DeepSeekClient(app_config.deepseek)
+    tool_registry.register(
+        ToolSpec(
+            ToolKind.FRESH_SEARCH,
+            "查询最新新闻、网页、赛程或其他时效信息",
+            _execute_registered_fresh_search,
+        )
+    )
     _apply_model_route_overrides()
     _ensure_builtin_memory_atoms()
     await rag_service.start()
+    learning_coordinator = BackgroundLearningCoordinator(
+        _maintain_group_learning,
+        target_groups=_daily_review_target_groups,
+        is_busy=lambda group_id: (
+            group_id in group_generation_inflight
+            or group_addressed_waiters.get(group_id, 0) > 0
+        ),
+        sweep_seconds=60.0,
+        busy_retry_seconds=8.0,
+    )
+    learning_coordinator.start()
     for group_id in sorted(app_config.allowed_groups):
         rag_service.ensure_default_evaluation_cases(group_id)
 
@@ -664,6 +696,8 @@ async def _shutdown_background_tasks() -> None:
         group_learning_tasks,
     )
     closers: list[object] = []
+    if learning_coordinator is not None:
+        closers.append(learning_coordinator.close())
     if deepseek_client is not None:
         closers.extend(client.close() for client in deepseek_client.clients.values())
     closers.append(image_ocr_service.aclose())
@@ -1780,6 +1814,31 @@ def _record_metric_event(
         logger.warning(f"qq_social_agent failed recording metric: type={event_type} error={exc}")
 
 
+def _record_tool_router_shadow(
+    *,
+    group_id: int,
+    user_id: int,
+    decision: ReplyDecision,
+    tool_plan: ToolRoutePlan,
+) -> None:
+    global tool_router_shadow_samples
+    if tool_router_shadow_samples >= TOOL_ROUTER_SHADOW_SAMPLE_LIMIT:
+        return
+    comparison = _compare_legacy_tool_decision(decision, tool_plan)
+    _record_metric_event(
+        "tool_router_shadow",
+        group_id=group_id,
+        user_id=user_id,
+        stage="routing",
+        action="match" if comparison.matched else "different",
+        decision_kinds=list(comparison.legacy_kinds),
+        routed_kinds=list(comparison.routed_kinds),
+        route_source=getattr(tool_plan, "source", "deterministic"),
+        sample_index=tool_router_shadow_samples + 1,
+    )
+    tool_router_shadow_samples += 1
+
+
 def _http_status_payload() -> dict[str, object]:
     now = time.time()
     db_ok, db_error = _status_db_health()
@@ -1813,6 +1872,17 @@ def _http_status_payload() -> dict[str, object]:
         },
         "search": fresh_context_tool.status_snapshot(),
         "rag": rag_service.status_snapshot(),
+        "learning": (
+            learning_coordinator.status_snapshot()
+            if learning_coordinator is not None
+            else {"running": False, "pending_groups": []}
+        ),
+        "pipeline": {
+            "timing_gate": "active",
+            "tool_router": "explicit_active_shadow_audit",
+            "tool_router_shadow_samples": tool_router_shadow_samples,
+            "tool_router_shadow_target": TOOL_ROUTER_SHADOW_SAMPLE_LIMIT,
+        },
         "ocr": _status_image_ocr(),
         "social_actions": social_action_service.status_snapshot(),
         "content_tools": {
@@ -2606,6 +2676,9 @@ async def _handle_group_message_locked(
         buffered_count=len(buffered_messages) if buffered_messages else 1,
         addressed=addressed_bot,
     )
+    # Learning follows recorded messages, not whether the bot is currently
+    # allowed to speak in this group.
+    _schedule_group_learning(group_id)
 
     group_cfg = app_config.group_config(group_id)
     state = memory.group_state(group_id)
@@ -2659,6 +2732,23 @@ async def _handle_group_message_locked(
     market_topic = bool(market_intents) or is_market_topic(text)
     fresh_intent = detect_fresh_intent(text)
     market_forced = bool(market_intents) and _is_explicit_market_lookup(text)
+    tool_plan = _route_tools(
+        text,
+        market_intents=market_intents,
+        fresh_intent=fresh_intent,
+        addressed=addressed_bot,
+        market_required=market_forced,
+    )
+    pipeline_state = PipelineState(
+        correlation_id=correlation_id or current_correlation_id(),
+        group_id=group_id,
+        user_id=user_id,
+        nickname=nickname,
+        text=text,
+        addressed=addressed_bot,
+        trigger_sequence=trigger_sequence,
+        tool_requests=tool_plan.requests,
+    )
     fresh_candidate = fresh_intent is not None
     if addressed_bot:
         _mark_passive_decision_forced(group_id)
@@ -2823,8 +2913,8 @@ async def _handle_group_message_locked(
             related_user_ids=related_member_user_ids,
         )
     )
+    rag_result: RAGRetrievalResult | None = None
     rag_context_applied = False
-    rag_structured_types: set[str] = set()
     fresh_context_task: asyncio.Task[str] | None = None
     if fresh_intent is not None and (fresh_intent.explicit or fresh_intent.required):
         prefetched_decision = ReplyDecision(
@@ -2870,104 +2960,41 @@ async def _handle_group_message_locked(
         _schedule_group_learning(group_id)
         return
     decision = pre_decision.decision
+    _record_tool_router_shadow(
+        group_id=group_id,
+        user_id=user_id,
+        decision=decision or ReplyDecision(False, 0.0, "legacy_pending", action="ignore"),
+        tool_plan=tool_plan,
+    )
+    if decision is None and any(request.required for request in tool_plan.requests):
+        decision = _apply_tool_plan(
+            ReplyDecision(
+                should_reply=True,
+                confidence=1.0,
+                reason="deterministic_required_tool",
+                mode="tool",
+                action="answer",
+            ),
+            tool_plan,
+        )
 
     if decision is None:
-        memory_context = _format_memory_context(
-            memory.relevant_memory_summaries(
-                group_id,
-                context_query,
-                limit=MID_MEMORY_KEEP_SUMMARIES,
-            )
-        )
-        rag_result = await rag_task
-        rag_context_applied = True
-        rag_structured_types = {
-            hit.document.doc_type for hit in rag_result.hits
-            if hit.document.doc_type in {"memory_atom", "member"}
-        }
-        if rag_result.context:
-            memory_context = rag_result.context
-        _record_metric_event(
-            "rag_retrieval",
-            group_id=group_id,
-            user_id=user_id,
-            stage="decision_context",
-            action="injected" if rag_result.context else "empty",
-            route=rag_result.plan.route,
-            lexical_count=rag_result.lexical_count,
-            semantic_count=rag_result.semantic_count,
-            injected_count=len(rag_result.hits),
-            elapsed_ms=rag_result.elapsed_ms,
-            error=rag_result.error,
-            resolved_user_ids=[item.user_id for item in rag_result.resolved_members],
-            resolved_names=[item.matched_name for item in rag_result.resolved_members],
-            hit_document_ids=[hit.document.id for hit in rag_result.hits],
-            hit_doc_types=[hit.document.doc_type for hit in rag_result.hits],
-            hit_scores=[round(hit.score, 4) for hit in rag_result.hits],
-            hit_reasons=[list(hit.reasons) for hit in rag_result.hits],
-            hit_sources=[f"{hit.document.source_name}:{hit.document.source_row_id}" for hit in rag_result.hits],
-        )
-        member_context = "" if "member" in rag_structured_types else _format_member_context(
-            memory.member_impressions_for_context(
-                group_id,
-                _related_member_user_ids(context_recent, current_user_id=user_id),
-                limit=MEMBER_IMPRESSION_CONTEXT_LIMIT,
-            )
-        )
-        memory_atoms_context = "" if "memory_atom" in rag_structured_types else _format_memory_atom_context(
-            memory.relevant_memory_atoms(
-                group_id,
-                context_query,
-                subject_user_ids=_related_member_user_ids(context_recent, current_user_id=user_id),
-                speaker_user_id=user_id,
-                relationship_user_ids=_related_member_user_ids(
-                    context_recent,
-                    current_user_id=user_id,
-                ),
-                limit=MEMORY_ATOM_CONTEXT_LIMIT,
-            )
-        )
-        style_context = _format_style_context(
-            memory.relevant_style_rules(
-                group_id,
-                context_query,
-                limit=STYLE_RULE_CONTEXT_LIMIT,
-                speaker_user_id=user_id,
-            )
-        )
-        jargon_context = await _selected_group_jargon_context(
-            group_id,
-            context_recent,
-            current_text=text,
-            current_nickname=nickname,
-        )
-
         try:
-            decision = await deepseek_client.should_reply(
+            timing = await deepseek_client.timing_gate(
                 persona=persona,
                 recent_messages=context_recent,
                 current_text=text,
                 current_nickname=_member_label(user_id, nickname),
-                mentioned=mentioned,
-                replied_to_bot=replied_to_bot,
-                addressed_repeat_count=addressed_repeat_count,
-                cue_repeat_context=_format_cue_repeat_context(cue_repeat_state),
-                market_topic=market_topic,
                 chat_label="QQ 群聊",
-                memory_context=memory_context,
-                style_context=style_context,
-                jargon_context=jargon_context,
-                member_context=member_context,
-                memory_atoms_context=memory_atoms_context,
-                fresh_context_hint=_format_fresh_context_hint(fresh_intent),
             )
+            decision = timing.to_reply_decision()
         except Exception as exc:
             decision = _decision_failure_fallback(
                 addressed_bot=addressed_bot,
-                reason="decision_error",
+                reason="timing_gate_error",
             )
             logger.warning(
-                "qq_social_agent decision failed: "
+                "qq_social_agent timing gate failed: "
                 f"group={group_id} addressed={addressed_bot} error={exc}"
             )
             if decision is None:
@@ -2978,7 +3005,7 @@ async def _handle_group_message_locked(
                     nickname=nickname,
                     text=text,
                     stage="llm_decision_error",
-                    reason=f"decision LLM 调用失败，且非点名没有兜底回复：{exc}",
+                    reason=f"Timing Gate 调用失败，且非点名没有兜底回复：{exc}",
                 )
                 _schedule_group_learning(group_id)
                 return
@@ -3020,6 +3047,7 @@ async def _handle_group_message_locked(
         market_intents=market_intents,
         fresh_intent=fresh_intent,
     )
+    decision = _apply_tool_plan(decision, tool_plan)
     decision = _enforce_addressed_reply_decision(
         decision,
         addressed_bot=addressed_bot,
@@ -3109,10 +3137,6 @@ async def _handle_group_message_locked(
     if not rag_context_applied:
         rag_result = await rag_task
         rag_context_applied = True
-        rag_structured_types = {
-            hit.document.doc_type for hit in rag_result.hits
-            if hit.document.doc_type in {"memory_atom", "member"}
-        }
         if rag_result.context:
             memory_context = rag_result.context
         _record_metric_event(
@@ -3135,7 +3159,7 @@ async def _handle_group_message_locked(
             hit_reasons=[list(hit.reasons) for hit in rag_result.hits],
             hit_sources=[f"{hit.document.source_name}:{hit.document.source_row_id}" for hit in rag_result.hits],
         )
-    if not member_context and "member" not in rag_structured_types:
+    if not member_context:
         member_context = _format_member_context(
             memory.member_impressions_for_context(
                 group_id,
@@ -3143,7 +3167,7 @@ async def _handle_group_message_locked(
                 limit=MEMBER_IMPRESSION_CONTEXT_LIMIT,
             )
         )
-    if not memory_atoms_context and "memory_atom" not in rag_structured_types:
+    if not memory_atoms_context:
         memory_atoms_context = _format_memory_atom_context(
             memory.relevant_memory_atoms(
                 group_id,
@@ -3194,6 +3218,42 @@ async def _handle_group_message_locked(
     )
     positive_feedback_context = _format_positive_feedback_context(
         memory.recent_approved_reply_feedback(group_id, POSITIVE_FEEDBACK_CONTEXT_LIMIT)
+    )
+    context_packet = assemble_generation_context(
+        memory_context=memory_context,
+        member_context=member_context,
+        memory_atoms_context=memory_atoms_context,
+        style_context=style_context,
+        raw_corpus_context=raw_corpus_context,
+        jargon_context=jargon_context,
+        recall_feedback_context=recall_feedback_context,
+        positive_feedback_context=positive_feedback_context,
+        rag_document_ids=tuple(
+            hit.document.id for hit in rag_result.hits
+        ) if rag_result is not None else (),
+        rag_document_types=tuple(
+            hit.document.doc_type for hit in rag_result.hits
+        ) if rag_result is not None else (),
+    )
+    pipeline_state.context = context_packet
+    memory_context = context_packet.get("memory")
+    member_context = context_packet.get("member")
+    memory_atoms_context = context_packet.get("memory_atoms")
+    style_context = context_packet.get("style")
+    raw_corpus_context = context_packet.get("raw_corpus")
+    jargon_context = context_packet.get("jargon")
+    recall_feedback_context = context_packet.get("recall_feedback")
+    positive_feedback_context = context_packet.get("positive_feedback")
+    _record_metric_event(
+        "context_assembled",
+        group_id=group_id,
+        user_id=user_id,
+        stage="generation_context",
+        action="ready",
+        section_names=[section.name for section in context_packet.sections],
+        section_chars={section.name: len(section.content) for section in context_packet.sections},
+        rag_document_ids=list(context_packet.rag_document_ids),
+        rag_document_types=list(context_packet.rag_document_types),
     )
 
     market_context = ""
@@ -4434,7 +4494,16 @@ async def _fresh_context_for(decision: ReplyDecision, *, fallback_text: str) -> 
             f"query={query!r} fallback={fallback_text!r}"
         )
         return ""
-    context = await fresh_context_tool.context_for(query, kind=decision.fresh_kind)
+    tool_result = await tool_registry.execute(
+        ToolRequest(
+            ToolKind.FRESH_SEARCH,
+            query=query,
+            reason="reply_requires_fresh_context",
+            required=True,
+            arguments={"kind": decision.fresh_kind},
+        )
+    )
+    context = tool_result.context
     search_status = fresh_context_tool.status_snapshot().get("last_request", {})
     search_status = search_status if isinstance(search_status, dict) else {}
     logger.info(
@@ -4457,6 +4526,22 @@ async def _fresh_context_for(decision: ReplyDecision, *, fallback_text: str) -> 
         query_preview=search_status.get("query_preview", ""),
     )
     return context
+
+
+async def _execute_registered_fresh_search(request: ToolRequest) -> ToolResult:
+    kind = str(request.arguments.get("kind", "web"))
+    context = await fresh_context_tool.context_for(request.query, kind=kind)
+    status = fresh_context_tool.status_snapshot().get("last_request", {})
+    status = status if isinstance(status, dict) else {}
+    raw_status = str(status.get("status", "") or "unknown")
+    return ToolResult(
+        ToolKind.FRESH_SEARCH,
+        "ok" if raw_status == "ok" else raw_status,
+        context=context,
+        elapsed_ms=int(status.get("latency_ms", 0) or 0),
+        error=str(status.get("error", "") or "")[:240],
+        metadata=status,
+    )
 
 
 async def _deep_url_context_for(
@@ -5265,10 +5350,14 @@ def _group_processing_lock(group_id: int) -> asyncio.Lock:
 def _schedule_group_learning(group_id: int) -> None:
     if deepseek_client is None:
         return
-    task = group_learning_tasks.get(group_id)
-    if task is not None and not task.done():
+    if learning_coordinator is not None:
+        learning_coordinator.notify(group_id)
         return
-    group_learning_tasks[group_id] = asyncio.create_task(_run_group_learning(group_id))
+    # Startup compatibility: the coordinator is normally available before any
+    # message event, but keep a single-task fallback for tests and early events.
+    task = group_learning_tasks.get(group_id)
+    if task is None or task.done():
+        group_learning_tasks[group_id] = asyncio.create_task(_run_group_learning(group_id))
 
 
 async def _run_group_learning(group_id: int) -> None:
@@ -5286,12 +5375,11 @@ async def _maintain_group_learning(group_id: int) -> None:
     if deepseek_client is None:
         return
 
-    await _maintain_member_profile_summaries(group_id)
-
     mid_messages = memory.messages_for_mid_summary(
         group_id,
         keep_recent=app_config.context_limit,
         batch_size=MID_MEMORY_BATCH_SIZE,
+        include_bot=False,
     )
     if (
         len(mid_messages) >= MID_MEMORY_MIN_BATCH
@@ -5343,46 +5431,50 @@ async def _maintain_group_learning(group_id: int) -> None:
         memory.last_style_rule_at(group_id),
         last_style_learn_attempt.get(group_id, 0.0),
     )
-    if time.time() - last_attempt < STYLE_LEARN_INTERVAL_SECONDS:
-        return
-    style_messages = memory.messages_for_style_learning(
-        group_id,
-        limit=STYLE_LEARN_CANDIDATE_LIMIT,
-    )
-    style_messages = _balanced_style_learning_messages(style_messages)
-    if len(style_messages) < STYLE_LEARN_MIN_MESSAGES:
-        return
-    last_style_learn_attempt[group_id] = time.time()
-    try:
-        rules = await deepseek_client.learn_style_rules(
-            messages=style_messages,
-            chat_label="QQ 群聊",
-        )
-        useful_rules = [
-            rule
-            for rule in rules
-            if _is_useful_style_rule(rule.situation, rule.style, rule.source_text)
-        ]
-        memory.add_style_rules(
+    if time.time() - last_attempt >= STYLE_LEARN_INTERVAL_SECONDS:
+        style_messages = memory.messages_for_style_learning(
             group_id,
-            [
-                (
-                    rule.situation,
-                    rule.style,
-                    rule.source_text,
-                    rule.source_user_ids,
-                    rule.source_message_ids,
-                )
-                for rule in useful_rules
-            ],
+            limit=STYLE_LEARN_CANDIDATE_LIMIT,
         )
-        if useful_rules:
-            logger.info(
-                "qq_social_agent style rules learned: "
-                f"group={group_id} rules={len(useful_rules)}"
-            )
-    except Exception as exc:
-        logger.warning(f"qq_social_agent style learning skipped: group={group_id} error={exc}")
+        style_messages = _balanced_style_learning_messages(style_messages)
+        if len(style_messages) >= STYLE_LEARN_MIN_MESSAGES:
+            last_style_learn_attempt[group_id] = time.time()
+            try:
+                rules = await deepseek_client.learn_style_rules(
+                    messages=style_messages,
+                    chat_label="QQ 群聊",
+                )
+                useful_rules = [
+                    rule
+                    for rule in rules
+                    if _is_useful_style_rule(rule.situation, rule.style, rule.source_text)
+                ]
+                memory.add_style_rules(
+                    group_id,
+                    [
+                        (
+                            rule.situation,
+                            rule.style,
+                            rule.source_text,
+                            rule.source_user_ids,
+                            rule.source_message_ids,
+                        )
+                        for rule in useful_rules
+                    ],
+                )
+                if useful_rules:
+                    logger.info(
+                        "qq_social_agent style rules learned: "
+                        f"group={group_id} rules={len(useful_rules)}"
+                    )
+            except Exception as exc:
+                logger.warning(
+                    f"qq_social_agent style learning skipped: group={group_id} error={exc}"
+                )
+
+    # Profile learning is intentionally last and capped per sweep. Reply-time
+    # work and the mid-memory backlog get priority over many sequential LLM calls.
+    await _maintain_member_profile_summaries(group_id, max_updates=1)
 
 
 def _balanced_style_learning_messages(messages: list[ChatMessage]) -> list[ChatMessage]:
@@ -5407,7 +5499,12 @@ def _balanced_style_learning_messages(messages: list[ChatMessage]) -> list[ChatM
     return balanced
 
 
-async def _maintain_member_profile_summaries(group_id: int, *, force: bool = False) -> None:
+async def _maintain_member_profile_summaries(
+    group_id: int,
+    *,
+    force: bool = False,
+    max_updates: int | None = None,
+) -> None:
     if deepseek_client is None:
         return
     now = time.time()
@@ -5420,6 +5517,7 @@ async def _maintain_member_profile_summaries(group_id: int, *, force: bool = Fal
     )
     if not active_user_ids:
         return
+    updated = 0
     for user_id in active_user_ids:
         last_summary_at = memory.last_member_profile_summary_at(group_id, user_id)
         if not force and now - last_summary_at < MEMBER_PROFILE_SUMMARY_INTERVAL_SECONDS:
@@ -5463,6 +5561,9 @@ async def _maintain_member_profile_summaries(group_id: int, *, force: bool = Fal
             "qq_social_agent member profile summarized: "
             f"group={group_id} user={user_id} messages={len(messages)}"
         )
+        updated += 1
+        if max_updates is not None and updated >= max(1, max_updates):
+            break
 
 
 def _format_memory_context(summaries: list[MemorySummary]) -> str:

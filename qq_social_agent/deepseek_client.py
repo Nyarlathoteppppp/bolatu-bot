@@ -15,6 +15,7 @@ from .config import DeepSeekConfig, LLMModelRoute, LLMProviderConfig, parse_llm_
 from .memory import ChatMessage
 from .persona import Persona
 from .prompts import PromptRegistry
+from .timing_gate import TimingDecision, parse_timing_decision
 
 
 @dataclass(frozen=True)
@@ -310,6 +311,51 @@ class DeepSeekClient:
         )
         content = response.choices[0].message.content or ""
         return _parse_reply_decision(content)
+
+    async def timing_gate(
+        self,
+        *,
+        persona: Persona,
+        recent_messages: list[ChatMessage],
+        current_text: str,
+        current_nickname: str,
+        chat_label: str = "QQ 群聊",
+    ) -> TimingDecision:
+        """Decide only whether/how to surface; tools and memory route elsewhere."""
+
+        context = _format_context_with_local_focus(
+            recent_messages[-14:],
+            formatter=_format_decision_message,
+        ) or "（暂无更多上下文）"
+        system = self.prompts.render(
+            "timing_gate",
+            "system",
+            persona_name=persona.name,
+            persona_decision_prompt=persona.decision_prompt,
+        )
+        user = self.prompts.render(
+            "timing_gate",
+            "user",
+            chat_label=chat_label,
+            context=context,
+            current_nickname=current_nickname,
+            current_text=current_text,
+        )
+        response = await self._chat_completion(
+            task="decision",
+            route_name="decision",
+            request={
+                "temperature": 0.15,
+                "max_tokens": 100,
+                "response_format": {"type": "json_object"},
+                "messages": [
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user},
+                ],
+            },
+        )
+        content = response.choices[0].message.content or ""
+        return parse_timing_decision(_loads_json_object(content))
 
     async def select_jargon_terms(
         self,
