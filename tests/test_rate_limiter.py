@@ -40,6 +40,14 @@ def test_rate_limiter_allows_mention_with_shorter_cooldown(tmp_path) -> None:
     assert limiter.allow(1, mentioned=True).allowed
 
 
+def test_rate_limiter_mention_bypasses_cooldown_entirely(tmp_path) -> None:
+    memory = MemoryStore(tmp_path / "bot.sqlite3")
+    memory.add_message(1, 999, "bot", "hello", is_bot=True, created_at=time.time())
+    limiter = RateLimiter(memory, _config())
+
+    assert limiter.allow(1, mentioned=True).allowed
+
+
 def test_queued_mention_ignores_reply_sent_after_event_arrived(tmp_path) -> None:
     memory = MemoryStore(tmp_path / "bot.sqlite3")
     arrived_at = time.time()

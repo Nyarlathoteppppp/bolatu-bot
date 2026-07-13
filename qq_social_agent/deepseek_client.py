@@ -594,8 +594,9 @@ class DeepSeekClient:
             current_text=current_text,
             candidate_count=candidate_count,
         )
+        direct_reply = prompt_flow == "reply_direct" and candidate_count == 1
         request = {
-            "max_tokens": max(self.config.max_tokens, 900),
+            "max_tokens": max(self.config.max_tokens, 320) if direct_reply else max(self.config.max_tokens, 900),
             "response_format": {"type": "json_object"},
             "messages": [
                 {"role": "system", "content": system},

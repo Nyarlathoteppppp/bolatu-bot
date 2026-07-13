@@ -586,7 +586,7 @@ def test_reply_candidates_retries_when_model_returns_too_few() -> None:
 def test_reply_candidates_includes_priority_context() -> None:
     client = DeepSeekClient.__new__(DeepSeekClient)
     client.config = SimpleNamespace(
-        max_tokens=900,
+        max_tokens=260,
         thinking="disabled",
         reasoning_effort="low",
         temperature=0.6,
@@ -644,7 +644,7 @@ def test_reply_candidates_includes_priority_context() -> None:
 def test_reply_direct_uses_direct_prompt_and_one_candidate() -> None:
     client = DeepSeekClient.__new__(DeepSeekClient)
     client.config = SimpleNamespace(
-        max_tokens=900,
+        max_tokens=260,
         thinking="disabled",
         reasoning_effort="low",
         temperature=0.6,
@@ -691,6 +691,7 @@ def test_reply_direct_uses_direct_prompt_and_one_candidate() -> None:
 
     assert [candidate.text for candidate in candidates] == ["风雪觉得这句可以接一下"]
     assert captured_calls[0][0:2] == ("reply_direct", "reply")
+    assert captured_calls[0][2]["max_tokens"] == 320
     system_prompt = captured_calls[0][2]["messages"][0]["content"]
     user_prompt = captured_calls[0][2]["messages"][1]["content"]
     assert "只生成 1 条" in system_prompt

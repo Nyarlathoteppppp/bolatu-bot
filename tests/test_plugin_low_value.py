@@ -1,5 +1,7 @@
 import asyncio
+import json
 import time
+from datetime import datetime
 from types import SimpleNamespace
 
 import nonebot
@@ -93,6 +95,8 @@ def _use_temp_plugin_memory(monkeypatch, tmp_path) -> MemoryStore:
     plugin.group_message_buffers.clear()
     plugin.group_buffer_tasks.clear()
     plugin.group_generation_inflight.clear()
+    plugin.group_addressed_waiters.clear()
+    plugin.group_inbound_sequences.clear()
     monkeypatch.setattr(plugin, "_private_tool_reply_delay_seconds", lambda: 0.0)
     return store
 
@@ -1007,8 +1011,54 @@ def test_pre_decision_gate_does_not_replace_repeated_question_with_mocking() -> 
         fresh_intent=None,
     )
 
-    assert result.decision is None
+    assert result.decision is not None
+    assert result.decision.should_reply
+    assert result.decision.action == "answer"
+    assert result.decision.reason == "local_addressed_reply"
     assert result.skip_reason == ""
+
+
+def test_pre_decision_gate_handles_addressed_fresh_lookup_locally() -> None:
+    result = _pre_decision_gate(
+        text="你们北大今年有两个菲奖得主了",
+        recent_messages=[],
+        persona=plugin.personas.get(plugin.app_config.default_persona),
+        addressed_bot=True,
+        mentioned=True,
+        replied_to_bot=False,
+        cue_repeat_state=None,
+        market_intents=[],
+        fresh_intent=FreshIntent(
+            query="你们北大今年有两个菲奖得主了",
+            kind="web",
+            required=True,
+        ),
+    )
+
+    assert result.decision is not None
+    assert result.decision.need_fresh_context
+    assert result.decision.fresh_kind == "web"
+    assert result.decision.reason == "local_addressed_fresh_lookup"
+
+
+def test_ai_work_intensity_time_band_defaults_and_override(monkeypatch, tmp_path) -> None:
+    store = _use_temp_plugin_memory(monkeypatch, tmp_path)
+    store.app_kv_set(plugin.AI_WORK_INTENSITY_PERCENT_KEY, "80")
+    midnight = datetime(2026, 7, 14, 1, 0, tzinfo=plugin.DAILY_REVIEW_TIMEZONE)
+    morning = datetime(2026, 7, 14, 8, 0, tzinfo=plugin.DAILY_REVIEW_TIMEZONE)
+    daytime = datetime(2026, 7, 14, 15, 0, tzinfo=plugin.DAILY_REVIEW_TIMEZONE)
+
+    assert plugin._ai_work_intensity_percent(midnight) == 100
+    assert plugin._ai_work_intensity_percent(morning) == 5
+    assert plugin._ai_work_intensity_percent(daytime) == 80
+
+    band, _ = plugin._ai_work_intensity_band(midnight)
+    store.app_kv_set(
+        plugin.AI_WORK_INTENSITY_OVERRIDE_KEY,
+        json.dumps({"band": band, "percent": 37}),
+    )
+    assert plugin._ai_work_intensity_percent(midnight) == 37
+    assert plugin._ai_work_intensity_percent(morning) == 5
 
 
 def test_addressed_question_cannot_be_silenced_by_llm_ignore() -> None:
@@ -1237,6 +1287,24 @@ def test_approval_letter_choice_takes_priority_over_tool_menu(monkeypatch, tmp_p
     assert handled
     assert bot.group_messages == [(1026813421, "第一条回复")]
     assert not bot.private_messages or "bot工具 查看" not in bot.private_messages[-1][1]
+
+
+def test_stale_group_reply_forces_trigger_user_mention(monkeypatch, tmp_path) -> None:
+    _use_temp_plugin_memory(monkeypatch, tmp_path)
+    base = _pending_approval()
+    approval = plugin.replace(
+        base,
+        trigger_sequence=10,
+        candidates=(plugin.PendingApprovalCandidate(1, "这条风雪接上了", "reply", "短回复"),),
+    )
+    plugin.pending_group_approvals[approval.group_id] = approval
+    plugin.group_inbound_sequences[approval.group_id] = 13
+    bot = FakeApprovalBot()
+
+    handled = asyncio.run(plugin._handle_group_approval_private(bot, 3370998238, "A"))
+
+    assert handled
+    assert bot.group_messages == [(1026813421, "[CQ:at,qq=184589072] 这条风雪接上了")]
 
 
 def test_approval_letter_cancel_takes_priority_over_tool_menu(monkeypatch, tmp_path) -> None:
@@ -1810,7 +1878,7 @@ def test_owner_can_set_ai_work_intensity_percent(monkeypatch, tmp_path) -> None:
     handled = asyncio.run(plugin._handle_group_approval_private(bot, 1535071184, "AI强度"))
 
     assert handled
-    assert "AI工作强度：30%" in bot.private_messages[-1][1]
+    assert "AI工作强度：当前生效 30%" in bot.private_messages[-1][1]
     assert "不影响：消息照常写入数据库" in bot.private_messages[-1][1]
 
 

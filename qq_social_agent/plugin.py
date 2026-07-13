@@ -149,6 +149,8 @@ group_learning_tasks: dict[int, asyncio.Task[None]] = {}
 group_message_buffers: dict[int, list["BufferedGroupMessage"]] = {}
 group_buffer_tasks: dict[int, asyncio.Task[None]] = {}
 group_generation_inflight: set[int] = set()
+group_addressed_waiters: dict[int, int] = {}
+group_inbound_sequences: dict[int, int] = {}
 group_passive_retry_buffers: dict[int, list["BufferedGroupMessage"]] = {}
 group_passive_retry_tasks: dict[int, asyncio.Task[None]] = {}
 group_passive_decision_state: dict[int, "PassiveDecisionState"] = {}
@@ -340,6 +342,7 @@ PRIVATE_FORCE_OBEY_ONCE_RE = re.compile(
 APPROVAL_REVIEW_ENABLED_KEY = "group_approval_review_enabled"
 APPROVAL_AUTO_SEND_PERCENT_KEY = "group_approval_auto_send_percent"
 AI_WORK_INTENSITY_PERCENT_KEY = "group_ai_work_intensity_percent"
+AI_WORK_INTENSITY_OVERRIDE_KEY = "group_ai_work_intensity_schedule_override"
 APPROVAL_REVIEW_ON_COMMANDS = {"开启审查", "打开审查", "恢复审查", "启用审查", "开启审核", "打开审核"}
 APPROVAL_REVIEW_OFF_COMMANDS = {"关闭审查", "关掉审查", "暂停审查", "免审", "免审批", "关闭审核", "关掉审核"}
 APPROVAL_REVIEW_STATUS_COMMANDS = {"审查状态", "审核状态", "审批状态"}
@@ -434,6 +437,7 @@ class BufferedGroupMessage:
     created_at: float
     source_message_id: str = ""
     correlation_id: str = ""
+    inbound_sequence: int = 0
 
 
 @dataclass(frozen=True)
@@ -458,6 +462,7 @@ class PendingGroupApproval:
     created_at: float
     correlation_id: str = ""
     tool_evidence: str = ""
+    trigger_sequence: int = 0
 
 
 @dataclass(frozen=True)
@@ -1442,7 +1447,7 @@ def _can_manage_approval_review(user_id: int) -> bool:
     return _is_tool_admin_user(user_id) or _is_owner_user(user_id) or user_id in APPROVAL_REVIEW_MANAGER_USER_IDS
 
 
-def _ai_work_intensity_percent() -> int:
+def _ai_work_intensity_base_percent() -> int:
     raw = memory.app_kv_get(AI_WORK_INTENSITY_PERCENT_KEY)
     try:
         percent = int((raw or "100").strip())
@@ -1451,9 +1456,38 @@ def _ai_work_intensity_percent() -> int:
     return max(0, min(100, percent))
 
 
+def _ai_work_intensity_band(now: datetime | None = None) -> tuple[str, int | None]:
+    current = now or datetime.now(DAILY_REVIEW_TIMEZONE)
+    if current.hour < 2:
+        return f"{current.date().isoformat()}:00-02", 100
+    if current.hour < 12:
+        return f"{current.date().isoformat()}:02-12", 5
+    return f"{current.date().isoformat()}:12-24", None
+
+
+def _ai_work_intensity_percent(now: datetime | None = None) -> int:
+    band, scheduled_default = _ai_work_intensity_band(now)
+    raw_override = memory.app_kv_get(AI_WORK_INTENSITY_OVERRIDE_KEY)
+    if raw_override:
+        try:
+            override = json.loads(raw_override)
+            if str(override.get("band") or "") == band:
+                return max(0, min(100, int(override.get("percent"))))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            pass
+    if scheduled_default is not None:
+        return scheduled_default
+    return _ai_work_intensity_base_percent()
+
+
 def _set_ai_work_intensity_percent(percent: int) -> int:
     cleaned = max(0, min(100, int(percent)))
     memory.app_kv_set(AI_WORK_INTENSITY_PERCENT_KEY, str(cleaned))
+    band, _ = _ai_work_intensity_band()
+    memory.app_kv_set(
+        AI_WORK_INTENSITY_OVERRIDE_KEY,
+        json.dumps({"band": band, "percent": cleaned}, ensure_ascii=False),
+    )
     return cleaned
 
 
@@ -1472,8 +1506,11 @@ def _ai_work_intensity_applies(*, addressed_bot: bool) -> bool:
 
 def _format_ai_work_intensity_status() -> str:
     percent = _ai_work_intensity_percent()
+    base_percent = _ai_work_intensity_base_percent()
     return (
-        f"AI工作强度：{percent}%\n"
+        f"AI工作强度：当前生效 {percent}%（日间常规 {base_percent}%）\n"
+        "时段默认：00:00–02:00 为 100%，02:00–12:00 为 5%，12:00–24:00 使用日间常规值；"
+        "手动设置可覆盖当前时段，到下一个时段边界重新应用默认。\n"
         "作用：控制群聊触发批次进入硬筛选、decision、搜索/行情和生成的概率。\n"
         "不影响：消息照常写入数据库、短期上下文、原文语料、画像素材和学习素材；艾特/回复/点名风雪不受概率影响。\n"
         "命令：工作强度 60；AI强度 30%；触发概率 100。0% 等同只记忆不主动插话。"
@@ -2234,6 +2271,8 @@ async def _handle_group_message_scoped(
             correlation_id=correlation_id,
         )
         return
+    inbound_sequence = group_inbound_sequences.get(group_id, 0) + 1
+    group_inbound_sequences[group_id] = inbound_sequence
     history_started_at = time.monotonic()
     reply_reference = await _resolve_reply_reference_for_event(bot, event, group_allowed=group_allowed)
     _record_metric_event(
@@ -2395,17 +2434,30 @@ async def _handle_group_message_scoped(
             text,
             source_message_id=source_message_id,
             correlation_id=correlation_id,
+            inbound_sequence=inbound_sequence,
         )
         return
-    async with _group_processing_lock(group_id):
-        await _handle_group_message_locked(
-            bot,
-            event,
-            preprocessed_text=text,
-            source_message_id=source_message_id,
-            correlation_id=correlation_id,
-            addressed_bot_hint=addressed_bot,
-        )
+    if addressed_bot:
+        _cancel_passive_decision_retry(group_id)
+        group_addressed_waiters[group_id] = group_addressed_waiters.get(group_id, 0) + 1
+    try:
+        async with _group_processing_lock(group_id):
+            await _handle_group_message_locked(
+                bot,
+                event,
+                preprocessed_text=text,
+                source_message_id=source_message_id,
+                correlation_id=correlation_id,
+                addressed_bot_hint=addressed_bot,
+                trigger_sequence=inbound_sequence,
+            )
+    finally:
+        if addressed_bot:
+            remaining = group_addressed_waiters.get(group_id, 1) - 1
+            if remaining > 0:
+                group_addressed_waiters[group_id] = remaining
+            else:
+                group_addressed_waiters.pop(group_id, None)
 
 
 async def _handle_group_message_locked(
@@ -2419,6 +2471,7 @@ async def _handle_group_message_locked(
     source_message_id: str = "",
     correlation_id: str = "",
     addressed_bot_hint: bool | None = None,
+    trigger_sequence: int = 0,
 ) -> None:
     flow_started_at = time.monotonic()
     text = _buffered_current_text(buffered_messages) if buffered_messages else (
@@ -2430,6 +2483,8 @@ async def _handle_group_message_locked(
         return
 
     user_id = _buffered_current_user_id(buffered_messages) if buffered_messages else int(event.user_id)
+    if buffered_messages:
+        trigger_sequence = buffered_messages[-1].inbound_sequence
     nickname = _buffered_current_nickname(buffered_messages) if buffered_messages else _nickname(event)
     mentioned = False if buffered_messages else _mentioned_bot(event, bot)
     replied_to_bot = False if buffered_messages else _replied_to_bot(event, bot)
@@ -2665,11 +2720,12 @@ async def _handle_group_message_locked(
                 mention_targets={},
                 created_at=time.time(),
                 correlation_id=current_correlation_id(),
+                trigger_sequence=trigger_sequence,
             ),
         )
         return
 
-    if _user_reply_cooling_down(group_id, user_id):
+    if not addressed_bot and _user_reply_cooling_down(group_id, user_id):
         logger.info(
             "qq_social_agent suppressed by user cooldown: "
             f"group={group_id} user={user_id} cooldown={app_config.user_reply_cooldowns[user_id]}"
@@ -2709,6 +2765,20 @@ async def _handle_group_message_locked(
     raw_corpus_context = ""
     jargon_context = ""
     context_query = _context_query_text(text, nickname, context_recent)
+    fresh_context_task: asyncio.Task[str] | None = None
+    if fresh_intent is not None and (fresh_intent.explicit or fresh_intent.required):
+        prefetched_decision = ReplyDecision(
+            should_reply=True,
+            confidence=1.0,
+            reason="backend_fresh_prefetch",
+            action="answer",
+            need_fresh_context=True,
+            fresh_query=fresh_intent.query,
+            fresh_kind=fresh_intent.kind,
+        )
+        fresh_context_task = asyncio.create_task(
+            _fresh_context_for(prefetched_decision, fallback_text=text)
+        )
 
     pre_decision = _pre_decision_gate(
         text=text,
@@ -2892,6 +2962,8 @@ async def _handle_group_message_locked(
     )
     _schedule_group_learning(group_id)
     if not decision.should_reply:
+        if fresh_context_task is not None and not fresh_context_task.done():
+            fresh_context_task.cancel()
         await _send_approval_suppression_notice(
             bot,
             group_id=group_id,
@@ -3038,13 +3110,26 @@ async def _handle_group_message_locked(
                         mention_targets={},
                         created_at=time.time(),
                         correlation_id=current_correlation_id(),
+                        trigger_sequence=trigger_sequence,
                     ),
                 )
                 return
 
     fresh_context = ""
     if decision.need_fresh_context:
-        fresh_context = await _fresh_context_for(decision, fallback_text=text)
+        if (
+            fresh_context_task is not None
+            and fresh_intent is not None
+            and decision.fresh_query.strip() == fresh_intent.query
+            and decision.fresh_kind == fresh_intent.kind
+        ):
+            fresh_context = await fresh_context_task
+        else:
+            if fresh_context_task is not None and not fresh_context_task.done():
+                fresh_context_task.cancel()
+            fresh_context = await _fresh_context_for(decision, fallback_text=text)
+    elif fresh_context_task is not None and not fresh_context_task.done():
+        fresh_context_task.cancel()
     deep_url_context = await _deep_url_context_for(text, addressed_bot=addressed_bot)
     if deep_url_context:
         fresh_context = _combine_text_sections(fresh_context, deep_url_context)
@@ -3173,6 +3258,7 @@ async def _handle_group_message_locked(
             created_at=time.time(),
             correlation_id=current_correlation_id(),
             tool_evidence=_approval_evidence_from_context(fresh_context),
+            trigger_sequence=trigger_sequence,
         ),
     )
 
@@ -4795,6 +4881,7 @@ def _buffer_group_message(
     *,
     source_message_id: str = "",
     correlation_id: str = "",
+    inbound_sequence: int = 0,
 ) -> None:
     group_id = int(event.group_id)
     _cancel_passive_decision_retry(group_id)
@@ -4807,6 +4894,7 @@ def _buffer_group_message(
         created_at=float(getattr(event, "time", 0) or time.time()),
         source_message_id=source_message_id or event_message_source_id(event),
         correlation_id=correlation_id,
+        inbound_sequence=inbound_sequence,
     )
     group_message_buffers.setdefault(group_id, []).append(item)
     _schedule_group_buffer_flush(group_id)
@@ -4827,6 +4915,9 @@ async def _flush_group_buffer_after_delay(group_id: int, *, delay: float = GROUP
     try:
         await asyncio.sleep(delay)
         async with _group_processing_lock(group_id):
+            if group_addressed_waiters.get(group_id, 0) > 0:
+                should_reschedule = True
+                return
             if group_id in group_generation_inflight:
                 logger.info(
                     "qq_social_agent group generation inflight: "
@@ -4883,9 +4974,13 @@ def _cancel_passive_decision_retry(group_id: int) -> None:
 
 
 async def _run_passive_decision_retry(group_id: int) -> None:
+    should_reschedule = False
     try:
         await asyncio.sleep(GROUP_PASSIVE_DECISION_GAP_SECONDS)
         async with _group_processing_lock(group_id):
+            if group_addressed_waiters.get(group_id, 0) > 0:
+                should_reschedule = True
+                return
             items = group_passive_retry_buffers.pop(group_id, [])
             if not items:
                 return
@@ -4908,6 +5003,11 @@ async def _run_passive_decision_retry(group_id: int) -> None:
         task = asyncio.current_task()
         if group_passive_retry_tasks.get(group_id) is task:
             group_passive_retry_tasks.pop(group_id, None)
+        if should_reschedule and group_passive_retry_buffers.get(group_id):
+            _schedule_passive_decision_retry(
+                group_id,
+                group_passive_retry_buffers[group_id],
+            )
 
 
 def _buffered_current_text(items: list[BufferedGroupMessage] | None) -> str:
@@ -6486,21 +6586,44 @@ async def _send_approved_group_reply_scoped(
         candidate_index=candidate.index,
         approval_wait_ms=max(0, int((time.time() - approval.created_at) * 1000)),
     )
-    reply_parts = split_reply_messages(candidate.text, max_messages=3)
+    effective_mention_targets = dict(approval.mention_targets)
+    reply_text = candidate.text
+    sequence_lag = max(
+        0,
+        group_inbound_sequences.get(approval.group_id, approval.trigger_sequence)
+        - approval.trigger_sequence,
+    )
+    force_trigger_mention = approval.trigger_sequence > 0 and sequence_lag >= 3
+    if force_trigger_mention:
+        effective_mention_targets[approval.trigger_user_id] = (
+            approval.trigger_nickname.strip() or str(approval.trigger_user_id)
+        )[:24]
+        trigger_marker = f"[[at:{approval.trigger_user_id}]]"
+        if trigger_marker not in reply_text:
+            reply_text = f"{trigger_marker} {reply_text}".strip()
+        _record_metric_event(
+            "stale_reply_mention",
+            group_id=approval.group_id,
+            user_id=approval.trigger_user_id,
+            stage="send",
+            action="force_mention",
+            newer_message_count=sequence_lag,
+        )
+    reply_parts = split_reply_messages(reply_text, max_messages=3)
     sent_mention_user_id: int | None = None
     recorded_user_reply = False
     for index, part_text in enumerate(reply_parts):
         try:
-            part_mention_user_id = _first_allowed_mention_id(part_text, approval.mention_targets)
+            part_mention_user_id = _first_allowed_mention_id(part_text, effective_mention_targets)
             sent_message_id = await _send_group_message(
                 bot,
                 approval.group_id,
-                _message_from_reply_part(part_text, approval.mention_targets),
+                _message_from_reply_part(part_text, effective_mention_targets),
             )
             if not recorded_user_reply:
                 _record_user_reply(approval.group_id, approval.trigger_user_id)
                 recorded_user_reply = True
-            memory_text = _memory_text_from_reply_part(part_text, approval.mention_targets)
+            memory_text = _memory_text_from_reply_part(part_text, effective_mention_targets)
             _record_bot_sent_message(
                 group_id=approval.group_id,
                 message_id=sent_message_id,

@@ -30,7 +30,38 @@ def pre_decision_gate(
     fresh_intent: FreshIntent | None,
 ) -> PreDecisionGateResult:
     if addressed_bot:
-        return PreDecisionGateResult()
+        if market_intents and is_explicit_market_lookup(text):
+            return PreDecisionGateResult(
+                decision=_market_decision(
+                    text=text,
+                    market_intents=market_intents,
+                    reason="local_addressed_market_lookup",
+                    confidence=1.0,
+                    mode="addressed",
+                )
+            )
+        if fresh_intent is not None and (fresh_intent.explicit or fresh_intent.required):
+            return PreDecisionGateResult(
+                decision=ReplyDecision(
+                    should_reply=True,
+                    confidence=1.0,
+                    reason="local_addressed_fresh_lookup",
+                    mode="addressed",
+                    action="answer",
+                    need_fresh_context=True,
+                    fresh_query=fresh_intent.query,
+                    fresh_kind=fresh_intent.kind,
+                )
+            )
+        return PreDecisionGateResult(
+            decision=ReplyDecision(
+                should_reply=True,
+                confidence=1.0,
+                reason="local_addressed_reply",
+                mode="addressed",
+                action="answer" if _looks_like_question_or_request(text) else "reply",
+            )
+        )
 
     if is_low_value_group_text(text):
         return PreDecisionGateResult(skip_reason="low_value_local")
@@ -71,7 +102,7 @@ def apply_backend_tool_decision(
             result,
             action=action,
             need_fresh_context=True,
-            fresh_query=result.fresh_query.strip() or fresh_intent.query,
+            fresh_query=fresh_intent.query,
             fresh_kind=fresh_intent.kind,
         )
     return result
@@ -118,6 +149,28 @@ def is_explicit_market_lookup(text: str) -> bool:
         "现在",
     )
     return any(term in lowered for term in lookup_terms)
+
+
+def _looks_like_question_or_request(text: str) -> bool:
+    markers = (
+        "?",
+        "？",
+        "吗",
+        "么",
+        "怎么",
+        "咋",
+        "为什么",
+        "谁",
+        "哪",
+        "多少",
+        "能不能",
+        "可以吗",
+        "帮我",
+        "说说",
+        "解释",
+        "看看",
+    )
+    return any(marker in text for marker in markers)
 
 
 def market_comment_after_tool(text: str) -> bool:

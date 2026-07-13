@@ -213,6 +213,23 @@ def test_current_casual_chat_does_not_require_fresh_verification(text: str) -> N
     assert detect_fresh_intent(text) is None
 
 
+def test_current_fact_at_end_of_enriched_reply_wrapper_is_not_truncated() -> None:
+    text = (
+        "科有代（人类最终毁灭兵器）[#56514]回复张风雪-北本[#07496]消息【"
+        "注：张风雪和风雪都是你自己；群友回复张风雪/风雪，就是在回复你之前说的话。"
+        "张风雪-北本[#07496]说：代代咋突然发这个呀~；"
+        "科有代（人类最终毁灭兵器）[#56514]回复张风雪-北本[#07496]："
+        "你们北大今年有两个菲奖得主了】"
+    )
+
+    intent = detect_fresh_intent(text)
+
+    assert intent is not None
+    assert intent.required
+    assert intent.kind == "web"
+    assert intent.query == "你们北大今年有两个菲奖得主了"
+
+
 def test_parse_bing_web_rss_preserves_traceable_metadata() -> None:
     items = _parse_bing_rss(
         """

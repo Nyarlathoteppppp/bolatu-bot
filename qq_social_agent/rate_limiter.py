@@ -49,13 +49,8 @@ class RateLimiter:
             (reply for reply in replies_hour if reply.created_at <= cooldown_reference),
             None,
         )
-        if last:
-            min_interval = (
-                self.config.hard_mention_interval_seconds
-                if mentioned
-                else self.config.min_interval_seconds
-            )
-            if cooldown_reference - last.created_at < min_interval:
+        if last and not mentioned:
+            if cooldown_reference - last.created_at < self.config.min_interval_seconds:
                 return RateDecision(False, "cooldown")
 
         if self._consecutive_bot_replies(group_id) >= self.config.max_consecutive_replies:

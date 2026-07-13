@@ -217,7 +217,12 @@ class FreshContextTool:
         answer = ""
         items: tuple[FreshItem, ...] = ()
         used_provider = providers[-1]
+        deadline = time.monotonic() + self.timeout_seconds
         for provider_name in _dedupe_strings(providers):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                errors.append("total_timeout")
+                break
             attempted.append(provider_name)
             used_provider = provider_name
             try:
@@ -225,6 +230,7 @@ class FreshContextTool:
                     provider_name,
                     normalized_query,
                     kind=normalized_kind,
+                    timeout_seconds=remaining,
                 )
             except SearchProviderError as exc:
                 errors.append(f"{provider_name}:{exc.code}")
@@ -266,7 +272,12 @@ class FreshContextTool:
         query: str,
         *,
         kind: str,
+        timeout_seconds: float | None = None,
     ) -> tuple[str, tuple[FreshItem, ...]]:
+        request_timeout = max(
+            0.1,
+            min(self.timeout_seconds, float(timeout_seconds or self.timeout_seconds)),
+        )
         if provider == "tavily":
             if not self.tavily_api_key:
                 raise SearchProviderError("missing_api_key")
@@ -275,7 +286,7 @@ class FreshContextTool:
                 query,
                 kind=kind,
                 api_key=self.tavily_api_key,
-                timeout_seconds=self.timeout_seconds,
+                timeout_seconds=request_timeout,
                 max_results=self.max_results,
             )
         if provider == "google_news":
@@ -283,14 +294,14 @@ class FreshContextTool:
                 _fetch_google_news_items,
                 query,
                 kind=kind,
-                timeout_seconds=self.timeout_seconds,
+                timeout_seconds=request_timeout,
                 max_results=self.max_results,
             )
         if provider == "bing_web":
             return "", await _invoke_provider(
                 _fetch_bing_web_items,
                 query,
-                timeout_seconds=self.timeout_seconds,
+                timeout_seconds=request_timeout,
                 max_results=self.max_results,
             )
         raise SearchProviderError("unsupported_provider")
@@ -818,24 +829,29 @@ def fresh_kind_from_text(text: str) -> str | None:
 
 
 def detect_fresh_intent(text: str) -> FreshIntent | None:
-    normalized = _normalize_query(text)
-    compact = re.sub(r"\s+", "", normalized.casefold())
+    full_text = re.sub(r"\s+", " ", str(text or "")).strip()
+    normalized = _normalize_query(full_text)
+    compact = re.sub(r"\s+", "", full_text.casefold())
     if not compact or _is_low_value_fresh_query(compact):
         return None
 
-    explicit_query = _explicit_search_query(normalized)
+    explicit_query = _explicit_search_query(full_text)
     explicit = explicit_query is not None
-    kind = _classify_fresh_kind(normalized, explicit=explicit)
+    kind = _classify_fresh_kind(full_text, explicit=explicit)
     if kind is None:
         return None
-    query = _normalize_query(explicit_query) if explicit_query is not None else _fresh_query_from_text(normalized)
+    query = (
+        _normalize_query(explicit_query)
+        if explicit_query is not None
+        else _fresh_query_from_text(_current_reply_text(full_text) or normalized)
+    )
     if _is_low_value_fresh_query(query):
         return None
     return FreshIntent(
         query=query,
         kind=kind,
         explicit=explicit,
-        required=explicit or _requires_fresh_verification(normalized),
+        required=explicit or _requires_fresh_verification(full_text),
     )
 
 
@@ -859,6 +875,20 @@ def _fresh_query_from_text(text: str) -> str:
     query = re.sub(r"(现在|今天)?(怎么样了|怎么了|是什么情况|咋了|如何了)$", "", query).strip()
     query = re.sub(r"(最新消息|最新新闻|新闻|赛果|比分|结果)$", "", query).strip()
     return _normalize_query(query or text)
+
+
+def _current_reply_text(text: str) -> str:
+    """Extract the current speaker's part from the enriched QQ reply wrapper."""
+
+    if "回复" not in text or "消息【" not in text or not text.endswith("】"):
+        return ""
+    for separator in ("：", ":"):
+        if separator not in text:
+            continue
+        current = text.rsplit(separator, 1)[-1].removesuffix("】").strip()
+        if current:
+            return current
+    return ""
 
 
 def _is_low_value_fresh_query(text: str) -> bool:
@@ -971,13 +1001,13 @@ def _classify_fresh_kind(text: str, *, explicit: bool) -> str | None:
         return "sports"
     if explicit:
         return "news" if has_news else "web"
+    if _requires_fresh_verification(text):
+        academic_terms = ("菲奖", "菲尔兹", "学术", "论文", "猜想", "定理", "期刊", "大学")
+        return "web" if any(term in lowered for term in academic_terms) else "news"
     if has_freshness and any(term in lowered for term in news_subject_terms):
         return "news"
     if has_freshness and any(term in lowered for term in ("版本", "文档", "官网", "更新", "发布")):
         return "web"
-    if _requires_fresh_verification(text):
-        academic_terms = ("菲奖", "菲尔兹", "学术", "论文", "猜想", "定理", "期刊", "大学")
-        return "web" if any(term in lowered for term in academic_terms) else "news"
     return None
 
 
