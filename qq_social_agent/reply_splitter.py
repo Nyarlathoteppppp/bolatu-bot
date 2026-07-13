@@ -29,7 +29,7 @@ def split_reply_messages(text: str, *, max_messages: int) -> list[str]:
 
 
 def _split_long_single_sentence(text: str, *, max_messages: int) -> list[str]:
-    if len(text) <= 120:
+    if len(text) <= 80:
         return [text]
 
     chunks = [chunk.strip() for chunk in re.split(r"(?<=[，,；;：:、])", text) if chunk.strip()]
@@ -58,7 +58,7 @@ def _split_long_single_sentence(text: str, *, max_messages: int) -> list[str]:
 
 
 def _split_sentences(text: str) -> list[str]:
-    chunks = re.findall(r".+?[。！？!?]+|.+$", text)
+    chunks = re.findall(r".+?(?:[。！？!?]+|…{2,}|\.{3,})|.+$", text)
     return [chunk.strip() for chunk in chunks if chunk.strip()]
 
 

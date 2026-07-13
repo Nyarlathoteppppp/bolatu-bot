@@ -31,3 +31,29 @@ def test_directed_reply_can_split_three_messages() -> None:
         "这个波动更像情绪盘。",
         "真要看还得等它站回关键位。",
     ]
+
+
+def test_split_real_long_reply_at_chinese_ellipsis() -> None:
+    text = (
+        "年包80万的大厂算法岗，你得先补完体系结构、数据结构、算法那堆东西再说啊……"
+        "而且现在算法岗卷成啥样了，双非本科基本简历都过不去，"
+        "建议先刷LeetCode+考研冲个985硕，或者看看AI infra运维岗能不能曲线救国"
+    )
+
+    assert split_reply_messages(text, max_messages=3) == [
+        "年包80万的大厂算法岗，你得先补完体系结构、数据结构、算法那堆东西再说啊……",
+        (
+            "而且现在算法岗卷成啥样了，双非本科基本简历都过不去，"
+            "建议先刷LeetCode+考研冲个985硕，或者看看AI infra运维岗能不能曲线救国"
+        ),
+    ]
+
+
+def test_split_comma_only_reply_below_model_character_limit() -> None:
+    text = "第一段信息很长，" + "需要继续解释清楚，" * 7 + "最后给出一个明确建议"
+
+    parts = split_reply_messages(text, max_messages=3)
+
+    assert len(text) < 120
+    assert len(parts) >= 2
+    assert "".join(parts) == text
