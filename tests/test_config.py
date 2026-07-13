@@ -202,5 +202,7 @@ def test_persona_registry_loads_persona_from_central_prompt_file() -> None:
     assert "勤能补拙" in persona.prompt
     assert "卡耐基梅隆" in persona.prompt
     assert "无糖可乐" in persona.prompt
+    assert "数学猜想" in persona.prompt
+    assert "不能确信自己理解准确" in persona.decision_prompt
     assert "QQ 群里的元气美少女妹妹" in persona.decision_prompt
     assert "棘手的大问题" in persona.decision_prompt
