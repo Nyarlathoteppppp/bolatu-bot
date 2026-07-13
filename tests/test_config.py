@@ -197,6 +197,10 @@ def test_persona_registry_loads_persona_from_central_prompt_file() -> None:
     persona = registry.get("zhangxuefeng")
 
     assert persona.name == "张风雪"
-    assert "温柔美少女妹妹" in persona.prompt
-    assert "QQ 群里的温柔美少女妹妹" in persona.decision_prompt
+    assert "元气美少女妹妹" in persona.prompt
+    assert "永不放弃" in persona.prompt
+    assert "勤能补拙" in persona.prompt
+    assert "卡耐基梅隆" in persona.prompt
+    assert "无糖可乐" in persona.prompt
+    assert "QQ 群里的元气美少女妹妹" in persona.decision_prompt
     assert "棘手的大问题" in persona.decision_prompt
