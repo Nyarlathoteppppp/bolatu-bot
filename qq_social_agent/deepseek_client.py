@@ -698,7 +698,7 @@ class DeepSeekClient:
             feedback_context=feedback_context.strip() or "（无审批反馈）",
         )
         request = {
-            "max_tokens": max(self.config.max_tokens, 700),
+            "max_tokens": max(self.config.max_tokens, 1200),
             "response_format": {"type": "json_object"},
             "messages": [
                 {"role": "system", "content": system},
@@ -1086,6 +1086,11 @@ def _parse_daily_review(
     try:
         raw = _loads_json_object(content)
     except json.JSONDecodeError:
+        recovered = _recover_json_string_field(content, "public_reply")
+        if recovered:
+            return DailyReviewDraft(_sanitize_reply(recovered, max_chars))
+        if content.lstrip().startswith("{"):
+            return DailyReviewDraft("")
         return DailyReviewDraft(_sanitize_reply(content, max_chars))
     public_reply = _sanitize_reply(str(raw.get("public_reply", "")), max_chars)
     if not public_reply:
@@ -1106,6 +1111,30 @@ def _parse_daily_review(
             raw.get("style_observations"), messages=messages, default_kind="style_observation", limit=8
         ),
     )
+
+
+def _recover_json_string_field(content: str, field: str) -> str:
+    match = re.search(rf'"{re.escape(field)}"\s*:\s*"', content)
+    if match is None:
+        return ""
+    escaped = False
+    raw_value: list[str] = []
+    for char in content[match.end() :]:
+        if escaped:
+            raw_value.extend(("\\", char))
+            escaped = False
+            continue
+        if char == "\\":
+            escaped = True
+            continue
+        if char == '"':
+            break
+        raw_value.append(char)
+    encoded = "".join(raw_value)
+    try:
+        return str(json.loads(f'"{encoded}"')).strip()
+    except json.JSONDecodeError:
+        return encoded.replace("\\n", "\n").replace('\\"', '"').replace("\\\\", "\\").strip()
 
 
 def _parse_memory_fact_list(

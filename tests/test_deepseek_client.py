@@ -442,6 +442,21 @@ def test_parse_daily_review_separates_public_reply_from_internal_learning() -> N
     assert draft.feedback_lessons[0].kind == "feedback_lesson"
 
 
+def test_parse_daily_review_recovers_public_text_from_truncated_json_without_leaking_wrapper() -> None:
+    draft = _parse_daily_review(
+        '{"public_reply":"今天从课程聊到留学，后面又研究起工作。风雪今天也接了不少话，稍微有点话多。',
+    )
+
+    assert draft.public_reply == "今天从课程聊到留学，后面又研究起工作。风雪今天也接了不少话，稍微有点话多。"
+    assert "public_reply" not in draft.public_reply
+
+
+def test_parse_daily_review_drops_unrecoverable_json_instead_of_sending_backend_format() -> None:
+    draft = _parse_daily_review('{"events":[')
+
+    assert draft.public_reply == ""
+
+
 def test_parse_reply_candidates_logs_diagnostic_when_short(monkeypatch) -> None:
     logs: list[str] = []
     monkeypatch.setattr(
