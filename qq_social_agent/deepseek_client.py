@@ -793,7 +793,7 @@ class DeepSeekClient:
             route_name="memory",
             request={
                 "temperature": 0.2,
-                "max_tokens": 360,
+                "max_tokens": 900,
                 "response_format": {"type": "json_object"},
                 "messages": [
                     {"role": "system", "content": system},
@@ -1129,7 +1129,11 @@ def _parse_mid_memory(
     try:
         raw = _loads_json_object(content)
     except json.JSONDecodeError:
-        return MidMemoryDraft("", ())
+        # Some providers truncate the optional structured arrays after already
+        # completing the summary. Preserve that useful prefix so one malformed
+        # batch cannot block the summary cursor forever.
+        recovered_summary = _recover_json_string_field(content, "summary").strip()
+        return MidMemoryDraft(recovered_summary[:1200], ())
     summary = str(raw.get("summary", "")).strip()
     raw_cues = raw.get("recall_cues", [])
     if not isinstance(raw_cues, list):

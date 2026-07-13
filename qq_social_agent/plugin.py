@@ -5424,6 +5424,18 @@ async def _maintain_group_learning(group_id: int) -> None:
                     jargon_count=len(draft.jargon_candidates),
                     open_thread_count=len(draft.open_threads),
                 )
+            else:
+                logger.warning(
+                    "qq_social_agent mid memory returned empty summary: "
+                    f"group={group_id} messages={len(summary_messages)}"
+                )
+                _record_metric_event(
+                    "mid_memory_learning",
+                    group_id=group_id,
+                    stage="memory",
+                    action="empty_summary",
+                    message_count=len(summary_messages),
+                )
         except Exception as exc:
             logger.warning(f"qq_social_agent mid memory skipped: group={group_id} error={exc}")
 

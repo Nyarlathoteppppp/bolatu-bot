@@ -8,7 +8,7 @@ from qq_social_agent.memory import MemoryStore
 from qq_social_agent.pipeline_types import OutputChannel, SocialIntent, ToolKind
 from qq_social_agent.timing_gate import parse_timing_decision
 from qq_social_agent.tool_router import apply_tool_plan, compare_legacy_decision, route_tools
-from qq_social_agent.deepseek_client import ReplyDecision
+from qq_social_agent.deepseek_client import ReplyDecision, _parse_mid_memory
 from qq_social_agent.tools.fresh_context import FreshIntent
 from qq_social_agent.tools.market_intent import MarketIntent
 
@@ -102,6 +102,16 @@ def test_mid_summary_page_can_exclude_bot_messages(tmp_path) -> None:
     assert all(not row.is_bot for row in rows)
     assert [row.text for row in rows] == ["消息0", "消息2", "消息4", "消息6"]
     memory.conn.close()
+
+
+def test_mid_memory_recovers_summary_from_truncated_structured_json() -> None:
+    draft = _parse_mid_memory(
+        '{"summary":"总览：群友讨论了算法和留学；按人：A[#10001]想继续准备",'
+        '"recall_cues":["算法"],"facts":[{"kind":"event"'
+    )
+
+    assert draft.summary.startswith("总览：群友讨论了算法和留学")
+    assert draft.facts == ()
 
 
 def test_background_learning_uses_one_worker_and_defers_busy_group() -> None:
