@@ -67,6 +67,7 @@ class FreshIntent:
     query: str
     kind: str
     explicit: bool = False
+    required: bool = False
 
 
 class SearchProviderError(RuntimeError):
@@ -830,7 +831,12 @@ def detect_fresh_intent(text: str) -> FreshIntent | None:
     query = _normalize_query(explicit_query) if explicit_query is not None else _fresh_query_from_text(normalized)
     if _is_low_value_fresh_query(query):
         return None
-    return FreshIntent(query=query, kind=kind, explicit=explicit)
+    return FreshIntent(
+        query=query,
+        kind=kind,
+        explicit=explicit,
+        required=explicit or _requires_fresh_verification(normalized),
+    )
 
 
 def should_use_fresh_context(query: str, fallback_text: str = "") -> bool:
@@ -946,7 +952,10 @@ def _classify_fresh_kind(text: str, *, explicit: bool) -> str | None:
     fresh_terms = (
         "最新",
         "刚刚",
+        "刚才",
         "今天",
+        "今年",
+        "本届",
         "现在",
         "目前",
         "发生什么",
@@ -966,7 +975,50 @@ def _classify_fresh_kind(text: str, *, explicit: bool) -> str | None:
         return "news"
     if has_freshness and any(term in lowered for term in ("版本", "文档", "官网", "更新", "发布")):
         return "web"
+    if _requires_fresh_verification(text):
+        academic_terms = ("菲奖", "菲尔兹", "学术", "论文", "猜想", "定理", "期刊", "大学")
+        return "web" if any(term in lowered for term in academic_terms) else "news"
     return None
+
+
+def _requires_fresh_verification(text: str) -> bool:
+    """Identify concrete current outcomes that should never rely on stale model memory."""
+
+    lowered = text.casefold()
+    time_terms = (
+        "今天",
+        "今年",
+        "本届",
+        "刚刚",
+        "刚才",
+        "最新",
+        "目前",
+        "现在已经",
+        "已经确定",
+        "已经公布",
+    )
+    outcome_terms = (
+        "得主",
+        "获奖",
+        "拿到",
+        "名单",
+        "颁奖",
+        "当选",
+        "夺冠",
+        "冠军",
+        "排名",
+        "入选",
+        "官宣",
+        "公布",
+        "发布",
+        "实锤",
+        "确定",
+        "解决了",
+        "证明了",
+    )
+    return any(term in lowered for term in time_terms) and any(
+        term in lowered for term in outcome_terms
+    )
 
 
 def _safe_external_query(query: str, *, max_chars: int = 120) -> str:

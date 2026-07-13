@@ -976,6 +976,24 @@ def test_backend_tool_decision_does_not_force_implicit_fresh_hint() -> None:
     assert decision == original
 
 
+def test_backend_tool_decision_forces_required_current_fact_verification() -> None:
+    decision = _apply_backend_tool_decision(
+        ReplyDecision(True, 0.92, "认可群友观点", mode="chat", action="agree"),
+        text="你们北大今年有两个菲奖得主了",
+        market_intents=[],
+        fresh_intent=FreshIntent(
+            query="北大今年两个菲奖得主",
+            kind="web",
+            required=True,
+        ),
+    )
+
+    assert decision.action == "agree"
+    assert decision.need_fresh_context
+    assert decision.fresh_query == "北大今年两个菲奖得主"
+    assert decision.fresh_kind == "web"
+
+
 def test_pre_decision_gate_does_not_replace_repeated_question_with_mocking() -> None:
     result = _pre_decision_gate(
         text="c 罗和梅西谁厉害",

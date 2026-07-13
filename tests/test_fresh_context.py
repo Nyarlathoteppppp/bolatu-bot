@@ -188,6 +188,31 @@ def test_detect_fresh_intent_avoids_casual_false_positives(text: str) -> None:
     assert detect_fresh_intent(text) is None
 
 
+@pytest.mark.parametrize(
+    ("text", "kind"),
+    [
+        ("你们北大今年有两个菲奖得主了", "web"),
+        ("今年的获奖名单已经公布了", "news"),
+        ("本届世界杯冠军已经确定", "sports"),
+    ],
+)
+def test_detect_fresh_intent_requires_verification_for_current_outcomes(
+    text: str,
+    kind: str,
+) -> None:
+    intent = detect_fresh_intent(text)
+
+    assert intent is not None
+    assert intent.kind == kind
+    assert not intent.explicit
+    assert intent.required
+
+
+@pytest.mark.parametrize("text", ["今年好累", "今天吃鹅腿", "目前不想说话"])
+def test_current_casual_chat_does_not_require_fresh_verification(text: str) -> None:
+    assert detect_fresh_intent(text) is None
+
+
 def test_parse_bing_web_rss_preserves_traceable_metadata() -> None:
     items = _parse_bing_rss(
         """

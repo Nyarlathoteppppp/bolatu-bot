@@ -65,7 +65,7 @@ def apply_backend_tool_decision(
             confidence=decision.confidence,
             mode=decision.mode,
         )
-    if fresh_intent is not None and fresh_intent.explicit:
+    if fresh_intent is not None and (fresh_intent.explicit or fresh_intent.required):
         action = "answer" if result.action == "fresh_context" else result.action
         result = replace(
             result,
