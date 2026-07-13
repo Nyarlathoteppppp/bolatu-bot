@@ -1454,11 +1454,19 @@ def _can_manage_approval_review(user_id: int) -> bool:
 
 
 def _ai_work_intensity_base_percent() -> int:
+    rate_config = app_config.raw.get("rate_control", {})
+    if not isinstance(rate_config, dict):
+        rate_config = {}
+    try:
+        configured_default = int(rate_config.get("daytime_work_intensity_percent", 8))
+    except (TypeError, ValueError):
+        configured_default = 8
+    configured_default = max(0, min(100, configured_default))
     raw = memory.app_kv_get(AI_WORK_INTENSITY_PERCENT_KEY)
     try:
-        percent = int((raw or "100").strip())
+        percent = int((raw or str(configured_default)).strip())
     except (TypeError, ValueError):
-        percent = 100
+        percent = configured_default
     return max(0, min(100, percent))
 
 

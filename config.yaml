@@ -62,6 +62,7 @@ deepseek:
   max_retries: 0
 
 rate_control:
+  daytime_work_intensity_percent: 8
   min_interval_seconds: 3
   hard_mention_interval_seconds: 1
   max_replies_per_10min: 40

@@ -1858,13 +1858,12 @@ def test_regular_basic_approver_cannot_set_approval_auto_send_percent(monkeypatc
     assert bot.private_messages[-1] == (123456789, "你只有基础审批权限：A/B/C/D/X/1/2/3/取消 处理审批单。")
 
 
-def test_ai_work_intensity_defaults_to_full(monkeypatch, tmp_path) -> None:
+def test_ai_work_intensity_defaults_to_configured_daytime_percent(monkeypatch, tmp_path) -> None:
     _use_temp_plugin_memory(monkeypatch, tmp_path)
     daytime = datetime(2026, 7, 14, 13, 0, tzinfo=plugin.DAILY_REVIEW_TIMEZONE)
 
     percent = plugin._ai_work_intensity_percent(daytime)
-    assert percent == 100
-    assert plugin._ai_work_intensity_selected(percent)
+    assert percent == 8
 
 
 def test_owner_can_set_ai_work_intensity_percent(monkeypatch, tmp_path) -> None:
@@ -1892,7 +1891,7 @@ def test_basic_approver_cannot_set_ai_work_intensity_percent(monkeypatch, tmp_pa
     handled = asyncio.run(plugin._handle_group_approval_private(bot, 3370998238, "工作强度 30"))
 
     assert handled
-    assert plugin._ai_work_intensity_percent(daytime) == 100
+    assert plugin._ai_work_intensity_percent(daytime) == 8
     assert bot.private_messages[-1] == (3370998238, "你只有基础审批权限：A/B/C/D/X/1/2/3/取消 处理审批单。")
 
 
