@@ -6,6 +6,7 @@ from qq_social_agent.deepseek_client import (
     ChatMessage,
     DeepSeekClient,
     _log_llm_usage,
+    _format_context_with_local_focus,
     _parse_jargon_terms,
     _parse_daily_review,
     _parse_long_message_summary,
@@ -25,6 +26,25 @@ def test_sanitize_empty_string_markers() -> None:
     assert _sanitize_reply("空字符串", 120) == ""
     assert _sanitize_reply("（空字符串）", 120) == ""
     assert _sanitize_reply('"（空字符串）"', 120) == ""
+
+
+def test_context_marks_only_contiguous_recent_topic_as_high_priority() -> None:
+    messages = [
+        ChatMessage(1, 1, "A", "在人均弱智的教室只有我智力正常", False, 100.0),
+        ChatMessage(1, 2, "B", "含铅", False, 400.0),
+        ChatMessage(1, 2, "B", "[图片OCR: 墨尔本自来水很好喝]", False, 406.0),
+    ]
+
+    context = _format_context_with_local_focus(
+        messages,
+        formatter=lambda message: f"{message.nickname}: {message.text}",
+    )
+
+    older, focused = context.split("【紧邻当前消息的连续话题", 1)
+    assert "智力正常" in older
+    assert "智力正常" not in focused
+    assert "含铅" in focused
+    assert "墨尔本自来水" in focused
 
 
 def test_sanitize_keeps_normal_reply() -> None:

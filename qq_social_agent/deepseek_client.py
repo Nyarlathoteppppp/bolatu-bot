@@ -262,7 +262,10 @@ class DeepSeekClient:
         memory_atoms_context: str = "",
         fresh_context_hint: str = "",
     ) -> ReplyDecision:
-        context = "\n".join(_format_decision_message(msg) for msg in recent_messages[-30:])
+        context = _format_context_with_local_focus(
+            recent_messages[-30:],
+            formatter=_format_decision_message,
+        )
         if not context:
             context = "（暂无更多上下文）"
         addressed = mentioned or replied_to_bot
@@ -316,7 +319,7 @@ class DeepSeekClient:
         chat_label: str = "QQ 群聊",
     ) -> tuple[str, ...]:
         context_messages = recent_messages[-18:]
-        context = "\n".join(_format_message(msg) for msg in context_messages)
+        context = _format_context_with_local_focus(context_messages, formatter=_format_message)
         if not context:
             context = "（暂无更多上下文）"
         heuristic_text = "、".join(heuristic_terms) if heuristic_terms else "无"
@@ -375,7 +378,7 @@ class DeepSeekClient:
             recent_messages,
             include_bot_history=include_bot_history,
         )
-        context = "\n".join(_format_message(msg) for msg in context_messages)
+        context = _format_context_with_local_focus(context_messages, formatter=_format_message)
         if not context:
             context = "（暂无更多上下文）"
         mode = (
@@ -796,6 +799,34 @@ def _reply_context_messages(
     if human_messages:
         return human_messages[-limit:]
     return messages[-min(limit, len(messages)):]
+
+
+def _format_context_with_local_focus(
+    messages: list[ChatMessage],
+    *,
+    formatter: Callable[[ChatMessage], str],
+    local_limit: int = 6,
+    topic_gap_seconds: float = 180.0,
+) -> str:
+    if not messages:
+        return ""
+    local_start = max(0, len(messages) - max(1, local_limit))
+    for index in range(len(messages) - 1, local_start, -1):
+        gap = float(messages[index].created_at) - float(messages[index - 1].created_at)
+        if gap > topic_gap_seconds:
+            local_start = index
+            break
+    older = messages[:local_start]
+    local = messages[local_start:]
+    sections: list[str] = []
+    if older:
+        sections.append("\n".join(formatter(msg) for msg in older))
+    sections.append(
+        "【紧邻当前消息的连续话题（最高优先级）：解释‘这/那/太可怕了/是吧’等省略表达时，"
+        "必须优先承接下面这些消息，禁止跨越话题断点拼接旧词】\n"
+        + "\n".join(formatter(msg) for msg in local)
+    )
+    return "\n\n".join(sections)
 
 
 def _optional_section(title: str, content: str) -> str:
