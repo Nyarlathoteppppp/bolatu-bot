@@ -323,6 +323,8 @@ class DeepSeekClient:
     ) -> tuple[str, ...]:
         context_messages = recent_messages[-18:]
         context = _format_context_with_local_focus(context_messages, formatter=_format_message)
+        recent_bot_replies = _recent_bot_reply_texts(recent_messages)
+        context = _append_recent_bot_duplicate_guard(context, recent_bot_replies)
         if not context:
             context = "（暂无更多上下文）"
         heuristic_text = "、".join(heuristic_terms) if heuristic_terms else "无"
@@ -544,7 +546,9 @@ class DeepSeekClient:
             recent_messages,
             include_bot_history=include_bot_history,
         )
-        context = "\n".join(_format_message(msg) for msg in context_messages)
+        context = _format_context_with_local_focus(context_messages, formatter=_format_message)
+        recent_bot_replies = _recent_bot_reply_texts(recent_messages)
+        context = _append_recent_bot_duplicate_guard(context, recent_bot_replies)
         if not context:
             context = "（暂无更多上下文）"
         mode = (
@@ -611,6 +615,7 @@ class DeepSeekClient:
             fallback_action=normalized_action,
             limit=candidate_count,
         )
+        candidates = _filter_recent_bot_duplicate_candidates(candidates, recent_bot_replies)
         if len(candidates) >= candidate_count:
             return candidates
 
@@ -619,6 +624,7 @@ class DeepSeekClient:
             previous_content=content,
             parsed_count=len(candidates),
             candidate_count=candidate_count,
+            avoid_texts=recent_bot_replies,
         )
         try:
             retry_response = await self._chat_completion(
@@ -632,6 +638,10 @@ class DeepSeekClient:
                 max_chars=persona.max_reply_chars,
                 fallback_action=normalized_action,
                 limit=candidate_count,
+            )
+            retry_candidates = _filter_recent_bot_duplicate_candidates(
+                retry_candidates,
+                recent_bot_replies,
             )
         except Exception as exc:
             logger.warning(f"qq_social_agent reply candidates retry failed: error={exc}")
@@ -802,6 +812,23 @@ def _reply_context_messages(
     if human_messages:
         return human_messages[-limit:]
     return messages[-min(limit, len(messages)):]
+
+
+def _recent_bot_reply_texts(messages: list[ChatMessage], *, limit: int = 4) -> tuple[str, ...]:
+    return tuple(msg.text for msg in messages[-16:] if msg.is_bot and msg.text.strip())[-limit:]
+
+
+def _append_recent_bot_duplicate_guard(context: str, recent_bot_replies: tuple[str, ...]) -> str:
+    if not recent_bot_replies:
+        return context
+    lines = "\n".join(f"- {text}" for text in recent_bot_replies)
+    guard = (
+        "【机器人刚刚发过的话（只用于查重，禁止复用措辞或核心答案）】\n"
+        f"{lines}\n"
+        "如果不同群友连续问同一种模板问题，必须按当前这个人分别回答；"
+        "不要把刚给别人的人名、结论或包袱机械再给一次。"
+    )
+    return f"{context}\n\n{guard}" if context else guard
 
 
 def _format_context_with_local_focus(
@@ -1489,8 +1516,16 @@ def _reply_candidates_retry_request(
     previous_content: str,
     parsed_count: int,
     candidate_count: int,
+    avoid_texts: tuple[str, ...] = (),
 ) -> dict[str, object]:
     messages = list(request.get("messages", []))
+    avoid_instruction = ""
+    if avoid_texts:
+        avoid_instruction = (
+            "另外，机器人刚才已经对别人说过以下内容，本轮禁止复用其措辞或核心答案："
+            + "；".join(avoid_texts)
+            + "。"
+        )
     messages.extend(
         [
             {"role": "assistant", "content": previous_content},
@@ -1501,7 +1536,7 @@ def _reply_candidates_retry_request(
                     "请重新输出一个完整 JSON 对象，格式严格为 "
                     '{"candidates":[{"text":"...","style":"...","action":"reply"}]}。'
                     f"candidates 必须正好 {candidate_count} 条，text 不能空，三条不能重复，"
-                    "不要输出 JSON 以外的任何文字。"
+                    f"不要输出 JSON 以外的任何文字。{avoid_instruction}"
                 ),
             },
         ]
@@ -1511,6 +1546,34 @@ def _reply_candidates_retry_request(
     retry_request["max_tokens"] = max(int(request.get("max_tokens", 0) or 0), 900)
     retry_request["response_format"] = {"type": "json_object"}
     return retry_request
+
+
+def _filter_recent_bot_duplicate_candidates(
+    candidates: tuple[ReplyCandidateDraft, ...],
+    recent_bot_replies: tuple[str, ...],
+) -> tuple[ReplyCandidateDraft, ...]:
+    if not recent_bot_replies:
+        return candidates
+    return tuple(
+        candidate
+        for candidate in candidates
+        if not any(_substantially_repeats(candidate.text, previous) for previous in recent_bot_replies)
+    )
+
+
+def _substantially_repeats(current: str, previous: str, *, min_common: int = 8) -> bool:
+    clean = lambda value: re.sub(r"[^0-9a-z\u4e00-\u9fff]+", "", value.casefold())
+    left = clean(current)
+    right = clean(previous)
+    if not left or not right:
+        return False
+    if left in right or right in left:
+        return min(len(left), len(right)) >= min_common
+    shorter, longer = (left, right) if len(left) <= len(right) else (right, left)
+    for size in range(len(shorter), min_common - 1, -1):
+        if any(shorter[start : start + size] in longer for start in range(len(shorter) - size + 1)):
+            return True
+    return False
 
 
 def _merge_reply_candidates(

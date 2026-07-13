@@ -7,6 +7,7 @@ from qq_social_agent.deepseek_client import (
     DeepSeekClient,
     _log_llm_usage,
     _format_context_with_local_focus,
+    _filter_recent_bot_duplicate_candidates,
     _parse_jargon_terms,
     _parse_daily_review,
     _parse_long_message_summary,
@@ -14,6 +15,7 @@ from qq_social_agent.deepseek_client import (
     _parse_mid_memory,
     _parse_reply_candidates,
     _parse_reply_decision,
+    ReplyCandidateDraft,
     _sanitize_reply,
     _usage_value,
     set_usage_recorder,
@@ -45,6 +47,20 @@ def test_context_marks_only_contiguous_recent_topic_as_high_priority() -> None:
     assert "智力正常" not in focused
     assert "含铅" in focused
     assert "墨尔本自来水" in focused
+
+
+def test_recent_bot_duplicate_filter_blocks_same_core_punchline() -> None:
+    candidates = (
+        ReplyCandidateDraft("司马懿吧，苟到最后的才是赢家", "answer", "直接判断"),
+        ReplyCandidateDraft("你更像贾诩，突出一个能活", "answer", "换角度"),
+    )
+
+    filtered = _filter_recent_bot_duplicate_candidates(
+        candidates,
+        ("你啊，司马懿吧——低调苟发育，苟到最后的才是赢家",),
+    )
+
+    assert [candidate.text for candidate in filtered] == ["你更像贾诩，突出一个能活"]
 
 
 def test_sanitize_keeps_normal_reply() -> None:
