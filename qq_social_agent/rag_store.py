@@ -23,6 +23,7 @@ class RAGDocument:
     source_name: str
     source_row_id: str
     source_message_ids: tuple[str, ...]
+    participant_user_ids: tuple[int, ...]
     created_at: float
     importance: float
     confidence: float
@@ -33,6 +34,22 @@ class RAGDocument:
 class RankedDocument:
     document: RAGDocument
     score: float
+
+
+@dataclass(frozen=True)
+class ResolvedMember:
+    user_id: int
+    matched_name: str
+
+
+@dataclass(frozen=True)
+class RAGEvaluationCase:
+    id: int
+    group_id: int
+    query: str
+    expected_terms: tuple[str, ...]
+    expected_user_ids: tuple[int, ...]
+    created_by: int
 
 
 class RAGStore:
@@ -60,6 +77,7 @@ class RAGStore:
               source_name text not null,
               source_row_id text not null,
               source_message_ids_json text not null default '[]',
+              participant_user_ids_json text not null default '[]',
               asserted_by_user_id integer,
               created_at real not null,
               valid_from real,
@@ -111,13 +129,44 @@ class RAGStore:
               elapsed_ms integer not null,
               cache_hit integer not null default 0,
               source_ids_json text not null default '[]',
+              details_json text not null default '{}',
               error text not null default '',
               created_at real not null
             );
             create index if not exists idx_rag_retrieval_events_time
               on rag_retrieval_events(created_at desc);
+
+            create table if not exists rag_retrieval_feedback (
+              id integer primary key autoincrement,
+              group_id integer not null,
+              retrieval_event_id integer not null,
+              document_id integer not null,
+              label text not null,
+              note text not null default '',
+              operator_id integer not null default 0,
+              created_at real not null,
+              foreign key(retrieval_event_id) references rag_retrieval_events(id),
+              foreign key(document_id) references rag_documents(id)
+            );
+            create index if not exists idx_rag_feedback_document
+              on rag_retrieval_feedback(document_id, created_at desc);
+
+            create table if not exists rag_evaluation_cases (
+              id integer primary key autoincrement,
+              group_id integer not null,
+              query text not null,
+              expected_terms_json text not null default '[]',
+              expected_user_ids_json text not null default '[]',
+              created_by integer not null default 0,
+              enabled integer not null default 1,
+              created_at real not null,
+              updated_at real not null
+            );
+            create unique index if not exists idx_rag_eval_group_query
+              on rag_evaluation_cases(group_id, query);
             """
         )
+        self._ensure_rag_v2_columns()
         try:
             self.conn.execute(
                 """
@@ -134,6 +183,24 @@ class RAGStore:
             self.fts_available = False
         self.conn.commit()
 
+    def _ensure_rag_v2_columns(self) -> None:
+        document_columns = {
+            str(row["name"])
+            for row in self.conn.execute("pragma table_info(rag_documents)").fetchall()
+        }
+        if "participant_user_ids_json" not in document_columns:
+            self.conn.execute(
+                "alter table rag_documents add column participant_user_ids_json text not null default '[]'"
+            )
+        retrieval_columns = {
+            str(row["name"])
+            for row in self.conn.execute("pragma table_info(rag_retrieval_events)").fetchall()
+        }
+        if "details_json" not in retrieval_columns:
+            self.conn.execute(
+                "alter table rag_retrieval_events add column details_json text not null default '{}'"
+            )
+
     def upsert_document(
         self,
         *,
@@ -144,6 +211,7 @@ class RAGStore:
         source_name: str,
         source_row_id: int | str,
         source_message_ids: list[int | str] | tuple[int | str, ...] = (),
+        participant_user_ids: list[int] | tuple[int, ...] = (),
         speaker_user_id: int | None = None,
         subject_user_id: int | None = None,
         asserted_by_user_id: int | None = None,
@@ -168,10 +236,11 @@ class RAGStore:
             """
             insert into rag_documents(
               stable_key, group_id, doc_type, content, speaker_user_id, subject_user_id,
-              source_name, source_row_id, source_message_ids_json, asserted_by_user_id,
+              source_name, source_row_id, source_message_ids_json, participant_user_ids_json,
+              asserted_by_user_id,
               created_at, valid_from, valid_to, importance, confidence, status,
               content_hash, embedding_status, indexed_at, updated_at
-            ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)
+            ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)
             on conflict(stable_key) do update set
               group_id=excluded.group_id,
               doc_type=excluded.doc_type,
@@ -181,6 +250,7 @@ class RAGStore:
               source_name=excluded.source_name,
               source_row_id=excluded.source_row_id,
               source_message_ids_json=excluded.source_message_ids_json,
+              participant_user_ids_json=excluded.participant_user_ids_json,
               asserted_by_user_id=excluded.asserted_by_user_id,
               created_at=excluded.created_at,
               valid_from=excluded.valid_from,
@@ -206,6 +276,7 @@ class RAGStore:
                 str(source_name)[:48],
                 str(source_row_id)[:80],
                 json.dumps([str(value) for value in source_message_ids], ensure_ascii=False),
+                json.dumps(sorted({int(value) for value in participant_user_ids if int(value) > 0})),
                 asserted_by_user_id,
                 float(created_at or now),
                 valid_from,
@@ -232,6 +303,69 @@ class RAGStore:
                     (document_id, clean_content, str(group_id), str(doc_type)[:32]),
                 )
         return document_id
+
+    def resolve_query_members(
+        self,
+        group_id: int,
+        query: str,
+        *,
+        limit: int = 8,
+    ) -> list[ResolvedMember]:
+        clean_query = re.sub(r"\s+", "", str(query)).casefold()
+        if not clean_query:
+            return []
+        rows = self.conn.execute(
+            """
+            select
+              p.user_id,
+              p.display_name,
+              p.aliases_json,
+              coalesce(g.nickname, '') as nickname,
+              coalesce(g.card, '') as card
+            from member_profiles p
+            left join group_members g
+              on g.group_id = p.group_id and g.user_id = p.user_id and g.active = 1
+            where p.group_id = ?
+            order by p.last_seen_at desc
+            """,
+            (int(group_id),),
+        ).fetchall()
+        explicit_ids = {int(value) for value in re.findall(r"(?<!\d)(\d{5,12})(?!\d)", clean_query)}
+        resolved: list[ResolvedMember] = []
+        seen: set[int] = set()
+        for row in rows:
+            user_id = int(row["user_id"])
+            names = [str(row["card"]), str(row["nickname"]), str(row["display_name"])]
+            try:
+                aliases = json.loads(str(row["aliases_json"] or "[]"))
+            except json.JSONDecodeError:
+                aliases = []
+            if isinstance(aliases, list):
+                names.extend(str(value) for value in aliases)
+            matched_name = ""
+            if user_id in explicit_ids:
+                matched_name = str(user_id)
+            else:
+                candidates = sorted(
+                    {
+                        re.sub(r"\s+", "", name).strip().casefold()
+                        for name in names
+                        if len(re.sub(r"\s+", "", name).strip()) >= 2
+                    },
+                    key=len,
+                    reverse=True,
+                )
+                matched_name = next((name for name in candidates if name in clean_query), "")
+            if not matched_name or user_id in seen:
+                continue
+            seen.add(user_id)
+            resolved.append(ResolvedMember(user_id=user_id, matched_name=matched_name))
+            if len(resolved) >= max(1, limit):
+                break
+        for user_id in sorted(explicit_ids):
+            if user_id not in seen and len(resolved) < max(1, limit):
+                resolved.append(ResolvedMember(user_id=user_id, matched_name=str(user_id)))
+        return resolved
 
     def commit(self) -> None:
         self.conn.commit()
@@ -440,6 +574,46 @@ class RAGStore:
         scored.sort(key=lambda item: (item.score, item.document.importance, item.document.created_at), reverse=True)
         return scored[:limit]
 
+    def person_documents(
+        self,
+        group_id: int,
+        user_ids: list[int],
+        *,
+        doc_types: tuple[str, ...],
+        limit: int = 20,
+    ) -> list[RankedDocument]:
+        targets = sorted({int(value) for value in user_ids if int(value) > 0})
+        if not targets:
+            return []
+        type_clause = ",".join("?" for _ in doc_types)
+        user_clause = ",".join("?" for _ in targets)
+        rows = self.conn.execute(
+            f"""
+            select d.* from rag_documents d
+            where d.group_id = ? and d.doc_type in ({type_clause}) and d.status = 'active'
+              and (
+                d.speaker_user_id in ({user_clause})
+                or d.subject_user_id in ({user_clause})
+                or exists (
+                  select 1 from json_each(d.participant_user_ids_json) p
+                  where cast(p.value as integer) in ({user_clause})
+                )
+              )
+              and (d.valid_from is null or d.valid_from <= ?)
+              and (d.valid_to is null or d.valid_to > ?)
+            order by d.importance desc, d.confidence desc, d.created_at desc
+            limit ?
+            """,
+            (
+                int(group_id), *doc_types, *targets, *targets, *targets,
+                time.time(), time.time(), max(1, int(limit)),
+            ),
+        ).fetchall()
+        return [
+            RankedDocument(_document_from_row(row), max(0.35, 0.62 - index * 0.025))
+            for index, row in enumerate(rows)
+        ]
+
     def record_retrieval(
         self,
         *,
@@ -449,6 +623,7 @@ class RAGStore:
         lexical_count: int,
         semantic_count: int,
         injected_ids: list[int],
+        details: dict[str, object] | None = None,
         elapsed_ms: int,
         cache_hit: bool,
         error: str = "",
@@ -457,8 +632,9 @@ class RAGStore:
             """
             insert into rag_retrieval_events(
               group_id, query_hash, route, lexical_count, semantic_count,
-              injected_count, elapsed_ms, cache_hit, source_ids_json, error, created_at
-            ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+              injected_count, elapsed_ms, cache_hit, source_ids_json, details_json,
+              error, created_at
+            ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 int(group_id),
@@ -470,11 +646,168 @@ class RAGStore:
                 elapsed_ms,
                 int(cache_hit),
                 json.dumps(injected_ids),
+                json.dumps(details or {}, ensure_ascii=False),
                 error[:240],
                 time.time(),
             ),
         )
         self.conn.commit()
+
+    def delete_documents_by_stable_prefix_except(
+        self,
+        prefix: str,
+        keep_keys: list[str] | tuple[str, ...],
+    ) -> int:
+        rows = self.conn.execute(
+            "select id, stable_key from rag_documents where stable_key like ?",
+            (f"{prefix}%",),
+        ).fetchall()
+        keep = set(keep_keys)
+        removed = 0
+        for row in rows:
+            if str(row["stable_key"]) in keep:
+                continue
+            document_id = int(row["id"])
+            if self.fts_available:
+                self.conn.execute("delete from rag_documents_fts where rowid = ?", (document_id,))
+            self.conn.execute("delete from rag_embeddings where document_id = ?", (document_id,))
+            self.conn.execute("delete from rag_documents where id = ?", (document_id,))
+            removed += 1
+        return removed
+
+    def feedback_adjustments(self, document_ids: list[int]) -> dict[int, float]:
+        if not document_ids:
+            return {}
+        placeholders = ",".join("?" for _ in document_ids)
+        rows = self.conn.execute(
+            f"""
+            select document_id, label, count(*) as count
+            from rag_retrieval_feedback
+            where document_id in ({placeholders})
+            group by document_id, label
+            """,
+            document_ids,
+        ).fetchall()
+        weights = {"relevant": 0.10, "irrelevant": -0.16, "wrong_person": -0.28, "stale": -0.34}
+        result: dict[int, float] = {}
+        for row in rows:
+            document_id = int(row["document_id"])
+            result[document_id] = result.get(document_id, 0.0) + weights.get(
+                str(row["label"]), 0.0
+            ) * min(3, int(row["count"]))
+        return {key: max(-0.55, min(0.30, value)) for key, value in result.items()}
+
+    def add_feedback_for_latest(
+        self,
+        *,
+        group_id: int,
+        position: int,
+        label: str,
+        operator_id: int,
+        note: str = "",
+    ) -> tuple[int, str]:
+        allowed = {"relevant", "irrelevant", "wrong_person", "stale"}
+        if label not in allowed:
+            raise ValueError("unknown feedback label")
+        row = self.conn.execute(
+            """
+            select id, source_ids_json from rag_retrieval_events
+            where group_id = ? and injected_count > 0
+            order by id desc limit 1
+            """,
+            (int(group_id),),
+        ).fetchone()
+        if row is None:
+            raise ValueError("这个群还没有可反馈的 RAG 命中")
+        try:
+            document_ids = [int(value) for value in json.loads(str(row["source_ids_json"]))]
+        except (json.JSONDecodeError, TypeError, ValueError):
+            document_ids = []
+        if position < 1 or position > len(document_ids):
+            raise ValueError(f"序号应在 1-{len(document_ids)} 之间")
+        document_id = document_ids[position - 1]
+        self.conn.execute(
+            """
+            insert into rag_retrieval_feedback(
+              group_id, retrieval_event_id, document_id, label, note, operator_id, created_at
+            ) values (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (int(group_id), int(row["id"]), document_id, label, note[:300], int(operator_id), time.time()),
+        )
+        self.conn.commit()
+        return document_id, label
+
+    def recent_feedback(self, group_id: int, *, limit: int = 10) -> list[sqlite3.Row]:
+        return self.conn.execute(
+            """
+            select f.*, d.doc_type, substr(d.content, 1, 100) as content_preview
+            from rag_retrieval_feedback f
+            join rag_documents d on d.id = f.document_id
+            where f.group_id = ? order by f.id desc limit ?
+            """,
+            (int(group_id), max(1, min(50, int(limit)))),
+        ).fetchall()
+
+    def add_evaluation_case(
+        self,
+        *,
+        group_id: int,
+        query: str,
+        expected_terms: list[str] | tuple[str, ...],
+        expected_user_ids: list[int] | tuple[int, ...] = (),
+        created_by: int = 0,
+    ) -> int:
+        clean_query = re.sub(r"\s+", " ", query).strip()
+        terms = [str(value).strip()[:80] for value in expected_terms if str(value).strip()]
+        users = sorted({int(value) for value in expected_user_ids if int(value) > 0})
+        if len(clean_query) < 2 or not terms:
+            raise ValueError("评测问题和期望关键词不能为空")
+        now = time.time()
+        self.conn.execute(
+            """
+            insert into rag_evaluation_cases(
+              group_id, query, expected_terms_json, expected_user_ids_json,
+              created_by, enabled, created_at, updated_at
+            ) values (?, ?, ?, ?, ?, 1, ?, ?)
+            on conflict(group_id, query) do update set
+              expected_terms_json=excluded.expected_terms_json,
+              expected_user_ids_json=excluded.expected_user_ids_json,
+              created_by=excluded.created_by, enabled=1, updated_at=excluded.updated_at
+            """,
+            (int(group_id), clean_query[:300], json.dumps(terms, ensure_ascii=False), json.dumps(users), int(created_by), now, now),
+        )
+        self.conn.commit()
+        row = self.conn.execute(
+            "select id from rag_evaluation_cases where group_id = ? and query = ?",
+            (int(group_id), clean_query[:300]),
+        ).fetchone()
+        return int(row["id"])
+
+    def evaluation_cases(self, group_id: int, *, limit: int = 50) -> list[RAGEvaluationCase]:
+        rows = self.conn.execute(
+            """
+            select * from rag_evaluation_cases
+            where group_id = ? and enabled = 1 order by id asc limit ?
+            """,
+            (int(group_id), max(1, min(200, int(limit)))),
+        ).fetchall()
+        result: list[RAGEvaluationCase] = []
+        for row in rows:
+            try:
+                terms = tuple(str(value) for value in json.loads(str(row["expected_terms_json"])))
+                users = tuple(int(value) for value in json.loads(str(row["expected_user_ids_json"])))
+            except (json.JSONDecodeError, TypeError, ValueError):
+                continue
+            result.append(RAGEvaluationCase(int(row["id"]), int(row["group_id"]), str(row["query"]), terms, users, int(row["created_by"])))
+        return result
+
+    def delete_evaluation_case(self, group_id: int, case_id: int) -> bool:
+        cursor = self.conn.execute(
+            "update rag_evaluation_cases set enabled=0, updated_at=? where id=? and group_id=?",
+            (time.time(), int(case_id), int(group_id)),
+        )
+        self.conn.commit()
+        return cursor.rowcount > 0
 
     def status_snapshot(self) -> dict[str, object]:
         counts = {
@@ -496,6 +829,12 @@ class RAGStore:
             """,
             (time.time() - 3600,),
         ).fetchone()
+        feedback_count = int(
+            self.conn.execute("select count(*) from rag_retrieval_feedback").fetchone()[0]
+        )
+        evaluation_count = int(
+            self.conn.execute("select count(*) from rag_evaluation_cases where enabled = 1").fetchone()[0]
+        )
         return {
             "fts5": self.fts_available,
             "documents": sum(counts.values()),
@@ -504,6 +843,8 @@ class RAGStore:
             "retrievals_1h": int(recent["count"] or 0),
             "average_retrieval_ms_1h": round(float(recent["avg_ms"] or 0.0), 1),
             "last_retrieval_at": float(recent["last_at"] or 0.0) or None,
+            "feedback_count": feedback_count,
+            "evaluation_case_count": evaluation_count,
         }
 
     def close(self) -> None:
@@ -515,6 +856,14 @@ def _document_from_row(row: sqlite3.Row) -> RAGDocument:
         source_ids = tuple(str(value) for value in json.loads(str(row["source_message_ids_json"])))
     except (json.JSONDecodeError, TypeError):
         source_ids = ()
+    try:
+        participant_ids = tuple(
+            int(value)
+            for value in json.loads(str(row["participant_user_ids_json"] or "[]"))
+            if int(value) > 0
+        )
+    except (json.JSONDecodeError, TypeError, ValueError, IndexError):
+        participant_ids = ()
     return RAGDocument(
         id=int(row["id"]),
         stable_key=str(row["stable_key"]),
@@ -526,6 +875,7 @@ def _document_from_row(row: sqlite3.Row) -> RAGDocument:
         source_name=str(row["source_name"]),
         source_row_id=str(row["source_row_id"]),
         source_message_ids=source_ids,
+        participant_user_ids=participant_ids,
         created_at=float(row["created_at"]),
         importance=float(row["importance"] or 0.0),
         confidence=float(row["confidence"] or 0.0),

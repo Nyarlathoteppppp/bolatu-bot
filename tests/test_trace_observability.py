@@ -46,6 +46,7 @@ def test_trace_snapshot_uses_fixed_stage_order_and_calculates_durations() -> Non
             "metadata": {"message_id": "9001", "api": "get_msg", "elapsed_ms": 30},
         },
         _event("message_buffered", "locked", "recorded", 100.3),
+        _event("rag_retrieval", "decision_context", "injected", 100.35, elapsed_ms=40, hit_document_ids=[7]),
         _event("decision_start", "group", "start", 100.4),
         _event("decision_result", "llm", "reply", 101.4, elapsed_ms=1_000, should_reply=True),
         _event("tool_call", "fresh_context", "news", 101.5, latency_ms=200, status="ok"),
@@ -71,6 +72,7 @@ def test_trace_snapshot_uses_fixed_stage_order_and_calculates_durations() -> Non
     assert all(phase["status"] == "ok" for phase in phases.values())
     assert phases["ocr"]["duration_ms"] == 100
     assert phases["history"]["duration_ms"] == 30
+    assert phases["rag"]["duration_ms"] == 40
     assert phases["decision"]["duration_ms"] == 1_000
     assert phases["search/tool"]["duration_ms"] == 200
     assert phases["generation"]["duration_ms"] == 500

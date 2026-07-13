@@ -28,6 +28,7 @@ class RAGIndexer:
     def sync_all(self, *, message_batch_limit: int = 12000) -> dict[str, int]:
         stats = {
             "conversation": self._sync_messages(message_batch_limit),
+            "conversation_participants": self._backfill_conversation_participants(),
             "summary": self._sync_summaries(),
             "memory_atom": self._sync_memory_atoms(),
             "member": self._sync_member_profiles(),
@@ -76,6 +77,7 @@ class RAGIndexer:
                     source_name="messages",
                     source_row_id=f"{first['id']}:{last['id']}",
                     source_message_ids=message_ids,
+                    participant_user_ids=sorted(speakers),
                     speaker_user_id=next(iter(speakers)) if len(speakers) == 1 else None,
                     asserted_by_user_id=next(iter(speakers)) if len(speakers) == 1 else None,
                     created_at=float(last["created_at"]),
@@ -86,6 +88,43 @@ class RAGIndexer:
             if rows:
                 self.store.set_index_cursor("messages", str(group_id), int(rows[-1]["id"]))
         return indexed
+
+    def _backfill_conversation_participants(self) -> int:
+        rows = self.store.conn.execute(
+            """
+            select id, group_id, source_row_id
+            from rag_documents
+            where doc_type = 'conversation'
+              and source_name = 'messages'
+              and participant_user_ids_json = '[]'
+            """
+        ).fetchall()
+        updated = 0
+        for row in rows:
+            try:
+                start_text, end_text = str(row["source_row_id"]).split(":", 1)
+                start_id, end_id = int(start_text), int(end_text)
+            except (TypeError, ValueError):
+                continue
+            participants = [
+                int(item["user_id"])
+                for item in self.store.conn.execute(
+                    """
+                    select distinct user_id from messages
+                    where group_id = ? and id between ? and ? and is_bot = 0
+                    order by user_id
+                    """,
+                    (int(row["group_id"]), start_id, end_id),
+                ).fetchall()
+            ]
+            if not participants:
+                continue
+            self.store.conn.execute(
+                "update rag_documents set participant_user_ids_json = ?, updated_at = ? where id = ?",
+                (json.dumps(participants), time.time(), int(row["id"])),
+            )
+            updated += 1
+        return updated
 
     def _message_chunks(self, rows: list[object]) -> list[list[object]]:
         chunks: list[list[object]] = []
@@ -170,6 +209,11 @@ class RAGIndexer:
                 source_row_id=row["id"],
                 source_message_ids=[row["source_message_id"]] if row["source_message_id"] else [],
                 subject_user_id=int(row["subject_user_id"]) if row["subject_user_id"] is not None else None,
+                participant_user_ids=[
+                    int(value)
+                    for value in (row["subject_user_id"], row["object_user_id"])
+                    if value is not None
+                ],
                 asserted_by_user_id=int(row["subject_user_id"]) if evidence == "message" and row["subject_user_id"] is not None else None,
                 created_at=float(row["observed_at"] or row["created_at"]),
                 valid_from=float(row["valid_from"]) if row["valid_from"] is not None else None,
@@ -199,6 +243,7 @@ class RAGIndexer:
                     source_name="member_profiles",
                     source_row_id=row["user_id"],
                     subject_user_id=int(row["user_id"]),
+                    participant_user_ids=[int(row["user_id"])],
                     created_at=float(row["last_seen_at"]),
                     importance=0.7,
                     confidence=0.9,
@@ -227,6 +272,7 @@ class RAGIndexer:
                     source_name="member_profile_summaries",
                     source_row_id=row["id"],
                     subject_user_id=int(row["user_id"]),
+                    participant_user_ids=[int(row["user_id"])],
                     created_at=float(row["created_at"]),
                     importance=0.62,
                     confidence=0.6,

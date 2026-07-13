@@ -395,6 +395,15 @@ MEMORY_ATOM_AUDIT_RE = re.compile(
 )
 RAG_STATUS_COMMANDS = {"RAG状态", "rag状态", "RAG status", "/rag status"}
 RAG_TEST_RE = re.compile(r"^(?:/)?(?:RAG测试|rag测试|RAG test|rag test)\s*[:：]?\s*(?P<query>.+)$", re.IGNORECASE)
+RAG_FEEDBACK_RE = re.compile(
+    r"^(?:/)?RAG反馈\s+(?P<label>相关|好|不相关|错人|人物错位|过期)\s+(?P<position>\d+)\s*(?:[:：]\s*(?P<note>.*))?$",
+    re.IGNORECASE,
+)
+RAG_FEEDBACK_LIST_COMMANDS = {"RAG反馈列表", "rag反馈列表"}
+RAG_EVAL_RUN_COMMANDS = {"RAG评测", "rag评测"}
+RAG_EVAL_LIST_COMMANDS = {"RAG评测列表", "rag评测列表"}
+RAG_EVAL_ADD_RE = re.compile(r"^(?:/)?RAG评测添加\s+(?P<body>.+)$", re.IGNORECASE | re.DOTALL)
+RAG_EVAL_DELETE_RE = re.compile(r"^(?:/)?RAG评测删除\s+(?P<case_id>\d+)$", re.IGNORECASE)
 PRIVATE_CONTEXT_RESET_COMMANDS = {
     "清空上下文",
     "清空背景",
@@ -502,6 +511,8 @@ async def _init_client() -> None:
     _apply_model_route_overrides()
     _ensure_builtin_memory_atoms()
     await rag_service.start()
+    for group_id in sorted(app_config.allowed_groups):
+        rag_service.ensure_default_evaluation_cases(group_id)
 
 
 def _record_llm_usage(
@@ -2323,6 +2334,29 @@ async def _handle_group_message_scoped(
     ) if group_allowed else None
     if content_context is not None and content_context.text:
         raw_text = _join_context_parts(raw_text, content_context.text)
+    if (
+        content_context is not None
+        and content_context.file_status == "ok"
+        and content_context.file_text
+    ):
+        indexed_chunks = rag_service.ingest_knowledge(
+            group_id=group_id,
+            kind="file",
+            source_identity=content_context.file_source_id or source_message_id,
+            title=content_context.file_name or "群文件",
+            content=content_context.file_text,
+            source_message_id=source_message_id,
+        )
+        _record_metric_event(
+            "rag_knowledge_ingested",
+            group_id=group_id,
+            user_id=int(event.user_id),
+            stage="rag",
+            action="file",
+            title=content_context.file_name,
+            indexed_chunks=indexed_chunks,
+            source_message_id=source_message_id,
+        )
     if content_context is not None and (content_context.file_count or content_context.voice_count):
         _record_metric_event(
             "content_ingestion",
@@ -2784,12 +2818,13 @@ async def _handle_group_message_locked(
     rag_task: asyncio.Task[RAGRetrievalResult] = asyncio.create_task(
         rag_service.retrieve(
             group_id=group_id,
-            query=f"{nickname}\n{text}",
+            query=text,
             addressed=addressed_bot,
             related_user_ids=related_member_user_ids,
         )
     )
     rag_context_applied = False
+    rag_structured_types: set[str] = set()
     fresh_context_task: asyncio.Task[str] | None = None
     if fresh_intent is not None and (fresh_intent.explicit or fresh_intent.required):
         prefetched_decision = ReplyDecision(
@@ -2846,6 +2881,10 @@ async def _handle_group_message_locked(
         )
         rag_result = await rag_task
         rag_context_applied = True
+        rag_structured_types = {
+            hit.document.doc_type for hit in rag_result.hits
+            if hit.document.doc_type in {"memory_atom", "member"}
+        }
         if rag_result.context:
             memory_context = rag_result.context
         _record_metric_event(
@@ -2860,15 +2899,22 @@ async def _handle_group_message_locked(
             injected_count=len(rag_result.hits),
             elapsed_ms=rag_result.elapsed_ms,
             error=rag_result.error,
+            resolved_user_ids=[item.user_id for item in rag_result.resolved_members],
+            resolved_names=[item.matched_name for item in rag_result.resolved_members],
+            hit_document_ids=[hit.document.id for hit in rag_result.hits],
+            hit_doc_types=[hit.document.doc_type for hit in rag_result.hits],
+            hit_scores=[round(hit.score, 4) for hit in rag_result.hits],
+            hit_reasons=[list(hit.reasons) for hit in rag_result.hits],
+            hit_sources=[f"{hit.document.source_name}:{hit.document.source_row_id}" for hit in rag_result.hits],
         )
-        member_context = _format_member_context(
+        member_context = "" if "member" in rag_structured_types else _format_member_context(
             memory.member_impressions_for_context(
                 group_id,
                 _related_member_user_ids(context_recent, current_user_id=user_id),
                 limit=MEMBER_IMPRESSION_CONTEXT_LIMIT,
             )
         )
-        memory_atoms_context = _format_memory_atom_context(
+        memory_atoms_context = "" if "memory_atom" in rag_structured_types else _format_memory_atom_context(
             memory.relevant_memory_atoms(
                 group_id,
                 context_query,
@@ -3063,6 +3109,10 @@ async def _handle_group_message_locked(
     if not rag_context_applied:
         rag_result = await rag_task
         rag_context_applied = True
+        rag_structured_types = {
+            hit.document.doc_type for hit in rag_result.hits
+            if hit.document.doc_type in {"memory_atom", "member"}
+        }
         if rag_result.context:
             memory_context = rag_result.context
         _record_metric_event(
@@ -3077,8 +3127,15 @@ async def _handle_group_message_locked(
             injected_count=len(rag_result.hits),
             elapsed_ms=rag_result.elapsed_ms,
             error=rag_result.error,
+            resolved_user_ids=[item.user_id for item in rag_result.resolved_members],
+            resolved_names=[item.matched_name for item in rag_result.resolved_members],
+            hit_document_ids=[hit.document.id for hit in rag_result.hits],
+            hit_doc_types=[hit.document.doc_type for hit in rag_result.hits],
+            hit_scores=[round(hit.score, 4) for hit in rag_result.hits],
+            hit_reasons=[list(hit.reasons) for hit in rag_result.hits],
+            hit_sources=[f"{hit.document.source_name}:{hit.document.source_row_id}" for hit in rag_result.hits],
         )
-    if not member_context:
+    if not member_context and "member" not in rag_structured_types:
         member_context = _format_member_context(
             memory.member_impressions_for_context(
                 group_id,
@@ -3086,7 +3143,7 @@ async def _handle_group_message_locked(
                 limit=MEMBER_IMPRESSION_CONTEXT_LIMIT,
             )
         )
-    if not memory_atoms_context:
+    if not memory_atoms_context and "memory_atom" not in rag_structured_types:
         memory_atoms_context = _format_memory_atom_context(
             memory.relevant_memory_atoms(
                 group_id,
@@ -3198,7 +3255,12 @@ async def _handle_group_message_locked(
             fresh_context = await _fresh_context_for(decision, fallback_text=text)
     elif fresh_context_task is not None and not fresh_context_task.done():
         fresh_context_task.cancel()
-    deep_url_context = await _deep_url_context_for(text, addressed_bot=addressed_bot)
+    deep_url_context = await _deep_url_context_for(
+        text,
+        addressed_bot=addressed_bot,
+        group_id=group_id,
+        source_message_id=source_message_id,
+    )
     if deep_url_context:
         fresh_context = _combine_text_sections(fresh_context, deep_url_context)
 
@@ -4397,7 +4459,13 @@ async def _fresh_context_for(decision: ReplyDecision, *, fallback_text: str) -> 
     return context
 
 
-async def _deep_url_context_for(text: str, *, addressed_bot: bool) -> str:
+async def _deep_url_context_for(
+    text: str,
+    *,
+    addressed_bot: bool,
+    group_id: int | None = None,
+    source_message_id: str = "",
+) -> str:
     result = await deep_content_tool.context_for_text(text, addressed_bot=addressed_bot)
     if not result.requested:
         return ""
@@ -4414,6 +4482,25 @@ async def _deep_url_context_for(text: str, *, addressed_bot: bool) -> str:
         latency_ms=read.latency_ms if read is not None else 0,
         error=read.error if read is not None else result.reason,
     )
+    if group_id is not None and read is not None and read.ok and read.text:
+        indexed_chunks = rag_service.ingest_knowledge(
+            group_id=group_id,
+            kind="web",
+            source_identity=read.final_url or result.url,
+            title=read.title or read.final_url or result.url,
+            content=read.text,
+            source_message_id=source_message_id,
+        )
+        _record_metric_event(
+            "rag_knowledge_ingested",
+            group_id=group_id,
+            stage="rag",
+            action="web",
+            title=read.title,
+            source=read.final_url,
+            indexed_chunks=indexed_chunks,
+            source_message_id=source_message_id,
+        )
     return result.context
 
 
@@ -6058,6 +6145,12 @@ def _is_private_tool_text(text: str) -> bool:
         or MEMORY_ATOM_AUDIT_RE.match(text) is not None
         or text in RAG_STATUS_COMMANDS
         or RAG_TEST_RE.match(text) is not None
+        or RAG_FEEDBACK_RE.match(text) is not None
+        or text in RAG_FEEDBACK_LIST_COMMANDS
+        or text in RAG_EVAL_RUN_COMMANDS
+        or text in RAG_EVAL_LIST_COMMANDS
+        or RAG_EVAL_ADD_RE.match(text) is not None
+        or RAG_EVAL_DELETE_RE.match(text) is not None
         or APPROVER_ADD_RE.match(text) is not None
         or APPROVER_DELETE_RE.match(text) is not None
         or _parse_metric_report_command(text) is not None
@@ -6096,6 +6189,7 @@ def _format_rag_status() -> str:
         f"- embedding={embedding.get('model')} available={embedding.get('available')} "
         f"calls={embedding.get('calls', 0)} failures={embedding.get('failures', 0)}\n"
         f"- 最近1小时检索={store.get('retrievals_1h', 0)}次，平均={store.get('average_retrieval_ms_1h', 0)}ms\n"
+        f"- 人工反馈={store.get('feedback_count', 0)}条，评测用例={store.get('evaluation_case_count', 0)}条\n"
         f"- 后台索引={snapshot.get('background_indexing')} query缓存={snapshot.get('query_cache_entries', 0)}\n"
         f"- 最近错误={snapshot.get('last_error') or embedding.get('last_error') or '无'}\n"
         "测试命令：RAG测试 以前谁聊过菲尔兹奖"
@@ -6342,6 +6436,70 @@ async def _handle_group_approval_private_impl(bot: Bot, user_id: int, text: str)
             user_id,
             await rag_service.diagnostic_query(group_id, rag_test_match.group("query").strip()),
         )
+        return True
+    rag_feedback_match = RAG_FEEDBACK_RE.match(compact_text)
+    if rag_feedback_match is not None:
+        group_id = _private_jargon_group_id()
+        if group_id is None:
+            await _send_private_text(bot, user_id, "RAG反馈失败：没有可用目标群。")
+            return True
+        label_map = {
+            "相关": "relevant", "好": "relevant", "不相关": "irrelevant",
+            "错人": "wrong_person", "人物错位": "wrong_person", "过期": "stale",
+        }
+        try:
+            document_id, label = rag_service.add_feedback(
+                group_id=group_id,
+                position=int(rag_feedback_match.group("position")),
+                label=label_map[rag_feedback_match.group("label")],
+                operator_id=user_id,
+                note=(rag_feedback_match.group("note") or "").strip(),
+            )
+            await _send_private_text(bot, user_id, f"已记录 RAG 反馈：文档 {document_id} / {label}，后续统一重排会自动采用。")
+        except ValueError as exc:
+            await _send_private_text(bot, user_id, f"RAG反馈失败：{exc}")
+        return True
+    if compact_text in RAG_FEEDBACK_LIST_COMMANDS:
+        group_id = _private_jargon_group_id()
+        await _send_private_text(bot, user_id, rag_service.feedback_report(group_id) if group_id else "没有可用目标群。")
+        return True
+    if compact_text in RAG_EVAL_LIST_COMMANDS:
+        group_id = _private_jargon_group_id()
+        await _send_private_text(bot, user_id, rag_service.evaluation_case_report(group_id) if group_id else "没有可用目标群。")
+        return True
+    rag_eval_add_match = RAG_EVAL_ADD_RE.match(compact_text)
+    if rag_eval_add_match is not None:
+        group_id = _private_jargon_group_id()
+        if group_id is None:
+            await _send_private_text(bot, user_id, "没有可用目标群。")
+            return True
+        parts = [part.strip() for part in re.split(r"\s*[|｜]\s*", rag_eval_add_match.group("body"))]
+        if len(parts) < 2:
+            await _send_private_text(bot, user_id, "格式：RAG评测添加 问题 | 关键词1,关键词2 | QQ1,QQ2（QQ 可留空）")
+            return True
+        terms = [value.strip() for value in re.split(r"[,，]", parts[1]) if value.strip()]
+        users = [int(value) for value in re.findall(r"\d{5,12}", parts[2])] if len(parts) >= 3 else []
+        try:
+            case_id = rag_service.add_evaluation_case(
+                group_id=group_id,
+                query=parts[0],
+                expected_terms=terms,
+                expected_user_ids=users,
+                created_by=user_id,
+            )
+            await _send_private_text(bot, user_id, f"已保存 RAG 评测用例 #{case_id}。")
+        except ValueError as exc:
+            await _send_private_text(bot, user_id, f"添加失败：{exc}")
+        return True
+    rag_eval_delete_match = RAG_EVAL_DELETE_RE.match(compact_text)
+    if rag_eval_delete_match is not None:
+        group_id = _private_jargon_group_id()
+        deleted = bool(group_id and rag_service.store.delete_evaluation_case(group_id, int(rag_eval_delete_match.group("case_id"))))
+        await _send_private_text(bot, user_id, "已删除该评测用例。" if deleted else "没有找到该评测用例。")
+        return True
+    if compact_text in RAG_EVAL_RUN_COMMANDS:
+        group_id = _private_jargon_group_id()
+        await _send_private_text(bot, user_id, await rag_service.run_evaluation(group_id) if group_id else "没有可用目标群。")
         return True
     metric_window = _parse_metric_report_command(compact_text)
     if metric_window is not None:

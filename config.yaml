@@ -150,6 +150,9 @@ history_sync:
 rag:
   enabled: true
   mode: hybrid
+  member_aliases:
+    "184589072":
+      - 小鸟
   embedding:
     enabled: true
     provider: siliconflow
@@ -174,6 +177,10 @@ rag:
     message_backfill_limit: 12000
     source_sync_interval_seconds: 30
     batch_pause_seconds: 1.0
+  knowledge:
+    enabled: true
+    max_chunk_chars: 900
+    overlap_chars: 100
 
 private_tools:
   reply_delay_enabled: true

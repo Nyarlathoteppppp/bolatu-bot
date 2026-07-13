@@ -152,3 +152,94 @@ def test_rag_service_lexical_fallback_without_api_key(tmp_path, monkeypatch) -> 
     assert result.semantic_count == 0
     assert "代代" in result.context
     asyncio.run(service.close())
+
+
+def test_person_past_resolves_alias_and_unifies_structured_memory(tmp_path, monkeypatch) -> None:
+    monkeypatch.delenv("RAG_TEST_KEY", raising=False)
+    db_path = tmp_path / "bot.sqlite3"
+    memory = MemoryStore(db_path)
+    memory.add_message(1, 184589072, "小鸟", "以前小鸟最爱讨论算法岗", created_at=1000)
+    memory.upsert_memory_atom(
+        atom_type="preference",
+        group_id=1,
+        subject_user_id=184589072,
+        content="小鸟过去偏爱算法岗话题",
+        source="message:1",
+        confidence=0.8,
+        status="active",
+    )
+    memory.conn.close()
+    service = RAGService(
+        db_path,
+        {
+            "enabled": True,
+            "member_aliases": {"184589072": ["小鸟"]},
+            "embedding": {"enabled": False},
+            "retrieval": {"exclude_recent_seconds": 0},
+        },
+    )
+
+    result = asyncio.run(
+        service.retrieve(group_id=1, query="小鸟以前喜欢聊什么", addressed=True)
+    )
+
+    assert result.plan.route == "person_past"
+    assert result.resolved_members[0].user_id == 184589072
+    assert any(hit.document.doc_type == "memory_atom" for hit in result.hits)
+    assert any("人物匹配" in hit.reasons for hit in result.hits)
+    asyncio.run(service.close())
+
+
+def test_retrieval_feedback_changes_unified_ranking(tmp_path) -> None:
+    db_path = tmp_path / "bot.sqlite3"
+    memory = MemoryStore(db_path)
+    memory.conn.close()
+    service = RAGService(
+        db_path,
+        {"enabled": True, "embedding": {"enabled": False}, "retrieval": {"exclude_recent_seconds": 0}},
+    )
+    first_id = service.store.upsert_document(
+        stable_key="manual:first", group_id=1, doc_type="summary", content="菲尔兹奖讨论版本甲",
+        source_name="manual", source_row_id="first",
+    )
+    service.store.upsert_document(
+        stable_key="manual:second", group_id=1, doc_type="summary", content="菲尔兹奖讨论版本乙",
+        source_name="manual", source_row_id="second",
+    )
+    service.store.commit()
+
+    initial = asyncio.run(service.retrieve(group_id=1, query="菲尔兹奖讨论", addressed=True))
+    initially_first_id = initial.hits[0].document.id
+    service.add_feedback(group_id=1, position=1, label="irrelevant", operator_id=9)
+    reranked = asyncio.run(service.retrieve(group_id=1, query="菲尔兹奖讨论", addressed=True))
+
+    assert reranked.hits[0].document.id != initially_first_id
+    assert any("反馈降权" in hit.reasons for hit in reranked.hits if hit.document.id == initially_first_id)
+    asyncio.run(service.close())
+
+
+def test_file_knowledge_is_chunked_and_retrievable(tmp_path) -> None:
+    db_path = tmp_path / "bot.sqlite3"
+    memory = MemoryStore(db_path)
+    memory.conn.close()
+    service = RAGService(
+        db_path,
+        {"enabled": True, "embedding": {"enabled": False}, "retrieval": {"exclude_recent_seconds": 0}},
+    )
+    count = service.ingest_knowledge(
+        group_id=1,
+        kind="file",
+        source_identity="file-123",
+        title="算法资料.txt",
+        content="这份文件专门解释三维挂谷猜想。" * 80,
+        source_message_id="88",
+    )
+    result = asyncio.run(
+        service.retrieve(group_id=1, query="那个文件里的三维挂谷猜想资料", addressed=True)
+    )
+
+    assert count >= 2
+    assert result.plan.route == "knowledge"
+    assert any(hit.document.doc_type == "file_knowledge" for hit in result.hits)
+    assert "文件知识库" in result.context
+    asyncio.run(service.close())

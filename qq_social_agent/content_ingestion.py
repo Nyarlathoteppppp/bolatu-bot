@@ -34,6 +34,9 @@ class ContentIngestionResult:
     voice_count: int = 0
     file_status: str = ""
     voice_status: str = ""
+    file_name: str = ""
+    file_source_id: str = ""
+    file_text: str = ""
 
     @property
     def text(self) -> str:
@@ -84,8 +87,13 @@ class ContentIngestionService:
 
         file_text = ""
         file_status = ""
+        file_name = ""
+        file_source_id = ""
+        file_body = ""
         if file_segments and allow_file_content:
-            file_text, file_status = await self._read_file_segment(bot, file_segments[0])
+            file_text, file_status, file_name, file_source_id, file_body = await self._read_file_segment(
+                bot, file_segments[0]
+            )
         elif file_segments:
             file_status = "context_not_allowed"
 
@@ -105,19 +113,22 @@ class ContentIngestionService:
             voice_count=len(voice_segments),
             file_status=file_status,
             voice_status=voice_status,
+            file_name=file_name,
+            file_source_id=file_source_id,
+            file_text=file_body,
         )
 
     async def _read_file_segment(
         self,
         bot: onebot_gateway.OneBotGateway,
         data: dict[str, Any],
-    ) -> tuple[str, str]:
+    ) -> tuple[str, str, str, str, str]:
         metadata = file_metadata(data)
         filename = str(metadata.get("name") or data.get("name") or "").strip()
         file_id = str(metadata.get("file_id") or data.get("file_id") or "").strip()
         file_ref = str(data.get("file") or "").strip()
         if not filename or not (file_id or file_ref):
-            return "", "missing_file_reference"
+            return "", "missing_file_reference", filename, file_id or file_ref, ""
         try:
             fetched = await onebot_gateway.get_file(
                 bot,
@@ -126,13 +137,13 @@ class ContentIngestionService:
                 timeout_seconds=self.onebot_timeout_seconds,
             )
         except Exception as exc:
-            return "", f"onebot_error:{type(exc).__name__}"
+            return "", f"onebot_error:{type(exc).__name__}", filename, file_id or file_ref, ""
         payload = _binary_payload(fetched, max_bytes=self.file_reader.config.max_file_bytes)
         if payload is None:
-            return "", "file_bytes_unavailable"
+            return "", "file_bytes_unavailable", filename, file_id or file_ref, ""
         content_type = _MIME_BY_EXTENSION.get(PurePath(filename).suffix.casefold(), "")
         result = self.file_reader.read(filename, payload, content_type=content_type)
-        return result.to_context(), result.status
+        return result.to_context(), result.status, result.filename, file_id or file_ref, result.text
 
     async def _transcribe_voice_segment(
         self,

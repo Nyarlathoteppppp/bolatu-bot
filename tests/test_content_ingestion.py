@@ -51,6 +51,9 @@ def test_addressed_file_reads_base64_content() -> None:
 
     assert result.file_status == "ok"
     assert "第一行" in result.file_context
+    assert result.file_name == "说明.txt"
+    assert result.file_source_id == "f1"
+    assert result.file_text == "第一行"
     assert bot.calls[0][0] == "get_file"
 
 

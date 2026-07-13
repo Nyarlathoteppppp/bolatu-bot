@@ -1,6 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import math
+import re
+import statistics
 import time
 from collections import OrderedDict
 from dataclasses import dataclass
@@ -13,13 +17,15 @@ from nonebot import logger
 from .embedding_client import EmbeddingConfig, SiliconFlowEmbeddingClient
 from .rag_indexer import RAGIndexer
 from .rag_router import RAGQueryPlan, plan_rag_query
-from .rag_store import RAGDocument, RAGStore, RankedDocument
+from .rag_store import RAGDocument, RAGEvaluationCase, RAGStore, RankedDocument, ResolvedMember
 
 
 # Structured memory atoms, member profiles, jargon and approval feedback already have
 # dedicated selectors in plugin.py. RAG owns the unstructured historical dialogue
 # path first, which avoids injecting the same evidence twice during migration.
 DEFAULT_DOCUMENT_TYPES = ("conversation", "summary")
+STRUCTURED_DOCUMENT_TYPES = ("memory_atom", "member")
+KNOWLEDGE_DOCUMENT_TYPES = ("file_knowledge", "web_knowledge")
 DOCUMENT_LABELS = {
     "conversation": "群聊原话",
     "summary": "阶段回想",
@@ -27,6 +33,8 @@ DOCUMENT_LABELS = {
     "member": "群友资料",
     "jargon": "群内黑话",
     "feedback": "审批反馈",
+    "file_knowledge": "文件知识库",
+    "web_knowledge": "网页知识库",
 }
 RAG_TIMEZONE = ZoneInfo("Asia/Shanghai")
 
@@ -45,12 +53,16 @@ class RAGConfig:
     background_batch_pause_seconds: float = 1.0
     message_backfill_limit: int = 12000
     source_sync_interval_seconds: float = 30.0
+    knowledge_enabled: bool = True
+    knowledge_chunk_chars: int = 900
+    knowledge_overlap_chars: int = 100
 
     @classmethod
     def from_mapping(cls, raw: object) -> "RAGConfig":
         config = raw if isinstance(raw, dict) else {}
         retrieval = config.get("retrieval", {}) if isinstance(config.get("retrieval", {}), dict) else {}
         indexing = config.get("indexing", {}) if isinstance(config.get("indexing", {}), dict) else {}
+        knowledge = config.get("knowledge", {}) if isinstance(config.get("knowledge", {}), dict) else {}
         mode = str(config.get("mode", "hybrid")).strip().lower()
         if mode not in {"lexical", "shadow", "hybrid"}:
             mode = "hybrid"
@@ -67,6 +79,9 @@ class RAGConfig:
             background_batch_pause_seconds=max(0.1, float(indexing.get("batch_pause_seconds", 1.0))),
             message_backfill_limit=max(100, int(indexing.get("message_backfill_limit", 12000))),
             source_sync_interval_seconds=max(1.0, float(indexing.get("source_sync_interval_seconds", 30.0))),
+            knowledge_enabled=bool(knowledge.get("enabled", True)),
+            knowledge_chunk_chars=max(300, min(2000, int(knowledge.get("max_chunk_chars", 900)))),
+            knowledge_overlap_chars=max(0, min(400, int(knowledge.get("overlap_chars", 100)))),
         )
 
 
@@ -76,6 +91,7 @@ class RAGHit:
     score: float
     lexical: bool
     semantic: bool
+    reasons: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -87,12 +103,25 @@ class RAGRetrievalResult:
     lexical_count: int
     semantic_count: int
     error: str = ""
+    resolved_members: tuple[ResolvedMember, ...] = ()
 
 
 class RAGService:
     def __init__(self, db_path: Path, raw_config: object):
         config_map = raw_config if isinstance(raw_config, dict) else {}
         self.config = RAGConfig.from_mapping(config_map)
+        raw_aliases = config_map.get("member_aliases", {})
+        self.member_aliases: dict[int, tuple[str, ...]] = {}
+        if isinstance(raw_aliases, dict):
+            for raw_user_id, raw_names in raw_aliases.items():
+                try:
+                    user_id = int(raw_user_id)
+                except (TypeError, ValueError):
+                    continue
+                names = raw_names if isinstance(raw_names, list) else [raw_names]
+                clean_names = tuple(str(value).strip() for value in names if len(str(value).strip()) >= 2)
+                if user_id > 0 and clean_names:
+                    self.member_aliases[user_id] = clean_names
         self.store = RAGStore(db_path)
         indexing = config_map.get("indexing", {}) if isinstance(config_map.get("indexing", {}), dict) else {}
         self.indexer = RAGIndexer(
@@ -169,9 +198,17 @@ class RAGService:
         related_user_ids: list[int] | None = None,
     ) -> RAGRetrievalResult:
         started = time.monotonic()
-        plan = plan_rag_query(query, addressed=addressed, related_user_ids=related_user_ids)
+        resolved_members: list[ResolvedMember] = []
+        if self.config.enabled:
+            resolved_members = self._resolve_query_members(group_id, query)
+        plan = plan_rag_query(
+            query,
+            addressed=addressed,
+            related_user_ids=related_user_ids,
+            has_person_reference=bool(resolved_members),
+        )
         if not self.config.enabled or not plan.enabled:
-            return RAGRetrievalResult(plan, (), "", 0, 0, 0)
+            return RAGRetrievalResult(plan, (), "", 0, 0, 0, resolved_members=tuple(resolved_members))
         lexical: list[RankedDocument] = []
         semantic: list[RankedDocument] = []
         cache_hit = False
@@ -185,14 +222,30 @@ class RAGService:
                 if self.config.exclude_recent_seconds > 0
                 else None
             )
+            resolved_ids = {member.user_id for member in resolved_members}
+            target_user_ids = sorted(
+                resolved_ids
+                if resolved_ids
+                else {int(value) for value in (related_user_ids or []) if int(value) > 0}
+            )
+            document_types = self._document_types_for_plan(plan, bool(resolved_members))
             if plan.lexical:
                 lexical = self.store.lexical_search(
                     group_id,
                     query,
                     limit=self.config.lexical_candidates,
-                    doc_types=DEFAULT_DOCUMENT_TYPES,
+                    doc_types=document_types,
                     exclude_recent_after=exclude_after,
                 )
+            if target_user_ids and plan.route in {"person_past", "identifier", "explicit_memory"}:
+                direct_person = self.store.person_documents(
+                    group_id,
+                    target_user_ids,
+                    doc_types=document_types,
+                    limit=min(20, self.config.lexical_candidates),
+                )
+                existing_ids = {item.document.id for item in lexical}
+                lexical.extend(item for item in direct_person if item.document.id not in existing_ids)
             if (
                 plan.semantic
                 and self.config.mode in {"shadow", "hybrid"}
@@ -205,13 +258,15 @@ class RAGService:
                         vector,
                         model=self.embedding.config.model,
                         limit=self.config.semantic_candidates,
-                        doc_types=DEFAULT_DOCUMENT_TYPES,
+                        doc_types=document_types,
                         exclude_recent_after=exclude_after,
                     )
             hits = self._merge_hits(
                 lexical,
                 semantic if self.config.mode == "hybrid" else [],
-                related_user_ids=related_user_ids or [],
+                query=query,
+                target_user_ids=target_user_ids,
+                route=plan.route,
             )
             context = _format_rag_context(hits, max_chars=self.config.max_context_chars)
         except Exception as exc:
@@ -228,6 +283,22 @@ class RAGService:
             lexical_count=len(lexical),
             semantic_count=len(semantic),
             injected_ids=[hit.document.id for hit in hits],
+            details={
+                "resolved_members": [
+                    {"user_id": item.user_id, "matched_name": item.matched_name}
+                    for item in resolved_members
+                ],
+                "hits": [
+                    {
+                        "document_id": hit.document.id,
+                        "doc_type": hit.document.doc_type,
+                        "score": round(hit.score, 4),
+                        "reasons": list(hit.reasons),
+                        "source": f"{hit.document.source_name}:{hit.document.source_row_id}",
+                    }
+                    for hit in hits
+                ],
+            },
             elapsed_ms=elapsed_ms,
             cache_hit=cache_hit,
             error=error,
@@ -240,7 +311,46 @@ class RAGService:
             len(lexical),
             len(semantic),
             error,
+            tuple(resolved_members),
         )
+
+    def _resolve_query_members(self, group_id: int, query: str) -> list[ResolvedMember]:
+        compact = re.sub(r"\s+", "", query).casefold()
+        stored = self.store.resolve_query_members(group_id, query)
+        configured: list[ResolvedMember] = []
+        for user_id, names in self.member_aliases.items():
+            matched = next((name for name in sorted(names, key=len, reverse=True) if name.casefold() in compact), "")
+            if not matched:
+                continue
+            # A longer exact group-card match wins over a short configured alias,
+            # e.g. “小鸟仙子” should not be collapsed into the canonical “小鸟”.
+            if any(
+                len(item.matched_name) > len(matched)
+                and matched.casefold() in item.matched_name.casefold()
+                for item in stored
+            ):
+                continue
+            configured.append(ResolvedMember(user_id, matched))
+        seen: set[int] = set()
+        result: list[ResolvedMember] = []
+        for item in (*configured, *stored):
+            if item.user_id in seen:
+                continue
+            seen.add(item.user_id)
+            result.append(item)
+        return result[:8]
+
+    def _document_types_for_plan(
+        self,
+        plan: RAGQueryPlan,
+        has_resolved_member: bool,
+    ) -> tuple[str, ...]:
+        types = list(DEFAULT_DOCUMENT_TYPES)
+        if plan.route in {"person_past", "identifier", "explicit_memory"} or has_resolved_member:
+            types.extend(STRUCTURED_DOCUMENT_TYPES)
+        if self.config.knowledge_enabled and plan.route in {"knowledge", "lexical"}:
+            types.extend(KNOWLEDGE_DOCUMENT_TYPES)
+        return tuple(dict.fromkeys(types))
 
     async def _query_embedding(self, query: str) -> tuple[list[float], bool]:
         cache_key = f"{self.embedding.config.model}\n{query.strip()}"
@@ -267,7 +377,9 @@ class RAGService:
         lexical: list[RankedDocument],
         semantic: list[RankedDocument],
         *,
-        related_user_ids: list[int],
+        query: str,
+        target_user_ids: list[int],
+        route: str,
     ) -> list[RAGHit]:
         combined: dict[int, dict[str, object]] = {}
         for item in lexical:
@@ -276,27 +388,91 @@ class RAGService:
         for item in semantic:
             entry = combined.setdefault(item.document.id, {"document": item.document, "lexical": 0.0, "semantic": 0.0})
             entry["semantic"] = max(float(entry["semantic"]), item.score)
-        related = set(int(value) for value in related_user_ids)
+        related = set(int(value) for value in target_user_ids)
+        feedback = self.store.feedback_adjustments(list(combined))
+        query_terms = _query_terms(query)
         hits: list[RAGHit] = []
         seen_content: set[str] = set()
         for entry in combined.values():
             document = entry["document"]
             lexical_score = float(entry["lexical"])
             semantic_score = float(entry["semantic"])
+            reasons: list[str] = []
+            participants = set(document.participant_user_ids)
+            if document.speaker_user_id:
+                participants.add(document.speaker_user_id)
+            if document.subject_user_id:
+                participants.add(document.subject_user_id)
             person_bonus = 0.0
-            if document.speaker_user_id in related or document.subject_user_id in related:
-                person_bonus = 0.16
+            if related and participants & related:
+                person_bonus = 0.22
+                reasons.append("人物匹配")
+            elif related and route == "person_past":
+                person_bonus = -0.10
+                reasons.append("人物未匹配")
+            if lexical_score > 0:
+                reasons.append("关键词")
+            if semantic_score > 0:
+                reasons.append("语义")
+            agreement_bonus = 0.08 if lexical_score > 0 and semantic_score > 0 else 0.0
+            if agreement_bonus:
+                reasons.append("双路命中")
+            normalized = re.sub(r"\s+", "", document.content).casefold()
+            covered = sum(1 for term in query_terms if term.casefold() in normalized)
+            coverage_bonus = min(0.12, covered * 0.035)
+            if covered:
+                reasons.append(f"词覆盖{covered}")
+            type_bonus = 0.0
+            if document.doc_type == "conversation":
+                type_bonus = 0.04
+            elif document.doc_type == "memory_atom" and route in {"person_past", "explicit_memory", "identifier"}:
+                type_bonus = 0.07
+                reasons.append("结构化记忆")
+            elif document.doc_type == "member" and related:
+                type_bonus = 0.06
+                reasons.append("群友资料")
+            elif document.doc_type in KNOWLEDGE_DOCUMENT_TYPES and route == "knowledge":
+                type_bonus = 0.10
+                reasons.append("知识库")
             evidence_bonus = 0.08 * document.confidence + 0.06 * document.importance
-            score = 0.38 * lexical_score + 0.46 * semantic_score + person_bonus + evidence_bonus
+            feedback_bonus = feedback.get(document.id, 0.0)
+            if feedback_bonus:
+                reasons.append("反馈加权" if feedback_bonus > 0 else "反馈降权")
+            score = (
+                0.34 * lexical_score
+                + 0.42 * semantic_score
+                + person_bonus
+                + agreement_bonus
+                + coverage_bonus
+                + type_bonus
+                + evidence_bonus
+                + feedback_bonus
+            )
             if score < self.config.min_score:
                 continue
             key = "".join(document.content.split()).casefold()[:240]
             if key in seen_content:
                 continue
             seen_content.add(key)
-            hits.append(RAGHit(document, score, lexical_score > 0, semantic_score > 0))
+            hits.append(RAGHit(document, score, lexical_score > 0, semantic_score > 0, tuple(reasons)))
         hits.sort(key=lambda hit: (hit.score, hit.document.importance, hit.document.created_at), reverse=True)
-        return hits[: self.config.max_items]
+        selected: list[RAGHit] = []
+        type_counts: dict[str, int] = {}
+        member_subjects: set[int] = set()
+        caps = {"member": 1, "memory_atom": 2, "summary": 2, "conversation": 4, "file_knowledge": 3, "web_knowledge": 3}
+        for hit in hits:
+            doc_type = hit.document.doc_type
+            if type_counts.get(doc_type, 0) >= caps.get(doc_type, self.config.max_items):
+                continue
+            if doc_type == "member" and hit.document.subject_user_id:
+                if hit.document.subject_user_id in member_subjects:
+                    continue
+                member_subjects.add(hit.document.subject_user_id)
+            selected.append(hit)
+            type_counts[doc_type] = type_counts.get(doc_type, 0) + 1
+            if len(selected) >= self.config.max_items:
+                break
+        return selected
 
     def status_snapshot(self) -> dict[str, object]:
         return {
@@ -312,6 +488,167 @@ class RAGService:
             "embedding": self.embedding.status_snapshot(),
         }
 
+    def ingest_knowledge(
+        self,
+        *,
+        group_id: int,
+        kind: str,
+        source_identity: str,
+        title: str,
+        content: str,
+        source_message_id: str = "",
+    ) -> int:
+        if not self.config.enabled or not self.config.knowledge_enabled or not content.strip():
+            return 0
+        doc_type = "file_knowledge" if kind == "file" else "web_knowledge"
+        source_name = "group_file" if kind == "file" else "web_reader"
+        identity_hash = hashlib.sha256(source_identity.encode("utf-8")).hexdigest()[:20]
+        prefix = f"knowledge:{doc_type}:{int(group_id)}:{identity_hash}:"
+        chunks = _split_knowledge_text(
+            content,
+            max_chars=self.config.knowledge_chunk_chars,
+            overlap_chars=self.config.knowledge_overlap_chars,
+        )
+        keys: list[str] = []
+        now = time.time()
+        for index, chunk in enumerate(chunks):
+            stable_key = f"{prefix}{index}"
+            keys.append(stable_key)
+            body = f"标题：{title.strip()[:180]}\n{chunk}"
+            self.store.upsert_document(
+                stable_key=stable_key,
+                group_id=group_id,
+                doc_type=doc_type,
+                content=body,
+                source_name=source_name,
+                source_row_id=source_identity[:80],
+                source_message_ids=(source_message_id,) if source_message_id else (),
+                created_at=now,
+                importance=0.62,
+                confidence=0.86,
+            )
+        self.store.delete_documents_by_stable_prefix_except(prefix, keys)
+        self.store.commit()
+        self._ensure_embedding_task()
+        return len(keys)
+
+    def add_feedback(
+        self,
+        *,
+        group_id: int,
+        position: int,
+        label: str,
+        operator_id: int,
+        note: str = "",
+    ) -> tuple[int, str]:
+        return self.store.add_feedback_for_latest(
+            group_id=group_id,
+            position=position,
+            label=label,
+            operator_id=operator_id,
+            note=note,
+        )
+
+    def feedback_report(self, group_id: int, *, limit: int = 10) -> str:
+        rows = self.store.recent_feedback(group_id, limit=limit)
+        if not rows:
+            return "这个群还没有 RAG 检索反馈。"
+        labels = {"relevant": "相关", "irrelevant": "不相关", "wrong_person": "人物错位", "stale": "已过期"}
+        lines = ["近期 RAG 检索反馈："]
+        for row in rows:
+            lines.append(
+                f"#{row['id']} 文档{row['document_id']} {labels.get(str(row['label']), row['label'])} "
+                f"[{row['doc_type']}] {row['content_preview']}"
+            )
+        return "\n".join(lines)
+
+    def add_evaluation_case(
+        self,
+        *,
+        group_id: int,
+        query: str,
+        expected_terms: list[str],
+        expected_user_ids: list[int],
+        created_by: int,
+    ) -> int:
+        return self.store.add_evaluation_case(
+            group_id=group_id,
+            query=query,
+            expected_terms=expected_terms,
+            expected_user_ids=expected_user_ids,
+            created_by=created_by,
+        )
+
+    def ensure_default_evaluation_cases(self, group_id: int) -> int:
+        if self.store.evaluation_cases(group_id, limit=1):
+            return 0
+        defaults = (
+            ("以前谁聊过菲尔兹奖", ["菲尔兹奖"]),
+            ("群里之前怎么讨论三维挂谷猜想", ["三维挂谷猜想"]),
+            ("之前提到司马懿时说了什么", ["司马懿"]),
+        )
+        for query, terms in defaults:
+            self.add_evaluation_case(
+                group_id=group_id,
+                query=query,
+                expected_terms=terms,
+                expected_user_ids=[],
+                created_by=0,
+            )
+        return len(defaults)
+
+    def evaluation_case_report(self, group_id: int) -> str:
+        cases = self.store.evaluation_cases(group_id)
+        if not cases:
+            return "这个群还没有 RAG 评测用例。"
+        lines = [f"RAG 评测用例（{len(cases)} 条）："]
+        for case in cases:
+            users = ",".join(str(value) for value in case.expected_user_ids) or "无"
+            lines.append(f"#{case.id} {case.query} | 关键词={','.join(case.expected_terms)} | 人物={users}")
+        return "\n".join(lines)
+
+    async def run_evaluation(self, group_id: int, *, limit: int = 30) -> str:
+        cases = self.store.evaluation_cases(group_id, limit=limit)
+        if not cases:
+            return "这个群还没有评测用例。可用：RAG评测添加 问题 | 关键词1,关键词2 | QQ号（QQ 可留空）"
+        passed = 0
+        attributed = 0
+        latencies: list[int] = []
+        details: list[str] = []
+        for case in cases:
+            result = await self.retrieve(group_id=group_id, query=case.query, addressed=True)
+            latencies.append(result.elapsed_ms)
+            combined = "\n".join(hit.document.content for hit in result.hits).casefold()
+            term_ok = all(term.casefold() in combined for term in case.expected_terms)
+            participant_ids: set[int] = set()
+            for hit in result.hits:
+                participant_ids.update(hit.document.participant_user_ids)
+                if hit.document.speaker_user_id:
+                    participant_ids.add(hit.document.speaker_user_id)
+                if hit.document.subject_user_id:
+                    participant_ids.add(hit.document.subject_user_id)
+            person_ok = all(value in participant_ids for value in case.expected_user_ids)
+            source_ok = bool(result.hits) and all(
+                hit.document.source_name and (hit.document.source_row_id or hit.document.source_message_ids)
+                for hit in result.hits
+            )
+            attributed += int(source_ok)
+            ok = term_ok and person_ok
+            passed += int(ok)
+            details.append(
+                f"#{case.id} {'通过' if ok else '未通过'} top={len(result.hits)} "
+                f"词={'是' if term_ok else '否'} 人={'是' if person_ok else '否'} "
+                f"来源={'是' if source_ok else '否'} {result.elapsed_ms}ms"
+            )
+        ordered = sorted(latencies)
+        p95 = ordered[min(len(ordered) - 1, max(0, math.ceil(len(ordered) * 0.95) - 1))]
+        avg = statistics.fmean(latencies) if latencies else 0.0
+        return (
+            f"RAG 检索质量评测：{passed}/{len(cases)} 通过，Recall@{self.config.max_items}="
+            f"{passed / len(cases):.1%}，来源可追溯={attributed / len(cases):.1%}，"
+            f"平均={avg:.0f}ms，P95={p95}ms\n" + "\n".join(details)
+        )
+
     async def diagnostic_query(self, group_id: int, query: str) -> str:
         result = await self.retrieve(group_id=group_id, query=query, addressed=True)
         if not result.hits:
@@ -322,7 +659,9 @@ class RAGService:
             )
         return (
             f"RAG测试：{query}\nroute={result.plan.route} lexical={result.lexical_count} "
-            f"semantic={result.semantic_count} elapsed={result.elapsed_ms}ms\n\n{result.context}"
+            f"semantic={result.semantic_count} elapsed={result.elapsed_ms}ms "
+            f"人物={','.join(f'{item.matched_name}({item.user_id})' for item in result.resolved_members) or '无'}\n\n"
+            f"{result.context}"
         )
 
 
@@ -341,7 +680,8 @@ def _format_rag_context(hits: list[RAGHit], *, max_chars: int) -> str:
         speaker = f"；说话人QQ={document.speaker_user_id}" if document.speaker_user_id else ""
         item = (
             f"{index}. [{DOCUMENT_LABELS.get(document.doc_type, document.doc_type)}；{stamp}{speaker}；"
-            f"来源={document.source_name}:{source_ids}；置信度={document.confidence:.2f}]\n{document.content}"
+            f"来源={document.source_name}:{source_ids}；得分={hit.score:.2f}；"
+            f"匹配={'+'.join(hit.reasons) or '基础排序'}；置信度={document.confidence:.2f}]\n{document.content}"
         )
         if used + len(item) > max_chars:
             remaining = max_chars - used
@@ -351,3 +691,32 @@ def _format_rag_context(hits: list[RAGHit], *, max_chars: int) -> str:
         lines.append(item)
         used += len(item)
     return "\n".join(lines)
+
+
+def _query_terms(query: str) -> list[str]:
+    return [
+        value
+        for value in re.findall(r"[\u3400-\u9fff]{2,}|[A-Za-z0-9_+.-]{2,}", query)
+        if value not in {"以前", "之前", "记得", "说过", "聊过", "文件", "网页", "这个", "那个"}
+    ][:10]
+
+
+def _split_knowledge_text(text: str, *, max_chars: int, overlap_chars: int) -> list[str]:
+    clean = re.sub(r"\n{3,}", "\n\n", str(text)).strip()
+    if not clean:
+        return []
+    chunks: list[str] = []
+    start = 0
+    while start < len(clean):
+        end = min(len(clean), start + max_chars)
+        if end < len(clean):
+            boundary = max(clean.rfind("\n", start + max_chars // 2, end), clean.rfind("。", start + max_chars // 2, end))
+            if boundary > start:
+                end = boundary + 1
+        chunk = clean[start:end].strip()
+        if chunk:
+            chunks.append(chunk)
+        if end >= len(clean):
+            break
+        start = max(start + 1, end - overlap_chars)
+    return chunks[:80]
