@@ -8,9 +8,10 @@ from qq_social_agent.memory import MemoryStore
 from qq_social_agent.pipeline_types import OutputChannel, SocialIntent, ToolKind
 from qq_social_agent.timing_gate import parse_timing_decision
 from qq_social_agent.tool_router import apply_tool_plan, compare_legacy_decision, route_tools
-from qq_social_agent.deepseek_client import ReplyDecision, _parse_mid_memory
+from qq_social_agent.deepseek_client import DeepSeekClient, ReplyDecision, _parse_mid_memory
 from qq_social_agent.tools.fresh_context import FreshIntent
 from qq_social_agent.tools.market_intent import MarketIntent
+from types import SimpleNamespace
 
 
 def test_context_assembler_keeps_memory_and_structured_context() -> None:
@@ -112,6 +113,23 @@ def test_mid_memory_recovers_summary_from_truncated_structured_json() -> None:
 
     assert draft.summary.startswith("总览：群友讨论了算法和留学")
     assert draft.facts == ()
+
+
+def test_mid_memory_has_background_timeout_budget() -> None:
+    client = object.__new__(DeepSeekClient)
+    client.config = SimpleNamespace(
+        decision_timeout_seconds=10.0,
+        decision_total_timeout_seconds=18.0,
+        reply_timeout_seconds=18.0,
+        reply_total_timeout_seconds=28.0,
+        daily_review_timeout_seconds=35.0,
+        daily_review_total_timeout_seconds=75.0,
+        utility_timeout_seconds=8.0,
+        utility_total_timeout_seconds=12.0,
+        timeout_seconds=30.0,
+    )
+
+    assert client._task_timeouts(task="mid_memory", route_name="memory") == (18.0, 40.0)
 
 
 def test_background_learning_uses_one_worker_and_defers_busy_group() -> None:

@@ -206,6 +206,12 @@ class DeepSeekClient:
         if route_name == "decision" or task == "decision":
             attempt = self.config.decision_timeout_seconds
             total = self.config.decision_total_timeout_seconds
+        elif task == "mid_memory":
+            # Sixty-message structured summaries are background work and need a
+            # wider budget than short utility classifications. This does not sit
+            # on the reply path.
+            attempt = max(self.config.utility_timeout_seconds, 18.0)
+            total = max(self.config.utility_total_timeout_seconds, 40.0)
         elif task == "daily_review":
             attempt = getattr(self.config, "daily_review_timeout_seconds", 35.0)
             total = getattr(self.config, "daily_review_total_timeout_seconds", 75.0)
