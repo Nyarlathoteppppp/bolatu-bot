@@ -556,12 +556,53 @@ async def _send_approval_rules_on_connect(bot: Bot) -> None:
         action="connected",
         bot_id=str(bot.self_id),
     )
+    await _reconcile_group_mutes(bot)
     await _send_approval_rules_to_approvers(bot, reason="bot_connect")
     await _send_changelog_notice_to_approvers(bot)
     await _notify_active_group_mutes(bot)
     _ensure_daily_review_task(bot)
     _ensure_group_directory_task(bot)
     _ensure_history_backfill_task(bot)
+
+
+async def _reconcile_group_mutes(bot: Bot) -> None:
+    """Refresh persisted mute deadlines in case notices arrived while bot was offline."""
+    self_id = int(bot.self_id)
+    now = time.time()
+    for group_id in _runtime_target_groups():
+        try:
+            payload = await onebot_gateway.call_api(
+                bot,
+                "get_group_member_info",
+                group_id=group_id,
+                user_id=self_id,
+                no_cache=True,
+            )
+            member = onebot_gateway.unwrap_data(payload)
+            if not isinstance(member, dict) or "shut_up_timestamp" not in member:
+                logger.warning(f"qq_social_agent mute reconcile missing state: group={group_id}")
+                continue
+            muted_until = max(0.0, float(member.get("shut_up_timestamp") or 0))
+            if muted_until <= now:
+                muted_until = 0.0
+            previous = float(memory.group_state(group_id)["muted_until"] or 0)
+            memory.mute_until(group_id, muted_until)
+            if previous != muted_until:
+                _record_metric_event(
+                    "group_send_state",
+                    group_id=group_id,
+                    user_id=self_id,
+                    stage="startup_reconcile",
+                    action="self_muted" if muted_until else "self_unmuted",
+                    previous_muted_until=previous,
+                    muted_until=muted_until,
+                )
+                logger.info(
+                    f"qq_social_agent mute reconciled: group={group_id} "
+                    f"previous={previous} current={muted_until}"
+                )
+        except Exception as exc:
+            logger.warning(f"qq_social_agent mute reconcile failed: group={group_id} error={exc}")
 
 
 async def _notify_active_group_mutes(bot: Bot) -> None:

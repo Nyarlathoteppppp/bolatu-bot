@@ -113,6 +113,31 @@ def test_self_group_ban_pauses_group_and_notifies_approver(monkeypatch, tmp_path
     assert "2123506373" in str(sent[0][1]["message"])
 
 
+def test_startup_reconcile_clears_mute_missed_while_offline(monkeypatch, tmp_path) -> None:
+    import nonebot
+
+    nonebot.init()
+    import qq_social_agent.plugin as plugin
+    from qq_social_agent.memory import MemoryStore
+
+    store = MemoryStore(tmp_path / "bot.sqlite3")
+    store.mute_until(1026813421, 9_999_999_999)
+    monkeypatch.setattr(plugin, "memory", store)
+    monkeypatch.setattr(plugin, "_runtime_target_groups", lambda: (1026813421,))
+
+    class FakeBot:
+        self_id = 1801507496
+
+        async def call_api(self, api: str, **data: object) -> dict[str, object]:
+            assert api == "get_group_member_info"
+            assert data["no_cache"] is True
+            return {"data": {"user_id": self.self_id, "shut_up_timestamp": 0}}
+
+    asyncio.run(plugin._reconcile_group_mutes(FakeBot()))
+
+    assert store.group_state(1026813421)["muted_until"] == 0
+
+
 def test_group_send_result_120_is_detected() -> None:
     import nonebot
 
