@@ -103,6 +103,7 @@ from .observability import (
 from .persona import PersonaRegistry
 from .political_guard import has_political_redline, political_safe_reply, sanitize_political_output
 from .rate_limiter import RateLimiter
+from .rag_retriever import RAGRetrievalResult, RAGService
 from .reply_splitter import split_reply_messages
 from .social_actions import PokeContext, SocialActionService, reaction_from_action
 from .tools.fresh_context import (
@@ -131,6 +132,7 @@ deep_content_tool = DeepContentTool.from_config(
     if isinstance(app_config.raw.get("content_tools", {}), dict)
     else {}
 )
+rag_service = RAGService(app_config.data_path, app_config.raw.get("rag", {}))
 _jargon_selection_config = app_config.raw.get("jargon_selection", {})
 JARGON_LLM_SELECTOR_ENABLED = bool(
     _jargon_selection_config.get("llm_selector_enabled", False)
@@ -391,6 +393,8 @@ MEMORY_ATOM_DISPUTE_RE = re.compile(
 MEMORY_ATOM_AUDIT_RE = re.compile(
     r"^(?:/)?(?:记忆证据|记忆审计|记忆历史)\s+(?P<atom_id>\d+)$"
 )
+RAG_STATUS_COMMANDS = {"RAG状态", "rag状态", "RAG status", "/rag status"}
+RAG_TEST_RE = re.compile(r"^(?:/)?(?:RAG测试|rag测试|RAG test|rag test)\s*[:：]?\s*(?P<query>.+)$", re.IGNORECASE)
 PRIVATE_CONTEXT_RESET_COMMANDS = {
     "清空上下文",
     "清空背景",
@@ -497,6 +501,7 @@ async def _init_client() -> None:
     deepseek_client = DeepSeekClient(app_config.deepseek)
     _apply_model_route_overrides()
     _ensure_builtin_memory_atoms()
+    await rag_service.start()
 
 
 def _record_llm_usage(
@@ -653,6 +658,7 @@ async def _shutdown_background_tasks() -> None:
     closers.append(image_ocr_service.aclose())
     closers.append(content_ingestion_service.aclose())
     closers.append(deep_content_tool.aclose())
+    closers.append(rag_service.close())
     await asyncio.gather(*closers, return_exceptions=True)
 
 
@@ -1787,6 +1793,7 @@ def _http_status_payload() -> dict[str, object]:
             },
         },
         "search": fresh_context_tool.status_snapshot(),
+        "rag": rag_service.status_snapshot(),
         "ocr": _status_image_ocr(),
         "social_actions": social_action_service.status_snapshot(),
         "content_tools": {
@@ -2765,6 +2772,16 @@ async def _handle_group_message_locked(
     raw_corpus_context = ""
     jargon_context = ""
     context_query = _context_query_text(text, nickname, context_recent)
+    related_member_user_ids = _related_member_user_ids(context_recent, current_user_id=user_id)
+    rag_task: asyncio.Task[RAGRetrievalResult] = asyncio.create_task(
+        rag_service.retrieve(
+            group_id=group_id,
+            query=f"{nickname}\n{text}",
+            addressed=addressed_bot,
+            related_user_ids=related_member_user_ids,
+        )
+    )
+    rag_context_applied = False
     fresh_context_task: asyncio.Task[str] | None = None
     if fresh_intent is not None and (fresh_intent.explicit or fresh_intent.required):
         prefetched_decision = ReplyDecision(
@@ -2792,6 +2809,8 @@ async def _handle_group_message_locked(
         fresh_intent=fresh_intent,
     )
     if pre_decision.skip_reason:
+        if not rag_task.done():
+            rag_task.cancel()
         logger.info(
             "qq_social_agent skipped by local pre-decision gate: "
             f"group={group_id} reason={pre_decision.skip_reason}"
@@ -2816,6 +2835,23 @@ async def _handle_group_message_locked(
                 context_query,
                 limit=MID_MEMORY_KEEP_SUMMARIES,
             )
+        )
+        rag_result = await rag_task
+        rag_context_applied = True
+        if rag_result.context:
+            memory_context = rag_result.context
+        _record_metric_event(
+            "rag_retrieval",
+            group_id=group_id,
+            user_id=user_id,
+            stage="decision_context",
+            action="injected" if rag_result.context else "empty",
+            route=rag_result.plan.route,
+            lexical_count=rag_result.lexical_count,
+            semantic_count=rag_result.semantic_count,
+            injected_count=len(rag_result.hits),
+            elapsed_ms=rag_result.elapsed_ms,
+            error=rag_result.error,
         )
         member_context = _format_member_context(
             memory.member_impressions_for_context(
@@ -2962,6 +2998,8 @@ async def _handle_group_message_locked(
     )
     _schedule_group_learning(group_id)
     if not decision.should_reply:
+        if not rag_task.done():
+            rag_task.cancel()
         if fresh_context_task is not None and not fresh_context_task.done():
             fresh_context_task.cancel()
         await _send_approval_suppression_notice(
@@ -2979,6 +3017,8 @@ async def _handle_group_message_locked(
         return
 
     if decision.action == "react":
+        if not rag_task.done():
+            rag_task.cancel()
         await _execute_reaction_action(
             bot,
             event,
@@ -2993,6 +3033,8 @@ async def _handle_group_message_locked(
         return
 
     if decision.action == "poke":
+        if not rag_task.done():
+            rag_task.cancel()
         await _execute_poke_action(
             bot,
             group_id=group_id,
@@ -3009,6 +3051,24 @@ async def _handle_group_message_locked(
                 context_query,
                 limit=MID_MEMORY_KEEP_SUMMARIES,
             )
+        )
+    if not rag_context_applied:
+        rag_result = await rag_task
+        rag_context_applied = True
+        if rag_result.context:
+            memory_context = rag_result.context
+        _record_metric_event(
+            "rag_retrieval",
+            group_id=group_id,
+            user_id=user_id,
+            stage="generation_context",
+            action="injected" if rag_result.context else "empty",
+            route=rag_result.plan.route,
+            lexical_count=rag_result.lexical_count,
+            semantic_count=rag_result.semantic_count,
+            injected_count=len(rag_result.hits),
+            elapsed_ms=rag_result.elapsed_ms,
+            error=rag_result.error,
         )
     if not member_context:
         member_context = _format_member_context(
@@ -5988,6 +6048,8 @@ def _is_private_tool_text(text: str) -> bool:
         or MEMORY_ATOM_CORRECT_RE.match(text) is not None
         or MEMORY_ATOM_DISPUTE_RE.match(text) is not None
         or MEMORY_ATOM_AUDIT_RE.match(text) is not None
+        or text in RAG_STATUS_COMMANDS
+        or RAG_TEST_RE.match(text) is not None
         or APPROVER_ADD_RE.match(text) is not None
         or APPROVER_DELETE_RE.match(text) is not None
         or _parse_metric_report_command(text) is not None
@@ -6008,6 +6070,28 @@ def _cool_down_other_approval_choices(approver_id: int) -> None:
     for user_id in _approval_user_ids():
         if user_id != approver_id:
             approval_choice_cooldowns[user_id] = until
+
+
+def _format_rag_status() -> str:
+    snapshot = rag_service.status_snapshot()
+    store = snapshot.get("store", {}) if isinstance(snapshot.get("store"), dict) else {}
+    embedding = snapshot.get("embedding", {}) if isinstance(snapshot.get("embedding"), dict) else {}
+    type_counts = store.get("document_types", {}) if isinstance(store.get("document_types"), dict) else {}
+    status_counts = store.get("embedding_status", {}) if isinstance(store.get("embedding_status"), dict) else {}
+    types_text = "、".join(f"{name}={count}" for name, count in sorted(type_counts.items())) or "无"
+    embeddings_text = "、".join(f"{name}={count}" for name, count in sorted(status_counts.items())) or "无"
+    return (
+        "轻量混合 RAG 状态：\n"
+        f"- enabled={snapshot.get('enabled')} mode={snapshot.get('mode')} FTS5={store.get('fts5')}\n"
+        f"- 文档总数={store.get('documents', 0)}（{types_text}）\n"
+        f"- 向量={embeddings_text}\n"
+        f"- embedding={embedding.get('model')} available={embedding.get('available')} "
+        f"calls={embedding.get('calls', 0)} failures={embedding.get('failures', 0)}\n"
+        f"- 最近1小时检索={store.get('retrievals_1h', 0)}次，平均={store.get('average_retrieval_ms_1h', 0)}ms\n"
+        f"- 后台索引={snapshot.get('background_indexing')} query缓存={snapshot.get('query_cache_entries', 0)}\n"
+        f"- 最近错误={snapshot.get('last_error') or embedding.get('last_error') or '无'}\n"
+        "测试命令：RAG测试 以前谁聊过菲尔兹奖"
+    )
 
 
 def _format_approval_user_report() -> str:
@@ -6234,6 +6318,21 @@ async def _handle_group_approval_private_impl(bot: Bot, user_id: int, text: str)
             bot,
             user_id,
             _format_memory_atom_report(_private_jargon_group_id(), atom_report_limit),
+        )
+        return True
+    if compact_text in RAG_STATUS_COMMANDS:
+        await _send_private_text(bot, user_id, _format_rag_status())
+        return True
+    rag_test_match = RAG_TEST_RE.match(compact_text)
+    if rag_test_match is not None:
+        group_id = _private_jargon_group_id()
+        if group_id is None:
+            await _send_private_text(bot, user_id, "RAG测试失败：没有可用目标群。")
+            return True
+        await _send_private_text(
+            bot,
+            user_id,
+            await rag_service.diagnostic_query(group_id, rag_test_match.group("query").strip()),
         )
         return True
     metric_window = _parse_metric_report_command(compact_text)

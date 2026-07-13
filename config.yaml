@@ -146,6 +146,34 @@ history_sync:
   enabled: true
   backfill_count: 80
 
+rag:
+  enabled: true
+  mode: hybrid
+  embedding:
+    enabled: true
+    provider: siliconflow
+    api_key_env: SILICONFLOW_API_KEY
+    base_url: https://api.siliconflow.cn/v1
+    model: BAAI/bge-m3
+    dimensions: 0
+    timeout_seconds: 8
+    batch_size: 24
+  retrieval:
+    online_timeout_ms: 800
+    lexical_candidates: 30
+    semantic_candidates: 30
+    max_items: 5
+    max_context_chars: 1500
+    min_score: 0.18
+    exclude_recent_seconds: 900
+  indexing:
+    episode_gap_seconds: 600
+    max_chunk_chars: 700
+    max_chunk_messages: 6
+    message_backfill_limit: 12000
+    source_sync_interval_seconds: 30
+    batch_pause_seconds: 1.0
+
 private_tools:
   reply_delay_enabled: true
   reply_delay_min_seconds: 0.15

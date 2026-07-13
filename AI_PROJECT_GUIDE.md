@@ -98,6 +98,11 @@ Docker / Docker Compose
 │   ├── observability.py           # correlation id、OneBot 活跃/错误状态
 │   ├── deepseek_client.py         # LLM 客户端：多 provider 路由、JSON 解析、各流程调用
 │   ├── memory.py                  # SQLite 存储：消息、去重、群目录、记忆、画像、反馈、指标、用量
+│   ├── rag_store.py               # 轻量 RAG 的证据文档、FTS5、向量和检索日志存储
+│   ├── rag_indexer.py             # 将原消息、摘要、记忆原子、画像、黑话、反馈增量索引
+│   ├── embedding_client.py        # 硅基流动 embedding 客户端
+│   ├── rag_router.py              # 判断何时只全文检索、何时追加语义检索
+│   ├── rag_retriever.py           # 混合召回、证据过滤、上下文预算和后台向量任务
 │   ├── config.py                  # 读取 config.yaml，构造模型 route/provider
 │   ├── persona.py                 # 从 prompt yaml 读取 persona
 │   ├── prompts.py                 # 从 prompt yaml 读取 flows/action_guides
