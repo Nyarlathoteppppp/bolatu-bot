@@ -895,12 +895,14 @@ def _ensure_daily_review_task(bot: Bot) -> None:
 
 async def _run_daily_review_scheduler(bot: Bot, bot_key: str) -> None:
     try:
-        if _daily_review_within_catch_up_window():
-            await _send_due_daily_reviews(bot)
         while True:
-            await asyncio.sleep(_seconds_until_next_daily_review())
-            await _send_due_daily_reviews(bot)
-            await asyncio.sleep(120)
+            within_catch_up = _daily_review_within_catch_up_window()
+            if within_catch_up:
+                await _send_due_daily_reviews(bot)
+            delay = _seconds_until_next_daily_review()
+            if within_catch_up:
+                delay = min(delay, 5 * 60)
+            await asyncio.sleep(max(1.0, delay))
     except asyncio.CancelledError:
         raise
     except Exception as exc:

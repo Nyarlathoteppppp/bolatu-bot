@@ -48,6 +48,8 @@ class DeepSeekConfig:
     decision_total_timeout_seconds: float
     reply_timeout_seconds: float
     reply_total_timeout_seconds: float
+    daily_review_timeout_seconds: float
+    daily_review_total_timeout_seconds: float
     utility_timeout_seconds: float
     utility_total_timeout_seconds: float
     max_retries: int
@@ -171,6 +173,8 @@ class AppConfig:
             decision_total_timeout_seconds=float(deepseek.get("decision_total_timeout_seconds", 18)),
             reply_timeout_seconds=float(deepseek.get("reply_timeout_seconds", 18)),
             reply_total_timeout_seconds=float(deepseek.get("reply_total_timeout_seconds", 28)),
+            daily_review_timeout_seconds=float(deepseek.get("daily_review_timeout_seconds", 35)),
+            daily_review_total_timeout_seconds=float(deepseek.get("daily_review_total_timeout_seconds", 75)),
             utility_timeout_seconds=float(deepseek.get("utility_timeout_seconds", 8)),
             utility_total_timeout_seconds=float(deepseek.get("utility_total_timeout_seconds", 12)),
             max_retries=max(0, min(2, int(deepseek.get("max_retries", 0)))),

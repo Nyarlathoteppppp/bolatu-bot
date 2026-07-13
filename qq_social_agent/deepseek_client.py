@@ -205,7 +205,10 @@ class DeepSeekClient:
         if route_name == "decision" or task == "decision":
             attempt = self.config.decision_timeout_seconds
             total = self.config.decision_total_timeout_seconds
-        elif route_name == "reply" or task in {"reply", "reply_direct", "reply_candidates", "daily_review"}:
+        elif task == "daily_review":
+            attempt = getattr(self.config, "daily_review_timeout_seconds", 35.0)
+            total = getattr(self.config, "daily_review_total_timeout_seconds", 75.0)
+        elif route_name == "reply" or task in {"reply", "reply_direct", "reply_candidates"}:
             attempt = self.config.reply_timeout_seconds
             total = self.config.reply_total_timeout_seconds
         elif route_name in {"utility", "jargon", "memory", "style", "member_profile"}:

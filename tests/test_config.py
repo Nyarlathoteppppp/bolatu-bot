@@ -144,6 +144,8 @@ def test_llm_latency_limits_default_to_fast_no_retry_policy() -> None:
     assert config.decision_total_timeout_seconds == 18
     assert config.reply_timeout_seconds == 18
     assert config.reply_total_timeout_seconds == 28
+    assert config.daily_review_timeout_seconds == 35
+    assert config.daily_review_total_timeout_seconds == 75
     assert config.max_retries == 0
 
 
