@@ -330,7 +330,6 @@ def test_client_methods_use_expected_model_routes() -> None:
         description="",
         prompt="人格",
         decision_prompt="决策人格",
-        keywords=(),
         max_reply_chars=120,
         passive_reply_probability=0.5,
     )
@@ -552,7 +551,6 @@ def test_reply_candidates_retries_when_model_returns_too_few() -> None:
         description="",
         prompt="人格",
         decision_prompt="决策人格",
-        keywords=(),
         max_reply_chars=120,
         passive_reply_probability=0.5,
     )
@@ -619,7 +617,6 @@ def test_reply_candidates_includes_priority_context() -> None:
         description="",
         prompt="人格",
         decision_prompt="决策人格",
-        keywords=(),
         max_reply_chars=120,
         passive_reply_probability=0.5,
     )
@@ -671,7 +668,6 @@ def test_reply_direct_uses_direct_prompt_and_one_candidate() -> None:
         description="",
         prompt="人格",
         decision_prompt="决策人格",
-        keywords=(),
         max_reply_chars=120,
         passive_reply_probability=0.5,
     )
@@ -728,7 +724,6 @@ def test_search_answer_uses_fast_route_and_small_prompt_budget() -> None:
         description="",
         prompt="人格",
         decision_prompt="决策人格",
-        keywords=(),
         max_reply_chars=220,
         passive_reply_probability=0.5,
     )

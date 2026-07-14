@@ -10,8 +10,6 @@ MEMORY_SIGNALS = (
     "之前",
     "以前",
     "上次",
-    "刚才",
-    "前面",
     "谁说",
     "说过",
     "聊过",
@@ -25,6 +23,15 @@ MEMORY_SIGNALS = (
     "黑话",
     "别名",
     "改名",
+)
+
+RECENT_CONTEXT_SIGNALS = (
+    "刚才",
+    "前面",
+    "上面",
+    "上一条",
+    "这句话",
+    "这句",
 )
 
 PERSON_PAST_SIGNALS = (
@@ -83,24 +90,24 @@ def plan_rag_query(
     if len(clean) < 2:
         return RAGQueryPlan(False, False, False, "too_short")
     memory_signal = any(signal in clean for signal in MEMORY_SIGNALS)
+    recent_context_signal = any(signal in clean for signal in RECENT_CONTEXT_SIGNALS)
     past_signal = any(signal in clean for signal in PERSON_PAST_SIGNALS)
     contains_identifier = bool(re.search(r"\d{5,12}", clean))
     pronoun_person_reference = bool(related_user_ids and PERSON_PRONOUN_RE.search(clean))
     person_past = past_signal and (has_person_reference or contains_identifier or pronoun_person_reference)
     knowledge_signal = any(signal in clean for signal in KNOWLEDGE_SIGNALS)
-    lexical = len(clean) >= 3
-    # A remote query embedding must not become part of every addressed reply.
-    # Existing structured member/profile selectors cover ordinary person questions;
-    # semantic RAG is reserved for explicit historical recall or exact QQ identifiers.
-    semantic = person_past or memory_signal or contains_identifier or knowledge_signal
     if person_past:
         route = "person_past"
     elif knowledge_signal:
         route = "knowledge"
+    elif recent_context_signal:
+        # The normal recent-message window is more accurate and cheaper for
+        # "刚才/上面" than historical RAG, which intentionally excludes fresh rows.
+        return RAGQueryPlan(False, False, False, "recent_context")
     elif memory_signal:
         route = "explicit_memory"
     elif contains_identifier:
         route = "identifier"
     else:
-        route = "lexical"
-    return RAGQueryPlan(lexical, lexical, semantic, route)
+        return RAGQueryPlan(False, False, False, "casual")
+    return RAGQueryPlan(True, True, True, route)

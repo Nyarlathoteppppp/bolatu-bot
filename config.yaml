@@ -179,6 +179,10 @@ rag:
     max_context_chars: 1900
     min_score: 0.18
     exclude_recent_seconds: 900
+    conversation_neighbor_messages: 3
+    conversation_episode_gap_seconds: 600
+    conversation_episode_max_chars: 900
+    max_expanded_conversation_hits: 2
   indexing:
     episode_gap_seconds: 600
     max_chunk_chars: 700

@@ -136,6 +136,44 @@ def test_followup_research_inherits_latest_real_user_topic() -> None:
     assert intent.required
 
 
+def test_bare_search_command_inherits_same_users_previous_message() -> None:
+    messages = [
+        ChatMessage(1, 7, "甲", "三维挂谷猜想和希尔伯特第六问题最近分别有什么进展", False, 100.0),
+        ChatMessage(1, 8, "乙", "我觉得都很难", False, 105.0),
+    ]
+
+    intent = infer_followup_fresh_intent(
+        "搜一下",
+        messages,
+        addressed=False,
+        current_user_id=7,
+        current_at=110.0,
+    )
+
+    assert intent is not None
+    assert intent.query.startswith("三维挂谷猜想")
+    assert intent.explicit and intent.required
+
+
+def test_bare_search_command_does_not_steal_old_or_other_users_topic() -> None:
+    messages = [ChatMessage(1, 8, "乙", "帮忙看看这个很长的话题", False, 100.0)]
+
+    assert infer_followup_fresh_intent(
+        "搜一下",
+        messages,
+        addressed=False,
+        current_user_id=7,
+        current_at=110.0,
+    ) is None
+    assert infer_followup_fresh_intent(
+        "搜一下",
+        [ChatMessage(1, 7, "甲", "两分钟前的旧问题是什么", False, 100.0)],
+        addressed=False,
+        current_user_id=7,
+        current_at=300.0,
+    ) is None
+
+
 def test_tool_route_mode_prefers_market_when_search_is_also_required() -> None:
     plan = route_tools(
         "查 NVDA 现在股价",

@@ -14,7 +14,6 @@ class Persona:
     description: str
     prompt: str
     decision_prompt: str
-    keywords: tuple[str, ...]
     max_reply_chars: int
     passive_reply_probability: float
 
@@ -32,7 +31,6 @@ class PersonaRegistry:
             raw = raw.get("persona", raw)
             if "id" not in raw:
                 continue
-            interests = raw.get("interests", {})
             style = raw.get("style", {})
             persona = Persona(
                 id=str(raw["id"]),
@@ -40,7 +38,6 @@ class PersonaRegistry:
                 description=str(raw.get("description", "")),
                 prompt=str(raw.get("prompt", "")),
                 decision_prompt=str(raw.get("decision_prompt", raw.get("prompt", ""))),
-                keywords=tuple(str(item) for item in interests.get("keywords", [])),
                 max_reply_chars=int(style.get("max_reply_chars", 180)),
                 passive_reply_probability=float(style.get("passive_reply_probability", 0.18)),
             )

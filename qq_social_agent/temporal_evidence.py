@@ -77,9 +77,11 @@ def detect_temporal_intent(query: str) -> TemporalIntent:
     clean = re.sub(r"\s+", "", str(query))
     current = any(signal in clean for signal in CURRENT_SIGNALS)
     historical = any(signal in clean for signal in HISTORICAL_SIGNALS)
-    if current and not historical:
+    # A question such as “之前说过考研，现在呢” asks for the current state;
+    # the historical phrase supplies comparison context and must not neutralize it.
+    if current:
         return TemporalIntent.CURRENT
-    if historical and not current:
+    if historical:
         return TemporalIntent.HISTORICAL
     return TemporalIntent.NEUTRAL
 

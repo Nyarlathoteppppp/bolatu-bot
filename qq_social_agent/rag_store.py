@@ -7,10 +7,15 @@ import re
 import sqlite3
 import struct
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from datetime import datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 from .temporal_evidence import default_evidence_kind
+
+
+RAG_TIMEZONE = ZoneInfo("Asia/Shanghai")
 
 
 @dataclass(frozen=True)
@@ -698,6 +703,81 @@ class RAGStore:
             for index, row in enumerate(rows)
         ]
 
+    def expand_conversation_document(
+        self,
+        document: RAGDocument,
+        *,
+        neighbor_messages: int = 3,
+        episode_gap_seconds: int = 600,
+        max_chars: int = 900,
+    ) -> RAGDocument:
+        """Expand an indexed chat chunk into a bounded surrounding episode.
+
+        ``source_row_id`` stores the internal first/last message row IDs.  The
+        expansion reads neighboring turns directly from the canonical message
+        table, so a retrieved conclusion keeps its question, speaker and nearby
+        corrections. Bot turns are retained but explicitly marked as context,
+        never as factual evidence.
+        """
+
+        if document.doc_type != "conversation" or document.source_name != "messages":
+            return document
+        try:
+            start_text, end_text = document.source_row_id.split(":", 1)
+            start_id, end_id = int(start_text), int(end_text)
+        except (TypeError, ValueError):
+            return document
+        radius = max(0, min(8, int(neighbor_messages)))
+        hit_rows = self.conn.execute(
+            """
+            select id, user_id, nickname, text, is_bot, created_at, source_message_id
+            from messages where group_id = ? and id between ? and ?
+            order by id asc
+            """,
+            (document.group_id, start_id, end_id),
+        ).fetchall()
+        if not hit_rows:
+            return document
+        before_rows = self.conn.execute(
+            """
+            select id, user_id, nickname, text, is_bot, created_at, source_message_id
+            from messages where group_id = ? and id < ? and length(trim(text)) >= 1
+            order by id desc limit ?
+            """,
+            (document.group_id, start_id, radius),
+        ).fetchall()
+        after_rows = self.conn.execute(
+            """
+            select id, user_id, nickname, text, is_bot, created_at, source_message_id
+            from messages where group_id = ? and id > ? and length(trim(text)) >= 1
+            order by id asc limit ?
+            """,
+            (document.group_id, end_id, radius),
+        ).fetchall()
+        rows = sorted((*before_rows, *hit_rows, *after_rows), key=lambda row: int(row["id"]))
+        rows = _episode_rows_around_hit(
+            rows,
+            start_id=start_id,
+            end_id=end_id,
+            gap_seconds=max(30, int(episode_gap_seconds)),
+        )
+        rows = _trim_episode_rows(rows, start_id=start_id, end_id=end_id, max_chars=max_chars)
+        if not rows:
+            return document
+        content = "\n".join(_format_episode_message(row) for row in rows)
+        if len(content) > max_chars:
+            content = content[: max(1, max_chars - 1)].rstrip() + "…"
+        source_ids = tuple(str(row["source_message_id"] or row["id"]) for row in rows)
+        participants = tuple(
+            sorted({int(row["user_id"]) for row in rows if not bool(row["is_bot"])})
+        )
+        return replace(
+            document,
+            content=content,
+            source_message_ids=source_ids,
+            participant_user_ids=participants or document.participant_user_ids,
+        )
+
     def record_retrieval(
         self,
         *,
@@ -1092,6 +1172,68 @@ class RAGStore:
 
     def close(self) -> None:
         self.conn.close()
+
+
+def _episode_rows_around_hit(
+    rows: list[sqlite3.Row],
+    *,
+    start_id: int,
+    end_id: int,
+    gap_seconds: int,
+) -> list[sqlite3.Row]:
+    hit_indexes = [
+        index for index, row in enumerate(rows) if start_id <= int(row["id"]) <= end_id
+    ]
+    if not hit_indexes:
+        return []
+    left, right = min(hit_indexes), max(hit_indexes)
+    while left > 0:
+        gap = float(rows[left]["created_at"]) - float(rows[left - 1]["created_at"])
+        if gap > gap_seconds:
+            break
+        left -= 1
+    while right + 1 < len(rows):
+        gap = float(rows[right + 1]["created_at"]) - float(rows[right]["created_at"])
+        if gap > gap_seconds:
+            break
+        right += 1
+    return rows[left : right + 1]
+
+
+def _trim_episode_rows(
+    rows: list[sqlite3.Row],
+    *,
+    start_id: int,
+    end_id: int,
+    max_chars: int,
+) -> list[sqlite3.Row]:
+    selected = list(rows)
+    budget = max(300, int(max_chars))
+    while len(selected) > 1:
+        size = sum(len(_format_episode_message(row)) + 1 for row in selected)
+        if size <= budget:
+            break
+        left_is_hit = start_id <= int(selected[0]["id"]) <= end_id
+        right_is_hit = start_id <= int(selected[-1]["id"]) <= end_id
+        if left_is_hit and right_is_hit:
+            break
+        if left_is_hit:
+            selected.pop()
+        elif right_is_hit:
+            selected.pop(0)
+        else:
+            left_distance = start_id - int(selected[0]["id"])
+            right_distance = int(selected[-1]["id"]) - end_id
+            selected.pop(0 if left_distance >= right_distance else -1)
+    return selected
+
+
+def _format_episode_message(row: sqlite3.Row) -> str:
+    stamp = datetime.fromtimestamp(float(row["created_at"]), RAG_TIMEZONE).strftime("%Y-%m-%d %H:%M")
+    user_id = int(row["user_id"])
+    nickname = str(row["nickname"] or user_id).strip()
+    role = "（机器人旧回复，仅供理解互动）" if bool(row["is_bot"]) else ""
+    return f"[{stamp}] {role}{nickname}[{str(user_id)[-5:]}]：{str(row['text']).strip()}"
 
 
 def _document_from_row(row: sqlite3.Row) -> RAGDocument:

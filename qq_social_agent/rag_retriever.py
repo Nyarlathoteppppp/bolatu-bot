@@ -7,7 +7,7 @@ import re
 import statistics
 import time
 from collections import OrderedDict
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -64,6 +64,10 @@ class RAGConfig:
     knowledge_enabled: bool = True
     knowledge_chunk_chars: int = 900
     knowledge_overlap_chars: int = 100
+    conversation_neighbor_messages: int = 3
+    conversation_episode_gap_seconds: int = 600
+    conversation_episode_max_chars: int = 900
+    max_expanded_conversation_hits: int = 2
 
     @classmethod
     def from_mapping(cls, raw: object) -> "RAGConfig":
@@ -90,6 +94,18 @@ class RAGConfig:
             knowledge_enabled=bool(knowledge.get("enabled", True)),
             knowledge_chunk_chars=max(300, min(2000, int(knowledge.get("max_chunk_chars", 900)))),
             knowledge_overlap_chars=max(0, min(400, int(knowledge.get("overlap_chars", 100)))),
+            conversation_neighbor_messages=max(
+                0, min(8, int(retrieval.get("conversation_neighbor_messages", 3)))
+            ),
+            conversation_episode_gap_seconds=max(
+                30, min(3600, int(retrieval.get("conversation_episode_gap_seconds", 600)))
+            ),
+            conversation_episode_max_chars=max(
+                300, min(1800, int(retrieval.get("conversation_episode_max_chars", 900)))
+            ),
+            max_expanded_conversation_hits=max(
+                0, min(4, int(retrieval.get("max_expanded_conversation_hits", 2)))
+            ),
         )
 
 
@@ -367,6 +383,7 @@ class RAGService:
                 route=plan.route,
                 required_topic=normalized_query.focused_topic,
             )
+            hits = self._expand_conversation_hits(hits)
             context = _format_rag_context(hits, max_chars=self.config.max_context_chars)
         except Exception as exc:
             error = str(exc)[:240]
@@ -479,9 +496,46 @@ class RAGService:
         types = list(DEFAULT_DOCUMENT_TYPES)
         if plan.route in {"person_past", "identifier", "explicit_memory"} or has_resolved_member:
             types.extend(STRUCTURED_DOCUMENT_TYPES)
-        if self.config.knowledge_enabled and plan.route in {"knowledge", "lexical"}:
+        if self.config.knowledge_enabled and plan.route == "knowledge":
             types.extend(KNOWLEDGE_DOCUMENT_TYPES)
         return tuple(dict.fromkeys(types))
+
+    def _expand_conversation_hits(self, hits: list[RAGHit]) -> list[RAGHit]:
+        """Replace top isolated message chunks with bounded surrounding episodes."""
+
+        if self.config.max_expanded_conversation_hits <= 0:
+            return hits
+        expanded: list[RAGHit] = []
+        expanded_count = 0
+        seen_windows: set[tuple[str, ...]] = set()
+        for hit in hits:
+            document = hit.document
+            if (
+                document.doc_type != "conversation"
+                or expanded_count >= self.config.max_expanded_conversation_hits
+            ):
+                expanded.append(hit)
+                continue
+            episode = self.store.expand_conversation_document(
+                document,
+                neighbor_messages=self.config.conversation_neighbor_messages,
+                episode_gap_seconds=self.config.conversation_episode_gap_seconds,
+                max_chars=self.config.conversation_episode_max_chars,
+            )
+            window_key = episode.source_message_ids
+            if window_key and window_key in seen_windows:
+                continue
+            if window_key:
+                seen_windows.add(window_key)
+            if episode.content != document.content:
+                hit = replace(
+                    hit,
+                    document=episode,
+                    reasons=tuple(dict.fromkeys((*hit.reasons, "相邻对话扩展"))),
+                )
+            expanded.append(hit)
+            expanded_count += 1
+        return expanded
 
     async def _query_embedding(self, query: str) -> tuple[list[float], bool]:
         cache_key = f"{self.embedding.config.model}\n{query.strip()}"

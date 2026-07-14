@@ -17,14 +17,17 @@ from qq_social_agent.temporal_evidence import (
 )
 
 
-def test_rag_router_only_uses_semantic_for_memory_like_queries() -> None:
+def test_rag_router_only_enables_explicit_retrieval_scenarios() -> None:
     casual = plan_rag_query("今天吃鹅腿吗", addressed=True)
     memory = plan_rag_query("你还记得以前谁说过菲尔兹奖吗", addressed=True)
+    recent = plan_rag_query("刚才谁说了这个", addressed=True)
 
-    assert casual.lexical is True
-    assert casual.semantic is False
+    assert casual.enabled is False
+    assert casual.route == "casual"
     assert memory.semantic is True
     assert memory.route == "explicit_memory"
+    assert recent.enabled is False
+    assert recent.route == "recent_context"
 
 
 def test_reply_envelope_uses_only_current_reply_for_rag_query() -> None:
@@ -343,10 +346,10 @@ def test_retrieval_feedback_changes_unified_ranking(tmp_path) -> None:
     )
     service.store.commit()
 
-    initial = asyncio.run(service.retrieve(group_id=1, query="菲尔兹奖讨论", addressed=True))
+    initial = asyncio.run(service.retrieve(group_id=1, query="之前的菲尔兹奖讨论", addressed=True))
     initially_first_id = initial.hits[0].document.id
     service.add_feedback(group_id=1, position=1, label="irrelevant", operator_id=9)
-    reranked = asyncio.run(service.retrieve(group_id=1, query="菲尔兹奖讨论", addressed=True))
+    reranked = asyncio.run(service.retrieve(group_id=1, query="之前的菲尔兹奖讨论", addressed=True))
 
     assert reranked.hits[0].document.id != initially_first_id
     assert any("反馈降权" in hit.reasons for hit in reranked.hits if hit.document.id == initially_first_id)
@@ -403,7 +406,7 @@ def test_rag_context_labels_reported_claim_as_non_objective(tmp_path) -> None:
         {"enabled": True, "embedding": {"enabled": False}, "retrieval": {"exclude_recent_seconds": 0}},
     )
 
-    result = asyncio.run(service.retrieve(group_id=1, query="准备考研", addressed=True))
+    result = asyncio.run(service.retrieve(group_id=1, query="之前谁说准备考研", addressed=True))
 
     assert "性质=说话者当时陈述" in result.context
     asyncio.run(service.close())
@@ -444,11 +447,53 @@ def test_current_question_downgrades_explicitly_contradicted_old_claim(tmp_path)
     )
     service.store.commit()
 
-    result = asyncio.run(service.retrieve(group_id=1, query="考研 现在", addressed=True))
+    result = asyncio.run(service.retrieve(group_id=1, query="之前说考研，现在呢", addressed=True))
 
     assert result.hits[0].document.id == new_id
     old_hit = next(hit for hit in result.hits if hit.document.id == old_id)
     assert "较新反证降权" in old_hit.reasons
+    asyncio.run(service.close())
+
+
+def test_conversation_hit_expands_to_surrounding_episode(tmp_path) -> None:
+    db_path = tmp_path / "bot.sqlite3"
+    memory = MemoryStore(db_path)
+    memory.add_message(1, 10, "甲", "你们刚才在讨论什么奖", created_at=1000, source_message_id=1)
+    memory.add_message(1, 11, "乙", "以前认真聊过菲尔兹奖名单", created_at=1001, source_message_id=2)
+    memory.add_message(
+        1, 99, "张风雪", "风雪记得好像是另一个名单", is_bot=True,
+        created_at=1002, source_message_id=3,
+    )
+    memory.add_message(1, 12, "丙", "后面已经纠正了，别把旧名单当结论", created_at=1003, source_message_id=4)
+    memory.add_message(1, 13, "丁", "这是很久以后的新话题", created_at=3000, source_message_id=5)
+    memory.conn.close()
+    service = RAGService(
+        db_path,
+        {
+            "enabled": True,
+            "embedding": {"enabled": False},
+            "indexing": {"max_chunk_messages": 1},
+            "retrieval": {
+                "exclude_recent_seconds": 0,
+                "conversation_neighbor_messages": 3,
+                "conversation_episode_gap_seconds": 600,
+                "conversation_episode_max_chars": 1200,
+            },
+        },
+    )
+
+    result = asyncio.run(
+        service.retrieve(group_id=1, query="之前聊过菲尔兹奖什么", addressed=True)
+    )
+
+    assert result.hits
+    episode = result.hits[0]
+    assert "相邻对话扩展" in episode.reasons
+    assert "你们刚才在讨论什么奖" in episode.document.content
+    assert "菲尔兹奖名单" in episode.document.content
+    assert "机器人旧回复，仅供理解互动" in episode.document.content
+    assert "后面已经纠正了" in episode.document.content
+    assert "很久以后的新话题" not in episode.document.content
     asyncio.run(service.close())
 
 

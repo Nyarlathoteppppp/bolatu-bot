@@ -145,6 +145,7 @@ from .tool_router import (
     apply_tool_plan as _apply_tool_plan,
     compare_legacy_decision as _compare_legacy_tool_decision,
     infer_followup_fresh_intent as _infer_followup_fresh_intent,
+    is_contextual_followup_lookup as _is_contextual_followup_lookup,
     route_mode as _tool_route_mode,
     route_tools as _route_tools,
 )
@@ -2602,6 +2603,23 @@ async def _handle_group_message_scoped(
     pipeline_state.mentioned = _mentioned_bot(event, bot)
     pipeline_state.replied_to_bot = _replied_to_bot(event, bot) or _reply_reference_to_bot(reply_reference, bot)
     user_policy = app_config.group_user_policy(int(event.user_id))
+    contextual_search_intent = (
+        _contextual_followup_search_intent(
+            group_id=group_id,
+            user_id=int(event.user_id),
+            text=plain_text,
+            event_at=float(getattr(event, "time", 0) or time.time()),
+        )
+        if group_allowed and not addressed_bot and plain_text
+        else None
+    )
+    contextual_search_request = contextual_search_intent is not None
+    if contextual_search_request:
+        pipeline_state.addressed = True
+        logger.info(
+            "qq_social_agent contextual follow-up search detected: "
+            f"group={group_id} user={int(event.user_id)} query={contextual_search_intent.query!r}"
+        )
     if (
         addressed_bot
         and user_policy.addressed_question_private_reply
@@ -2701,6 +2719,7 @@ async def _handle_group_message_scoped(
         text
         and group_allowed
         and not addressed_bot
+        and not contextual_search_request
     ):
         if not _ordinary_user_trigger_selected(user_policy.ordinary_trigger_percent):
             _record_policy_suppressed_group_message(
@@ -2729,7 +2748,28 @@ async def _handle_group_message_scoped(
             pipeline_state=pipeline_state,
         )
         return
-    if addressed_bot:
+    forced_buffered_messages: list[BufferedGroupMessage] | None = None
+    if contextual_search_request and group_message_buffers.get(group_id):
+        task = group_buffer_tasks.pop(group_id, None)
+        if task is not None and not task.done():
+            task.cancel()
+        forced_buffered_messages = group_message_buffers.pop(group_id, [])
+        forced_buffered_messages.append(
+            BufferedGroupMessage(
+                bot=bot,
+                event=event,
+                text=text,
+                user_id=int(event.user_id),
+                nickname=_nickname(event),
+                created_at=float(getattr(event, "time", 0) or time.time()),
+                source_message_id=source_message_id or event_message_source_id(event),
+                correlation_id=correlation_id,
+                inbound_sequence=inbound_sequence,
+                pipeline_state=pipeline_state,
+            )
+        )
+    effective_addressed = addressed_bot or contextual_search_request
+    if effective_addressed:
         _cancel_passive_decision_retry(group_id)
         group_addressed_waiters[group_id] = group_addressed_waiters.get(group_id, 0) + 1
     try:
@@ -2737,15 +2777,16 @@ async def _handle_group_message_scoped(
             await _handle_group_message_locked(
                 bot,
                 event,
+                buffered_messages=forced_buffered_messages,
                 preprocessed_text=text,
                 source_message_id=source_message_id,
                 correlation_id=correlation_id,
-                addressed_bot_hint=addressed_bot,
+                addressed_bot_hint=effective_addressed,
                 trigger_sequence=inbound_sequence,
                 pipeline_state=pipeline_state,
             )
     finally:
-        if addressed_bot:
+        if effective_addressed:
             remaining = group_addressed_waiters.get(group_id, 1) - 1
             if remaining > 0:
                 group_addressed_waiters[group_id] = remaining
@@ -2784,7 +2825,7 @@ async def _handle_group_message_locked(
     replied_to_bot = False if buffered_messages else _replied_to_bot(event, bot)
     if not buffered_messages and addressed_bot_hint and _event_has_reply_context(event):
         replied_to_bot = True
-    addressed_bot = mentioned or replied_to_bot or (False if buffered_messages else bool(addressed_bot_hint))
+    addressed_bot = mentioned or replied_to_bot or bool(addressed_bot_hint)
     addressed_repeat_count = 1 if addressed_bot else 0
     if pipeline_state is None and buffered_messages:
         pipeline_state = buffered_messages[-1].pipeline_state
@@ -3133,6 +3174,8 @@ async def _handle_group_message_locked(
             tool_query_text,
             context_recent,
             addressed=addressed_bot,
+            current_user_id=user_id,
+            current_at=event_at,
         )
         if followup_fresh_intent is not None:
             fresh_intent = followup_fresh_intent
@@ -5547,6 +5590,28 @@ def _append_market_intent(
         return
     seen.add(key)
     intents.append(intent)
+
+
+def _contextual_followup_search_intent(
+    *,
+    group_id: int,
+    user_id: int,
+    text: str,
+    event_at: float,
+):
+    """Resolve a bare ``搜一下`` against persisted and not-yet-flushed chat."""
+
+    if not _is_contextual_followup_lookup(text):
+        return None
+    candidates: list[object] = list(memory.recent_messages(group_id, 12))
+    candidates.extend(group_message_buffers.get(group_id, ()))
+    return _infer_followup_fresh_intent(
+        text,
+        candidates,
+        addressed=False,
+        current_user_id=user_id,
+        current_at=event_at,
+    )
 
 
 def _buffer_group_message(

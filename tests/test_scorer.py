@@ -13,7 +13,6 @@ def _persona() -> Persona:
         description="",
         prompt="",
         decision_prompt="",
-        keywords=("考研", "就业", "计算机"),
         max_reply_chars=120,
         passive_reply_probability=1.0,
     )
@@ -47,7 +46,7 @@ def test_low_value_text_is_suppressed() -> None:
     assert not result.should_reply
 
 
-def test_keyword_question_can_pass_passive_gate() -> None:
+def test_substantial_question_can_pass_passive_gate() -> None:
     result = score_message(
         text="计算机就业现在到底还能不能冲？",
         recent_messages=[],
@@ -85,7 +84,7 @@ def test_recent_bot_reply_dampens_but_does_not_block_strong_topic() -> None:
         persona=_persona(),
         mentioned=False,
         replied_to_bot=False,
-        passive_threshold=45,
+        passive_threshold=35,
         passive_probability=1.0,
         rng=random.Random(1),
     )

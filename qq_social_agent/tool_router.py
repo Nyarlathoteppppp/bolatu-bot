@@ -34,8 +34,13 @@ ACADEMIC_QUESTION_TERMS = (
 )
 FOLLOWUP_LOOKUP_RE = re.compile(
     r"(?:帮我|给我|你)?\s*(?:继续|接着|再)?\s*"
-    r"(?:研究研究|研究一下|深入研究|详细查查|详细查一下|展开查|展开看看|具体看看|继续搜|接着搜|再查查)"
+    r"(?:研究研究|研究一下|深入研究|详细查查|详细查一下|展开查|展开看看|具体看看|继续搜|接着搜|再查查|搜一下|搜索一下|查一下|查查|搜搜)"
 )
+BARE_FOLLOWUP_LOOKUP_RE = re.compile(
+    r"^\s*(?:你)?\s*(?:帮我)?\s*(?:搜一下|搜索一下|查一下|查查|搜搜)\s*[吧呀啊。！!]*\s*$",
+    re.IGNORECASE,
+)
+FOLLOWUP_TOPIC_MAX_AGE_SECONDS = 120.0
 
 
 @dataclass(frozen=True)
@@ -131,6 +136,8 @@ def infer_followup_fresh_intent(
     recent_messages: Iterable[object],
     *,
     addressed: bool,
+    current_user_id: int | None = None,
+    current_at: float | None = None,
 ) -> FreshIntent | None:
     """Turn an addressed "research this further" turn into a concrete lookup.
 
@@ -139,17 +146,41 @@ def infer_followup_fresh_intent(
     the next search query.
     """
 
-    if not addressed or FOLLOWUP_LOOKUP_RE.search(text) is None:
+    bare_command = is_contextual_followup_lookup(text)
+    if FOLLOWUP_LOOKUP_RE.search(text) is None:
         return None
-    for message in reversed(tuple(recent_messages)):
-        if bool(getattr(message, "is_bot", False)):
-            continue
-        candidate = re.sub(r"\s+", " ", str(getattr(message, "text", "") or "")).strip()
-        if not _useful_followup_topic(candidate, current_text=text):
-            continue
-        kind = "news" if any(token in candidate for token in ("现在", "今天", "最新", "今年", "刚刚")) else "web"
-        return FreshIntent(candidate[:120], kind, explicit=True, required=True)
+    if not addressed and not bare_command:
+        return None
+    messages = tuple(recent_messages)
+    now = float(current_at or 0.0) or max(
+        (float(getattr(message, "created_at", 0.0) or 0.0) for message in messages),
+        default=0.0,
+    )
+    passes = (True, False) if current_user_id else (False,)
+    for same_user_only in passes:
+        for message in reversed(messages):
+            if bool(getattr(message, "is_bot", False)):
+                continue
+            message_user_id = int(getattr(message, "user_id", 0) or 0)
+            if same_user_only and message_user_id != int(current_user_id or 0):
+                continue
+            if bare_command and not addressed and current_user_id and message_user_id != int(current_user_id):
+                continue
+            message_at = float(getattr(message, "created_at", 0.0) or 0.0)
+            if bare_command and now > 0 and message_at > 0 and now - message_at > FOLLOWUP_TOPIC_MAX_AGE_SECONDS:
+                continue
+            candidate = re.sub(r"\s+", " ", str(getattr(message, "text", "") or "")).strip()
+            if not _useful_followup_topic(candidate, current_text=text):
+                continue
+            kind = "news" if any(token in candidate for token in ("现在", "今天", "最新", "今年", "刚刚")) else "web"
+            return FreshIntent(candidate[:120], kind, explicit=True, required=True)
     return None
+
+
+def is_contextual_followup_lookup(text: str) -> bool:
+    """Whether this turn is a query-less command such as ``搜一下``."""
+
+    return BARE_FOLLOWUP_LOOKUP_RE.fullmatch(str(text or "")) is not None
 
 
 def apply_tool_plan(decision: ReplyDecision, plan: ToolRoutePlan) -> ReplyDecision:

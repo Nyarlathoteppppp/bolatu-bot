@@ -241,8 +241,6 @@ def _tool_symbols_from_market_intents(intents: list[MarketIntent]) -> tuple[Tool
 
 def _has_interesting_local_signal(text: str, persona: Persona) -> bool:
     lowered = text.casefold()
-    if any(str(keyword).casefold() in lowered for keyword in persona.keywords if keyword):
-        return True
     if any(
         marker in text
         for marker in (

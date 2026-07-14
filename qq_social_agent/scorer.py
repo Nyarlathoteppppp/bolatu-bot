@@ -45,11 +45,6 @@ def score_message(
         score += 28
         reasons.append("question")
 
-    matched_keywords = [kw for kw in persona.keywords if kw and kw.lower() in stripped.lower()]
-    if matched_keywords:
-        score += min(42, 14 + len(matched_keywords) * 9)
-        reasons.append("persona_keyword:" + ",".join(matched_keywords[:3]))
-
     if len(stripped) >= 2 and stripped not in LOW_VALUE_TEXT:
         score += 20
         reasons.append("casual_chat")
