@@ -127,8 +127,9 @@ from .pipeline_stages import (
 )
 from .political_guard import has_political_redline, political_safe_reply, sanitize_political_output
 from .rate_limiter import RateLimiter
-from .rag_retriever import RAGRetrievalResult, RAGService
 from .rag_admin import RAGAdminController
+from .rag_query import normalize_rag_query
+from .rag_retriever import RAGRetrievalResult, RAGService
 from .reference_resolver import resolve_context_reference
 from .social_actions import PokeContext, SocialActionService, reaction_from_action
 from .tools.fresh_context import (
@@ -2927,13 +2928,15 @@ async def _handle_group_message_locked(
         _schedule_group_learning(group_id)
         return
 
-    market_intents = detect_market_intents(text, limit=2)
-    market_topic = bool(market_intents) or is_market_topic(text)
-    fresh_intent = detect_fresh_intent(text)
-    market_forced = bool(market_intents) and _is_explicit_market_lookup(text)
+    normalized_rag_query = normalize_rag_query(text)
+    tool_query_text = normalized_rag_query.current_utterance or text
+    market_intents = detect_market_intents(tool_query_text, limit=2)
+    market_topic = bool(market_intents) or is_market_topic(tool_query_text)
+    fresh_intent = detect_fresh_intent(tool_query_text)
+    market_forced = bool(market_intents) and _is_explicit_market_lookup(tool_query_text)
     tool_plan = _tool_plan_with_runtime_context(
         _route_tools(
-            text,
+            tool_query_text,
             market_intents=market_intents,
             fresh_intent=fresh_intent,
             addressed=addressed_bot,
@@ -3107,19 +3110,27 @@ async def _handle_group_message_locked(
     style_context = ""
     raw_corpus_context = ""
     jargon_context = ""
-    context_query = _context_query_text(text, nickname, context_recent)
+    context_query = _context_query_text(
+        normalized_rag_query.current_utterance,
+        nickname,
+        context_recent,
+    )
     related_member_user_ids = _related_member_user_ids(context_recent, current_user_id=user_id)
     reference_resolution = resolve_context_reference(
-        text,
+        normalized_rag_query.current_utterance,
         context_recent,
         current_user_id=user_id,
-        resolve_named_users=lambda candidate: rag_service.resolve_named_user_ids(group_id, candidate),
+        resolve_named_users=lambda candidate: rag_service.resolve_named_user_ids(
+            group_id,
+            candidate,
+            excluded_user_ids={int(event.self_id)},
+        ),
     )
     pipeline_state.reference_user_ids = reference_resolution.user_ids
     pipeline_state.reference_reason = reference_resolution.reason
     if fresh_intent is None:
         followup_fresh_intent = _infer_followup_fresh_intent(
-            text,
+            tool_query_text,
             context_recent,
             addressed=addressed_bot,
         )
@@ -3127,7 +3138,7 @@ async def _handle_group_message_locked(
             fresh_intent = followup_fresh_intent
             tool_plan = _tool_plan_with_runtime_context(
                 _route_tools(
-                    text,
+                    tool_query_text,
                     market_intents=market_intents,
                     fresh_intent=fresh_intent,
                     addressed=addressed_bot,
@@ -3150,6 +3161,7 @@ async def _handle_group_message_locked(
             query=reference_resolution.expanded_query or text,
             addressed=addressed_bot,
             related_user_ids=list(reference_resolution.user_ids),
+            excluded_user_ids=[int(event.self_id)],
         )
     )
     rag_result: RAGRetrievalResult | None = None
@@ -3433,6 +3445,9 @@ async def _handle_group_message_locked(
             resolved_names=[item.matched_name for item in rag_result.resolved_members],
             reference_reason=reference_resolution.reason,
             reference_confidence=reference_resolution.confidence,
+            normalized_query=rag_result.normalized_query,
+            focused_topic=rag_result.focused_topic,
+            reply_envelope_removed=rag_result.reply_envelope_removed,
             hit_document_ids=[hit.document.id for hit in rag_result.hits],
             hit_doc_types=[hit.document.doc_type for hit in rag_result.hits],
             hit_scores=[round(hit.score, 4) for hit in rag_result.hits],

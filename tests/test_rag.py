@@ -6,6 +6,7 @@ import time
 from qq_social_agent.memory import MemoryStore
 from qq_social_agent.rag_indexer import RAGIndexer
 from qq_social_agent.rag_retriever import RAGService
+from qq_social_agent.rag_query import normalize_rag_query
 from qq_social_agent.rag_router import plan_rag_query
 from qq_social_agent.rag_store import RAGStore
 from qq_social_agent.temporal_evidence import (
@@ -24,6 +25,134 @@ def test_rag_router_only_uses_semantic_for_memory_like_queries() -> None:
     assert casual.semantic is False
     assert memory.semantic is True
     assert memory.route == "explicit_memory"
+
+
+def test_reply_envelope_uses_only_current_reply_for_rag_query() -> None:
+    raw = (
+        "歌迷老蛆[#71184]回复张风雪-北本[#07496]消息【"
+        "注：张风雪和风雪都是你自己；"
+        "张风雪-北本[#07496]说：风雪记得他研究方向不是这个吧；"
+        "歌迷老蛆[#71184]回复张风雪-北本[#07496]：之前聊过菲尔兹你忘了】"
+    )
+
+    normalized = normalize_rag_query(raw)
+
+    assert normalized.current_utterance == "之前聊过菲尔兹你忘了"
+    assert normalized.text == "菲尔兹"
+    assert normalized.focused_topic == "菲尔兹"
+    assert normalized.reply_envelope_removed
+
+    with_semicolon = normalize_rag_query(raw.replace("之前聊过菲尔兹你忘了", "之前聊过菲尔兹；你忘了"))
+    assert with_semicolon.current_utterance == "之前聊过菲尔兹；你忘了"
+
+
+def test_five_digit_context_tail_is_not_resolved_as_full_qq_id(tmp_path) -> None:
+    db_path = tmp_path / "bot.sqlite3"
+    memory = MemoryStore(db_path)
+    memory.add_message(1, 1535071184, "歌迷老蛆", "测试", created_at=1000)
+    memory.conn.close()
+    store = RAGStore(db_path)
+
+    resolved = store.resolve_query_members(
+        1,
+        "歌迷老蛆[#71184]回复张风雪[#07496]：之前聊过菲尔兹",
+    )
+
+    assert all(item.user_id not in {71184, 7496} for item in resolved)
+    assert any(item.user_id == 1535071184 for item in resolved)
+    store.close()
+
+
+def test_real_fields_reply_regression_prefers_topic_over_reply_template(tmp_path) -> None:
+    db_path = tmp_path / "bot.sqlite3"
+    memory = MemoryStore(db_path)
+    memory.add_message(
+        1,
+        3066256514,
+        "科有代",
+        "王虹和邓煜已经获得2026菲尔兹奖，邓煜研究PDE和统计物理",
+        created_at=1000,
+        source_message_id=11,
+    )
+    for index, text in enumerate(("撒个娇看看", "为什么不想读博", "你也买股票了", "为什么不接话"), start=20):
+        memory.add_message(
+            1,
+            1535071184,
+            "歌迷老蛆",
+            f"歌迷老蛆[#71184]回复张风雪[#07496]：{text}",
+            created_at=1000 + index,
+            source_message_id=index,
+        )
+    memory.conn.close()
+    service = RAGService(
+        db_path,
+        {"enabled": True, "embedding": {"enabled": False}, "retrieval": {"exclude_recent_seconds": 0}},
+    )
+    raw = (
+        "歌迷老蛆[#71184]回复张风雪-北本[#07496]消息【"
+        "张风雪-北本[#07496]说：风雪记得他研究方向不是这个吧；"
+        "歌迷老蛆[#71184]回复张风雪-北本[#07496]：之前聊过菲尔兹你忘了】"
+    )
+
+    result = asyncio.run(
+        service.retrieve(
+            group_id=1,
+            query=raw,
+            addressed=True,
+            excluded_user_ids=[1801507496],
+        )
+    )
+
+    assert result.normalized_query == "菲尔兹"
+    assert result.plan.route == "explicit_memory"
+    assert result.resolved_members == ()
+    assert result.hits
+    assert "菲尔兹" in result.hits[0].document.content
+    assert "主题精确命中" in result.hits[0].reasons
+    asyncio.run(service.close())
+
+
+def test_rag_can_exclude_bot_identity_from_person_resolution(tmp_path) -> None:
+    db_path = tmp_path / "bot.sqlite3"
+    memory = MemoryStore(db_path)
+    memory.add_message(1, 1801507496, "张风雪", "机器人旧话", created_at=1000)
+    memory.add_message(1, 10001, "群友", "群友旧话", created_at=1001)
+    memory.conn.close()
+    service = RAGService(
+        db_path,
+        {"enabled": True, "embedding": {"enabled": False}, "retrieval": {"exclude_recent_seconds": 0}},
+    )
+
+    resolved = service.resolve_named_user_ids(
+        1,
+        "张风雪以前说过什么",
+        excluded_user_ids={1801507496},
+    )
+
+    assert 1801507496 not in resolved
+    asyncio.run(service.close())
+
+
+def test_default_rag_evaluation_cases_merge_real_regressions(tmp_path) -> None:
+    db_path = tmp_path / "bot.sqlite3"
+    memory = MemoryStore(db_path)
+    memory.conn.close()
+    service = RAGService(db_path, {"enabled": True, "embedding": {"enabled": False}})
+    service.add_evaluation_case(
+        group_id=1,
+        query="以前谁聊过菲尔兹奖",
+        expected_terms=["菲尔兹奖"],
+        expected_user_ids=[],
+        created_by=9,
+    )
+
+    added = service.ensure_default_evaluation_cases(1)
+    queries = {case.query for case in service.store.evaluation_cases(1)}
+
+    assert added == 3
+    assert len(queries) == 4
+    assert any("之前聊过菲尔兹你忘了" in query for query in queries)
+    asyncio.run(service.close())
 
 
 def test_rag_indexer_preserves_speaker_time_and_source(tmp_path) -> None:

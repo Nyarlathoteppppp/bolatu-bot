@@ -170,13 +170,13 @@ rag:
     model: BAAI/bge-m3
     dimensions: 0
     timeout_seconds: 8
-    batch_size: 24
+    batch_size: 32
   retrieval:
-    online_timeout_ms: 800
-    lexical_candidates: 30
-    semantic_candidates: 30
-    max_items: 5
-    max_context_chars: 1500
+    online_timeout_ms: 600
+    lexical_candidates: 50
+    semantic_candidates: 50
+    max_items: 6
+    max_context_chars: 1900
     min_score: 0.18
     exclude_recent_seconds: 900
   indexing:
@@ -184,8 +184,8 @@ rag:
     max_chunk_chars: 700
     max_chunk_messages: 6
     message_backfill_limit: 12000
-    source_sync_interval_seconds: 30
-    batch_pause_seconds: 1.0
+    source_sync_interval_seconds: 20
+    batch_pause_seconds: 0.5
   knowledge:
     enabled: true
     max_chunk_chars: 900

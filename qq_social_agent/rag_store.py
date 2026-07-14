@@ -408,7 +408,13 @@ class RAGStore:
             """,
             (int(group_id),),
         ).fetchall()
-        explicit_ids = {int(value) for value in re.findall(r"(?<!\d)(\d{5,12})(?!\d)", clean_query)}
+        # Context labels use five-digit QQ tails such as [#07496]. They are
+        # attribution hints, not complete QQ numbers, and must never create
+        # synthetic people like user 7496.
+        explicit_ids = {
+            int(value)
+            for value in re.findall(r"(?<![#\d])(\d{5,12})(?!\d)", clean_query)
+        }
         resolved: list[ResolvedMember] = []
         seen: set[int] = set()
         for row in rows:

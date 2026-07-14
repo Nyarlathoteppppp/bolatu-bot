@@ -16,6 +16,7 @@ from nonebot import logger
 
 from .embedding_client import EmbeddingConfig, SiliconFlowEmbeddingClient
 from .rag_indexer import RAGIndexer
+from .rag_query import normalize_rag_query
 from .rag_router import RAGQueryPlan, plan_rag_query
 from .rag_store import RAGDocument, RAGEvaluationCase, RAGStore, RankedDocument, ResolvedMember
 from .temporal_evidence import (
@@ -111,6 +112,9 @@ class RAGRetrievalResult:
     semantic_count: int
     error: str = ""
     resolved_members: tuple[ResolvedMember, ...] = ()
+    normalized_query: str = ""
+    focused_topic: str = ""
+    reply_envelope_removed: bool = False
 
 
 class RAGService:
@@ -257,24 +261,48 @@ class RAGService:
         query: str,
         addressed: bool,
         related_user_ids: list[int] | None = None,
+        excluded_user_ids: list[int] | None = None,
     ) -> RAGRetrievalResult:
         started = time.monotonic()
+        normalized_query = normalize_rag_query(query)
+        search_query = normalized_query.text
+        excluded_ids = {int(value) for value in (excluded_user_ids or []) if int(value) > 0}
+        related_ids = [
+            int(value)
+            for value in (related_user_ids or [])
+            if int(value) > 0 and int(value) not in excluded_ids
+        ]
         resolved_members: list[ResolvedMember] = []
         if self.config.enabled:
-            resolved_members = self._resolve_query_members(group_id, query)
+            resolved_members = self._resolve_query_members(
+                group_id,
+                search_query,
+                excluded_user_ids=excluded_ids,
+            )
             known_ids = {item.user_id for item in resolved_members}
-            for user_id in related_user_ids or []:
-                if int(user_id) > 0 and int(user_id) not in known_ids:
-                    resolved_members.append(ResolvedMember(int(user_id), "上下文指代"))
-                    known_ids.add(int(user_id))
+            for user_id in related_ids:
+                if user_id > 0 and user_id not in known_ids:
+                    resolved_members.append(ResolvedMember(user_id, "上下文指代"))
+                    known_ids.add(user_id)
         plan = plan_rag_query(
-            query,
+            normalized_query.current_utterance,
             addressed=addressed,
-            related_user_ids=related_user_ids,
+            related_user_ids=related_ids,
             has_person_reference=bool(resolved_members),
         )
         if not self.config.enabled or not plan.enabled:
-            return RAGRetrievalResult(plan, (), "", 0, 0, 0, resolved_members=tuple(resolved_members))
+            return RAGRetrievalResult(
+                plan,
+                (),
+                "",
+                0,
+                0,
+                0,
+                resolved_members=tuple(resolved_members),
+                normalized_query=search_query,
+                focused_topic=normalized_query.focused_topic,
+                reply_envelope_removed=normalized_query.reply_envelope_removed,
+            )
         lexical: list[RankedDocument] = []
         semantic: list[RankedDocument] = []
         cache_hit = False
@@ -296,13 +324,13 @@ class RAGService:
             target_user_ids = sorted(
                 resolved_ids
                 if resolved_ids
-                else {int(value) for value in (related_user_ids or []) if int(value) > 0}
+                else set(related_ids)
             )
             document_types = self._document_types_for_plan(plan, bool(resolved_members))
             if plan.lexical:
                 lexical = self.store.lexical_search(
                     group_id,
-                    query,
+                    search_query,
                     limit=self.config.lexical_candidates,
                     doc_types=document_types,
                     exclude_recent_after=exclude_after,
@@ -321,7 +349,7 @@ class RAGService:
                 and self.config.mode in {"shadow", "hybrid"}
                 and self.embedding.available
             ):
-                vector, cache_hit = await self._query_embedding(query)
+                vector, cache_hit = await self._query_embedding(search_query)
                 if vector:
                     semantic = self.store.semantic_search(
                         group_id,
@@ -334,9 +362,10 @@ class RAGService:
             hits = self._merge_hits(
                 lexical,
                 semantic if self.config.mode == "hybrid" else [],
-                query=query,
+                query=search_query,
                 target_user_ids=target_user_ids,
                 route=plan.route,
+                required_topic=normalized_query.focused_topic,
             )
             context = _format_rag_context(hits, max_chars=self.config.max_context_chars)
         except Exception as exc:
@@ -348,7 +377,7 @@ class RAGService:
         elapsed_ms = int((time.monotonic() - started) * 1000)
         self.store.record_retrieval(
             group_id=group_id,
-            query=query,
+            query=search_query,
             route=plan.route,
             lexical_count=len(lexical),
             semantic_count=len(semantic),
@@ -358,6 +387,9 @@ class RAGService:
                     {"user_id": item.user_id, "matched_name": item.matched_name}
                     for item in resolved_members
                 ],
+                "raw_query_normalized": search_query != re.sub(r"\s+", " ", str(query)).strip(),
+                "reply_envelope_removed": normalized_query.reply_envelope_removed,
+                "focused_topic": normalized_query.focused_topic,
                 "hits": [
                     {
                         "document_id": hit.document.id,
@@ -382,13 +414,25 @@ class RAGService:
             len(semantic),
             error,
             tuple(resolved_members),
+            search_query,
+            normalized_query.focused_topic,
+            normalized_query.reply_envelope_removed,
         )
 
-    def _resolve_query_members(self, group_id: int, query: str) -> list[ResolvedMember]:
+    def _resolve_query_members(
+        self,
+        group_id: int,
+        query: str,
+        *,
+        excluded_user_ids: set[int] | None = None,
+    ) -> list[ResolvedMember]:
         compact = re.sub(r"\s+", "", query).casefold()
         stored = self.store.resolve_query_members(group_id, query)
+        excluded = excluded_user_ids or set()
         configured: list[ResolvedMember] = []
         for user_id, names in self.member_aliases.items():
+            if user_id in excluded:
+                continue
             matched = next((name for name in sorted(names, key=len, reverse=True) if name.casefold() in compact), "")
             if not matched:
                 continue
@@ -404,14 +448,28 @@ class RAGService:
         seen: set[int] = set()
         result: list[ResolvedMember] = []
         for item in (*configured, *stored):
-            if item.user_id in seen:
+            if item.user_id in seen or item.user_id in excluded:
                 continue
             seen.add(item.user_id)
             result.append(item)
         return result[:8]
 
-    def resolve_named_user_ids(self, group_id: int, text: str) -> tuple[int, ...]:
-        return tuple(item.user_id for item in self._resolve_query_members(group_id, text))
+    def resolve_named_user_ids(
+        self,
+        group_id: int,
+        text: str,
+        *,
+        excluded_user_ids: set[int] | None = None,
+    ) -> tuple[int, ...]:
+        normalized = normalize_rag_query(text)
+        return tuple(
+            item.user_id
+            for item in self._resolve_query_members(
+                group_id,
+                normalized.text,
+                excluded_user_ids=excluded_user_ids,
+            )
+        )
 
     def _document_types_for_plan(
         self,
@@ -453,6 +511,7 @@ class RAGService:
         query: str,
         target_user_ids: list[int],
         route: str,
+        required_topic: str = "",
     ) -> list[RAGHit]:
         combined: dict[int, dict[str, object]] = {}
         for item in lexical:
@@ -496,6 +555,10 @@ class RAGService:
             coverage_bonus = min(0.12, covered * 0.035)
             if covered:
                 reasons.append(f"词覆盖{covered}")
+            topic_bonus = 0.0
+            if required_topic and required_topic.casefold() in normalized:
+                topic_bonus = 0.30
+                reasons.append("主题精确命中")
             type_bonus = 0.0
             if document.doc_type == "conversation":
                 type_bonus = 0.04
@@ -523,6 +586,7 @@ class RAGService:
                 + person_bonus
                 + agreement_bonus
                 + coverage_bonus
+                + topic_bonus
                 + type_bonus
                 + evidence_bonus
                 + feedback_bonus
@@ -554,6 +618,30 @@ class RAGService:
             type_counts[doc_type] = type_counts.get(doc_type, 0) + 1
             if len(selected) >= self.config.max_items:
                 break
+        if required_topic and not any(
+            required_topic.casefold() in hit.document.content.casefold()
+            for hit in selected
+        ):
+            topic_hit = next(
+                (
+                    hit
+                    for hit in hits
+                    if required_topic.casefold() in hit.document.content.casefold()
+                ),
+                None,
+            )
+            if topic_hit is not None:
+                guaranteed = RAGHit(
+                    topic_hit.document,
+                    topic_hit.score,
+                    topic_hit.lexical,
+                    topic_hit.semantic,
+                    tuple(dict.fromkeys((*topic_hit.reasons, "主题召回保底"))),
+                )
+                if len(selected) >= self.config.max_items:
+                    selected[-1] = guaranteed
+                else:
+                    selected.append(guaranteed)
         return selected
 
     def status_snapshot(self) -> dict[str, object]:
@@ -708,14 +796,22 @@ class RAGService:
         )
 
     def ensure_default_evaluation_cases(self, group_id: int) -> int:
-        if self.store.evaluation_cases(group_id, limit=1):
-            return 0
         defaults = (
             ("以前谁聊过菲尔兹奖", ["菲尔兹奖"]),
             ("群里之前怎么讨论三维挂谷猜想", ["三维挂谷猜想"]),
             ("之前提到司马懿时说了什么", ["司马懿"]),
+            (
+                "歌迷老蛆[#71184]回复张风雪-北本[#07496]消息【"
+                "张风雪-北本[#07496]说：风雪记得他研究方向不是这个吧；"
+                "歌迷老蛆[#71184]回复张风雪-北本[#07496]：之前聊过菲尔兹你忘了】",
+                ["菲尔兹"],
+            ),
         )
+        existing = {case.query for case in self.store.evaluation_cases(group_id, limit=200)}
+        added = 0
         for query, terms in defaults:
+            if query in existing:
+                continue
             self.add_evaluation_case(
                 group_id=group_id,
                 query=query,
@@ -723,7 +819,8 @@ class RAGService:
                 expected_user_ids=[],
                 created_by=0,
             )
-        return len(defaults)
+            added += 1
+        return added
 
     def evaluation_case_report(self, group_id: int) -> str:
         cases = self.store.evaluation_cases(group_id)

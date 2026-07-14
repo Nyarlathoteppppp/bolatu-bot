@@ -187,6 +187,10 @@ def test_prompt_registry_loads_central_prompt_file() -> None:
     assert "群聊免审直发单条生成" in prompts.raw["flows"]["reply_direct"]["flow"]
     assert "温柔接话" in prompts.action_guide("reply")
     assert "关心/承接" in prompts.action_guide("care")
+    persona_prompt = prompts.raw["persona"]["prompt"]
+    assert "务实的社会民主主义左派" in persona_prompt
+    assert "身份政治" in persona_prompt
+    assert "token 像空气一样" in persona_prompt
 
 
 def test_central_prompt_file_contains_all_runtime_flows() -> None:
