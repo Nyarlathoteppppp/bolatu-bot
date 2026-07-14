@@ -109,14 +109,27 @@ from .pipeline_types import (
     OutputChannel,
     PipelineMode,
     PipelineState,
-    SocialIntent,
     ToolKind,
     ToolRequest,
     ToolResult,
 )
+from .pipeline_stages import (
+    apply_candidates as _pipeline_apply_candidates,
+    apply_context as _pipeline_apply_context,
+    apply_decision as _pipeline_apply_decision,
+    mark_approval_pending as _pipeline_mark_approval_pending,
+    mark_completed as _pipeline_mark_completed,
+    mark_failed as _pipeline_mark_failed,
+    mark_gated as _pipeline_mark_gated,
+    mark_sending as _pipeline_mark_sending,
+    mark_sent as _pipeline_mark_sent,
+    mark_understood as _pipeline_mark_understood,
+)
 from .political_guard import has_political_redline, political_safe_reply, sanitize_political_output
 from .rate_limiter import RateLimiter
 from .rag_retriever import RAGRetrievalResult, RAGService
+from .rag_admin import RAGAdminController
+from .reference_resolver import resolve_context_reference
 from .social_actions import PokeContext, SocialActionService, reaction_from_action
 from .tools.fresh_context import (
     FreshContextTool,
@@ -154,6 +167,7 @@ deep_content_tool = DeepContentTool.from_config(
     else {}
 )
 rag_service = RAGService(app_config.data_path, app_config.raw.get("rag", {}))
+rag_admin = RAGAdminController(rag_service)
 tool_registry = ToolRegistry()
 TOOL_ROUTER_SHADOW_SAMPLE_LIMIT = 200
 tool_router_shadow_samples = memory.metric_event_count("tool_router_shadow")
@@ -418,17 +432,6 @@ MEMORY_ATOM_DISPUTE_RE = re.compile(
 MEMORY_ATOM_AUDIT_RE = re.compile(
     r"^(?:/)?(?:记忆证据|记忆审计|记忆历史)\s+(?P<atom_id>\d+)$"
 )
-RAG_STATUS_COMMANDS = {"RAG状态", "rag状态", "RAG status", "/rag status"}
-RAG_TEST_RE = re.compile(r"^(?:/)?(?:RAG测试|rag测试|RAG test|rag test)\s*[:：]?\s*(?P<query>.+)$", re.IGNORECASE)
-RAG_FEEDBACK_RE = re.compile(
-    r"^(?:/)?RAG反馈\s+(?P<label>相关|好|不相关|错人|人物错位|过期)\s+(?P<position>\d+)\s*(?:[:：]\s*(?P<note>.*))?$",
-    re.IGNORECASE,
-)
-RAG_FEEDBACK_LIST_COMMANDS = {"RAG反馈列表", "rag反馈列表"}
-RAG_EVAL_RUN_COMMANDS = {"RAG评测", "rag评测"}
-RAG_EVAL_LIST_COMMANDS = {"RAG评测列表", "rag评测列表"}
-RAG_EVAL_ADD_RE = re.compile(r"^(?:/)?RAG评测添加\s+(?P<body>.+)$", re.IGNORECASE | re.DOTALL)
-RAG_EVAL_DELETE_RE = re.compile(r"^(?:/)?RAG评测删除\s+(?P<case_id>\d+)$", re.IGNORECASE)
 PRIVATE_CONTEXT_RESET_COMMANDS = {
     "清空上下文",
     "清空背景",
@@ -477,6 +480,7 @@ class BufferedGroupMessage:
     source_message_id: str = ""
     correlation_id: str = ""
     inbound_sequence: int = 0
+    pipeline_state: PipelineState | None = None
 
 
 @dataclass(frozen=True)
@@ -1847,6 +1851,7 @@ def _tool_plan_with_runtime_context(
     *,
     addressed: bool,
     group_id: int,
+    user_id: int,
     source_message_id: str,
 ) -> ToolRoutePlan:
     requests: list[ToolRequest] = []
@@ -1857,35 +1862,12 @@ def _tool_plan_with_runtime_context(
                 {
                     "addressed": addressed,
                     "group_id": group_id,
+                    "user_id": user_id,
                     "source_message_id": source_message_id,
                 }
             )
         requests.append(replace(request, arguments=arguments))
     return ToolRoutePlan(tuple(requests), source=plan.source)
-
-
-def _apply_decision_to_pipeline_state(
-    pipeline_state: PipelineState,
-    decision: ReplyDecision,
-) -> None:
-    pipeline_state.decision_action = decision.action
-    pipeline_state.decision_reason = decision.reason
-    pipeline_state.decision_confidence = decision.confidence
-    if not decision.should_reply:
-        pipeline_state.output_channel = OutputChannel.SILENT
-        return
-    if decision.action == "react":
-        pipeline_state.output_channel = OutputChannel.REACT
-    elif decision.action == "poke":
-        pipeline_state.output_channel = OutputChannel.POKE
-    else:
-        pipeline_state.output_channel = OutputChannel.TEXT
-    pipeline_state.social_intent = {
-        "answer": SocialIntent.ANSWER,
-        "care": SocialIntent.CARE,
-        "tease": SocialIntent.PLAY,
-        "agree": SocialIntent.AGREE,
-    }.get(decision.action, SocialIntent.CHAT)
 
 
 def _http_status_payload() -> dict[str, object]:
@@ -2131,6 +2113,9 @@ def _status_approvals() -> dict[str, object]:
                 "created_at": approval.created_at,
                 "age_seconds": max(0, int(now - approval.created_at)),
                 "correlation_id": approval.correlation_id,
+                "pipeline_stage": (
+                    approval.pipeline_state.stage.value if approval.pipeline_state is not None else "legacy"
+                ),
             }
         )
     return {
@@ -2389,6 +2374,17 @@ async def _handle_group_message_scoped(
     plain_text = _plain_text(event)
     group_allowed = app_config.group_allowed(group_id)
     source_message_id = event_message_source_id(event)
+    pipeline_state = PipelineState(
+        correlation_id=correlation_id,
+        group_id=group_id,
+        user_id=int(event.user_id),
+        nickname=_nickname(event),
+        text=plain_text,
+        addressed=False,
+        source_message_id=source_message_id,
+        self_id=int(event.self_id),
+        trigger_sequence=0,
+    )
     _record_metric_event(
         "pipeline_receive",
         group_id=group_id,
@@ -2420,6 +2416,7 @@ async def _handle_group_message_scoped(
         return
     inbound_sequence = group_inbound_sequences.get(group_id, 0) + 1
     group_inbound_sequences[group_id] = inbound_sequence
+    pipeline_state.trigger_sequence = inbound_sequence
     history_started_at = time.monotonic()
     reply_reference = await _resolve_reply_reference_for_event(bot, event, group_allowed=group_allowed)
     _record_metric_event(
@@ -2467,6 +2464,7 @@ async def _handle_group_message_scoped(
             title=content_context.file_name or "群文件",
             content=content_context.file_text,
             source_message_id=source_message_id,
+            created_by=int(event.user_id),
         )
         _record_metric_event(
             "rag_knowledge_ingested",
@@ -2520,6 +2518,11 @@ async def _handle_group_message_scoped(
         correlation_id=correlation_id,
     )
     text = raw_text
+    pipeline_state.text = raw_text or plain_text
+    pipeline_state.addressed = addressed_bot
+    pipeline_state.mentioned = _mentioned_bot(event, bot)
+    pipeline_state.replied_to_bot = _replied_to_bot(event, bot) or _reply_reference_to_bot(reply_reference, bot)
+    _pipeline_mark_understood(pipeline_state)
     if group_allowed and not addressed_bot and _should_ignore_unreadable_media_event(
         event,
         forward_context=forward_context,
@@ -2605,6 +2608,7 @@ async def _handle_group_message_scoped(
             source_message_id=source_message_id,
             correlation_id=correlation_id,
             inbound_sequence=inbound_sequence,
+            pipeline_state=pipeline_state,
         )
         return
     if addressed_bot:
@@ -2620,6 +2624,7 @@ async def _handle_group_message_scoped(
                 correlation_id=correlation_id,
                 addressed_bot_hint=addressed_bot,
                 trigger_sequence=inbound_sequence,
+                pipeline_state=pipeline_state,
             )
     finally:
         if addressed_bot:
@@ -2642,6 +2647,7 @@ async def _handle_group_message_locked(
     correlation_id: str = "",
     addressed_bot_hint: bool | None = None,
     trigger_sequence: int = 0,
+    pipeline_state: PipelineState | None = None,
 ) -> None:
     flow_started_at = time.monotonic()
     text = _buffered_current_text(buffered_messages) if buffered_messages else (
@@ -2662,6 +2668,31 @@ async def _handle_group_message_locked(
         replied_to_bot = True
     addressed_bot = mentioned or replied_to_bot or (False if buffered_messages else bool(addressed_bot_hint))
     addressed_repeat_count = 1 if addressed_bot else 0
+    if pipeline_state is None and buffered_messages:
+        pipeline_state = buffered_messages[-1].pipeline_state
+    if pipeline_state is None:
+        pipeline_state = PipelineState(
+            correlation_id=correlation_id or current_correlation_id(),
+            group_id=group_id,
+            user_id=user_id,
+            nickname=nickname,
+            text=text,
+            addressed=addressed_bot,
+            source_message_id=source_message_id,
+            self_id=int(event.self_id),
+            mentioned=mentioned,
+            replied_to_bot=replied_to_bot,
+            trigger_sequence=trigger_sequence,
+        )
+        _pipeline_mark_understood(pipeline_state)
+    else:
+        pipeline_state.user_id = user_id
+        pipeline_state.nickname = nickname
+        pipeline_state.text = text
+        pipeline_state.addressed = addressed_bot
+        pipeline_state.mentioned = mentioned
+        pipeline_state.replied_to_bot = replied_to_bot
+        pipeline_state.trigger_sequence = trigger_sequence
 
     if not buffered_messages and replied_to_bot and _is_low_value_reply_to_bot_event(event):
         plain_reply_text = _plain_text(event)
@@ -2793,19 +2824,11 @@ async def _handle_group_message_locked(
         ),
         addressed=addressed_bot,
         group_id=group_id,
+        user_id=user_id,
         source_message_id=source_message_id,
     )
-    pipeline_state = PipelineState(
-        correlation_id=correlation_id or current_correlation_id(),
-        group_id=group_id,
-        user_id=user_id,
-        nickname=nickname,
-        text=text,
-        addressed=addressed_bot,
-        mode=_tool_route_mode(tool_plan),
-        trigger_sequence=trigger_sequence,
-        tool_requests=tool_plan.requests,
-    )
+    pipeline_state.mode = _tool_route_mode(tool_plan)
+    pipeline_state.tool_requests = tool_plan.requests
     fresh_candidate = fresh_intent is not None
     if addressed_bot:
         _mark_passive_decision_forced(group_id)
@@ -2902,21 +2925,28 @@ async def _handle_group_message_locked(
             )
             return
         reply = political_safe_reply()
+        political_candidates = (
+            PendingApprovalCandidate(1, reply, "political_guard", "政治红线兜底"),
+        )
+        approval_id = _new_approval_id(group_id)
+        _pipeline_apply_candidates(pipeline_state, political_candidates)
+        _pipeline_mark_approval_pending(pipeline_state, approval_id)
         await _request_group_approval(
             bot,
             PendingGroupApproval(
-                approval_id=_new_approval_id(group_id),
+                approval_id=approval_id,
                 group_id=group_id,
                 trigger_user_id=user_id,
                 trigger_nickname=nickname,
                 trigger_text=text,
                 persona_name=persona.name,
                 self_id=int(event.self_id),
-                candidates=(PendingApprovalCandidate(1, reply, "political_guard", "政治红线兜底"),),
+                candidates=political_candidates,
                 mention_targets={},
                 created_at=time.time(),
                 correlation_id=current_correlation_id(),
                 trigger_sequence=trigger_sequence,
+                pipeline_state=pipeline_state,
             ),
         )
         return
@@ -2962,6 +2992,14 @@ async def _handle_group_message_locked(
     jargon_context = ""
     context_query = _context_query_text(text, nickname, context_recent)
     related_member_user_ids = _related_member_user_ids(context_recent, current_user_id=user_id)
+    reference_resolution = resolve_context_reference(
+        text,
+        context_recent,
+        current_user_id=user_id,
+        resolve_named_users=lambda candidate: rag_service.resolve_named_user_ids(group_id, candidate),
+    )
+    pipeline_state.reference_user_ids = reference_resolution.user_ids
+    pipeline_state.reference_reason = reference_resolution.reason
     if fresh_intent is None:
         followup_fresh_intent = _infer_followup_fresh_intent(
             text,
@@ -2980,6 +3018,7 @@ async def _handle_group_message_locked(
                 ),
                 addressed=addressed_bot,
                 group_id=group_id,
+                user_id=user_id,
                 source_message_id=source_message_id,
             )
             pipeline_state.tool_requests = tool_plan.requests
@@ -2991,9 +3030,9 @@ async def _handle_group_message_locked(
     rag_task: asyncio.Task[RAGRetrievalResult] = asyncio.create_task(
         rag_service.retrieve(
             group_id=group_id,
-            query=text,
+            query=reference_resolution.expanded_query or text,
             addressed=addressed_bot,
-            related_user_ids=related_member_user_ids,
+            related_user_ids=list(reference_resolution.user_ids),
         )
     )
     rag_result: RAGRetrievalResult | None = None
@@ -3051,6 +3090,7 @@ async def _handle_group_message_locked(
         _schedule_group_learning(group_id)
         return
     decision = pre_decision.decision
+    _pipeline_mark_gated(pipeline_state)
     _record_tool_router_shadow(
         group_id=group_id,
         user_id=user_id,
@@ -3161,7 +3201,14 @@ async def _handle_group_message_locked(
         addressed_bot=addressed_bot,
         text=text,
     )
-    _apply_decision_to_pipeline_state(pipeline_state, decision)
+    _pipeline_apply_decision(
+        pipeline_state,
+        should_reply=decision.should_reply,
+        action=decision.action,
+        reason=decision.reason,
+        confidence=decision.confidence,
+        elapsed_ms=int((time.monotonic() - decision_started_at) * 1000),
+    )
     if addressed_bot and "非点名" in decision.reason:
         logger.warning(
             "qq_social_agent decision state mismatch: "
@@ -3207,6 +3254,7 @@ async def _handle_group_message_locked(
                 f"confidence={decision.confidence:.2f} reason={decision.reason}"
             ),
         )
+        _pipeline_mark_completed(pipeline_state)
         return
 
     if pipeline_state.output_channel is OutputChannel.REACT:
@@ -3223,6 +3271,7 @@ async def _handle_group_message_locked(
             buffered_messages=buffered_messages,
             source_message_id=source_message_id,
         )
+        _pipeline_mark_completed(pipeline_state)
         return
 
     if pipeline_state.output_channel is OutputChannel.POKE:
@@ -3235,6 +3284,7 @@ async def _handle_group_message_locked(
             nickname=nickname,
             text=text,
         )
+        _pipeline_mark_completed(pipeline_state)
         return
 
     if not memory_context:
@@ -3264,6 +3314,8 @@ async def _handle_group_message_locked(
             error=rag_result.error,
             resolved_user_ids=[item.user_id for item in rag_result.resolved_members],
             resolved_names=[item.matched_name for item in rag_result.resolved_members],
+            reference_reason=reference_resolution.reason,
+            reference_confidence=reference_resolution.confidence,
             hit_document_ids=[hit.document.id for hit in rag_result.hits],
             hit_doc_types=[hit.document.doc_type for hit in rag_result.hits],
             hit_scores=[round(hit.score, 4) for hit in rag_result.hits],
@@ -3347,7 +3399,7 @@ async def _handle_group_message_locked(
         ) if rag_result is not None else (),
         mode=pipeline_state.mode,
     )
-    pipeline_state.context = context_packet
+    _pipeline_apply_context(pipeline_state, context_packet)
     memory_context = context_packet.get("memory")
     member_context = context_packet.get("member")
     memory_atoms_context = context_packet.get("memory_atoms")
@@ -3421,28 +3473,33 @@ async def _handle_group_message_locked(
                 f"group={group_id} chars={len(market_report)}"
             )
             if not decision.comment_after_tool:
+                market_candidates = (
+                    PendingApprovalCandidate(
+                        1,
+                        market_report,
+                        "market_check",
+                        "行情工具报告，不额外编判断",
+                    ),
+                )
+                approval_id = _new_approval_id(group_id)
+                _pipeline_apply_candidates(pipeline_state, market_candidates)
+                _pipeline_mark_approval_pending(pipeline_state, approval_id)
                 await _request_group_approval(
                     bot,
                     PendingGroupApproval(
-                        approval_id=_new_approval_id(group_id),
+                        approval_id=approval_id,
                         group_id=group_id,
                         trigger_user_id=user_id,
                         trigger_nickname=nickname,
                         trigger_text=text,
                         persona_name=persona.name,
                         self_id=int(event.self_id),
-                        candidates=(
-                            PendingApprovalCandidate(
-                                1,
-                                market_report,
-                                "market_check",
-                                "行情工具报告，不额外编判断",
-                            ),
-                        ),
+                        candidates=market_candidates,
                         mention_targets={},
                         created_at=time.time(),
                         correlation_id=current_correlation_id(),
                         trigger_sequence=trigger_sequence,
+                        pipeline_state=pipeline_state,
                     ),
                 )
                 return
@@ -3531,14 +3588,7 @@ async def _handle_group_message_locked(
             chat_label="QQ 群聊",
             market_context=market_context,
             fresh_context=fresh_context,
-            memory_context=memory_context,
-            style_context=style_context,
-            raw_corpus_context=raw_corpus_context,
-            jargon_context=jargon_context,
-            member_context=member_context,
-            memory_atoms_context=memory_atoms_context,
-            recall_feedback_context=recall_feedback_context,
-            positive_feedback_context=positive_feedback_context,
+            context_packet=pipeline_state.context,
             mention_targets=_format_mention_targets(mention_targets),
             priority_context=_focused_user_tone_context(user_id),
             include_bot_history=tool_answer_mode,
@@ -3603,6 +3653,12 @@ async def _handle_group_message_locked(
         return
     if len(approval_candidates) < reply_candidate_limit:
         _pad_approval_candidates(approval_candidates, action=decision.action, limit=reply_candidate_limit)
+    generation_elapsed_ms = int((time.monotonic() - generation_started_at) * 1000)
+    _pipeline_apply_candidates(
+        pipeline_state,
+        approval_candidates,
+        elapsed_ms=generation_elapsed_ms,
+    )
     logger.info(
         "qq_social_agent pending group reply candidates approval: "
         f"group={group_id} candidates={len(approval_candidates)} direct_single_reply={direct_single_reply}"
@@ -3623,13 +3679,15 @@ async def _handle_group_message_locked(
             for result in pipeline_state.tool_results
         ],
         candidate_count=len(approval_candidates),
-        elapsed_ms=int((time.monotonic() - generation_started_at) * 1000),
+        elapsed_ms=generation_elapsed_ms,
         flow_elapsed_ms=int((time.monotonic() - flow_started_at) * 1000),
     )
+    approval_id = _new_approval_id(group_id)
+    _pipeline_mark_approval_pending(pipeline_state, approval_id)
     await _request_group_approval(
         bot,
         PendingGroupApproval(
-            approval_id=_new_approval_id(group_id),
+            approval_id=approval_id,
             group_id=group_id,
             trigger_user_id=user_id,
             trigger_nickname=nickname,
@@ -3642,6 +3700,7 @@ async def _handle_group_message_locked(
             correlation_id=current_correlation_id(),
             tool_evidence=_approval_evidence_from_context(fresh_context),
             trigger_sequence=trigger_sequence,
+            pipeline_state=pipeline_state,
         ),
     )
 
@@ -4776,6 +4835,7 @@ async def _execute_registered_deep_url(request: ToolRequest) -> ToolResult:
     }
     group_id = int(request.arguments.get("group_id", 0) or 0)
     source_message_id = str(request.arguments.get("source_message_id", "") or "")
+    user_id = int(request.arguments.get("user_id", 0) or 0)
     if group_id and read is not None and read.ok and read.text:
         indexed_chunks = rag_service.ingest_knowledge(
             group_id=group_id,
@@ -4784,6 +4844,7 @@ async def _execute_registered_deep_url(request: ToolRequest) -> ToolResult:
             title=read.title or read.final_url or result.url,
             content=read.text,
             source_message_id=source_message_id,
+            created_by=user_id,
         )
         metadata["indexed_chunks"] = indexed_chunks
         _record_metric_event(
@@ -5364,6 +5425,7 @@ def _buffer_group_message(
     source_message_id: str = "",
     correlation_id: str = "",
     inbound_sequence: int = 0,
+    pipeline_state: PipelineState | None = None,
 ) -> None:
     group_id = int(event.group_id)
     _cancel_passive_decision_retry(group_id)
@@ -5377,6 +5439,7 @@ def _buffer_group_message(
         source_message_id=source_message_id or event_message_source_id(event),
         correlation_id=correlation_id,
         inbound_sequence=inbound_sequence,
+        pipeline_state=pipeline_state,
     )
     group_message_buffers.setdefault(group_id, []).append(item)
     _schedule_group_buffer_flush(group_id)
@@ -6498,14 +6561,7 @@ def _is_private_tool_text(text: str) -> bool:
         or MEMORY_ATOM_CORRECT_RE.match(text) is not None
         or MEMORY_ATOM_DISPUTE_RE.match(text) is not None
         or MEMORY_ATOM_AUDIT_RE.match(text) is not None
-        or text in RAG_STATUS_COMMANDS
-        or RAG_TEST_RE.match(text) is not None
-        or RAG_FEEDBACK_RE.match(text) is not None
-        or text in RAG_FEEDBACK_LIST_COMMANDS
-        or text in RAG_EVAL_RUN_COMMANDS
-        or text in RAG_EVAL_LIST_COMMANDS
-        or RAG_EVAL_ADD_RE.match(text) is not None
-        or RAG_EVAL_DELETE_RE.match(text) is not None
+        or rag_admin.matches(text)
         or APPROVER_ADD_RE.match(text) is not None
         or APPROVER_DELETE_RE.match(text) is not None
         or _parse_metric_report_command(text) is not None
@@ -6526,29 +6582,6 @@ def _cool_down_other_approval_choices(approver_id: int) -> None:
     for user_id in _approval_user_ids():
         if user_id != approver_id:
             approval_choice_cooldowns[user_id] = until
-
-
-def _format_rag_status() -> str:
-    snapshot = rag_service.status_snapshot()
-    store = snapshot.get("store", {}) if isinstance(snapshot.get("store"), dict) else {}
-    embedding = snapshot.get("embedding", {}) if isinstance(snapshot.get("embedding"), dict) else {}
-    type_counts = store.get("document_types", {}) if isinstance(store.get("document_types"), dict) else {}
-    status_counts = store.get("embedding_status", {}) if isinstance(store.get("embedding_status"), dict) else {}
-    types_text = "、".join(f"{name}={count}" for name, count in sorted(type_counts.items())) or "无"
-    embeddings_text = "、".join(f"{name}={count}" for name, count in sorted(status_counts.items())) or "无"
-    return (
-        "轻量混合 RAG 状态：\n"
-        f"- enabled={snapshot.get('enabled')} mode={snapshot.get('mode')} FTS5={store.get('fts5')}\n"
-        f"- 文档总数={store.get('documents', 0)}（{types_text}）\n"
-        f"- 向量={embeddings_text}\n"
-        f"- embedding={embedding.get('model')} available={embedding.get('available')} "
-        f"calls={embedding.get('calls', 0)} failures={embedding.get('failures', 0)}\n"
-        f"- 最近1小时检索={store.get('retrievals_1h', 0)}次，平均={store.get('average_retrieval_ms_1h', 0)}ms\n"
-        f"- 人工反馈={store.get('feedback_count', 0)}条，评测用例={store.get('evaluation_case_count', 0)}条\n"
-        f"- 后台索引={snapshot.get('background_indexing')} query缓存={snapshot.get('query_cache_entries', 0)}\n"
-        f"- 最近错误={snapshot.get('last_error') or embedding.get('last_error') or '无'}\n"
-        "测试命令：RAG测试 以前谁聊过菲尔兹奖"
-    )
 
 
 def _format_approval_user_report() -> str:
@@ -6777,84 +6810,13 @@ async def _handle_group_approval_private_impl(bot: Bot, user_id: int, text: str)
             _format_memory_atom_report(_private_jargon_group_id(), atom_report_limit),
         )
         return True
-    if compact_text in RAG_STATUS_COMMANDS:
-        await _send_private_text(bot, user_id, _format_rag_status())
-        return True
-    rag_test_match = RAG_TEST_RE.match(compact_text)
-    if rag_test_match is not None:
-        group_id = _private_jargon_group_id()
-        if group_id is None:
-            await _send_private_text(bot, user_id, "RAG测试失败：没有可用目标群。")
-            return True
-        await _send_private_text(
-            bot,
-            user_id,
-            await rag_service.diagnostic_query(group_id, rag_test_match.group("query").strip()),
-        )
-        return True
-    rag_feedback_match = RAG_FEEDBACK_RE.match(compact_text)
-    if rag_feedback_match is not None:
-        group_id = _private_jargon_group_id()
-        if group_id is None:
-            await _send_private_text(bot, user_id, "RAG反馈失败：没有可用目标群。")
-            return True
-        label_map = {
-            "相关": "relevant", "好": "relevant", "不相关": "irrelevant",
-            "错人": "wrong_person", "人物错位": "wrong_person", "过期": "stale",
-        }
-        try:
-            document_id, label = rag_service.add_feedback(
-                group_id=group_id,
-                position=int(rag_feedback_match.group("position")),
-                label=label_map[rag_feedback_match.group("label")],
-                operator_id=user_id,
-                note=(rag_feedback_match.group("note") or "").strip(),
-            )
-            await _send_private_text(bot, user_id, f"已记录 RAG 反馈：文档 {document_id} / {label}，后续统一重排会自动采用。")
-        except ValueError as exc:
-            await _send_private_text(bot, user_id, f"RAG反馈失败：{exc}")
-        return True
-    if compact_text in RAG_FEEDBACK_LIST_COMMANDS:
-        group_id = _private_jargon_group_id()
-        await _send_private_text(bot, user_id, rag_service.feedback_report(group_id) if group_id else "没有可用目标群。")
-        return True
-    if compact_text in RAG_EVAL_LIST_COMMANDS:
-        group_id = _private_jargon_group_id()
-        await _send_private_text(bot, user_id, rag_service.evaluation_case_report(group_id) if group_id else "没有可用目标群。")
-        return True
-    rag_eval_add_match = RAG_EVAL_ADD_RE.match(compact_text)
-    if rag_eval_add_match is not None:
-        group_id = _private_jargon_group_id()
-        if group_id is None:
-            await _send_private_text(bot, user_id, "没有可用目标群。")
-            return True
-        parts = [part.strip() for part in re.split(r"\s*[|｜]\s*", rag_eval_add_match.group("body"))]
-        if len(parts) < 2:
-            await _send_private_text(bot, user_id, "格式：RAG评测添加 问题 | 关键词1,关键词2 | QQ1,QQ2（QQ 可留空）")
-            return True
-        terms = [value.strip() for value in re.split(r"[,，]", parts[1]) if value.strip()]
-        users = [int(value) for value in re.findall(r"\d{5,12}", parts[2])] if len(parts) >= 3 else []
-        try:
-            case_id = rag_service.add_evaluation_case(
-                group_id=group_id,
-                query=parts[0],
-                expected_terms=terms,
-                expected_user_ids=users,
-                created_by=user_id,
-            )
-            await _send_private_text(bot, user_id, f"已保存 RAG 评测用例 #{case_id}。")
-        except ValueError as exc:
-            await _send_private_text(bot, user_id, f"添加失败：{exc}")
-        return True
-    rag_eval_delete_match = RAG_EVAL_DELETE_RE.match(compact_text)
-    if rag_eval_delete_match is not None:
-        group_id = _private_jargon_group_id()
-        deleted = bool(group_id and rag_service.store.delete_evaluation_case(group_id, int(rag_eval_delete_match.group("case_id"))))
-        await _send_private_text(bot, user_id, "已删除该评测用例。" if deleted else "没有找到该评测用例。")
-        return True
-    if compact_text in RAG_EVAL_RUN_COMMANDS:
-        group_id = _private_jargon_group_id()
-        await _send_private_text(bot, user_id, await rag_service.run_evaluation(group_id) if group_id else "没有可用目标群。")
+    rag_admin_result = await rag_admin.handle(
+        compact_text,
+        group_id=_private_jargon_group_id(),
+        operator_id=user_id,
+    )
+    if rag_admin_result.handled:
+        await _send_private_text(bot, user_id, rag_admin_result.text)
         return True
     metric_window = _parse_metric_report_command(compact_text)
     if metric_window is not None:
@@ -7191,6 +7153,9 @@ async def _send_approved_group_reply_scoped(
     notify_success: bool = True,
 ) -> None:
     send_started_at = time.monotonic()
+    pipeline_state = approval.pipeline_state
+    if pipeline_state is not None:
+        _pipeline_mark_sending(pipeline_state)
     logger.info(
         "qq_social_agent group approval accepted: "
         f"approver={approver_id} group={approval.group_id} candidate={candidate.index} high_quality={high_quality}"
@@ -7239,6 +7204,8 @@ async def _send_approved_group_reply_scoped(
                 approval.group_id,
                 _message_from_reply_part(part_text, effective_mention_targets),
             )
+            if pipeline_state is not None:
+                _pipeline_mark_sent(pipeline_state, sent_message_id)
             if not recorded_user_reply:
                 _record_user_reply(approval.group_id, approval.trigger_user_id)
                 recorded_user_reply = True
@@ -7264,6 +7231,8 @@ async def _send_approved_group_reply_scoped(
             )
         except ActionFailed as exc:
             blocked = _is_group_send_blocked_error(exc)
+            if pipeline_state is not None:
+                _pipeline_mark_failed(pipeline_state, _action_failed_summary(exc))
             logger.warning(
                 "qq_social_agent failed sending approved group reply: "
                 f"group={approval.group_id} {_action_failed_summary(exc)}"
@@ -7308,6 +7277,9 @@ async def _send_approved_group_reply_scoped(
         last_group_mention_targets[approval.group_id] = (sent_mention_user_id, time.time())
     else:
         last_group_mention_targets.pop(approval.group_id, None)
+    send_elapsed_ms = int((time.monotonic() - send_started_at) * 1000)
+    if pipeline_state is not None:
+        _pipeline_mark_completed(pipeline_state, elapsed_ms=send_elapsed_ms)
     _record_metric_event(
         "message_sent",
         group_id=approval.group_id,
@@ -7315,8 +7287,9 @@ async def _send_approved_group_reply_scoped(
         stage="send",
         action=candidate.action,
         message_count=len(reply_parts),
-        elapsed_ms=int((time.monotonic() - send_started_at) * 1000),
+        elapsed_ms=send_elapsed_ms,
         approval_id=approval.approval_id,
+        pipeline_stages=list(pipeline_state.stage_history) if pipeline_state is not None else [],
     )
     if high_quality:
         _save_approved_reply_feedback(approval, candidate, approver_id=approver_id or 0)

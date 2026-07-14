@@ -8,6 +8,12 @@ from qq_social_agent.rag_indexer import RAGIndexer
 from qq_social_agent.rag_retriever import RAGService
 from qq_social_agent.rag_router import plan_rag_query
 from qq_social_agent.rag_store import RAGStore
+from qq_social_agent.temporal_evidence import (
+    TemporalIntent,
+    detect_temporal_intent,
+    recency_adjustment,
+    statements_conflict,
+)
 
 
 def test_rag_router_only_uses_semantic_for_memory_like_queries() -> None:
@@ -242,4 +248,125 @@ def test_file_knowledge_is_chunked_and_retrievable(tmp_path) -> None:
     assert result.plan.route == "knowledge"
     assert any(hit.document.doc_type == "file_knowledge" for hit in result.hits)
     assert "文件知识库" in result.context
+    asyncio.run(service.close())
+
+
+def test_temporal_evidence_prefers_recent_for_current_questions() -> None:
+    now = time.time()
+
+    assert detect_temporal_intent("小鸟现在还准备考研吗") is TemporalIntent.CURRENT
+    assert detect_temporal_intent("小鸟以前准备考研吗") is TemporalIntent.HISTORICAL
+    assert recency_adjustment(now - 3600, TemporalIntent.CURRENT, now=now) > recency_adjustment(
+        now - 400 * 86400,
+        TemporalIntent.CURRENT,
+        now=now,
+    )
+    assert statements_conflict("小鸟已经放弃考研", "小鸟准备考研", ["考研"])
+
+
+def test_rag_context_labels_reported_claim_as_non_objective(tmp_path) -> None:
+    db_path = tmp_path / "bot.sqlite3"
+    memory = MemoryStore(db_path)
+    memory.add_message(1, 10, "甲", "甲说自己准备考研", created_at=time.time() - 3600)
+    memory.conn.close()
+    service = RAGService(
+        db_path,
+        {"enabled": True, "embedding": {"enabled": False}, "retrieval": {"exclude_recent_seconds": 0}},
+    )
+
+    result = asyncio.run(service.retrieve(group_id=1, query="准备考研", addressed=True))
+
+    assert "性质=说话者当时陈述" in result.context
+    asyncio.run(service.close())
+
+
+def test_current_question_downgrades_explicitly_contradicted_old_claim(tmp_path) -> None:
+    db_path = tmp_path / "bot.sqlite3"
+    memory = MemoryStore(db_path)
+    memory.conn.close()
+    service = RAGService(
+        db_path,
+        {"enabled": True, "embedding": {"enabled": False}, "retrieval": {"exclude_recent_seconds": 0}},
+    )
+    now = time.time()
+    old_id = service.store.upsert_document(
+        stable_key="claim:old",
+        group_id=1,
+        doc_type="conversation",
+        content="小鸟准备考研",
+        source_name="messages",
+        source_row_id="1",
+        speaker_user_id=7,
+        participant_user_ids=(7,),
+        created_at=now - 400 * 86400,
+        evidence_kind="reported_claim",
+    )
+    new_id = service.store.upsert_document(
+        stable_key="claim:new",
+        group_id=1,
+        doc_type="conversation",
+        content="小鸟已经放弃考研",
+        source_name="messages",
+        source_row_id="2",
+        speaker_user_id=7,
+        participant_user_ids=(7,),
+        created_at=now - 86400,
+        evidence_kind="reported_claim",
+    )
+    service.store.commit()
+
+    result = asyncio.run(service.retrieve(group_id=1, query="考研 现在", addressed=True))
+
+    assert result.hits[0].document.id == new_id
+    old_hit = next(hit for hit in result.hits if hit.document.id == old_id)
+    assert "较新反证降权" in old_hit.reasons
+    asyncio.run(service.close())
+
+
+def test_knowledge_source_versions_deduplicate_and_soft_delete(tmp_path) -> None:
+    db_path = tmp_path / "bot.sqlite3"
+    memory = MemoryStore(db_path)
+    memory.conn.close()
+    service = RAGService(db_path, {"enabled": True, "embedding": {"enabled": False}})
+
+    first_count = service.ingest_knowledge(
+        group_id=1,
+        kind="file",
+        source_identity="file-a",
+        title="资料.txt",
+        content="第一版资料里说明了三维挂谷猜想。" * 50,
+        created_by=9,
+    )
+    duplicate_count = service.ingest_knowledge(
+        group_id=1,
+        kind="file",
+        source_identity="file-copy",
+        title="资料副本.txt",
+        content="第一版资料里说明了三维挂谷猜想。" * 50,
+        created_by=9,
+    )
+    sources = service.store.knowledge_sources(1)
+
+    assert duplicate_count == first_count
+    assert len(sources) == 1
+    assert sources[0].version == 1
+
+    service.ingest_knowledge(
+        group_id=1,
+        kind="file",
+        source_identity="file-a",
+        title="资料.txt",
+        content="第二版资料修正了三维挂谷猜想的说明。" * 50,
+        created_by=9,
+    )
+    source = service.store.knowledge_sources(1)[0]
+    assert source.version == 2
+    assert service.reindex_knowledge_source(1, source.id) == source.chunk_count
+    assert service.delete_knowledge_source(1, source.id)
+    assert service.store.knowledge_sources(1) == []
+    inactive = service.store.conn.execute(
+        "select count(*) from rag_documents where stable_key like ? and status='inactive'",
+        (f"{source.stable_prefix}%",),
+    ).fetchone()[0]
+    assert inactive >= first_count
     asyncio.run(service.close())

@@ -5,7 +5,25 @@ import asyncio
 from qq_social_agent.background_learning import BackgroundLearningCoordinator
 from qq_social_agent.context_assembler import assemble_generation_context
 from qq_social_agent.memory import ChatMessage, MemoryStore
-from qq_social_agent.pipeline_types import OutputChannel, PipelineMode, SocialIntent, ToolKind
+from qq_social_agent.pipeline_types import (
+    ContextPacket,
+    OutputChannel,
+    PipelineMode,
+    PipelineStage,
+    PipelineState,
+    SocialIntent,
+    ToolKind,
+)
+from qq_social_agent.pipeline_stages import (
+    apply_candidates,
+    apply_context,
+    apply_decision,
+    mark_approval_pending,
+    mark_completed,
+    mark_gated,
+    mark_sending,
+    mark_sent,
+)
 from qq_social_agent.timing_gate import parse_timing_decision
 from qq_social_agent.tool_router import (
     apply_tool_plan,
@@ -128,6 +146,42 @@ def test_tool_route_mode_prefers_market_when_search_is_also_required() -> None:
     )
 
     assert route_mode(plan) is PipelineMode.MARKET
+
+
+def test_pipeline_state_crosses_decision_context_approval_and_delivery() -> None:
+    state = PipelineState("cid", 1, 2, "甲", "你怎么看", True, source_message_id="88")
+    candidate = SimpleNamespace(index=1, text="风雪觉得可以", action="answer", style="直接回答")
+
+    mark_gated(state)
+    apply_decision(
+        state,
+        should_reply=True,
+        action="answer",
+        reason="addressed",
+        confidence=1.0,
+        elapsed_ms=4,
+    )
+    apply_context(state, ContextPacket(mode=PipelineMode.CHAT))
+    apply_candidates(state, [candidate], elapsed_ms=20)
+    mark_approval_pending(state, "approval-1")
+    mark_sending(state)
+    mark_sent(state, 99)
+    mark_completed(state, elapsed_ms=8)
+
+    assert state.stage is PipelineStage.COMPLETED
+    assert state.approval_id == "approval-1"
+    assert state.sent_message_ids == ("99",)
+    assert state.candidates[0].text == "风雪觉得可以"
+    assert state.stage_history == [
+        "received",
+        "gated",
+        "decided",
+        "context_ready",
+        "generated",
+        "approval_pending",
+        "sending",
+        "completed",
+    ]
 
 
 def test_mid_summary_page_can_exclude_bot_messages(tmp_path) -> None:

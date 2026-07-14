@@ -10,6 +10,8 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
+from .temporal_evidence import default_evidence_kind
+
 
 @dataclass(frozen=True)
 class RAGDocument:
@@ -24,10 +26,14 @@ class RAGDocument:
     source_row_id: str
     source_message_ids: tuple[str, ...]
     participant_user_ids: tuple[int, ...]
+    asserted_by_user_id: int | None
     created_at: float
+    valid_from: float | None
+    valid_to: float | None
     importance: float
     confidence: float
     status: str
+    evidence_kind: str
 
 
 @dataclass(frozen=True)
@@ -50,6 +56,24 @@ class RAGEvaluationCase:
     expected_terms: tuple[str, ...]
     expected_user_ids: tuple[int, ...]
     created_by: int
+
+
+@dataclass(frozen=True)
+class RAGKnowledgeSource:
+    id: int
+    group_id: int
+    kind: str
+    source_identity: str
+    title: str
+    content_hash: str
+    stable_prefix: str
+    version: int
+    chunk_count: int
+    source_message_id: str
+    created_by: int
+    status: str
+    created_at: float
+    updated_at: float
 
 
 class RAGStore:
@@ -85,6 +109,7 @@ class RAGStore:
               importance real not null default 0.5,
               confidence real not null default 0.6,
               status text not null default 'active',
+              evidence_kind text not null default 'unknown',
               content_hash text not null,
               embedding_status text not null default 'pending',
               embedding_model text,
@@ -164,6 +189,27 @@ class RAGStore:
             );
             create unique index if not exists idx_rag_eval_group_query
               on rag_evaluation_cases(group_id, query);
+
+            create table if not exists rag_knowledge_sources (
+              id integer primary key autoincrement,
+              group_id integer not null,
+              kind text not null,
+              source_identity text not null,
+              identity_hash text not null,
+              title text not null,
+              content_hash text not null,
+              stable_prefix text not null,
+              version integer not null default 1,
+              chunk_count integer not null default 0,
+              source_message_id text not null default '',
+              created_by integer not null default 0,
+              status text not null default 'active',
+              created_at real not null,
+              updated_at real not null,
+              unique(group_id, kind, identity_hash)
+            );
+            create index if not exists idx_rag_knowledge_sources_group_status
+              on rag_knowledge_sources(group_id, status, updated_at desc);
             """
         )
         self._ensure_rag_v2_columns()
@@ -192,6 +238,35 @@ class RAGStore:
             self.conn.execute(
                 "alter table rag_documents add column participant_user_ids_json text not null default '[]'"
             )
+        if "evidence_kind" not in document_columns:
+            self.conn.execute(
+                "alter table rag_documents add column evidence_kind text not null default 'unknown'"
+            )
+        self.conn.execute(
+            """
+            update rag_documents
+            set evidence_kind = case doc_type
+              when 'conversation' then 'reported_claim'
+              when 'summary' then 'summary'
+              when 'memory_atom' then 'structured_fact'
+              when 'member' then 'profile_summary'
+              when 'jargon' then 'curated_definition'
+              when 'feedback' then 'approval_feedback'
+              when 'file_knowledge' then 'reference'
+              when 'web_knowledge' then 'reference'
+              else 'unknown'
+            end
+            where evidence_kind is null or evidence_kind = '' or evidence_kind = 'unknown'
+            """
+        )
+        self.conn.execute(
+            """
+            update rag_documents
+            set evidence_kind = 'directory_fact'
+            where doc_type = 'member' and source_name = 'member_profiles'
+              and evidence_kind = 'profile_summary'
+            """
+        )
         retrieval_columns = {
             str(row["name"])
             for row in self.conn.execute("pragma table_info(rag_retrieval_events)").fetchall()
@@ -221,6 +296,7 @@ class RAGStore:
         importance: float = 0.5,
         confidence: float = 0.6,
         status: str = "active",
+        evidence_kind: str | None = None,
     ) -> int:
         clean_content = re.sub(r"[ \t]+", " ", str(content)).strip()
         if not clean_content:
@@ -239,8 +315,8 @@ class RAGStore:
               source_name, source_row_id, source_message_ids_json, participant_user_ids_json,
               asserted_by_user_id,
               created_at, valid_from, valid_to, importance, confidence, status,
-              content_hash, embedding_status, indexed_at, updated_at
-            ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)
+              evidence_kind, content_hash, embedding_status, indexed_at, updated_at
+            ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)
             on conflict(stable_key) do update set
               group_id=excluded.group_id,
               doc_type=excluded.doc_type,
@@ -258,6 +334,7 @@ class RAGStore:
               importance=excluded.importance,
               confidence=excluded.confidence,
               status=excluded.status,
+              evidence_kind=excluded.evidence_kind,
               content_hash=excluded.content_hash,
               embedding_status=case
                 when rag_documents.content_hash != excluded.content_hash then 'pending'
@@ -284,6 +361,7 @@ class RAGStore:
                 max(0.0, min(1.0, float(importance))),
                 max(0.0, min(1.0, float(confidence))),
                 str(status)[:24] or "active",
+                str(evidence_kind or default_evidence_kind(doc_type))[:32],
                 digest,
                 now,
                 now,
@@ -675,6 +753,159 @@ class RAGStore:
             removed += 1
         return removed
 
+    def register_knowledge_source(
+        self,
+        *,
+        group_id: int,
+        kind: str,
+        source_identity: str,
+        title: str,
+        content_hash: str,
+        source_message_id: str = "",
+        created_by: int = 0,
+    ) -> tuple[RAGKnowledgeSource, bool]:
+        clean_kind = "file" if kind == "file" else "web"
+        clean_identity = str(source_identity).strip()[:500]
+        identity_hash = hashlib.sha256(clean_identity.encode("utf-8")).hexdigest()
+        existing_duplicate = self.conn.execute(
+            """
+            select * from rag_knowledge_sources
+            where group_id = ? and kind = ? and content_hash = ? and status = 'active'
+            order by updated_at desc limit 1
+            """,
+            (int(group_id), clean_kind, content_hash),
+        ).fetchone()
+        if existing_duplicate is not None:
+            return _knowledge_source_from_row(existing_duplicate), True
+        existing = self.conn.execute(
+            """
+            select * from rag_knowledge_sources
+            where group_id = ? and kind = ? and identity_hash = ?
+            """,
+            (int(group_id), clean_kind, identity_hash),
+        ).fetchone()
+        now = time.time()
+        if existing is None:
+            cursor = self.conn.execute(
+                """
+                insert into rag_knowledge_sources(
+                  group_id, kind, source_identity, identity_hash, title, content_hash,
+                  stable_prefix, version, chunk_count, source_message_id, created_by,
+                  status, created_at, updated_at
+                ) values (?, ?, ?, ?, ?, ?, '', 1, 0, ?, ?, 'active', ?, ?)
+                """,
+                (
+                    int(group_id), clean_kind, clean_identity, identity_hash,
+                    str(title).strip()[:180], content_hash, str(source_message_id)[:80],
+                    int(created_by), now, now,
+                ),
+            )
+            source_id = int(cursor.lastrowid)
+            prefix = f"knowledge:{clean_kind}:{int(group_id)}:{source_id}:"
+            self.conn.execute(
+                "update rag_knowledge_sources set stable_prefix = ? where id = ?",
+                (prefix, source_id),
+            )
+        else:
+            source_id = int(existing["id"])
+            version = int(existing["version"] or 0) + 1
+            self.conn.execute(
+                """
+                update rag_knowledge_sources
+                set source_identity=?, title=?, content_hash=?, version=?,
+                    source_message_id=?, created_by=?, status='active', updated_at=?
+                where id=?
+                """,
+                (
+                    clean_identity, str(title).strip()[:180], content_hash, version,
+                    str(source_message_id)[:80], int(created_by), now, source_id,
+                ),
+            )
+        row = self.conn.execute(
+            "select * from rag_knowledge_sources where id = ?", (source_id,)
+        ).fetchone()
+        return _knowledge_source_from_row(row), False
+
+    def update_knowledge_source_chunks(self, source_id: int, chunk_count: int) -> None:
+        self.conn.execute(
+            "update rag_knowledge_sources set chunk_count=?, updated_at=? where id=?",
+            (max(0, int(chunk_count)), time.time(), int(source_id)),
+        )
+
+    def knowledge_sources(
+        self,
+        group_id: int,
+        *,
+        include_deleted: bool = False,
+        limit: int = 50,
+    ) -> list[RAGKnowledgeSource]:
+        status_sql = "" if include_deleted else "and status = 'active'"
+        rows = self.conn.execute(
+            f"""
+            select * from rag_knowledge_sources
+            where group_id = ? {status_sql}
+            order by updated_at desc limit ?
+            """,
+            (int(group_id), max(1, min(200, int(limit)))),
+        ).fetchall()
+        return [_knowledge_source_from_row(row) for row in rows]
+
+    def delete_knowledge_source(self, group_id: int, source_id: int) -> bool:
+        source = self.conn.execute(
+            "select * from rag_knowledge_sources where id=? and group_id=? and status='active'",
+            (int(source_id), int(group_id)),
+        ).fetchone()
+        if source is None:
+            return False
+        prefix = str(source["stable_prefix"])
+        rows = self.conn.execute(
+            "select id from rag_documents where stable_key like ? and status='active'",
+            (f"{prefix}%",),
+        ).fetchall()
+        for row in rows:
+            document_id = int(row["id"])
+            if self.fts_available:
+                self.conn.execute("delete from rag_documents_fts where rowid=?", (document_id,))
+        self.conn.execute(
+            "update rag_documents set status='inactive', valid_to=?, updated_at=? where stable_key like ?",
+            (time.time(), time.time(), f"{prefix}%"),
+        )
+        self.conn.execute(
+            "update rag_knowledge_sources set status='deleted', updated_at=? where id=?",
+            (time.time(), int(source_id)),
+        )
+        self.conn.commit()
+        return True
+
+    def reindex_knowledge_source(self, group_id: int, source_id: int) -> int:
+        source = self.conn.execute(
+            "select * from rag_knowledge_sources where id=? and group_id=? and status='active'",
+            (int(source_id), int(group_id)),
+        ).fetchone()
+        if source is None:
+            return 0
+        prefix = str(source["stable_prefix"])
+        rows = self.conn.execute(
+            "select id, content, doc_type from rag_documents where stable_key like ? and status='active'",
+            (f"{prefix}%",),
+        ).fetchall()
+        now = time.time()
+        for row in rows:
+            document_id = int(row["id"])
+            self.conn.execute("delete from rag_embeddings where document_id=?", (document_id,))
+            self.conn.execute(
+                "update rag_documents set embedding_status='pending', updated_at=? where id=?",
+                (now, document_id),
+            )
+            if self.fts_available:
+                self.conn.execute("delete from rag_documents_fts where rowid=?", (document_id,))
+                self.conn.execute(
+                    "insert into rag_documents_fts(rowid,content,group_id,doc_type) values(?,?,?,?)",
+                    (document_id, str(row["content"]), str(group_id), str(row["doc_type"])),
+                )
+        self.conn.commit()
+        return len(rows)
+
     def feedback_adjustments(self, document_ids: list[int]) -> dict[int, float]:
         if not document_ids:
             return {}
@@ -835,6 +1066,11 @@ class RAGStore:
         evaluation_count = int(
             self.conn.execute("select count(*) from rag_evaluation_cases where enabled = 1").fetchone()[0]
         )
+        active_knowledge_sources = int(
+            self.conn.execute(
+                "select count(*) from rag_knowledge_sources where status='active'"
+            ).fetchone()[0]
+        )
         return {
             "fts5": self.fts_available,
             "documents": sum(counts.values()),
@@ -845,6 +1081,7 @@ class RAGStore:
             "last_retrieval_at": float(recent["last_at"] or 0.0) or None,
             "feedback_count": feedback_count,
             "evaluation_case_count": evaluation_count,
+            "active_knowledge_sources": active_knowledge_sources,
         }
 
     def close(self) -> None:
@@ -876,10 +1113,33 @@ def _document_from_row(row: sqlite3.Row) -> RAGDocument:
         source_row_id=str(row["source_row_id"]),
         source_message_ids=source_ids,
         participant_user_ids=participant_ids,
+        asserted_by_user_id=int(row["asserted_by_user_id"]) if row["asserted_by_user_id"] is not None else None,
         created_at=float(row["created_at"]),
+        valid_from=float(row["valid_from"]) if row["valid_from"] is not None else None,
+        valid_to=float(row["valid_to"]) if row["valid_to"] is not None else None,
         importance=float(row["importance"] or 0.0),
         confidence=float(row["confidence"] or 0.0),
         status=str(row["status"]),
+        evidence_kind=str(row["evidence_kind"] or default_evidence_kind(str(row["doc_type"]))),
+    )
+
+
+def _knowledge_source_from_row(row: sqlite3.Row) -> RAGKnowledgeSource:
+    return RAGKnowledgeSource(
+        id=int(row["id"]),
+        group_id=int(row["group_id"]),
+        kind=str(row["kind"]),
+        source_identity=str(row["source_identity"]),
+        title=str(row["title"]),
+        content_hash=str(row["content_hash"]),
+        stable_prefix=str(row["stable_prefix"]),
+        version=int(row["version"]),
+        chunk_count=int(row["chunk_count"]),
+        source_message_id=str(row["source_message_id"]),
+        created_by=int(row["created_by"]),
+        status=str(row["status"]),
+        created_at=float(row["created_at"]),
+        updated_at=float(row["updated_at"]),
     )
 
 

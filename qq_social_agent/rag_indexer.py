@@ -83,6 +83,7 @@ class RAGIndexer:
                     created_at=float(last["created_at"]),
                     importance=0.45,
                     confidence=0.65,
+                    evidence_kind="reported_claim",
                 )
                 indexed += 1
             if rows:
@@ -186,6 +187,7 @@ class RAGIndexer:
                 valid_from=float(row["start_at"]),
                 importance=0.65,
                 confidence=0.65,
+                evidence_kind="summary",
             )
         if rows:
             self.store.set_index_cursor("memory_summaries", "global", int(rows[-1]["id"]))
@@ -231,6 +233,7 @@ class RAGIndexer:
                 importance=float(row["importance"] or 0.5),
                 confidence=float(row["confidence"] or 0.6),
                 status=str(row["status"] or "active"),
+                evidence_kind=("reported_claim" if evidence == "message" else "structured_fact"),
             )
         if rows:
             self.store.set_index_cursor(
@@ -270,6 +273,7 @@ class RAGIndexer:
                     created_at=float(row["last_seen_at"]),
                     importance=0.7,
                     confidence=0.9,
+                    evidence_kind="directory_fact",
                 )
             if rows:
                 self.store.set_index_cursor(
@@ -313,6 +317,7 @@ class RAGIndexer:
                     created_at=float(row["created_at"]),
                     importance=0.62,
                     confidence=0.6,
+                    evidence_kind="profile_summary",
                 )
             if rows:
                 self.store.set_index_cursor(
@@ -349,6 +354,7 @@ class RAGIndexer:
                 created_at=float(row["created_at"]),
                 importance=0.85,
                 confidence=0.9,
+                evidence_kind="curated_definition",
             )
         if rows:
             self.store.set_index_cursor("custom_jargon_entries", "global", int(rows[-1]["id"]))
@@ -383,6 +389,7 @@ class RAGIndexer:
                     created_at=float(row["reason_at"]),
                     importance=0.8,
                     confidence=0.95,
+                    evidence_kind="approval_feedback",
                 )
             if rows:
                 self.store.set_index_cursor(
@@ -415,6 +422,7 @@ class RAGIndexer:
                     created_at=float(row["created_at"]),
                     importance=0.72,
                     confidence=0.9,
+                    evidence_kind="approval_feedback",
                 )
             if rows:
                 self.store.set_index_cursor(

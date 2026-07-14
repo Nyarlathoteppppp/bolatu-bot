@@ -162,7 +162,9 @@ BOT_TOOL_SECTION_MESSAGES = {
 17. RAG反馈 相关/不相关/错人/过期 序号：评价最近一次 RAG 命中，例：RAG反馈 错人 2。
 18. RAG反馈列表：查看近期人工反馈。
 19. RAG评测添加 问题 | 关键词1,关键词2 | QQ号：保存可重复运行的检索用例；QQ 可留空。
-20. RAG评测 / RAG评测列表 / RAG评测删除 ID：运行、查看或删除质量评测用例。""",
+20. RAG评测 / RAG评测列表 / RAG评测删除 ID：运行、查看或删除质量评测用例。
+21. RAG知识库：查看当前群的文件/网页来源、版本和分块数。
+22. RAG知识库删除 ID：软删除来源并停止检索；RAG知识库重建 ID：重新生成全文与向量索引。""",
     "prompt": """bot工具 prompt：
 用法：这里只告诉你该改哪个文件；真正改 prompt 需要在服务器工作区编辑 yaml 后重启后端。
 1. 集中 prompt 文件：/opt/qq-social-agent/prompts/zhangfengxue.yaml。

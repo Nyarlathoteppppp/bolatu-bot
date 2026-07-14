@@ -14,6 +14,7 @@ from openai import AsyncOpenAI
 from .config import DeepSeekConfig, LLMModelRoute, LLMProviderConfig, parse_llm_model_route
 from .memory import ChatMessage
 from .persona import Persona
+from .pipeline_types import ContextPacket
 from .prompts import PromptRegistry
 from .timing_gate import TimingDecision, parse_timing_decision
 
@@ -599,7 +600,17 @@ class DeepSeekClient:
         candidate_count: int = 3,
         prompt_flow: str = "reply_candidates",
         task_name: str = "reply_candidates",
+        context_packet: ContextPacket | None = None,
     ) -> tuple[ReplyCandidateDraft, ...]:
+        if context_packet is not None:
+            memory_context = context_packet.get("memory")
+            style_context = context_packet.get("style")
+            raw_corpus_context = context_packet.get("raw_corpus")
+            jargon_context = context_packet.get("jargon")
+            member_context = context_packet.get("member")
+            memory_atoms_context = context_packet.get("memory_atoms")
+            recall_feedback_context = context_packet.get("recall_feedback")
+            positive_feedback_context = context_packet.get("positive_feedback")
         selected_recent = (
             recent_messages[-max(1, context_message_limit) :]
             if context_message_limit is not None

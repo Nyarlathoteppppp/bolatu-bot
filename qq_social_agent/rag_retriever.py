@@ -18,6 +18,13 @@ from .embedding_client import EmbeddingConfig, SiliconFlowEmbeddingClient
 from .rag_indexer import RAGIndexer
 from .rag_router import RAGQueryPlan, plan_rag_query
 from .rag_store import RAGDocument, RAGEvaluationCase, RAGStore, RankedDocument, ResolvedMember
+from .temporal_evidence import (
+    TemporalIntent,
+    detect_temporal_intent,
+    evidence_kind_label,
+    recency_adjustment,
+    statements_conflict,
+)
 
 
 # Structured memory atoms, member profiles, jargon and approval feedback already have
@@ -255,6 +262,11 @@ class RAGService:
         resolved_members: list[ResolvedMember] = []
         if self.config.enabled:
             resolved_members = self._resolve_query_members(group_id, query)
+            known_ids = {item.user_id for item in resolved_members}
+            for user_id in related_user_ids or []:
+                if int(user_id) > 0 and int(user_id) not in known_ids:
+                    resolved_members.append(ResolvedMember(int(user_id), "上下文指代"))
+                    known_ids.add(int(user_id))
         plan = plan_rag_query(
             query,
             addressed=addressed,
@@ -398,6 +410,9 @@ class RAGService:
             result.append(item)
         return result[:8]
 
+    def resolve_named_user_ids(self, group_id: int, text: str) -> tuple[int, ...]:
+        return tuple(item.user_id for item in self._resolve_query_members(group_id, text))
+
     def _document_types_for_plan(
         self,
         plan: RAGQueryPlan,
@@ -449,6 +464,7 @@ class RAGService:
         related = set(int(value) for value in target_user_ids)
         feedback = self.store.feedback_adjustments(list(combined))
         query_terms = _query_terms(query)
+        temporal_intent = detect_temporal_intent(query)
         hits: list[RAGHit] = []
         seen_content: set[str] = set()
         for entry in combined.values():
@@ -496,6 +512,11 @@ class RAGService:
             feedback_bonus = feedback.get(document.id, 0.0)
             if feedback_bonus:
                 reasons.append("反馈加权" if feedback_bonus > 0 else "反馈降权")
+            time_bonus = recency_adjustment(document.created_at, temporal_intent)
+            if time_bonus >= 0.08:
+                reasons.append("当前问题优先新证据")
+            elif time_bonus < 0:
+                reasons.append("陈旧证据降权")
             score = (
                 0.34 * lexical_score
                 + 0.42 * semantic_score
@@ -505,6 +526,7 @@ class RAGService:
                 + type_bonus
                 + evidence_bonus
                 + feedback_bonus
+                + time_bonus
             )
             if score < self.config.min_score:
                 continue
@@ -513,6 +535,8 @@ class RAGService:
                 continue
             seen_content.add(key)
             hits.append(RAGHit(document, score, lexical_score > 0, semantic_score > 0, tuple(reasons)))
+        if temporal_intent is TemporalIntent.CURRENT:
+            hits = _downgrade_explicitly_contradicted_history(hits, query_terms, related)
         hits.sort(key=lambda hit: (hit.score, hit.document.importance, hit.document.created_at), reverse=True)
         selected: list[RAGHit] = []
         type_counts: dict[str, int] = {}
@@ -557,13 +581,27 @@ class RAGService:
         title: str,
         content: str,
         source_message_id: str = "",
+        created_by: int = 0,
     ) -> int:
         if not self.config.enabled or not self.config.knowledge_enabled or not content.strip():
             return 0
         doc_type = "file_knowledge" if kind == "file" else "web_knowledge"
         source_name = "group_file" if kind == "file" else "web_reader"
-        identity_hash = hashlib.sha256(source_identity.encode("utf-8")).hexdigest()[:20]
-        prefix = f"knowledge:{doc_type}:{int(group_id)}:{identity_hash}:"
+        content_hash = hashlib.sha256(content.strip().encode("utf-8")).hexdigest()
+        source, duplicate = self.store.register_knowledge_source(
+            group_id=group_id,
+            kind=kind,
+            source_identity=source_identity,
+            title=title,
+            content_hash=content_hash,
+            source_message_id=source_message_id,
+            created_by=created_by,
+        )
+        if duplicate:
+            self.store.commit()
+            return source.chunk_count
+        prefix = source.stable_prefix
+        version_prefix = f"{prefix}v{source.version}:"
         chunks = _split_knowledge_text(
             content,
             max_chars=self.config.knowledge_chunk_chars,
@@ -572,7 +610,7 @@ class RAGService:
         keys: list[str] = []
         now = time.time()
         for index, chunk in enumerate(chunks):
-            stable_key = f"{prefix}{index}"
+            stable_key = f"{version_prefix}{index}"
             keys.append(stable_key)
             body = f"标题：{title.strip()[:180]}\n{chunk}"
             self.store.upsert_document(
@@ -581,16 +619,46 @@ class RAGService:
                 doc_type=doc_type,
                 content=body,
                 source_name=source_name,
-                source_row_id=source_identity[:80],
+                source_row_id=f"knowledge_source:{source.id}:v{source.version}",
                 source_message_ids=(source_message_id,) if source_message_id else (),
                 created_at=now,
                 importance=0.62,
                 confidence=0.86,
+                evidence_kind="reference",
             )
-        self.store.delete_documents_by_stable_prefix_except(prefix, keys)
+        self.store.conn.execute(
+            "update rag_documents set status='inactive', valid_to=?, updated_at=? "
+            "where stable_key like ? and stable_key not like ? and status='active'",
+            (time.time(), time.time(), f"{prefix}%", f"{version_prefix}%"),
+        )
+        self.store.update_knowledge_source_chunks(source.id, len(keys))
         self.store.commit()
         self._ensure_embedding_task()
         return len(keys)
+
+    def knowledge_source_report(self, group_id: int) -> str:
+        sources = self.store.knowledge_sources(group_id)
+        if not sources:
+            return "这个群还没有文件或网页知识库来源。"
+        lines = [f"知识库来源（{len(sources)} 个）："]
+        for source in sources:
+            kind = "文件" if source.kind == "file" else "网页"
+            stamp = datetime.fromtimestamp(source.updated_at, RAG_TIMEZONE).strftime("%Y-%m-%d %H:%M")
+            lines.append(
+                f"#{source.id} [{kind}] v{source.version} {source.title or source.source_identity[:40]} "
+                f"（{source.chunk_count}块，{stamp}）"
+            )
+        lines.append("命令：RAG知识库删除 ID；RAG知识库重建 ID")
+        return "\n".join(lines)
+
+    def delete_knowledge_source(self, group_id: int, source_id: int) -> bool:
+        return self.store.delete_knowledge_source(group_id, source_id)
+
+    def reindex_knowledge_source(self, group_id: int, source_id: int) -> int:
+        count = self.store.reindex_knowledge_source(group_id, source_id)
+        if count:
+            self._ensure_embedding_task()
+        return count
 
     def add_feedback(
         self,
@@ -739,7 +807,8 @@ def _format_rag_context(hits: list[RAGHit], *, max_chars: int) -> str:
         source_ids = "、".join(document.source_message_ids[:4]) or document.source_row_id
         speaker = f"；说话人QQ={document.speaker_user_id}" if document.speaker_user_id else ""
         item = (
-            f"{index}. [{DOCUMENT_LABELS.get(document.doc_type, document.doc_type)}；{stamp}{speaker}；"
+            f"{index}. [{DOCUMENT_LABELS.get(document.doc_type, document.doc_type)}；"
+            f"性质={evidence_kind_label(document.evidence_kind)}；{stamp}{speaker}；"
             f"来源={document.source_name}:{source_ids}；得分={hit.score:.2f}；"
             f"匹配={'+'.join(hit.reasons) or '基础排序'}；置信度={document.confidence:.2f}]\n{document.content}"
         )
@@ -753,12 +822,63 @@ def _format_rag_context(hits: list[RAGHit], *, max_chars: int) -> str:
     return "\n".join(lines)
 
 
+def _downgrade_explicitly_contradicted_history(
+    hits: list[RAGHit],
+    query_terms: list[str],
+    target_user_ids: set[int],
+) -> list[RAGHit]:
+    if len(hits) < 2 or not query_terms:
+        return hits
+    ordered = sorted(hits, key=lambda hit: hit.document.created_at, reverse=True)
+    adjusted: dict[int, RAGHit] = {hit.document.id: hit for hit in hits}
+    for newer_index, newer in enumerate(ordered):
+        newer_people = _document_people(newer.document)
+        for older in ordered[newer_index + 1 :]:
+            older_people = _document_people(older.document)
+            if target_user_ids:
+                if not (newer_people & target_user_ids and older_people & target_user_ids):
+                    continue
+            elif newer_people and older_people and not (newer_people & older_people):
+                continue
+            if not statements_conflict(newer.document.content, older.document.content, query_terms):
+                continue
+            current = adjusted[older.document.id]
+            reasons = tuple(dict.fromkeys((*current.reasons, "较新反证降权")))
+            adjusted[older.document.id] = RAGHit(
+                current.document,
+                current.score - 0.28,
+                current.lexical,
+                current.semantic,
+                reasons,
+            )
+            break
+    return list(adjusted.values())
+
+
+def _document_people(document: RAGDocument) -> set[int]:
+    values = set(document.participant_user_ids)
+    for value in (document.speaker_user_id, document.subject_user_id, document.asserted_by_user_id):
+        if value:
+            values.add(value)
+    return values
+
+
 def _query_terms(query: str) -> list[str]:
-    return [
-        value
-        for value in re.findall(r"[\u3400-\u9fff]{2,}|[A-Za-z0-9_+.-]{2,}", query)
-        if value not in {"以前", "之前", "记得", "说过", "聊过", "文件", "网页", "这个", "那个"}
-    ][:10]
+    ignored = {"以前", "之前", "现在", "目前", "最近", "记得", "说过", "聊过", "文件", "网页", "这个", "那个"}
+    terms: list[str] = []
+    for value in re.findall(r"[\u3400-\u9fff]{2,}|[A-Za-z0-9_+.-]{2,}", query):
+        if value in ignored:
+            continue
+        candidates = [value]
+        if re.fullmatch(r"[\u3400-\u9fff]+", value) and len(value) > 3:
+            candidates.extend(value[index : index + 2] for index in range(len(value) - 1))
+        for candidate in candidates:
+            if candidate in ignored or candidate in terms:
+                continue
+            terms.append(candidate)
+            if len(terms) >= 16:
+                return terms
+    return terms
 
 
 def _split_knowledge_text(text: str, *, max_chars: int, overlap_chars: int) -> list[str]:

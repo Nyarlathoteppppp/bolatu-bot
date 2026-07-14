@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from .pipeline_types import PipelineState
+
 
 @dataclass(frozen=True)
 class PendingApprovalCandidate:
@@ -26,3 +28,4 @@ class PendingGroupApproval:
     correlation_id: str = ""
     tool_evidence: str = ""
     trigger_sequence: int = 0
+    pipeline_state: PipelineState | None = None

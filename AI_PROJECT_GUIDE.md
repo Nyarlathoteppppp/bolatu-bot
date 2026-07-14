@@ -103,7 +103,11 @@ Docker / Docker Compose
 │   ├── embedding_client.py        # 硅基流动 embedding 客户端
 │   ├── rag_router.py              # 判断何时只全文检索、何时追加语义检索
 │   ├── rag_retriever.py           # 混合召回、证据过滤、上下文预算和后台向量任务
+│   ├── rag_admin.py               # 私聊 RAG 状态、反馈、评测和知识库管理控制器
 │   ├── pipeline_types.py          # PipelineState / ContextPacket / ToolRequest / ToolResult
+│   ├── pipeline_stages.py         # 决策、上下文、生成、审批、发送的状态迁移
+│   ├── temporal_evidence.py       # 当前/历史意图、证据性质、时间与明确冲突降权
+│   ├── reference_resolver.py      # 他/她/后来呢等轻量上下文指代消解
 │   ├── context_assembler.py       # 按 chat/search/market/deep_url 模式组装和预算上下文
 │   ├── timing_gate.py             # silent/text/react/poke 和五类基本社交意图
 │   ├── tool_router.py             # 搜索/行情/网页确定性路由、连续检索主题继承与审计
@@ -349,7 +353,7 @@ flowchart TD
 - `decision_gate.py` 处理点名、低价值消息和明确行情等确定性规则。
 - `tool_router.py` 独立判断是否需要搜索、行情、网页等工具；明确工具意图不进入 Timing Gate。
 - `timing_gate.py` 不看长期记忆、不选择工具，只决定 `silent/text/react/poke` 和 `answer/care/play/agree/chat`。
-- `PipelineState` 保存当前模式、输出通道、社交意图、工具请求/结果和最终 `ContextPacket`。
+- 每条入站消息只有一份 `PipelineState`；它保存来源、模式、输出通道、社交意图、工具请求/结果、`ContextPacket`、候选、审批 ID、发送消息 ID、失败原因和阶段耗时。审批单携带同一对象进入发送阶段。
 - `ToolRegistry` 已统一注册搜索、行情和深度网页读取；shadow 指标只用于和旧判断做兼容审计，不再控制执行。
 - 只有确定生成文字后，`context_assembler.py` 才组装上下文；普通聊天保留分层记忆，搜索/行情/网页模式主动排除旧摘要、画像、风格和原文语料，避免覆盖新事实。
 - 明确搜索、行情评论和网页阅读使用单候选 `search_answer` 与独立快速模型路由；“帮我研究研究”等连续追问会继承最近一条真实群友问题。
@@ -426,9 +430,12 @@ B[#尾号]回复A[#尾号]消息【A说：...；B回复A：...】
 - 点名/明确要求后成功读取的 txt/PDF/docx 和网页会按来源分块写成 `file_knowledge` / `web_knowledge`，不会跨群检索，也不会执行文档或网页中的指令。
 - Trace 的 `rag` 阶段展示 route、解析到的人物、命中文档 ID/类型/得分/排序原因/证据来源。
 - 私聊工具命令：`RAG状态`、`RAG测试 问题`、`RAG反馈 相关|不相关|错人|过期 序号`、`RAG评测`、`RAG评测列表`、`RAG评测添加 问题 | 关键词 | QQ`。
+- `RAG知识库` 查看文件/网页来源和版本；`RAG知识库删除 ID` 软删除来源；`RAG知识库重建 ID` 重建全文与向量索引。同一群内相同内容不会重复建库，更新来源会保留旧版本审计但只检索新版本。
 - 评测用例是可重复运行的小型回归集，输出 Recall@K、平均延迟和 P95；反馈只调整后续排序，不删除原始证据。
 - 源数据同步由后台 worker 使用独立 SQLite 连接增量执行；消息回复中的 `retrieve()` 只发同步信号，不再内联重建索引。
 - 群友画像索引只保留每人的当前快照可检索，旧快照仍留在源表中用于审计。
+- 检索证据区分“群友当时陈述、历史摘要、结构化事实、阶段画像和文件/网页资料”；问“现在”时新证据获得时间加权，只有同一人物、同一主题出现明确肯定/否定变化时旧证据才会标记“较新反证降权”。问“以前/当时”不会用新鲜度覆盖历史。
+- “他/她/这个人/那后来呢”等只在能够从最近对话唯一解析人物时扩展检索查询；无法唯一确认时不强绑人物，也不额外调用 LLM。
 
 ## 9. 审批机制
 
