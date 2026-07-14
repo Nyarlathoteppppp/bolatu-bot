@@ -118,6 +118,7 @@ class PipelineState:
     self_id: int = 0
     mentioned: bool = False
     replied_to_bot: bool = False
+    private_reply_user_id: int = 0
     reference_user_ids: tuple[int, ...] = ()
     reference_reason: str = "none"
     mode: PipelineMode = PipelineMode.CHAT

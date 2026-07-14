@@ -1564,6 +1564,84 @@ def _ai_work_intensity_selected(percent: int | None = None) -> bool:
     return random.random() < cleaned / 100.0
 
 
+def _ordinary_user_trigger_selected(percent: int) -> bool:
+    cleaned = max(0, min(100, int(percent)))
+    if cleaned >= 100:
+        return True
+    if cleaned <= 0:
+        return False
+    return random.random() < cleaned / 100.0
+
+
+def _looks_like_addressed_question(text: str) -> bool:
+    clean_text = re.sub(r"\s+", "", text or "")
+    if not clean_text:
+        return False
+    if re.search(r"[?？]", clean_text):
+        return True
+    question_terms = (
+        "为什么",
+        "为啥",
+        "怎么",
+        "怎样",
+        "如何",
+        "什么",
+        "谁",
+        "哪里",
+        "哪儿",
+        "哪个",
+        "哪种",
+        "多少",
+        "几次",
+        "几点",
+        "能不能",
+        "是不是",
+        "有没有",
+        "要不要",
+        "可不可以",
+        "行不行",
+        "请问",
+        "帮我查",
+        "帮我看看",
+    )
+    if any(term in clean_text for term in question_terms):
+        return True
+    return bool(re.search(r"(?:吗|嘛|么|呢)[呀啊吧呐~～!！。.]?$", clean_text))
+
+
+def _record_policy_suppressed_group_message(
+    *,
+    group_id: int,
+    user_id: int,
+    nickname: str,
+    text: str,
+    source_message_id: str,
+    correlation_id: str,
+    reason: str,
+    trigger_percent: int | None = None,
+) -> None:
+    memory.add_message(
+        group_id,
+        user_id,
+        nickname,
+        text,
+        is_bot=False,
+        source_message_id=source_message_id,
+        correlation_id=correlation_id,
+    )
+    _record_metric_event(
+        "suppression",
+        group_id=group_id,
+        user_id=user_id,
+        stage="group_user_policy",
+        action=reason,
+        trigger_percent=trigger_percent,
+        source_message_id=source_message_id,
+        correlation_id=correlation_id,
+    )
+    _schedule_group_learning(group_id)
+
+
 def _ai_work_intensity_applies(*, addressed_bot: bool) -> bool:
     return not addressed_bot
 
@@ -2522,6 +2600,13 @@ async def _handle_group_message_scoped(
     pipeline_state.addressed = addressed_bot
     pipeline_state.mentioned = _mentioned_bot(event, bot)
     pipeline_state.replied_to_bot = _replied_to_bot(event, bot) or _reply_reference_to_bot(reply_reference, bot)
+    user_policy = app_config.group_user_policy(int(event.user_id))
+    if (
+        addressed_bot
+        and user_policy.addressed_question_private_reply
+        and _looks_like_addressed_question(plain_text)
+    ):
+        pipeline_state.private_reply_user_id = int(event.user_id)
     _pipeline_mark_understood(pipeline_state)
     if group_allowed and not addressed_bot and _should_ignore_unreadable_media_event(
         event,
@@ -2566,6 +2651,21 @@ async def _handle_group_message_scoped(
             nickname=_nickname(event),
             chat_label=f"QQ 群聊 {group_id}",
         )
+    if group_allowed and user_policy.memory_only:
+        _record_policy_suppressed_group_message(
+            group_id=group_id,
+            user_id=int(event.user_id),
+            nickname=_nickname(event),
+            text=text or raw_text or plain_text or "[只艾特机器人]",
+            source_message_id=source_message_id,
+            correlation_id=correlation_id,
+            reason="memory_only",
+        )
+        logger.info(
+            "qq_social_agent user policy stored without trigger: "
+            f"group={group_id} user={int(event.user_id)} policy=memory_only"
+        )
+        return
     if (
         plain_text
         and group_allowed
@@ -2601,6 +2701,23 @@ async def _handle_group_message_scoped(
         and group_allowed
         and not addressed_bot
     ):
+        if not _ordinary_user_trigger_selected(user_policy.ordinary_trigger_percent):
+            _record_policy_suppressed_group_message(
+                group_id=group_id,
+                user_id=int(event.user_id),
+                nickname=_nickname(event),
+                text=text,
+                source_message_id=source_message_id,
+                correlation_id=correlation_id,
+                reason="ordinary_trigger_probability",
+                trigger_percent=user_policy.ordinary_trigger_percent,
+            )
+            logger.info(
+                "qq_social_agent user policy trigger sample missed: "
+                f"group={group_id} user={int(event.user_id)} "
+                f"percent={user_policy.ordinary_trigger_percent}"
+            )
+            return
         _buffer_group_message(
             bot,
             event,
@@ -6342,11 +6459,22 @@ async def _request_group_approval(bot: Bot, approval: PendingGroupApproval) -> N
         if approval.tool_evidence
         else ""
     )
+    private_reply_user_id = (
+        approval.pipeline_state.private_reply_user_id
+        if approval.pipeline_state is not None
+        else 0
+    )
+    delivery_line = (
+        f"发送位置：私聊 {private_reply_user_id}（仅回复这次群内提问）\n"
+        if private_reply_user_id
+        else ""
+    )
     message = (
         f"待发群：{approval.group_id}\n"
         f"审批ID：{approval.approval_id}\n"
         f"触发人：{_member_label(approval.trigger_user_id, approval.trigger_nickname)}\n"
-        f"触发消息：{approval.trigger_text}\n\n"
+        f"触发消息：{approval.trigger_text}\n"
+        f"{delivery_line}\n"
         f"候选：\n{preview}{evidence_section}\n\n"
         "回复：A/B/C 或 1/2/3 发送；D/X/取消 不发；T 工具单。"
     )
@@ -7171,6 +7299,59 @@ async def _send_approved_group_reply_scoped(
         candidate_index=candidate.index,
         approval_wait_ms=max(0, int((time.time() - approval.created_at) * 1000)),
     )
+    private_reply_user_id = pipeline_state.private_reply_user_id if pipeline_state is not None else 0
+    if private_reply_user_id:
+        private_text = _memory_text_from_reply_part(candidate.text, approval.mention_targets)
+        try:
+            result = await _send_private_message(
+                bot,
+                user_id=private_reply_user_id,
+                message=Message(f"（回复你刚才在群里的提问）\n{private_text}"),
+            )
+            sent_message_id = _extract_message_id(result)
+            if pipeline_state is not None:
+                _pipeline_mark_sent(pipeline_state, sent_message_id)
+                _pipeline_mark_completed(
+                    pipeline_state,
+                    elapsed_ms=int((time.monotonic() - send_started_at) * 1000),
+                )
+            _record_metric_event(
+                "message_sent",
+                group_id=approval.group_id,
+                user_id=approval.trigger_user_id,
+                stage="send",
+                action=candidate.action,
+                delivery="private_group_question_redirect",
+                private_reply_user_id=private_reply_user_id,
+                message_count=1,
+                elapsed_ms=int((time.monotonic() - send_started_at) * 1000),
+                approval_id=approval.approval_id,
+                pipeline_stages=list(pipeline_state.stage_history) if pipeline_state is not None else [],
+            )
+        except ActionFailed as exc:
+            if pipeline_state is not None:
+                _pipeline_mark_failed(pipeline_state, _action_failed_summary(exc))
+            logger.warning(
+                "qq_social_agent failed redirecting group answer to private: "
+                f"group={approval.group_id} user={private_reply_user_id} {_action_failed_summary(exc)}"
+            )
+            _record_metric_event(
+                "private_redirect_failed",
+                group_id=approval.group_id,
+                user_id=private_reply_user_id,
+                stage="send",
+                action="action_failed",
+                approval_id=approval.approval_id,
+                error=_action_failed_summary(exc),
+            )
+            if approver_id is not None and approver_id != private_reply_user_id:
+                await _send_private_text(bot, approver_id, f"私聊转发失败：{_action_failed_summary(exc)}")
+            return
+        if high_quality:
+            _save_approved_reply_feedback(approval, candidate, approver_id=approver_id or 0)
+        if notify_success and approver_id is not None and approver_id != private_reply_user_id:
+            await _send_private_text(bot, approver_id, "已私聊转发。")
+        return
     delivery_plan = build_delivery_plan(
         reply_text=candidate.text,
         mention_targets=approval.mention_targets,

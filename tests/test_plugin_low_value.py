@@ -1930,6 +1930,78 @@ def test_ai_work_intensity_only_applies_to_unaddressed_messages() -> None:
     assert not plugin._ai_work_intensity_applies(addressed_bot=True)
 
 
+def test_ordinary_user_trigger_probability_is_an_independent_gate(monkeypatch) -> None:
+    monkeypatch.setattr(plugin.random, "random", lambda: 0.09)
+    assert plugin._ordinary_user_trigger_selected(10)
+
+    monkeypatch.setattr(plugin.random, "random", lambda: 0.10)
+    assert not plugin._ordinary_user_trigger_selected(10)
+    assert plugin._ordinary_user_trigger_selected(100)
+    assert not plugin._ordinary_user_trigger_selected(0)
+
+
+def test_addressed_question_detection_does_not_redirect_plain_mentions() -> None:
+    assert plugin._looks_like_addressed_question("你吃过这个鹅腿吗")
+    assert plugin._looks_like_addressed_question("帮我看看三维挂谷猜想有什么新进展")
+    assert plugin._looks_like_addressed_question("这个怎么做？")
+    assert not plugin._looks_like_addressed_question("风雪晚上好")
+    assert not plugin._looks_like_addressed_question("这个确实挺好笑")
+
+
+def test_policy_suppressed_message_is_still_recorded_and_learned(monkeypatch, tmp_path) -> None:
+    store = _use_temp_plugin_memory(monkeypatch, tmp_path)
+    learned: list[int] = []
+    monkeypatch.setattr(plugin, "_schedule_group_learning", learned.append)
+
+    plugin._record_policy_suppressed_group_message(
+        group_id=1026813421,
+        user_id=2123506373,
+        nickname="不喜欢机器人",
+        text="这条只进入记忆",
+        source_message_id="9988",
+        correlation_id="group:9988",
+        reason="memory_only",
+    )
+
+    messages = store.recent_messages(1026813421, 3)
+    assert messages[-1].user_id == 2123506373
+    assert messages[-1].text == "这条只进入记忆"
+    assert learned == [1026813421]
+
+
+def test_group_question_answer_can_redirect_to_private_without_group_send(monkeypatch, tmp_path) -> None:
+    store = _use_temp_plugin_memory(monkeypatch, tmp_path)
+    state = plugin.PipelineState(
+        "cid-private-answer",
+        1026813421,
+        3370998238,
+        "审批人",
+        "你怎么看这个问题？",
+        True,
+        private_reply_user_id=3370998238,
+    )
+    approval = plugin.replace(_pending_approval(), trigger_user_id=3370998238, pipeline_state=state)
+    bot = FakeApprovalBot()
+
+    asyncio.run(
+        plugin._send_approved_group_reply(
+            bot,
+            approval,
+            approval.candidates[0],
+            approver_id=None,
+            high_quality=False,
+            notify_success=False,
+        )
+    )
+
+    assert bot.group_messages == []
+    assert bot.private_messages == [
+        (3370998238, "（回复你刚才在群里的提问）\n第一条回复")
+    ]
+    assert all(not message.is_bot for message in store.recent_messages(1026813421, 5))
+    assert state.stage.value == "completed"
+
+
 def test_request_group_approval_auto_sends_by_probability(monkeypatch, tmp_path) -> None:
     store = _use_temp_plugin_memory(monkeypatch, tmp_path)
     plugin._set_approval_auto_send_percent(100)

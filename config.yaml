@@ -12,6 +12,13 @@ access_control:
     - 2776760548
     - 3115344487
 
+group_user_policies:
+  "2123506373":
+    memory_only: true
+  "3370998238":
+    ordinary_trigger_percent: 10
+    addressed_question_private_reply: true
+
 deepseek:
   base_url: https://api.deepseek.com
   providers:

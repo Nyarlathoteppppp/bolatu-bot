@@ -73,6 +73,13 @@ class RateConfig:
     quiet_hours_end: str
 
 
+@dataclass(frozen=True)
+class GroupUserPolicy:
+    memory_only: bool = False
+    ordinary_trigger_percent: int = 100
+    addressed_question_private_reply: bool = False
+
+
 class AppConfig:
     def __init__(self, raw: dict[str, Any]):
         self.raw = raw
@@ -91,6 +98,7 @@ class AppConfig:
         self.allowed_groups = _int_set(access.get("allowed_groups", []))
         self.allowed_private_users = _int_set(access.get("allowed_private_users", []))
         self.user_reply_cooldowns = _int_int_dict(rate.get("user_reply_cooldowns", {}))
+        self.group_user_policies = _group_user_policies(raw.get("group_user_policies", {}))
 
         thinking = str(deepseek.get("thinking", "disabled")).lower()
         if thinking not in {"enabled", "disabled"}:
@@ -216,6 +224,9 @@ class AppConfig:
     def private_user_allowed(self, user_id: int | str) -> bool:
         return not self.allowed_private_users or int(user_id) in self.allowed_private_users
 
+    def group_user_policy(self, user_id: int | str) -> GroupUserPolicy:
+        return self.group_user_policies.get(int(user_id), GroupUserPolicy())
+
 
 def load_config(path: Path | None = None) -> AppConfig:
     config_path = path or PROJECT_ROOT / "config.yaml"
@@ -238,6 +249,31 @@ def _int_int_dict(values: object) -> dict[int, int]:
     if not isinstance(values, dict):
         raise ValueError("expected mapping of int keys to int values")
     return {int(key): int(value) for key, value in values.items()}
+
+
+def _group_user_policies(values: object) -> dict[int, GroupUserPolicy]:
+    if values is None:
+        return {}
+    if not isinstance(values, dict):
+        raise ValueError("group_user_policies must be a mapping")
+    policies: dict[int, GroupUserPolicy] = {}
+    for raw_user_id, raw_policy in values.items():
+        if not isinstance(raw_policy, dict):
+            raise ValueError(f"group_user_policies.{raw_user_id} must be a mapping")
+        try:
+            trigger_percent = int(raw_policy.get("ordinary_trigger_percent", 100))
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"group_user_policies.{raw_user_id}.ordinary_trigger_percent must be an integer"
+            ) from exc
+        policies[int(raw_user_id)] = GroupUserPolicy(
+            memory_only=bool(raw_policy.get("memory_only", False)),
+            ordinary_trigger_percent=max(0, min(100, trigger_percent)),
+            addressed_question_private_reply=bool(
+                raw_policy.get("addressed_question_private_reply", False)
+            ),
+        )
+    return policies
 
 
 def _llm_providers(deepseek: dict[str, Any]) -> dict[str, LLMProviderConfig]:

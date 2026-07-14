@@ -134,6 +134,28 @@ def test_user_reply_cooldowns_can_be_configured() -> None:
     assert config.user_reply_cooldowns == {3370998238: 120, 123: 30}
 
 
+def test_group_user_policies_control_memory_sampling_and_private_redirect() -> None:
+    config = AppConfig(
+        {
+            "group_user_policies": {
+                "2123506373": {"memory_only": True},
+                "3370998238": {
+                    "ordinary_trigger_percent": 10,
+                    "addressed_question_private_reply": True,
+                },
+                "123": {"ordinary_trigger_percent": 150},
+            }
+        }
+    )
+
+    assert config.group_user_policy(2123506373).memory_only
+    delegated = config.group_user_policy("3370998238")
+    assert delegated.ordinary_trigger_percent == 10
+    assert delegated.addressed_question_private_reply
+    assert config.group_user_policy(123).ordinary_trigger_percent == 100
+    assert config.group_user_policy(999).ordinary_trigger_percent == 100
+
+
 def test_usage_tracking_can_be_disabled() -> None:
     config = AppConfig({"deepseek": {"usage_tracking_enabled": False}}).deepseek
 
