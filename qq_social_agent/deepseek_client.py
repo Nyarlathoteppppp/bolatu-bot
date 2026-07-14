@@ -215,7 +215,12 @@ class DeepSeekClient:
         elif task == "daily_review":
             attempt = getattr(self.config, "daily_review_timeout_seconds", 35.0)
             total = getattr(self.config, "daily_review_total_timeout_seconds", 75.0)
-        elif route_name == "reply" or task in {"reply", "reply_direct", "reply_candidates"}:
+        elif route_name in {"reply", "search"} or task in {
+            "reply",
+            "reply_direct",
+            "reply_candidates",
+            "search_answer",
+        }:
             attempt = self.config.reply_timeout_seconds
             total = self.config.reply_total_timeout_seconds
         elif route_name in {"utility", "jargon", "memory", "style", "member_profile"}:
@@ -590,12 +595,18 @@ class DeepSeekClient:
         mention_targets: str = "",
         priority_context: str = "",
         include_bot_history: bool = True,
+        context_message_limit: int | None = None,
         candidate_count: int = 3,
         prompt_flow: str = "reply_candidates",
         task_name: str = "reply_candidates",
     ) -> tuple[ReplyCandidateDraft, ...]:
+        selected_recent = (
+            recent_messages[-max(1, context_message_limit) :]
+            if context_message_limit is not None
+            else recent_messages
+        )
         context_messages = _reply_context_messages(
-            recent_messages,
+            selected_recent,
             include_bot_history=include_bot_history,
         )
         context = _format_context_with_local_focus(context_messages, formatter=_format_message)
@@ -647,8 +658,15 @@ class DeepSeekClient:
             candidate_count=candidate_count,
         )
         direct_reply = prompt_flow == "reply_direct" and candidate_count == 1
+        search_reply = prompt_flow == "search_answer" and candidate_count == 1
         request = {
-            "max_tokens": max(self.config.max_tokens, 320) if direct_reply else max(self.config.max_tokens, 900),
+            "max_tokens": (
+                180
+                if search_reply
+                else max(self.config.max_tokens, 320)
+                if direct_reply
+                else max(self.config.max_tokens, 900)
+            ),
             "response_format": {"type": "json_object"},
             "messages": [
                 {"role": "system", "content": system},
@@ -660,7 +678,12 @@ class DeepSeekClient:
         else:
             request["temperature"] = self.config.temperature
 
-        response = await self._chat_completion(task=task_name, route_name="reply", request=request)
+        generation_route = "search" if search_reply else "reply"
+        response = await self._chat_completion(
+            task=task_name,
+            route_name=generation_route,
+            request=request,
+        )
         content = response.choices[0].message.content or ""
         candidates = _parse_reply_candidates(
             content,
@@ -682,7 +705,7 @@ class DeepSeekClient:
         try:
             retry_response = await self._chat_completion(
                 task=task_name,
-                route_name="reply",
+                route_name=generation_route,
                 request=retry_request,
             )
             retry_content = retry_response.choices[0].message.content or ""
@@ -1592,7 +1615,7 @@ def _reply_candidates_retry_request(
                     f"上一轮只成功解析出 {parsed_count} 条候选，但必须给满 {candidate_count} 条。"
                     "请重新输出一个完整 JSON 对象，格式严格为 "
                     '{"candidates":[{"text":"...","style":"...","action":"reply"}]}。'
-                    f"candidates 必须正好 {candidate_count} 条，text 不能空，三条不能重复，"
+                    f"candidates 必须正好 {candidate_count} 条，text 不能空，各条不能重复，"
                     f"不要输出 JSON 以外的任何文字。{avoid_instruction}"
                 ),
             },
@@ -1600,7 +1623,8 @@ def _reply_candidates_retry_request(
     )
     retry_request = dict(request)
     retry_request["messages"] = messages
-    retry_request["max_tokens"] = max(int(request.get("max_tokens", 0) or 0), 900)
+    retry_floor = 320 if candidate_count == 1 else 900
+    retry_request["max_tokens"] = max(int(request.get("max_tokens", 0) or 0), retry_floor)
     retry_request["response_format"] = {"type": "json_object"}
     return retry_request
 

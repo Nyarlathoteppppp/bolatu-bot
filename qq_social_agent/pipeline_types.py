@@ -12,6 +12,13 @@ class OutputChannel(str, Enum):
     POKE = "poke"
 
 
+class PipelineMode(str, Enum):
+    CHAT = "chat"
+    SEARCH = "search"
+    MARKET = "market"
+    DEEP_URL = "deep_url"
+
+
 class SocialIntent(str, Enum):
     ANSWER = "answer"
     CARE = "care"
@@ -62,9 +69,11 @@ class ContextSection:
 
 @dataclass(frozen=True)
 class ContextPacket:
+    mode: PipelineMode = PipelineMode.CHAT
     sections: tuple[ContextSection, ...] = ()
     rag_document_ids: tuple[int, ...] = ()
     rag_document_types: tuple[str, ...] = ()
+    dropped_sections: tuple[str, ...] = ()
 
     def get(self, name: str, default: str = "") -> str:
         for section in self.sections:
@@ -84,10 +93,19 @@ class PipelineState:
     nickname: str
     text: str
     addressed: bool
+    mode: PipelineMode = PipelineMode.CHAT
     trigger_sequence: int = 0
     output_channel: OutputChannel = OutputChannel.SILENT
     social_intent: SocialIntent = SocialIntent.CHAT
+    decision_action: str = "ignore"
+    decision_reason: str = ""
+    decision_confidence: float = 0.0
     tool_requests: tuple[ToolRequest, ...] = ()
     tool_results: tuple[ToolResult, ...] = ()
     context: ContextPacket = field(default_factory=ContextPacket)
 
+    def add_tool_result(self, result: ToolResult) -> None:
+        self.tool_results = (*self.tool_results, result)
+
+    def tool_result(self, kind: ToolKind) -> ToolResult | None:
+        return next((item for item in self.tool_results if item.kind == kind), None)

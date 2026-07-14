@@ -696,3 +696,59 @@ def test_reply_direct_uses_direct_prompt_and_one_candidate() -> None:
     user_prompt = captured_calls[0][2]["messages"][1]["content"]
     assert "只生成 1 条" in system_prompt
     assert "输出 1 条最终要直接发送的回复 JSON" in user_prompt
+
+
+def test_search_answer_uses_fast_route_and_small_prompt_budget() -> None:
+    client = DeepSeekClient.__new__(DeepSeekClient)
+    client.config = SimpleNamespace(
+        max_tokens=260,
+        thinking="disabled",
+        reasoning_effort="low",
+        temperature=0.6,
+    )
+    client.prompts = PromptRegistry()
+    captured_calls: list[tuple[str, str, dict[str, object]]] = []
+
+    async def fake_chat_completion(*, task: str, route_name: str, request: dict[str, object]) -> object:
+        captured_calls.append((task, route_name, request))
+        return SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(
+                        content='{"candidates":[{"text":"截至今天，KOSPI仍处于技术性熊市。","style":"事实优先","action":"answer"}]}'
+                    )
+                )
+            ]
+        )
+
+    client._chat_completion = fake_chat_completion
+    persona = Persona(
+        id="test",
+        name="张风雪",
+        description="",
+        prompt="人格",
+        decision_prompt="决策人格",
+        keywords=(),
+        max_reply_chars=220,
+        passive_reply_probability=0.5,
+    )
+
+    candidates = asyncio.run(
+        client.reply_candidates(
+            persona=persona,
+            recent_messages=[],
+            current_text="搜索韩国股市现状",
+            current_nickname="A[#11111]",
+            mentioned=True,
+            action="answer",
+            fresh_context="最新背景信息：KOSPI下跌超过20%。",
+            candidate_count=1,
+            prompt_flow="search_answer",
+            task_name="search_answer",
+        )
+    )
+
+    assert candidates[0].text.startswith("截至今天")
+    assert captured_calls[0][0:2] == ("search_answer", "search")
+    assert captured_calls[0][2]["max_tokens"] == 180
+    assert "旧说法" in captured_calls[0][2]["messages"][0]["content"]

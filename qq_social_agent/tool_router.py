@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, replace
+from typing import Iterable
 
 from .deepseek_client import ReplyDecision, ToolSymbol
-from .pipeline_types import ToolKind, ToolRequest
+from .pipeline_types import PipelineMode, ToolKind, ToolRequest
 from .tools.fresh_context import FreshIntent
 from .tools.market_intent import MarketIntent
 
@@ -30,6 +31,10 @@ ACADEMIC_QUESTION_TERMS = (
     "最新进展",
     "有什么进展",
     "怎么理解",
+)
+FOLLOWUP_LOOKUP_RE = re.compile(
+    r"(?:帮我|给我|你)?\s*(?:继续|接着|再)?\s*"
+    r"(?:研究研究|研究一下|深入研究|详细查查|详细查一下|展开查|展开看看|具体看看|继续搜|接着搜|再查查)"
 )
 
 
@@ -105,9 +110,46 @@ def route_tools(
                 query=text,
                 reason="addressed_url",
                 required=False,
+                arguments={"addressed": True},
             )
         )
     return ToolRoutePlan(tuple(_dedupe_requests(requests)))
+
+
+def route_mode(plan: ToolRoutePlan) -> PipelineMode:
+    if plan.first(ToolKind.MARKET) is not None:
+        return PipelineMode.MARKET
+    if plan.first(ToolKind.FRESH_SEARCH) is not None:
+        return PipelineMode.SEARCH
+    if plan.first(ToolKind.DEEP_URL) is not None:
+        return PipelineMode.DEEP_URL
+    return PipelineMode.CHAT
+
+
+def infer_followup_fresh_intent(
+    text: str,
+    recent_messages: Iterable[object],
+    *,
+    addressed: bool,
+) -> FreshIntent | None:
+    """Turn an addressed "research this further" turn into a concrete lookup.
+
+    The topic is taken from the latest substantive user message rather than
+    from the bot's previous answer, so an earlier hallucination cannot become
+    the next search query.
+    """
+
+    if not addressed or FOLLOWUP_LOOKUP_RE.search(text) is None:
+        return None
+    for message in reversed(tuple(recent_messages)):
+        if bool(getattr(message, "is_bot", False)):
+            continue
+        candidate = re.sub(r"\s+", " ", str(getattr(message, "text", "") or "")).strip()
+        if not _useful_followup_topic(candidate, current_text=text):
+            continue
+        kind = "news" if any(token in candidate for token in ("现在", "今天", "最新", "今年", "刚刚")) else "web"
+        return FreshIntent(candidate[:120], kind, explicit=True, required=True)
+    return None
 
 
 def apply_tool_plan(decision: ReplyDecision, plan: ToolRoutePlan) -> ReplyDecision:
@@ -174,3 +216,16 @@ def _is_academic_lookup(text: str) -> bool:
     return any(term in clean for term in ACADEMIC_TOPIC_TERMS) and any(
         term in clean for term in ACADEMIC_QUESTION_TERMS
     )
+
+
+def _useful_followup_topic(candidate: str, *, current_text: str) -> bool:
+    compact = re.sub(r"[\s，。！？,.!?]+", "", candidate)
+    if len(compact) < 4 or candidate == current_text:
+        return False
+    if FOLLOWUP_LOOKUP_RE.search(candidate):
+        return False
+    if candidate.startswith("[") and any(
+        marker in candidate for marker in ("[图片", "[表情包", "[语音", "[视频")
+    ):
+        return False
+    return True

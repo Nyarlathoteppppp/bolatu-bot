@@ -26,6 +26,7 @@ deepseek:
   model: siliconflow/MiniMaxAI/MiniMax-M2.5
   decision_model: siliconflow/Qwen/Qwen3.5-35B-A3B
   reply_model: siliconflow/MiniMaxAI/MiniMax-M2.5
+  search_model: siliconflow/Qwen/Qwen3.5-35B-A3B
   utility_model: siliconflow/MiniMaxAI/MiniMax-M2.5
   jargon_model: siliconflow/Qwen/Qwen3.5-35B-A3B
   memory_model: siliconflow/Qwen/Qwen3.5-35B-A3B
@@ -40,6 +41,7 @@ deepseek:
   fallback_models:
     decision: deepseek/deepseek-v4-flash
     reply: deepseek/deepseek-v4-flash
+    search: deepseek/deepseek-v4-flash
     utility: deepseek/deepseek-v4-flash
     jargon: deepseek/deepseek-v4-flash
     memory: deepseek/deepseek-v4-flash

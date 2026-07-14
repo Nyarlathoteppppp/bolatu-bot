@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import html
 import inspect
 import os
@@ -226,12 +227,18 @@ class FreshContextTool:
             attempted.append(provider_name)
             used_provider = provider_name
             try:
-                answer, items = await self._lookup_provider(
-                    provider_name,
-                    normalized_query,
-                    kind=normalized_kind,
-                    timeout_seconds=remaining,
+                answer, items = await asyncio.wait_for(
+                    self._lookup_provider(
+                        provider_name,
+                        normalized_query,
+                        kind=normalized_kind,
+                        timeout_seconds=remaining,
+                    ),
+                    timeout=max(0.1, remaining),
                 )
+            except asyncio.TimeoutError:
+                errors.append(f"{provider_name}:total_timeout")
+                answer, items = "", ()
             except SearchProviderError as exc:
                 errors.append(f"{provider_name}:{exc.code}")
                 answer, items = "", ()

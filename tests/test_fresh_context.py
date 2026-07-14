@@ -1,3 +1,5 @@
+import asyncio
+
 import pytest
 
 import qq_social_agent.tools.fresh_context as fresh_context
@@ -161,6 +163,27 @@ async def test_tavily_answer_without_items_keeps_tavily_provider(monkeypatch) ->
     assert lookup.provider == "tavily"
     assert lookup.status == "ok"
     assert lookup.answer == "只有摘要，没有列表。"
+
+
+@pytest.mark.anyio
+async def test_fresh_context_enforces_total_timeout(monkeypatch) -> None:
+    async def slow_tavily_lookup(query: str, *, kind: str, api_key: str):
+        await asyncio.sleep(2)
+        return "不该等到这里", ()
+
+    monkeypatch.setattr(fresh_context, "_fetch_tavily_lookup", slow_tavily_lookup)
+    tool = FreshContextTool(
+        provider="tavily",
+        tavily_api_key="test-key",
+        timeout_seconds=1,
+    )
+    started = asyncio.get_running_loop().time()
+
+    lookup = await tool.lookup("严格超时测试")
+
+    assert asyncio.get_running_loop().time() - started < 1.3
+    assert lookup.status == "failed"
+    assert "total_timeout" in lookup.error
 
 
 def test_detect_explicit_web_news_and_sports_intents() -> None:

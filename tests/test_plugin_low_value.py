@@ -1687,6 +1687,27 @@ def test_owner_can_switch_reply_model(monkeypatch, tmp_path) -> None:
     )
 
 
+def test_owner_can_switch_search_model(monkeypatch, tmp_path) -> None:
+    store = _use_temp_plugin_memory(monkeypatch, tmp_path)
+    client = FakeModelClient()
+    monkeypatch.setattr(plugin, "deepseek_client", client)
+    bot = FakeApprovalBot()
+
+    handled = asyncio.run(
+        plugin._handle_group_approval_private(
+            bot,
+            1535071184,
+            "切搜索模型 deepseek/deepseek-v4-flash",
+        )
+    )
+
+    assert handled
+    assert client.current_route("search").label == "deepseek/deepseek-v4-flash"
+    assert '"search": "deepseek/deepseek-v4-flash"' in store.app_kv_get(
+        plugin.MODEL_ROUTE_OVERRIDES_KEY
+    )
+
+
 def test_owner_can_switch_style_model(monkeypatch, tmp_path) -> None:
     store = _use_temp_plugin_memory(monkeypatch, tmp_path)
     client = FakeModelClient()

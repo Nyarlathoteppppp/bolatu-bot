@@ -8,6 +8,7 @@ def test_deepseek_split_models_default_to_flash_for_utility() -> None:
 
     assert config.model == "deepseek-v4-pro"
     assert config.reply_model == "deepseek-v4-pro"
+    assert config.search_model == "deepseek-v4-flash"
     assert config.decision_model == "deepseek-v4-flash"
     assert config.utility_model == "deepseek-v4-flash"
     assert config.jargon_model == "deepseek-v4-flash"
@@ -22,6 +23,7 @@ def test_deepseek_split_models_can_be_configured() -> None:
                 "model": "base",
                 "decision_model": "decision",
                 "reply_model": "reply",
+                "search_model": "search",
                 "utility_model": "utility",
                 "jargon_model": "jargon",
                 "memory_model": "memory",
@@ -33,6 +35,7 @@ def test_deepseek_split_models_can_be_configured() -> None:
 
     assert config.decision_model == "decision"
     assert config.reply_model == "reply"
+    assert config.search_model == "search"
     assert config.utility_model == "utility"
     assert config.jargon_model == "jargon"
     assert config.memory_model == "memory"

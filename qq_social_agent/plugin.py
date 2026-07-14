@@ -39,6 +39,7 @@ from .approval_rules import (
     JARGON_LIST_RE,
     TOKEN_REPORT_COMMAND_ALIASES,
 )
+from .approval_models import PendingApprovalCandidate, PendingGroupApproval
 from .background_learning import BackgroundLearningCoordinator
 from .config import load_config
 from .context_assembler import assemble_generation_context
@@ -52,6 +53,7 @@ from .decision_gate import (
     pre_decision_gate as _pre_decision_gate,
 )
 from .deepseek_client import DeepSeekClient, MemberProfileDraft, ReplyDecision, set_usage_recorder
+from .delivery import build_delivery_plan
 from .group_jargon import (
     GroupJargonEntry,
     detect_group_jargon_terms,
@@ -103,11 +105,18 @@ from .observability import (
     render_trace_html,
 )
 from .persona import PersonaRegistry
-from .pipeline_types import PipelineState, ToolKind, ToolRequest, ToolResult
+from .pipeline_types import (
+    OutputChannel,
+    PipelineMode,
+    PipelineState,
+    SocialIntent,
+    ToolKind,
+    ToolRequest,
+    ToolResult,
+)
 from .political_guard import has_political_redline, political_safe_reply, sanitize_political_output
 from .rate_limiter import RateLimiter
 from .rag_retriever import RAGRetrievalResult, RAGService
-from .reply_splitter import split_reply_messages
 from .social_actions import PokeContext, SocialActionService, reaction_from_action
 from .tools.fresh_context import (
     FreshContextTool,
@@ -121,6 +130,8 @@ from .tool_router import (
     ToolRoutePlan,
     apply_tool_plan as _apply_tool_plan,
     compare_legacy_decision as _compare_legacy_tool_decision,
+    infer_followup_fresh_intent as _infer_followup_fresh_intent,
+    route_mode as _tool_route_mode,
     route_tools as _route_tools,
 )
 from .tool_registry import ToolRegistry, ToolSpec
@@ -373,7 +384,7 @@ MODEL_ROUTE_OVERRIDES_KEY = "llm_model_route_overrides"
 MODEL_ROUTE_STATUS_COMMANDS = {"模型状态", "模型", "model status", "/模型状态"}
 MODEL_ROUTE_RESET_COMMANDS = {"清模型覆盖", "清除模型覆盖", "重置模型", "恢复默认模型", "model reset", "/清模型覆盖"}
 MODEL_ROUTE_COMMAND_RE = re.compile(
-    r"^(?:/)?(?:切|设置|更换|改)?(?P<target>回复|reply|决策|decision|黑话|jargon|记忆|memory|回想|风格|style|学习|style_learning|画像|群友画像|member_profile|profile|工具|utility|utility_model)模型\s+"
+    r"^(?:/)?(?:切|设置|更换|改)?(?P<target>回复|reply|搜索|search|决策|decision|黑话|jargon|记忆|memory|回想|风格|style|学习|style_learning|画像|群友画像|member_profile|profile|工具|utility|utility_model)模型\s+"
     r"(?P<model>\S.+)$",
     re.IGNORECASE,
 )
@@ -430,6 +441,7 @@ PRIVATE_CONTEXT_RESET_COMMANDS = {
 MODEL_ROUTE_INFOS = (
     ("decision", "决策", "群聊是否插嘴、action、是否需要联网搜索"),
     ("reply", "回复", "私聊回复、群聊审批三候选生成"),
+    ("search", "搜索回复", "消化联网事实并生成精简回答"),
     ("jargon", "黑话", "黑话词典注入选择"),
     ("memory", "记忆", "中期聊天回想压缩"),
     ("style", "风格", "群聊表达风格学习"),
@@ -468,31 +480,6 @@ class BufferedGroupMessage:
 
 
 @dataclass(frozen=True)
-class PendingApprovalCandidate:
-    index: int
-    text: str
-    action: str
-    style: str
-
-
-@dataclass(frozen=True)
-class PendingGroupApproval:
-    approval_id: str
-    group_id: int
-    trigger_user_id: int
-    trigger_nickname: str
-    trigger_text: str
-    persona_name: str
-    self_id: int
-    candidates: tuple[PendingApprovalCandidate, ...]
-    mention_targets: dict[int, str]
-    created_at: float
-    correlation_id: str = ""
-    tool_evidence: str = ""
-    trigger_sequence: int = 0
-
-
-@dataclass(frozen=True)
 class PassiveDecisionState:
     last_decision_at: float
     waiting_count: int
@@ -527,6 +514,20 @@ async def _init_client() -> None:
             ToolKind.FRESH_SEARCH,
             "查询最新新闻、网页、赛程或其他时效信息",
             _execute_registered_fresh_search,
+        )
+    )
+    tool_registry.register(
+        ToolSpec(
+            ToolKind.MARKET,
+            "查询美股或加密资产行情并生成可核验的工具报告",
+            _execute_registered_market,
+        )
+    )
+    tool_registry.register(
+        ToolSpec(
+            ToolKind.DEEP_URL,
+            "安全读取群友明确发来的网页正文",
+            _execute_registered_deep_url,
         )
     )
     _apply_model_route_overrides()
@@ -1609,7 +1610,7 @@ def _format_model_route_status() -> str:
         provider = app_config.deepseek.providers[route.provider]
         lines.append(f"- {route.label}（{_provider_key_source(provider.name)} / {provider.api_key_env}）")
     lines.append("")
-    lines.append("命令示例：切回复模型 siliconflow/MiniMaxAI/MiniMax-M2.5；切画像模型 siliconflow/MiniMaxAI/MiniMax-M2.5；切决策模型 siliconflow/Qwen/Qwen3.5-35B-A3B；清模型覆盖。")
+    lines.append("命令示例：切回复模型 siliconflow/MiniMaxAI/MiniMax-M2.5；切搜索模型 siliconflow/Qwen/Qwen3.5-35B-A3B；切决策模型 siliconflow/Qwen/Qwen3.5-35B-A3B；清模型覆盖。")
     return "\n".join(lines)
 
 
@@ -1708,6 +1709,8 @@ def _model_route_name_from_text(target: str) -> str | None:
     mapping = {
         "回复": "reply",
         "reply": "reply",
+        "搜索": "search",
+        "search": "search",
         "决策": "decision",
         "decision": "decision",
         "黑话": "jargon",
@@ -1839,6 +1842,52 @@ def _record_tool_router_shadow(
     tool_router_shadow_samples += 1
 
 
+def _tool_plan_with_runtime_context(
+    plan: ToolRoutePlan,
+    *,
+    addressed: bool,
+    group_id: int,
+    source_message_id: str,
+) -> ToolRoutePlan:
+    requests: list[ToolRequest] = []
+    for request in plan.requests:
+        arguments = dict(request.arguments)
+        if request.kind is ToolKind.DEEP_URL:
+            arguments.update(
+                {
+                    "addressed": addressed,
+                    "group_id": group_id,
+                    "source_message_id": source_message_id,
+                }
+            )
+        requests.append(replace(request, arguments=arguments))
+    return ToolRoutePlan(tuple(requests), source=plan.source)
+
+
+def _apply_decision_to_pipeline_state(
+    pipeline_state: PipelineState,
+    decision: ReplyDecision,
+) -> None:
+    pipeline_state.decision_action = decision.action
+    pipeline_state.decision_reason = decision.reason
+    pipeline_state.decision_confidence = decision.confidence
+    if not decision.should_reply:
+        pipeline_state.output_channel = OutputChannel.SILENT
+        return
+    if decision.action == "react":
+        pipeline_state.output_channel = OutputChannel.REACT
+    elif decision.action == "poke":
+        pipeline_state.output_channel = OutputChannel.POKE
+    else:
+        pipeline_state.output_channel = OutputChannel.TEXT
+    pipeline_state.social_intent = {
+        "answer": SocialIntent.ANSWER,
+        "care": SocialIntent.CARE,
+        "tease": SocialIntent.PLAY,
+        "agree": SocialIntent.AGREE,
+    }.get(decision.action, SocialIntent.CHAT)
+
+
 def _http_status_payload() -> dict[str, object]:
     now = time.time()
     db_ok, db_error = _status_db_health()
@@ -1879,7 +1928,9 @@ def _http_status_payload() -> dict[str, object]:
         ),
         "pipeline": {
             "timing_gate": "active",
-            "tool_router": "explicit_active_shadow_audit",
+            "tool_router": "active",
+            "registered_tools": [spec.kind.value for spec in tool_registry.available()],
+            "shadow_audit": "legacy_comparison_only",
             "tool_router_shadow_samples": tool_router_shadow_samples,
             "tool_router_shadow_target": TOOL_ROUTER_SHADOW_SAMPLE_LIMIT,
         },
@@ -2732,12 +2783,17 @@ async def _handle_group_message_locked(
     market_topic = bool(market_intents) or is_market_topic(text)
     fresh_intent = detect_fresh_intent(text)
     market_forced = bool(market_intents) and _is_explicit_market_lookup(text)
-    tool_plan = _route_tools(
-        text,
-        market_intents=market_intents,
-        fresh_intent=fresh_intent,
+    tool_plan = _tool_plan_with_runtime_context(
+        _route_tools(
+            text,
+            market_intents=market_intents,
+            fresh_intent=fresh_intent,
+            addressed=addressed_bot,
+            market_required=market_forced,
+        ),
         addressed=addressed_bot,
-        market_required=market_forced,
+        group_id=group_id,
+        source_message_id=source_message_id,
     )
     pipeline_state = PipelineState(
         correlation_id=correlation_id or current_correlation_id(),
@@ -2746,6 +2802,7 @@ async def _handle_group_message_locked(
         nickname=nickname,
         text=text,
         addressed=addressed_bot,
+        mode=_tool_route_mode(tool_plan),
         trigger_sequence=trigger_sequence,
         tool_requests=tool_plan.requests,
     )
@@ -2905,6 +2962,32 @@ async def _handle_group_message_locked(
     jargon_context = ""
     context_query = _context_query_text(text, nickname, context_recent)
     related_member_user_ids = _related_member_user_ids(context_recent, current_user_id=user_id)
+    if fresh_intent is None:
+        followup_fresh_intent = _infer_followup_fresh_intent(
+            text,
+            context_recent,
+            addressed=addressed_bot,
+        )
+        if followup_fresh_intent is not None:
+            fresh_intent = followup_fresh_intent
+            tool_plan = _tool_plan_with_runtime_context(
+                _route_tools(
+                    text,
+                    market_intents=market_intents,
+                    fresh_intent=fresh_intent,
+                    addressed=addressed_bot,
+                    market_required=market_forced,
+                ),
+                addressed=addressed_bot,
+                group_id=group_id,
+                source_message_id=source_message_id,
+            )
+            pipeline_state.tool_requests = tool_plan.requests
+            pipeline_state.mode = _tool_route_mode(tool_plan)
+            logger.info(
+                "qq_social_agent inferred follow-up search: "
+                f"group={group_id} query={fresh_intent.query!r} kind={fresh_intent.kind}"
+            )
     rag_task: asyncio.Task[RAGRetrievalResult] = asyncio.create_task(
         rag_service.retrieve(
             group_id=group_id,
@@ -2915,19 +2998,23 @@ async def _handle_group_message_locked(
     )
     rag_result: RAGRetrievalResult | None = None
     rag_context_applied = False
-    fresh_context_task: asyncio.Task[str] | None = None
+    fresh_context_task: asyncio.Task[ToolResult] | None = None
+    market_context_task: asyncio.Task[ToolResult] | None = None
     if fresh_intent is not None and (fresh_intent.explicit or fresh_intent.required):
-        prefetched_decision = ReplyDecision(
-            should_reply=True,
-            confidence=1.0,
+        fresh_request = tool_plan.first(ToolKind.FRESH_SEARCH) or ToolRequest(
+            ToolKind.FRESH_SEARCH,
+            query=fresh_intent.query,
             reason="backend_fresh_prefetch",
-            action="answer",
-            need_fresh_context=True,
-            fresh_query=fresh_intent.query,
-            fresh_kind=fresh_intent.kind,
+            required=True,
+            arguments={"kind": fresh_intent.kind},
         )
         fresh_context_task = asyncio.create_task(
-            _fresh_context_for(prefetched_decision, fallback_text=text)
+            _execute_fresh_tool_request(fresh_request, metric_stage="fresh_context")
+        )
+    prefetched_market_request = tool_plan.first(ToolKind.MARKET)
+    if prefetched_market_request is not None and prefetched_market_request.required:
+        market_context_task = asyncio.create_task(
+            tool_registry.execute(prefetched_market_request)
         )
 
     pre_decision = _pre_decision_gate(
@@ -2944,6 +3031,10 @@ async def _handle_group_message_locked(
     if pre_decision.skip_reason:
         if not rag_task.done():
             rag_task.cancel()
+        if fresh_context_task is not None and not fresh_context_task.done():
+            fresh_context_task.cancel()
+        if market_context_task is not None and not market_context_task.done():
+            market_context_task.cancel()
         logger.info(
             "qq_social_agent skipped by local pre-decision gate: "
             f"group={group_id} reason={pre_decision.skip_reason}"
@@ -2965,6 +3056,23 @@ async def _handle_group_message_locked(
         user_id=user_id,
         decision=decision or ReplyDecision(False, 0.0, "legacy_pending", action="ignore"),
         tool_plan=tool_plan,
+    )
+    _record_metric_event(
+        "tool_route_plan",
+        group_id=group_id,
+        user_id=user_id,
+        stage="routing",
+        action="active",
+        pipeline_mode=pipeline_state.mode.value,
+        requests=[
+            {
+                "kind": request.kind.value,
+                "required": request.required,
+                "reason": request.reason,
+                "query": _short_notice_text(request.query, 80),
+            }
+            for request in pipeline_state.tool_requests
+        ],
     )
     if decision is None and any(request.required for request in tool_plan.requests):
         decision = _apply_tool_plan(
@@ -3053,6 +3161,7 @@ async def _handle_group_message_locked(
         addressed_bot=addressed_bot,
         text=text,
     )
+    _apply_decision_to_pipeline_state(pipeline_state, decision)
     if addressed_bot and "非点名" in decision.reason:
         logger.warning(
             "qq_social_agent decision state mismatch: "
@@ -3079,11 +3188,13 @@ async def _handle_group_message_locked(
         flow_elapsed_ms=int((time.monotonic() - flow_started_at) * 1000),
     )
     _schedule_group_learning(group_id)
-    if not decision.should_reply:
+    if pipeline_state.output_channel is OutputChannel.SILENT:
         if not rag_task.done():
             rag_task.cancel()
         if fresh_context_task is not None and not fresh_context_task.done():
             fresh_context_task.cancel()
+        if market_context_task is not None and not market_context_task.done():
+            market_context_task.cancel()
         await _send_approval_suppression_notice(
             bot,
             group_id=group_id,
@@ -3098,7 +3209,7 @@ async def _handle_group_message_locked(
         )
         return
 
-    if decision.action == "react":
+    if pipeline_state.output_channel is OutputChannel.REACT:
         if not rag_task.done():
             rag_task.cancel()
         await _execute_reaction_action(
@@ -3114,7 +3225,7 @@ async def _handle_group_message_locked(
         )
         return
 
-    if decision.action == "poke":
+    if pipeline_state.output_channel is OutputChannel.POKE:
         if not rag_task.done():
             rag_task.cancel()
         await _execute_poke_action(
@@ -3234,6 +3345,7 @@ async def _handle_group_message_locked(
         rag_document_types=tuple(
             hit.document.doc_type for hit in rag_result.hits
         ) if rag_result is not None else (),
+        mode=pipeline_state.mode,
     )
     pipeline_state.context = context_packet
     memory_context = context_packet.get("memory")
@@ -3252,6 +3364,8 @@ async def _handle_group_message_locked(
         action="ready",
         section_names=[section.name for section in context_packet.sections],
         section_chars={section.name: len(section.content) for section in context_packet.sections},
+        pipeline_mode=context_packet.mode.value,
+        dropped_sections=list(context_packet.dropped_sections),
         rag_document_ids=list(context_packet.rag_document_ids),
         rag_document_types=list(context_packet.rag_document_types),
     )
@@ -3264,9 +3378,42 @@ async def _handle_group_message_locked(
             fallback_text=text,
             fallback_intents=market_intents,
         )
-        market_report, market_context = await _market_report_and_context_for(
-            requested_intents,
-            market_topic=market_topic,
+        market_request = tool_plan.first(ToolKind.MARKET) or ToolRequest(
+            ToolKind.MARKET,
+            query=text,
+            reason="decision_requires_market",
+            required=True,
+            arguments={
+                "symbols": tuple(
+                    {
+                        "kind": item.kind,
+                        "symbol": item.symbol,
+                        "display": item.display_name,
+                    }
+                    for item in requested_intents[:2]
+                )
+            },
+        )
+        market_result = (
+            await market_context_task
+            if market_context_task is not None and market_request == prefetched_market_request
+            else await tool_registry.execute(market_request)
+        )
+        pipeline_state.add_tool_result(market_result)
+        market_report = market_result.evidence
+        market_context = market_result.context
+        _record_metric_event(
+            "tool_call",
+            group_id=group_id,
+            user_id=user_id,
+            stage="market",
+            action="registry_execute",
+            tool_kind=ToolKind.MARKET.value,
+            success=market_result.ok,
+            status=market_result.status,
+            latency_ms=market_result.elapsed_ms,
+            error=market_result.error,
+            **dict(market_result.metadata),
         )
         if market_report:
             logger.info(
@@ -3308,21 +3455,44 @@ async def _handle_group_message_locked(
             and decision.fresh_query.strip() == fresh_intent.query
             and decision.fresh_kind == fresh_intent.kind
         ):
-            fresh_context = await fresh_context_task
+            fresh_result = await fresh_context_task
         else:
             if fresh_context_task is not None and not fresh_context_task.done():
                 fresh_context_task.cancel()
-            fresh_context = await _fresh_context_for(decision, fallback_text=text)
+            query = decision.fresh_query.strip() or text.strip()
+            fresh_result = await _execute_fresh_tool_request(
+                ToolRequest(
+                    ToolKind.FRESH_SEARCH,
+                    query=query,
+                    reason="reply_requires_fresh_context",
+                    required=True,
+                    arguments={"kind": decision.fresh_kind},
+                ),
+                metric_stage="fresh_context",
+            )
+        pipeline_state.add_tool_result(fresh_result)
+        fresh_context = fresh_result.context
     elif fresh_context_task is not None and not fresh_context_task.done():
         fresh_context_task.cancel()
-    deep_url_context = await _deep_url_context_for(
-        text,
-        addressed_bot=addressed_bot,
-        group_id=group_id,
-        source_message_id=source_message_id,
-    )
-    if deep_url_context:
-        fresh_context = _combine_text_sections(fresh_context, deep_url_context)
+    deep_request = tool_plan.first(ToolKind.DEEP_URL)
+    if deep_request is not None:
+        deep_result = await tool_registry.execute(deep_request)
+        pipeline_state.add_tool_result(deep_result)
+        _record_metric_event(
+            "tool_call",
+            group_id=group_id,
+            user_id=user_id,
+            stage="deep_url_reader",
+            action="registry_execute",
+            tool_kind=ToolKind.DEEP_URL.value,
+            success=deep_result.ok,
+            status=deep_result.status,
+            latency_ms=deep_result.elapsed_ms,
+            error=deep_result.error,
+            **dict(deep_result.metadata),
+        )
+        if deep_result.context:
+            fresh_context = _combine_text_sections(fresh_context, deep_result.context)
 
     suppress_mention_user_id = _repeat_mention_suppressed_user(group_id, user_id)
     mention_targets = _mention_targets(
@@ -3333,7 +3503,20 @@ async def _handle_group_message_locked(
         suppress_user_id=suppress_mention_user_id,
     )
     direct_single_reply = _approval_direct_single_reply_enabled()
-    reply_candidate_limit = 1 if direct_single_reply else 3
+    tool_answer_mode = pipeline_state.mode in {
+        PipelineMode.SEARCH,
+        PipelineMode.MARKET,
+        PipelineMode.DEEP_URL,
+    }
+    reply_candidate_limit = 1 if direct_single_reply or tool_answer_mode else 3
+    prompt_flow = (
+        "search_answer"
+        if tool_answer_mode
+        else "reply_direct"
+        if direct_single_reply
+        else "reply_candidates"
+    )
+    task_name = "search_answer" if tool_answer_mode else prompt_flow
     generation_started_at = time.monotonic()
     try:
         reply_candidates = await deepseek_client.reply_candidates(
@@ -3358,10 +3541,11 @@ async def _handle_group_message_locked(
             positive_feedback_context=positive_feedback_context,
             mention_targets=_format_mention_targets(mention_targets),
             priority_context=_focused_user_tone_context(user_id),
-            include_bot_history=False,
+            include_bot_history=tool_answer_mode,
+            context_message_limit=8 if tool_answer_mode else None,
             candidate_count=reply_candidate_limit,
-            prompt_flow="reply_direct" if direct_single_reply else "reply_candidates",
-            task_name="reply_direct" if direct_single_reply else "reply_candidates",
+            prompt_flow=prompt_flow,
+            task_name=task_name,
         )
     except Exception as exc:
         logger.warning(
@@ -3427,8 +3611,17 @@ async def _handle_group_message_locked(
         "candidate_generated",
         group_id=group_id,
         user_id=user_id,
-        stage="reply_direct" if direct_single_reply else "reply_candidates",
+        stage=prompt_flow,
         action=decision.action,
+        pipeline_mode=pipeline_state.mode.value,
+        tool_results=[
+            {
+                "kind": result.kind.value,
+                "status": result.status,
+                "elapsed_ms": result.elapsed_ms,
+            }
+            for result in pipeline_state.tool_results
+        ],
         candidate_count=len(approval_candidates),
         elapsed_ms=int((time.monotonic() - generation_started_at) * 1000),
         flow_elapsed_ms=int((time.monotonic() - flow_started_at) * 1000),
@@ -4438,94 +4631,73 @@ async def _market_context_for(intents: list[MarketIntent], *, market_topic: bool
                 "回复时让对方报 ticker 或币种，例如 NVDA、TSLA、BTC、ETH；不要编造行情。"
             )
         return ""
-    context = await market_tool.context_for(intents)
-    logger.info(
-        "qq_social_agent market tool: "
-        f"intents={[(intent.kind, intent.symbol) for intent in intents]} "
-        f"has_context={bool(context)}"
-    )
-    _record_metric_event(
-        "tool_call",
-        stage="market",
-        action="context",
-        has_context=bool(context),
-        symbols=",".join(intent.symbol for intent in intents),
-    )
-    return context
-
-
-async def _market_report_and_context_for(
-    intents: list[MarketIntent],
-    *,
-    market_topic: bool,
-) -> tuple[str, str]:
-    if not intents:
-        if market_topic:
-            text = "没看见具体标的，报 ticker 或币种我才能查，比如 NVDA、TSLA、BTC、ETH。"
-            context = (
-                "市场工具提示：用户在聊美股、加密货币或看盘，但没有给出具体标的。"
-                "已提示对方报 ticker 或币种；不要编造行情。"
-            )
-            return text, context
-        return "", ""
-
-    report, context = await market_tool.report_and_context_for(intents)
-    logger.info(
-        "qq_social_agent market tool: "
-        f"intents={[(intent.kind, intent.symbol) for intent in intents]} "
-        f"has_report={bool(report)} has_context={bool(context)}"
-    )
-    _record_metric_event(
-        "tool_call",
-        stage="market",
-        action="report",
-        has_report=bool(report),
-        has_context=bool(context),
-        symbols=",".join(intent.symbol for intent in intents),
-    )
-    return report, context
-
-
-async def _fresh_context_for(decision: ReplyDecision, *, fallback_text: str) -> str:
-    query = decision.fresh_query.strip() or fallback_text.strip()
-    if not query:
-        logger.info(
-            "qq_social_agent fresh context skipped: "
-            f"query={query!r} fallback={fallback_text!r}"
-        )
-        return ""
-    tool_result = await tool_registry.execute(
+    result = await tool_registry.execute(
         ToolRequest(
-            ToolKind.FRESH_SEARCH,
-            query=query,
-            reason="reply_requires_fresh_context",
+            ToolKind.MARKET,
+            query=" ".join(item.display_name for item in intents),
+            reason="private_market_context",
             required=True,
-            arguments={"kind": decision.fresh_kind},
+            arguments={
+                "symbols": tuple(
+                    {
+                        "kind": item.kind,
+                        "symbol": item.symbol,
+                        "display": item.display_name,
+                    }
+                    for item in intents[:2]
+                )
+            },
         )
     )
-    context = tool_result.context
-    search_status = fresh_context_tool.status_snapshot().get("last_request", {})
-    search_status = search_status if isinstance(search_status, dict) else {}
+    logger.info(
+        "qq_social_agent market registry: "
+        f"intents={[(intent.kind, intent.symbol) for intent in intents]} "
+        f"status={result.status} has_context={bool(result.context)}"
+    )
+    _record_metric_event(
+        "tool_call",
+        stage="market",
+        action="registry_execute_private",
+        tool_kind=ToolKind.MARKET.value,
+        success=result.ok,
+        status=result.status,
+        latency_ms=result.elapsed_ms,
+        error=result.error,
+        has_context=bool(result.context),
+        symbols=",".join(intent.symbol for intent in intents),
+    )
+    return result.context
+
+
+async def _execute_fresh_tool_request(
+    request: ToolRequest,
+    *,
+    metric_stage: str,
+) -> ToolResult:
+    tool_result = await tool_registry.execute(request)
+    search_status = dict(tool_result.metadata)
     logger.info(
         "qq_social_agent fresh context: "
-        f"kind={decision.fresh_kind} query={search_status.get('query_preview', '')!r} "
+        f"kind={request.arguments.get('kind', 'web')} "
+        f"query={search_status.get('query_preview', '')!r} "
         f"status={search_status.get('status', '')} provider={search_status.get('provider', '')}"
     )
     _record_metric_event(
         "tool_call",
-        stage="fresh_context",
-        action=decision.fresh_kind,
-        success=search_status.get("status") == "ok",
-        status=search_status.get("status", ""),
+        stage=metric_stage,
+        action=str(request.arguments.get("kind", "web")),
+        tool_kind=request.kind.value,
+        success=tool_result.ok,
+        status=tool_result.status,
         provider=search_status.get("provider", ""),
         attempted_providers=search_status.get("attempted_providers", []),
         result_count=search_status.get("result_count", 0),
         cached=search_status.get("cached", False),
-        latency_ms=search_status.get("latency_ms", 0),
-        error=search_status.get("error", ""),
+        latency_ms=tool_result.elapsed_ms,
+        error=tool_result.error,
         query_preview=search_status.get("query_preview", ""),
     )
-    return context
+    return tool_result
 
 
 async def _execute_registered_fresh_search(request: ToolRequest) -> ToolResult:
@@ -4544,30 +4716,67 @@ async def _execute_registered_fresh_search(request: ToolRequest) -> ToolResult:
     )
 
 
-async def _deep_url_context_for(
-    text: str,
-    *,
-    addressed_bot: bool,
-    group_id: int | None = None,
-    source_message_id: str = "",
-) -> str:
-    result = await deep_content_tool.context_for_text(text, addressed_bot=addressed_bot)
-    if not result.requested:
-        return ""
-    read = result.read
-    _record_metric_event(
-        "tool_call",
-        stage="deep_url_reader",
-        action="read",
-        success=bool(read and read.ok),
-        status=read.status if read is not None else result.reason,
-        bytes_read=read.bytes_read if read is not None else 0,
-        redirects=read.redirects if read is not None else 0,
-        truncated=read.truncated if read is not None else False,
-        latency_ms=read.latency_ms if read is not None else 0,
-        error=read.error if read is not None else result.reason,
+async def _execute_registered_market(request: ToolRequest) -> ToolResult:
+    started_at = time.monotonic()
+    intents: list[MarketIntent] = []
+    raw_symbols = request.arguments.get("symbols", ())
+    if isinstance(raw_symbols, (list, tuple)):
+        for raw in raw_symbols[:2]:
+            if not isinstance(raw, dict) or not raw.get("symbol"):
+                continue
+            intents.append(
+                MarketIntent(
+                    kind=str(raw.get("kind") or "stock"),
+                    symbol=str(raw.get("symbol") or ""),
+                    display_name=str(raw.get("display") or raw.get("symbol") or ""),
+                )
+            )
+    if not intents:
+        intents = detect_market_intents(request.query, limit=2)
+    report, context = await market_tool.report_and_context_for(intents)
+    elapsed_ms = int((time.monotonic() - started_at) * 1000)
+    return ToolResult(
+        ToolKind.MARKET,
+        "ok" if intents and (report or context) else "no_result",
+        context=context,
+        evidence=report,
+        elapsed_ms=elapsed_ms,
+        metadata={
+            "symbols": [item.symbol for item in intents],
+            "intent_count": len(intents),
+            "has_report": bool(report),
+            "has_context": bool(context),
+        },
     )
-    if group_id is not None and read is not None and read.ok and read.text:
+
+
+async def _execute_registered_deep_url(request: ToolRequest) -> ToolResult:
+    addressed = bool(request.arguments.get("addressed", False))
+    force = bool(request.arguments.get("force", False))
+    result = await deep_content_tool.context_for_text(
+        request.query,
+        addressed_bot=addressed,
+        force=force,
+    )
+    if not result.requested:
+        return ToolResult(
+            ToolKind.DEEP_URL,
+            "skipped",
+            error=result.reason,
+            metadata={"url": result.url, "reason": result.reason},
+        )
+    read = result.read
+    metadata = {
+        "url": result.url,
+        "final_url": read.final_url if read is not None else "",
+        "title": read.title if read is not None else "",
+        "bytes_read": read.bytes_read if read is not None else 0,
+        "redirects": read.redirects if read is not None else 0,
+        "truncated": read.truncated if read is not None else False,
+    }
+    group_id = int(request.arguments.get("group_id", 0) or 0)
+    source_message_id = str(request.arguments.get("source_message_id", "") or "")
+    if group_id and read is not None and read.ok and read.text:
         indexed_chunks = rag_service.ingest_knowledge(
             group_id=group_id,
             kind="web",
@@ -4576,6 +4785,7 @@ async def _deep_url_context_for(
             content=read.text,
             source_message_id=source_message_id,
         )
+        metadata["indexed_chunks"] = indexed_chunks
         _record_metric_event(
             "rag_knowledge_ingested",
             group_id=group_id,
@@ -4586,7 +4796,51 @@ async def _deep_url_context_for(
             indexed_chunks=indexed_chunks,
             source_message_id=source_message_id,
         )
-    return result.context
+    return ToolResult(
+        ToolKind.DEEP_URL,
+        "ok" if read is not None and read.ok else (read.status if read is not None else result.reason),
+        context=result.context,
+        elapsed_ms=read.latency_ms if read is not None else 0,
+        error=read.error if read is not None else result.reason,
+        metadata=metadata,
+    )
+
+
+async def _deep_url_context_for(
+    text: str,
+    *,
+    addressed_bot: bool,
+    group_id: int | None = None,
+    source_message_id: str = "",
+) -> str:
+    tool_result = await tool_registry.execute(
+        ToolRequest(
+            ToolKind.DEEP_URL,
+            query=text,
+            reason="deep_url_context",
+            required=False,
+            arguments={
+                "addressed": addressed_bot,
+                "group_id": group_id or 0,
+                "source_message_id": source_message_id,
+            },
+        )
+    )
+    metadata = dict(tool_result.metadata)
+    _record_metric_event(
+        "tool_call",
+        stage="deep_url_reader",
+        action="read",
+        tool_kind=ToolKind.DEEP_URL.value,
+        success=tool_result.ok,
+        status=tool_result.status,
+        bytes_read=metadata.get("bytes_read", 0),
+        redirects=metadata.get("redirects", 0),
+        truncated=metadata.get("truncated", False),
+        latency_ms=tool_result.elapsed_ms,
+        error=tool_result.error,
+    )
+    return tool_result.context
 
 
 async def _execute_poke_action(
@@ -5044,30 +5298,18 @@ async def _private_fresh_context_for(text: str) -> str:
     intent = detect_fresh_intent(text)
     if intent is None:
         return _combine_text_sections(*parts)
-    context = await fresh_context_tool.context_for(intent.query, kind=intent.kind)
-    search_status = fresh_context_tool.status_snapshot().get("last_request", {})
-    search_status = search_status if isinstance(search_status, dict) else {}
-    logger.info(
-        "qq_social_agent private fresh context: "
-        f"kind={intent.kind} query={search_status.get('query_preview', '')!r} "
-        f"status={search_status.get('status', '')} provider={search_status.get('provider', '')}"
+    result = await _execute_fresh_tool_request(
+        ToolRequest(
+            ToolKind.FRESH_SEARCH,
+            query=intent.query,
+            reason="private_explicit_search",
+            required=True,
+            arguments={"kind": intent.kind},
+        ),
+        metric_stage="fresh_context_private",
     )
-    _record_metric_event(
-        "tool_call",
-        stage="fresh_context_private",
-        action=intent.kind,
-        success=search_status.get("status") == "ok",
-        status=search_status.get("status", ""),
-        provider=search_status.get("provider", ""),
-        attempted_providers=search_status.get("attempted_providers", []),
-        result_count=search_status.get("result_count", 0),
-        cached=search_status.get("cached", False),
-        latency_ms=search_status.get("latency_ms", 0),
-        error=search_status.get("error", ""),
-        query_preview=search_status.get("query_preview", ""),
-    )
-    if context:
-        parts.append(context)
+    if result.context:
+        parts.append(result.context)
     return _combine_text_sections(*parts)
 
 
@@ -6391,7 +6633,7 @@ async def _handle_model_route_command(bot: Bot, user_id: int, text: str) -> bool
         return True
     route_name = _model_route_name_from_text(match.group("target"))
     if route_name is None:
-        await _send_private_text(bot, user_id, "未知模型类型，只能切 决策/回复/黑话/记忆/风格/画像/工具 模型。")
+        await _send_private_text(bot, user_id, "未知模型类型，只能切 决策/回复/搜索/黑话/记忆/风格/画像/工具 模型。")
         return True
     route_label = match.group("model").strip()
     try:
@@ -6964,30 +7206,29 @@ async def _send_approved_group_reply_scoped(
         candidate_index=candidate.index,
         approval_wait_ms=max(0, int((time.time() - approval.created_at) * 1000)),
     )
-    effective_mention_targets = dict(approval.mention_targets)
-    reply_text = candidate.text
-    sequence_lag = max(
-        0,
-        group_inbound_sequences.get(approval.group_id, approval.trigger_sequence)
-        - approval.trigger_sequence,
+    delivery_plan = build_delivery_plan(
+        reply_text=candidate.text,
+        mention_targets=approval.mention_targets,
+        trigger_user_id=approval.trigger_user_id,
+        trigger_nickname=approval.trigger_nickname,
+        trigger_sequence=approval.trigger_sequence,
+        current_sequence=group_inbound_sequences.get(
+            approval.group_id,
+            approval.trigger_sequence,
+        ),
+        max_messages=3,
     )
-    force_trigger_mention = approval.trigger_sequence > 0 and sequence_lag >= 3
-    if force_trigger_mention:
-        effective_mention_targets[approval.trigger_user_id] = (
-            approval.trigger_nickname.strip() or str(approval.trigger_user_id)
-        )[:24]
-        trigger_marker = f"[[at:{approval.trigger_user_id}]]"
-        if trigger_marker not in reply_text:
-            reply_text = f"{trigger_marker} {reply_text}".strip()
+    effective_mention_targets = delivery_plan.mention_targets
+    if delivery_plan.forced_trigger_mention:
         _record_metric_event(
             "stale_reply_mention",
             group_id=approval.group_id,
             user_id=approval.trigger_user_id,
             stage="send",
             action="force_mention",
-            newer_message_count=sequence_lag,
+            newer_message_count=delivery_plan.sequence_lag,
         )
-    reply_parts = split_reply_messages(reply_text, max_messages=3)
+    reply_parts = delivery_plan.parts
     sent_mention_user_id: int | None = None
     recorded_user_reply = False
     for index, part_text in enumerate(reply_parts):

@@ -4,10 +4,16 @@ import asyncio
 
 from qq_social_agent.background_learning import BackgroundLearningCoordinator
 from qq_social_agent.context_assembler import assemble_generation_context
-from qq_social_agent.memory import MemoryStore
-from qq_social_agent.pipeline_types import OutputChannel, SocialIntent, ToolKind
+from qq_social_agent.memory import ChatMessage, MemoryStore
+from qq_social_agent.pipeline_types import OutputChannel, PipelineMode, SocialIntent, ToolKind
 from qq_social_agent.timing_gate import parse_timing_decision
-from qq_social_agent.tool_router import apply_tool_plan, compare_legacy_decision, route_tools
+from qq_social_agent.tool_router import (
+    apply_tool_plan,
+    compare_legacy_decision,
+    infer_followup_fresh_intent,
+    route_mode,
+    route_tools,
+)
 from qq_social_agent.deepseek_client import DeepSeekClient, ReplyDecision, _parse_mid_memory
 from qq_social_agent.tools.fresh_context import FreshIntent
 from qq_social_agent.tools.market_intent import MarketIntent
@@ -28,6 +34,24 @@ def test_context_assembler_keeps_memory_and_structured_context() -> None:
     assert packet.get("member") == "旧人物选择器"
     assert packet.get("memory_atoms") == "长期事实"
     assert packet.get("style") == "短句接话"
+
+
+def test_search_context_drops_old_chat_evidence() -> None:
+    packet = assemble_generation_context(
+        memory_context="旧聊天里有人说 ASIC 只用于挖矿",
+        member_context="人物画像",
+        memory_atoms_context="长期记忆",
+        style_context="群聊风格",
+        raw_corpus_context="群友原话",
+        jargon_context="ASIC：专用集成电路",
+        mode=PipelineMode.SEARCH,
+    )
+
+    assert packet.mode is PipelineMode.SEARCH
+    assert packet.get("jargon") == "ASIC：专用集成电路"
+    assert packet.get("memory") == ""
+    assert packet.get("raw_corpus") == ""
+    assert "memory" in packet.dropped_sections
 
 
 def test_tool_router_routes_required_tools_without_social_action_choice() -> None:
@@ -79,6 +103,31 @@ def test_tool_router_searches_academic_concept_without_asking_timing_model() -> 
     assert request is not None
     assert request.required
     assert request.arguments["kind"] == "web"
+
+
+def test_followup_research_inherits_latest_real_user_topic() -> None:
+    messages = [
+        ChatMessage(1, 7, "群友", "你知道 ASIC 芯片吗，相关股票有前景吗", False, 10.0),
+        ChatMessage(1, 99, "张风雪", "这个得具体查，不能瞎推荐", True, 11.0),
+    ]
+
+    intent = infer_followup_fresh_intent("你帮我研究研究", messages, addressed=True)
+
+    assert intent is not None
+    assert "ASIC" in intent.query
+    assert intent.required
+
+
+def test_tool_route_mode_prefers_market_when_search_is_also_required() -> None:
+    plan = route_tools(
+        "查 NVDA 现在股价",
+        market_intents=[MarketIntent(kind="stock", symbol="NVDA", display_name="英伟达")],
+        fresh_intent=FreshIntent("NVDA 现在股价", "web", explicit=True, required=True),
+        addressed=True,
+        market_required=True,
+    )
+
+    assert route_mode(plan) is PipelineMode.MARKET
 
 
 def test_mid_summary_page_can_exclude_bot_messages(tmp_path) -> None:

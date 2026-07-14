@@ -34,6 +34,7 @@ class DeepSeekConfig:
     model: str
     decision_model: str
     reply_model: str
+    search_model: str
     utility_model: str
     jargon_model: str
     memory_model: str
@@ -99,6 +100,7 @@ class AppConfig:
         base_model = str(deepseek.get("model", "deepseek-v4-flash"))
         decision_model = str(deepseek.get("decision_model", "deepseek-v4-flash"))
         reply_model = str(deepseek.get("reply_model", base_model))
+        search_model = str(deepseek.get("search_model", decision_model))
         utility_model = str(deepseek.get("utility_model", "deepseek-v4-flash"))
         jargon_model = str(deepseek.get("jargon_model", utility_model))
         memory_model = str(deepseek.get("memory_model", utility_model))
@@ -111,6 +113,7 @@ class AppConfig:
             "base": parse_llm_model_route(base_model, providers, default_provider="deepseek"),
             "decision": parse_llm_model_route(decision_model, providers, default_provider="deepseek"),
             "reply": parse_llm_model_route(reply_model, providers, default_provider="deepseek"),
+            "search": parse_llm_model_route(search_model, providers, default_provider="deepseek"),
             "utility": parse_llm_model_route(utility_model, providers, default_provider="deepseek"),
             "jargon": parse_llm_model_route(jargon_model, providers, default_provider="deepseek"),
             "memory": parse_llm_model_route(memory_model, providers, default_provider="deepseek"),
@@ -125,6 +128,11 @@ class AppConfig:
             ),
             "reply": _parse_model_route(
                 str(fallback_models.get("reply", reply_model)),
+                providers,
+                default_provider="deepseek",
+            ),
+            "search": _parse_model_route(
+                str(fallback_models.get("search", fallback_models.get("reply", reply_model))),
                 providers,
                 default_provider="deepseek",
             ),
@@ -159,6 +167,7 @@ class AppConfig:
             model=base_model,
             decision_model=decision_model,
             reply_model=reply_model,
+            search_model=search_model,
             utility_model=utility_model,
             jargon_model=jargon_model,
             memory_model=memory_model,

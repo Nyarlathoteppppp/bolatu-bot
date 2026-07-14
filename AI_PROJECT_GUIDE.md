@@ -104,10 +104,12 @@ Docker / Docker Compose
 │   ├── rag_router.py              # 判断何时只全文检索、何时追加语义检索
 │   ├── rag_retriever.py           # 混合召回、证据过滤、上下文预算和后台向量任务
 │   ├── pipeline_types.py          # PipelineState / ContextPacket / ToolRequest / ToolResult
-│   ├── context_assembler.py       # 生成阶段的分类型上下文组装与精确去重
+│   ├── context_assembler.py       # 按 chat/search/market/deep_url 模式组装和预算上下文
 │   ├── timing_gate.py             # silent/text/react/poke 和五类基本社交意图
-│   ├── tool_router.py             # 确定性工具路由与 shadow 对比
+│   ├── tool_router.py             # 搜索/行情/网页确定性路由、连续检索主题继承与审计
 │   ├── tool_registry.py           # 统一工具注册和结构化执行结果
+│   ├── approval_models.py         # 审批候选与待审批单数据模型
+│   ├── delivery.py                # 回复切分、延迟回复强制艾特等发送计划
 │   ├── background_learning.py     # 单工作者后台学习调度，避开回复热路径
 │   ├── config.py                  # 读取 config.yaml，构造模型 route/provider
 │   ├── persona.py                 # 从 prompt yaml 读取 persona
@@ -319,13 +321,16 @@ flowchart TD
   Q --> R
   R -- 否 --> Z
   R -- react --> RE["set_msg_emoji_like 表情回应"]
-  R -- 文字回复 --> S["ContextPacket: RAG/画像/记忆原子/风格/原文/反馈"]
+  R -- 文字回复 --> S["PipelineMode + ContextPacket"]
   S --> T{"需要工具?"}
-  T -- 行情 --> U["MarketTool"]
-  T -- 最新背景 --> V["FreshContextTool"]
+  T -- 行情 --> U["ToolRegistry: MarketTool"]
+  T -- 最新背景 --> V["ToolRegistry: FreshContextTool"]
+  T -- 网页 --> VV["ToolRegistry: DeepContentTool"]
   T -- 否 --> W["LLM reply_candidates"]
-  U --> W
-  V --> W
+  U --> WS
+  V --> WS["精简 search_answer"]
+  VV --> WS
+  WS --> X
   W --> X["清洗/政治输出兜底/补齐 3 候选"]
   X --> Y{"人工审查?"}
   Y -- 开启 --> AA["私聊审批人 A/B/C"]
@@ -344,7 +349,10 @@ flowchart TD
 - `decision_gate.py` 处理点名、低价值消息和明确行情等确定性规则。
 - `tool_router.py` 独立判断是否需要搜索、行情、网页等工具；明确工具意图不进入 Timing Gate。
 - `timing_gate.py` 不看长期记忆、不选择工具，只决定 `silent/text/react/poke` 和 `answer/care/play/agree/chat`。
-- 只有确定生成文字后，`context_assembler.py` 才组装 RAG、画像、记忆原子、风格、原文和审批反馈。
+- `PipelineState` 保存当前模式、输出通道、社交意图、工具请求/结果和最终 `ContextPacket`。
+- `ToolRegistry` 已统一注册搜索、行情和深度网页读取；shadow 指标只用于和旧判断做兼容审计，不再控制执行。
+- 只有确定生成文字后，`context_assembler.py` 才组装上下文；普通聊天保留分层记忆，搜索/行情/网页模式主动排除旧摘要、画像、风格和原文语料，避免覆盖新事实。
+- 明确搜索、行情评论和网页阅读使用单候选 `search_answer` 与独立快速模型路由；“帮我研究研究”等连续追问会继承最近一条真实群友问题。
 
 OneBot 扩展入口：
 
@@ -921,10 +929,10 @@ git push origin main
 
 ## 18. 当前工程风险和注意点
 
-1. `plugin.py` 仍然较大，但 Pipeline 类型、上下文组装、Timing Gate、工具路由/注册和学习调度已经拆出；后续继续拆：
+1. `plugin.py` 仍然较大，但 Pipeline 类型、模式化上下文、Timing Gate、工具路由/注册、审批模型、发送计划和学习调度已经拆出；后续继续拆事件编排本身：
    - `group_flow.py`
    - `private_flow.py`
-   - `approval.py`
+   - `approval_service.py`
    - `learning.py`
    - `message_format.py`
 
