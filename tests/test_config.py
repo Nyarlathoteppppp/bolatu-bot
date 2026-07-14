@@ -185,7 +185,8 @@ def test_prompt_registry_loads_central_prompt_file() -> None:
     )
     assert "群聊三候选生成" in prompts.raw["flows"]["reply_candidates"]["flow"]
     assert "群聊免审直发单条生成" in prompts.raw["flows"]["reply_direct"]["flow"]
-    assert "温柔接话" in prompts.action_guide("reply")
+    assert "自然接话" in prompts.action_guide("reply")
+    assert "语气由当前氛围决定" in prompts.action_guide("reply")
     assert "关心/承接" in prompts.action_guide("care")
     persona_prompt = prompts.raw["persona"]["prompt"]
     assert "务实的社会民主主义左派" in persona_prompt
@@ -232,6 +233,7 @@ def test_persona_registry_loads_persona_from_central_prompt_file() -> None:
     assert "卡耐基梅隆" in persona.prompt
     assert "无糖可乐" in persona.prompt
     assert "数学猜想" in persona.prompt
-    assert "不能确信自己理解准确" in persona.decision_prompt
+    assert "陌生学术概念时不装懂" in persona.decision_prompt
+    assert "应先搜索核对" in persona.decision_prompt
     assert "QQ 群里的元气美少女妹妹" in persona.decision_prompt
-    assert "棘手的大问题" in persona.decision_prompt
+    assert "别人明显难受时会收住" in persona.decision_prompt
