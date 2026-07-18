@@ -11,11 +11,22 @@ if ! /usr/sbin/lsof -nP -iTCP:"${LOCAL_PROXY_PORT}" -sTCP:LISTEN >/dev/null 2>&1
     --port "${LOCAL_PROXY_PORT}" \
     >> "${PROJECT_DIR}/logs/direct-http-proxy.log" \
     2>> "${PROJECT_DIR}/logs/direct-http-proxy.err.log" &
+fi
+
+for _ in 1 2 3 4 5; do
+  if /usr/bin/nc -z 127.0.0.1 "${LOCAL_PROXY_PORT}" >/dev/null 2>&1; then
+    break
+  fi
   sleep 1
+done
+
+if ! /usr/bin/nc -z 127.0.0.1 "${LOCAL_PROXY_PORT}" >/dev/null 2>&1; then
+  echo "local Codex proxy did not start on 127.0.0.1:${LOCAL_PROXY_PORT}" >&2
+  exit 1
 fi
 
 ssh qqbot-server \
-  'pids=$(sudo lsof -tiTCP:7897 -sTCP:LISTEN 2>/dev/null || true); if [ -n "$pids" ]; then sudo kill $pids || true; sleep 1; fi' \
+  'pids=$(lsof -tiTCP:7897 -sTCP:LISTEN 2>/dev/null || true); if [ -n "$pids" ]; then kill $pids || true; sleep 1; fi' \
   >/dev/null 2>&1 || true
 
 exec /usr/bin/ssh \
