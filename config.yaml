@@ -146,6 +146,12 @@ fresh_search:
   tavily:
     api_key_env: TAVILY_API_KEY
 
+data_retention:
+  metric_events_enabled: true
+  metric_events_days: 30
+  metric_events_max_rows: 80000
+  metric_events_sweep_seconds: 21600
+
 jargon_selection:
   llm_selector_enabled: false
 

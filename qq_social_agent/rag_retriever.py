@@ -400,6 +400,8 @@ class RAGService:
             semantic_count=len(semantic),
             injected_ids=[hit.document.id for hit in hits],
             details={
+                "query_preview": search_query[:160],
+                "current_utterance_preview": normalized_query.current_utterance[:160],
                 "resolved_members": [
                     {"user_id": item.user_id, "matched_name": item.matched_name}
                     for item in resolved_members

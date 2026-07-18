@@ -1146,6 +1146,39 @@ class RAGStore:
             """,
             (time.time() - 3600,),
         ).fetchone()
+        route_rows = self.conn.execute(
+            """
+            select route, count(*) as count, avg(elapsed_ms) as avg_ms, avg(injected_count) as avg_injected
+            from rag_retrieval_events
+            where created_at >= ?
+            group by route
+            order by count desc, route asc
+            limit 8
+            """,
+            (time.time() - 3600,),
+        ).fetchall()
+        last_retrieval = self.conn.execute(
+            """
+            select route, injected_count, elapsed_ms, error, created_at, details_json
+            from rag_retrieval_events
+            order by created_at desc, id desc
+            limit 1
+            """
+        ).fetchone()
+        last_retrieval_payload: dict[str, object] | None = None
+        if last_retrieval is not None:
+            try:
+                details = json.loads(str(last_retrieval["details_json"] or "{}"))
+            except (json.JSONDecodeError, TypeError, ValueError):
+                details = {}
+            last_retrieval_payload = {
+                "route": str(last_retrieval["route"]),
+                "injected_count": int(last_retrieval["injected_count"] or 0),
+                "elapsed_ms": int(last_retrieval["elapsed_ms"] or 0),
+                "error": str(last_retrieval["error"] or ""),
+                "created_at": float(last_retrieval["created_at"] or 0.0),
+                "query_preview": str(details.get("query_preview") or "")[:160],
+            }
         feedback_count = int(
             self.conn.execute("select count(*) from rag_retrieval_feedback").fetchone()[0]
         )
@@ -1165,6 +1198,16 @@ class RAGStore:
             "retrievals_1h": int(recent["count"] or 0),
             "average_retrieval_ms_1h": round(float(recent["avg_ms"] or 0.0), 1),
             "last_retrieval_at": float(recent["last_at"] or 0.0) or None,
+            "retrieval_routes_1h": [
+                {
+                    "route": str(row["route"]),
+                    "count": int(row["count"] or 0),
+                    "average_ms": round(float(row["avg_ms"] or 0.0), 1),
+                    "average_injected": round(float(row["avg_injected"] or 0.0), 1),
+                }
+                for row in route_rows
+            ],
+            "last_retrieval": last_retrieval_payload,
             "feedback_count": feedback_count,
             "evaluation_case_count": evaluation_count,
             "active_knowledge_sources": active_knowledge_sources,

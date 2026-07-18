@@ -152,6 +152,14 @@ from .tool_router import (
 from .tool_registry import ToolRegistry, ToolSpec
 
 
+def _bounded_config_int(value: object, *, default: int, minimum: int, maximum: int) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        parsed = default
+    return max(minimum, min(maximum, parsed))
+
+
 load_dotenv()
 
 app_config = load_config()
@@ -203,9 +211,32 @@ notice_directory_refresh_tasks: dict[int, asyncio.Task[None]] = {}
 pending_group_approvals: dict[int, "PendingGroupApproval"] = {}
 recent_suppression_events: list["SuppressionEvent"] = []
 daily_review_tasks: dict[str, asyncio.Task[None]] = {}
+maintenance_tasks: dict[str, asyncio.Task[None]] = {}
 approval_processing_lock = asyncio.Lock()
 approval_choice_cooldowns: dict[int, float] = {}
 PROCESS_STARTED_AT = time.time()
+_data_retention_config = app_config.raw.get("data_retention", {})
+if not isinstance(_data_retention_config, dict):
+    _data_retention_config = {}
+METRIC_RETENTION_ENABLED = bool(_data_retention_config.get("metric_events_enabled", True))
+METRIC_RETENTION_DAYS = _bounded_config_int(
+    _data_retention_config.get("metric_events_days"),
+    default=30,
+    minimum=1,
+    maximum=365,
+)
+METRIC_RETENTION_MAX_ROWS = _bounded_config_int(
+    _data_retention_config.get("metric_events_max_rows"),
+    default=80000,
+    minimum=5000,
+    maximum=500000,
+)
+METRIC_RETENTION_SWEEP_SECONDS = _bounded_config_int(
+    _data_retention_config.get("metric_events_sweep_seconds"),
+    default=6 * 60 * 60,
+    minimum=60 * 10,
+    maximum=7 * 24 * 60 * 60,
+)
 
 _driver = get_driver()
 if hasattr(_driver, "server_app"):
@@ -538,6 +569,9 @@ async def _init_client() -> None:
     )
     _apply_model_route_overrides()
     _ensure_builtin_memory_atoms()
+    _run_metric_retention_once("startup")
+    if METRIC_RETENTION_ENABLED and "metric_retention" not in maintenance_tasks:
+        maintenance_tasks["metric_retention"] = asyncio.create_task(_run_metric_retention_loop())
     await rag_service.start()
     learning_coordinator = BackgroundLearningCoordinator(
         _maintain_group_learning,
@@ -701,6 +735,7 @@ async def _shutdown_background_tasks() -> None:
         group_buffer_tasks,
         group_passive_retry_tasks,
         group_learning_tasks,
+        maintenance_tasks,
     )
     closers: list[object] = []
     if learning_coordinator is not None:
@@ -1899,6 +1934,40 @@ def _record_metric_event(
         )
     except Exception as exc:
         logger.warning(f"qq_social_agent failed recording metric: type={event_type} error={exc}")
+
+
+def _run_metric_retention_once(reason: str) -> None:
+    if not METRIC_RETENTION_ENABLED:
+        return
+    try:
+        result = memory.prune_metric_events(
+            max_age_seconds=METRIC_RETENTION_DAYS * 24 * 60 * 60,
+            max_rows=METRIC_RETENTION_MAX_ROWS,
+        )
+    except Exception as exc:
+        logger.warning(f"qq_social_agent metric retention failed: reason={reason} error={exc}")
+        return
+    deleted = int(result.get("deleted_by_age", 0)) + int(result.get("deleted_by_rows", 0))
+    if deleted <= 0:
+        return
+    logger.info(
+        "qq_social_agent metric retention: "
+        f"reason={reason} deleted={deleted} remaining={result.get('remaining', 0)}"
+    )
+    _record_metric_event(
+        "maintenance",
+        stage="metric_retention",
+        action=reason,
+        retention_days=METRIC_RETENTION_DAYS,
+        max_rows=METRIC_RETENTION_MAX_ROWS,
+        **result,
+    )
+
+
+async def _run_metric_retention_loop() -> None:
+    while True:
+        await asyncio.sleep(METRIC_RETENTION_SWEEP_SECONDS)
+        _run_metric_retention_once("scheduled")
 
 
 def _record_tool_router_shadow(

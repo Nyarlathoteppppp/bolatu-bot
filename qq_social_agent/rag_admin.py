@@ -130,6 +130,23 @@ class RAGAdminController:
         embedding = snapshot.get("embedding", {}) if isinstance(snapshot.get("embedding"), dict) else {}
         type_counts = store.get("document_types", {}) if isinstance(store.get("document_types"), dict) else {}
         status_counts = store.get("embedding_status", {}) if isinstance(store.get("embedding_status"), dict) else {}
+        route_rows = store.get("retrieval_routes_1h", [])
+        route_rows = route_rows if isinstance(route_rows, list) else []
+        route_text = "、".join(
+            f"{row.get('route')}={row.get('count')}次/{row.get('average_ms')}ms/注入{row.get('average_injected')}"
+            for row in route_rows
+            if isinstance(row, dict)
+        ) or "无"
+        last_retrieval = store.get("last_retrieval", {})
+        last_retrieval = last_retrieval if isinstance(last_retrieval, dict) else {}
+        last_text = "无"
+        if last_retrieval:
+            query_preview = str(last_retrieval.get("query_preview") or "").strip()
+            last_text = (
+                f"{last_retrieval.get('route')} 注入{last_retrieval.get('injected_count')} "
+                f"{last_retrieval.get('elapsed_ms')}ms"
+                + (f" q={query_preview}" if query_preview else "")
+            )
         types_text = "、".join(f"{name}={count}" for name, count in sorted(type_counts.items())) or "无"
         embeddings_text = "、".join(f"{name}={count}" for name, count in sorted(status_counts.items())) or "无"
         return (
@@ -140,6 +157,8 @@ class RAGAdminController:
             f"- embedding={embedding.get('model')} available={embedding.get('available')} "
             f"calls={embedding.get('calls', 0)} failures={embedding.get('failures', 0)}\n"
             f"- 最近1小时检索={store.get('retrievals_1h', 0)}次，平均={store.get('average_retrieval_ms_1h', 0)}ms\n"
+            f"- route近况={route_text}\n"
+            f"- 最近检索={last_text}\n"
             f"- 人工反馈={store.get('feedback_count', 0)}条，评测用例={store.get('evaluation_case_count', 0)}条\n"
             f"- 知识库来源={store.get('active_knowledge_sources', 0)}个（命令：RAG知识库）\n"
             f"- 后台索引={snapshot.get('background_indexing')} query缓存={snapshot.get('query_cache_entries', 0)}\n"

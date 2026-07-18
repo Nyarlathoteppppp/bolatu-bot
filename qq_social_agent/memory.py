@@ -2244,6 +2244,53 @@ class MemoryStore:
         ).fetchall()
         return [_metric_event_from_row(row) for row in rows]
 
+    def prune_metric_events(
+        self,
+        *,
+        max_age_seconds: int | None = None,
+        max_rows: int | None = None,
+    ) -> dict[str, int]:
+        deleted_by_age = 0
+        deleted_by_rows = 0
+        if max_age_seconds is not None and max_age_seconds > 0:
+            cutoff = time.time() - int(max_age_seconds)
+            cursor = self.conn.execute(
+                "delete from bot_metric_events where created_at < ?",
+                (cutoff,),
+            )
+            deleted_by_age = int(cursor.rowcount or 0)
+        if max_rows is not None and max_rows > 0:
+            cutoff_row = self.conn.execute(
+                """
+                select created_at, id
+                from bot_metric_events
+                order by created_at desc, id desc
+                limit 1 offset ?
+                """,
+                (int(max_rows) - 1,),
+            ).fetchone()
+            if cutoff_row is not None:
+                cursor = self.conn.execute(
+                    """
+                    delete from bot_metric_events
+                    where created_at < ?
+                       or (created_at = ? and id < ?)
+                    """,
+                    (
+                        float(cutoff_row["created_at"]),
+                        float(cutoff_row["created_at"]),
+                        int(cutoff_row["id"]),
+                    ),
+                )
+                deleted_by_rows = int(cursor.rowcount or 0)
+        self.conn.commit()
+        row = self.conn.execute("select count(*) as count from bot_metric_events").fetchone()
+        return {
+            "deleted_by_age": deleted_by_age,
+            "deleted_by_rows": deleted_by_rows,
+            "remaining": int(row["count"] or 0) if row else 0,
+        }
+
     def upsert_memory_atom(
         self,
         *,
