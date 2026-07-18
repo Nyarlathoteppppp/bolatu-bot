@@ -131,7 +131,7 @@ from .rag_admin import RAGAdminController
 from .rag_query import normalize_rag_query
 from .rag_retriever import RAGRetrievalResult, RAGService
 from .reference_resolver import resolve_context_reference
-from .social_actions import PokeContext, SocialActionService, reaction_from_action
+from .social_actions import PokeContext, ReactionResult, SocialActionService, reaction_from_action
 from .tools.fresh_context import (
     FreshContextTool,
     detect_fresh_intent,
@@ -3379,6 +3379,7 @@ async def _handle_group_message_locked(
         action=decision.action,
         reason=decision.reason,
         confidence=decision.confidence,
+        side_reaction=decision.side_reaction,
         elapsed_ms=int((time.monotonic() - decision_started_at) * 1000),
     )
     if addressed_bot and "非点名" in decision.reason:
@@ -3390,6 +3391,7 @@ async def _handle_group_message_locked(
         "qq_social_agent llm decision: "
         f"group={group_id} should_reply={decision.should_reply} "
         f"confidence={decision.confidence:.2f} action={decision.action} mode={decision.mode} "
+        f"side_reaction={decision.side_reaction} "
         f"need_fresh={decision.need_fresh_context} fresh_query={decision.fresh_query!r} "
         f"reason={decision.reason}"
     )
@@ -3402,6 +3404,7 @@ async def _handle_group_message_locked(
         should_reply=decision.should_reply,
         confidence=round(decision.confidence, 3),
         decision_reason=decision.reason,
+        side_reaction=decision.side_reaction,
         need_fresh=decision.need_fresh_context,
         elapsed_ms=int((time.monotonic() - decision_started_at) * 1000),
         flow_elapsed_ms=int((time.monotonic() - flow_started_at) * 1000),
@@ -3557,6 +3560,7 @@ async def _handle_group_message_locked(
     positive_feedback_context = _format_positive_feedback_context(
         memory.recent_approved_reply_feedback(group_id, POSITIVE_FEEDBACK_CONTEXT_LIMIT)
     )
+    social_action_context = social_action_service.recent_reaction_context(group_id)
     context_packet = assemble_generation_context(
         memory_context=memory_context,
         member_context=member_context,
@@ -3566,6 +3570,7 @@ async def _handle_group_message_locked(
         jargon_context=jargon_context,
         recall_feedback_context=recall_feedback_context,
         positive_feedback_context=positive_feedback_context,
+        social_action_context=social_action_context,
         rag_document_ids=tuple(
             hit.document.id for hit in rag_result.hits
         ) if rag_result is not None else (),
@@ -3583,6 +3588,7 @@ async def _handle_group_message_locked(
     jargon_context = context_packet.get("jargon")
     recall_feedback_context = context_packet.get("recall_feedback")
     positive_feedback_context = context_packet.get("positive_feedback")
+    social_action_context = context_packet.get("social_actions")
     _record_metric_event(
         "context_assembled",
         group_id=group_id,
@@ -5159,24 +5165,27 @@ async def _execute_reaction_action(
     decision: ReplyDecision,
     buffered_messages: list[BufferedGroupMessage] | None,
     source_message_id: str,
-) -> None:
+    reaction_override: str = "",
+    notify_on_skip: bool = True,
+) -> ReactionResult | None:
     target_message_id = _reaction_target_message_id(event, buffered_messages, source_message_id=source_message_id)
-    reaction = reaction_from_action(decision.action, decision.reaction)
+    reaction = reaction_from_action(decision.action, reaction_override or decision.reaction)
     if not target_message_id or not target_message_id.isdigit():
         logger.info(
             "qq_social_agent reaction skipped: "
             f"group={group_id} user={user_id} reason=missing_message_id reaction={reaction}"
         )
-        await _send_approval_suppression_notice(
-            bot,
-            group_id=group_id,
-            user_id=user_id,
-            nickname=nickname,
-            text=text,
-            stage="social_action_react",
-            reason="表情回应未执行：当前消息没有可用 message_id。",
-        )
-        return
+        if notify_on_skip:
+            await _send_approval_suppression_notice(
+                bot,
+                group_id=group_id,
+                user_id=user_id,
+                nickname=nickname,
+                text=text,
+                stage="social_action_react",
+                reason="表情回应未执行：当前消息没有可用 message_id。",
+            )
+        return None
     try:
         result = await social_action_service.react_to_message(
             bot,
@@ -5184,6 +5193,7 @@ async def _execute_reaction_action(
             user_id=user_id,
             message_id=target_message_id,
             reaction=reaction,
+            target_label=_member_label(user_id, nickname),
         )
     except ActionFailed as exc:
         logger.warning(
@@ -5200,7 +5210,7 @@ async def _execute_reaction_action(
             reaction=reaction,
             error=_action_failed_summary(exc),
         )
-        return
+        return None
     except Exception as exc:
         logger.warning(
             "qq_social_agent reaction failed: "
@@ -5216,7 +5226,7 @@ async def _execute_reaction_action(
             reaction=reaction,
             error=str(exc)[:160],
         )
-        return
+        return None
     _record_metric_event(
         "social_action",
         group_id=group_id,
@@ -5233,20 +5243,22 @@ async def _execute_reaction_action(
             "qq_social_agent reaction sent: "
             f"group={group_id} message_id={target_message_id} reaction={result.reaction} emoji_id={result.emoji_id}"
         )
-        return
+        return result
     logger.info(
         "qq_social_agent reaction skipped: "
         f"group={group_id} message_id={target_message_id} reason={result.reason}"
     )
-    await _send_approval_suppression_notice(
-        bot,
-        group_id=group_id,
-        user_id=user_id,
-        nickname=nickname,
-        text=text,
-        stage="social_action_react",
-        reason=f"表情回应未执行：{result.reason}",
-    )
+    if notify_on_skip:
+        await _send_approval_suppression_notice(
+            bot,
+            group_id=group_id,
+            user_id=user_id,
+            nickname=nickname,
+            text=text,
+            stage="social_action_react",
+            reason=f"表情回应未执行：{result.reason}",
+        )
+    return result
 
 
 def _reaction_target_message_id(
@@ -6549,12 +6561,14 @@ async def _request_group_approval(bot: Bot, approval: PendingGroupApproval) -> N
         if private_reply_user_id
         else ""
     )
+    side_reaction = _approval_side_reaction(approval)
+    side_reaction_line = f"附带表情：{side_reaction}\n" if side_reaction else ""
     message = (
         f"待发群：{approval.group_id}\n"
         f"审批ID：{approval.approval_id}\n"
         f"触发人：{_member_label(approval.trigger_user_id, approval.trigger_nickname)}\n"
         f"触发消息：{approval.trigger_text}\n"
-        f"{delivery_line}\n"
+        f"{delivery_line}{side_reaction_line}\n"
         f"候选：\n{preview}{evidence_section}\n\n"
         "回复：A/B/C 或 1/2/3 发送；D/X/取消 不发；T 工具单。"
     )
@@ -6603,6 +6617,13 @@ def _format_approval_candidates(approval: PendingGroupApproval) -> str:
         style_line = f"\n   style：{style}" if style else ""
         lines.append(f"{candidate.index}. {candidate.text}{style_line}")
     return "\n\n".join(lines).strip()
+
+
+def _approval_side_reaction(approval: PendingGroupApproval) -> str:
+    pipeline_state = approval.pipeline_state
+    if pipeline_state is None:
+        return ""
+    return str(pipeline_state.decision_side_reaction or "").strip()
 
 
 def _pad_approval_candidates(
@@ -7538,6 +7559,7 @@ async def _send_approved_group_reply_scoped(
         last_group_mention_targets[approval.group_id] = (sent_mention_user_id, time.time())
     else:
         last_group_mention_targets.pop(approval.group_id, None)
+    await _execute_approved_side_reaction(bot, approval)
     send_elapsed_ms = int((time.monotonic() - send_started_at) * 1000)
     if pipeline_state is not None:
         _pipeline_mark_completed(pipeline_state, elapsed_ms=send_elapsed_ms)
@@ -7560,6 +7582,83 @@ async def _send_approved_group_reply_scoped(
         await _send_private_message(bot, user_id=approver_id, message=Message("已发。"))
     except ActionFailed:
         pass
+
+
+async def _execute_approved_side_reaction(bot: Bot, approval: PendingGroupApproval) -> None:
+    pipeline_state = approval.pipeline_state
+    side_reaction = _approval_side_reaction(approval)
+    if pipeline_state is None or not side_reaction:
+        return
+    target_message_id = str(pipeline_state.source_message_id or "").strip()
+    if not target_message_id.isdigit():
+        logger.info(
+            "qq_social_agent approved side reaction skipped: "
+            f"group={approval.group_id} reason=missing_message_id reaction={side_reaction}"
+        )
+        return
+    reaction = reaction_from_action(pipeline_state.decision_action, side_reaction)
+    try:
+        result = await social_action_service.react_to_message(
+            bot,
+            group_id=approval.group_id,
+            user_id=approval.trigger_user_id,
+            message_id=target_message_id,
+            reaction=reaction,
+            target_label=_member_label(approval.trigger_user_id, approval.trigger_nickname),
+        )
+    except ActionFailed as exc:
+        logger.warning(
+            "qq_social_agent approved side reaction failed: "
+            f"group={approval.group_id} message_id={target_message_id} {_action_failed_summary(exc)}"
+        )
+        _record_metric_event(
+            "social_action_failed",
+            group_id=approval.group_id,
+            user_id=approval.trigger_user_id,
+            stage="approved_side_reaction",
+            action="react",
+            reaction=reaction,
+            error=_action_failed_summary(exc),
+        )
+        return
+    except Exception as exc:
+        logger.warning(
+            "qq_social_agent approved side reaction failed: "
+            f"group={approval.group_id} message_id={target_message_id} error={exc}"
+        )
+        _record_metric_event(
+            "social_action_failed",
+            group_id=approval.group_id,
+            user_id=approval.trigger_user_id,
+            stage="approved_side_reaction",
+            action="react",
+            reaction=reaction,
+            error=str(exc)[:160],
+        )
+        return
+    _record_metric_event(
+        "social_action",
+        group_id=approval.group_id,
+        user_id=approval.trigger_user_id,
+        stage="approved_side_reaction",
+        action="react",
+        reaction=result.reaction,
+        reason=result.reason,
+        emoji_id=result.emoji_id,
+        sent=result.sent,
+        approval_id=approval.approval_id,
+    )
+    if result.sent:
+        logger.info(
+            "qq_social_agent approved side reaction sent: "
+            f"group={approval.group_id} message_id={target_message_id} "
+            f"reaction={result.reaction} emoji_id={result.emoji_id}"
+        )
+    else:
+        logger.info(
+            "qq_social_agent approved side reaction skipped: "
+            f"group={approval.group_id} message_id={target_message_id} reason={result.reason}"
+        )
 
 
 def _is_group_send_blocked_error(exc: ActionFailed) -> bool:

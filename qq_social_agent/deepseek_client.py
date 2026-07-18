@@ -41,6 +41,7 @@ class ReplyDecision:
     fresh_query: str = ""
     fresh_kind: str = "news"
     reaction: str = ""
+    side_reaction: str = ""
 
 
 @dataclass(frozen=True)
@@ -479,6 +480,7 @@ class DeepSeekClient:
             member_context_section=_optional_section("当前相关群友", member_context),
             memory_atoms_context_section=_optional_section("长期记忆单元", memory_atoms_context),
             recall_feedback_context_section=_optional_section("主人撤回反馈", recall_feedback_context),
+            social_action_context_section="",
             style_context_section=_optional_section("群聊表达风格参考", style_context),
             raw_corpus_context_section=_optional_section("群友原文语料参考", raw_corpus_context),
             jargon_context_section=_optional_section("群内黑话词典", jargon_context),
@@ -593,6 +595,7 @@ class DeepSeekClient:
         memory_atoms_context: str = "",
         recall_feedback_context: str = "",
         positive_feedback_context: str = "",
+        social_action_context: str = "",
         mention_targets: str = "",
         priority_context: str = "",
         include_bot_history: bool = True,
@@ -611,6 +614,7 @@ class DeepSeekClient:
             memory_atoms_context = context_packet.get("memory_atoms")
             recall_feedback_context = context_packet.get("recall_feedback")
             positive_feedback_context = context_packet.get("positive_feedback")
+            social_action_context = context_packet.get("social_actions")
         selected_recent = (
             recent_messages[-max(1, context_message_limit) :]
             if context_message_limit is not None
@@ -657,6 +661,7 @@ class DeepSeekClient:
             memory_atoms_context_section=_optional_section("长期记忆单元", memory_atoms_context),
             recall_feedback_context_section=_optional_section("主人撤回/不准奏反馈", recall_feedback_context),
             positive_feedback_context_section=_optional_section("审批人标记过的优质发言方向", positive_feedback_context),
+            social_action_context_section=_optional_section("最近表情动作", social_action_context),
             style_context_section=_optional_section("群聊表达风格参考", style_context),
             raw_corpus_context_section=_optional_section("群友原文语料参考", raw_corpus_context),
             jargon_context_section=_optional_section("群内黑话词典", jargon_context),
@@ -980,6 +985,15 @@ def _parse_reply_decision(content: str) -> ReplyDecision:
     fresh_query = str(raw.get("fresh_query", "") or "").strip()
     fresh_kind = str(raw.get("fresh_kind", "news") or "news").strip().lower()
     reaction = _normalize_reaction_name(str(raw.get("reaction", "") or ""))
+    side_reaction = _normalize_reaction_name(
+        str(
+            raw.get("side_reaction", "")
+            or raw.get("sideReaction", "")
+            or raw.get("emoji_reaction", "")
+            or raw.get("emojiReaction", "")
+            or ""
+        )
+    )
     if fresh_kind not in {"news", "sports", "web"}:
         fresh_kind = "news"
     if action == "market_check":
@@ -990,10 +1004,19 @@ def _parse_reply_decision(content: str) -> ReplyDecision:
         action = "answer"
     if action == "ignore":
         should_reply = False
+    if action == "react":
+        if not reaction and side_reaction:
+            reaction = side_reaction
+        side_reaction = ""
+    elif reaction and not side_reaction:
+        side_reaction = reaction
+        reaction = ""
     if need_tool and tool == "market":
         action = "market_check"
     if not should_reply:
         action = "ignore"
+        reaction = ""
+        side_reaction = ""
     return ReplyDecision(
         should_reply,
         confidence,
@@ -1008,6 +1031,7 @@ def _parse_reply_decision(content: str) -> ReplyDecision:
         fresh_query[:120],
         fresh_kind,
         reaction,
+        side_reaction,
     )
 
 

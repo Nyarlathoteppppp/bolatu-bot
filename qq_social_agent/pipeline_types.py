@@ -129,6 +129,7 @@ class PipelineState:
     decision_action: str = "ignore"
     decision_reason: str = ""
     decision_confidence: float = 0.0
+    decision_side_reaction: str = ""
     tool_requests: tuple[ToolRequest, ...] = ()
     tool_results: tuple[ToolResult, ...] = ()
     context: ContextPacket = field(default_factory=ContextPacket)

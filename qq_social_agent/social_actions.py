@@ -9,16 +9,16 @@ from . import onebot_gateway
 
 
 DEFAULT_REACTION_EMOJI_IDS = {
-    "agree": "76",
-    "like": "76",
-    "care": "49",
-    "hug": "49",
-    "laugh": "28",
-    "tease": "101",
-    "surprise": "32",
-    "question": "32",
-    "applause": "99",
-    "heart": "66",
+    "agree": ("76",),
+    "like": ("76",),
+    "care": ("49",),
+    "hug": ("49",),
+    "laugh": ("28",),
+    "tease": ("101",),
+    "surprise": ("32",),
+    "question": ("32",),
+    "applause": ("99",),
+    "heart": ("66",),
 }
 
 
@@ -28,6 +28,17 @@ class ReactionResult:
     reason: str
     reaction: str
     emoji_id: str
+
+
+@dataclass(frozen=True)
+class SocialReactionRecord:
+    group_id: int
+    user_id: int
+    target_label: str
+    message_id: str
+    reaction: str
+    emoji_id: str
+    created_at: float
 
 
 @dataclass(frozen=True)
@@ -51,7 +62,7 @@ class SocialActionService:
         self,
         *,
         enabled: bool = True,
-        emoji_ids: dict[str, str] | None = None,
+        emoji_ids: dict[str, object] | None = None,
         per_user_cooldown_seconds: int = 120,
         per_group_cooldown_seconds: int = 18,
         max_per_group_hour: int = 24,
@@ -63,9 +74,12 @@ class SocialActionService:
         poke_max_per_group_day: int = 4,
     ) -> None:
         self.enabled = enabled
-        self.emoji_ids = dict(DEFAULT_REACTION_EMOJI_IDS)
+        self.emoji_ids = {
+            key: tuple(values)
+            for key, values in DEFAULT_REACTION_EMOJI_IDS.items()
+        }
         if emoji_ids:
-            self.emoji_ids.update({str(key): str(value) for key, value in emoji_ids.items() if value})
+            self.emoji_ids.update(_normalize_emoji_id_config(emoji_ids))
         self.per_user_cooldown_seconds = max(0, int(per_user_cooldown_seconds))
         self.per_group_cooldown_seconds = max(0, int(per_group_cooldown_seconds))
         self.max_per_group_hour = max(0, int(max_per_group_hour))
@@ -73,6 +87,7 @@ class SocialActionService:
         self._last_group_reaction_at: dict[int, float] = {}
         self._group_reaction_times: dict[int, deque[float]] = {}
         self._reacted_messages: set[tuple[int, str]] = set()
+        self._recent_reactions: dict[int, deque[SocialReactionRecord]] = {}
         self.poke_enabled = bool(poke_enabled)
         self.poke_familiar_user_ids = set(poke_familiar_user_ids or set())
         self.poke_per_user_cooldown_seconds = max(0, int(poke_per_user_cooldown_seconds))
@@ -172,6 +187,16 @@ class SocialActionService:
             "poke_max_per_group_day": self.poke_max_per_group_day,
         }
 
+    def recent_reaction_context(self, group_id: int, *, limit: int = 4) -> str:
+        records = self._recent_reactions.get(group_id)
+        if not records:
+            return ""
+        lines: list[str] = []
+        for record in list(records)[-max(1, limit) :]:
+            label = record.target_label or f"QQ {record.user_id}"
+            lines.append(f"- 风雪刚给 {label} 的消息点了 {record.reaction} 表情")
+        return "\n".join(lines)
+
     async def react_to_message(
         self,
         bot: onebot_gateway.OneBotGateway,
@@ -180,11 +205,12 @@ class SocialActionService:
         user_id: int,
         message_id: int | str,
         reaction: str,
+        target_label: str = "",
         now: float | None = None,
     ) -> ReactionResult:
         current = time.time() if now is None else now
         normalized = normalize_reaction(reaction)
-        emoji_id = self.emoji_ids.get(normalized, self.emoji_ids["agree"])
+        emoji_id = self._emoji_id_for(group_id, normalized)
         message_key = str(message_id or "").strip()
         if not self.enabled:
             return ReactionResult(False, "disabled", normalized, emoji_id)
@@ -194,7 +220,15 @@ class SocialActionService:
         if reason:
             return ReactionResult(False, reason, normalized, emoji_id)
         await onebot_gateway.set_msg_emoji_like(bot, message_key, emoji_id)
-        self._remember_reaction(group_id, user_id, message_key, now=current)
+        self._remember_reaction(
+            group_id,
+            user_id,
+            message_key,
+            reaction=normalized,
+            emoji_id=emoji_id,
+            target_label=target_label,
+            now=current,
+        )
         return ReactionResult(True, "sent", normalized, emoji_id)
 
     def _cooldown_reason(self, group_id: int, user_id: int, message_id: str, *, now: float) -> str:
@@ -213,11 +247,53 @@ class SocialActionService:
             return "group_hourly_limit"
         return ""
 
-    def _remember_reaction(self, group_id: int, user_id: int, message_id: str, *, now: float) -> None:
+    def _emoji_id_for(self, group_id: int, reaction: str) -> str:
+        candidates = self.emoji_ids.get(reaction) or self.emoji_ids["agree"]
+        if len(candidates) <= 1:
+            return candidates[0]
+        recent = list(self._recent_reactions.get(group_id, ()))
+        last_emoji = recent[-1].emoji_id if recent else ""
+        usage = {emoji_id: 0 for emoji_id in candidates}
+        for record in recent:
+            if record.emoji_id in usage:
+                usage[record.emoji_id] += 1
+        ranked = sorted(
+            candidates,
+            key=lambda emoji_id: (
+                emoji_id == last_emoji,
+                usage.get(emoji_id, 0),
+                candidates.index(emoji_id),
+            ),
+        )
+        return ranked[0]
+
+    def _remember_reaction(
+        self,
+        group_id: int,
+        user_id: int,
+        message_id: str,
+        *,
+        reaction: str,
+        emoji_id: str,
+        target_label: str,
+        now: float,
+    ) -> None:
         self._reacted_messages.add((group_id, message_id))
         self._last_user_reaction_at[(group_id, user_id)] = now
         self._last_group_reaction_at[group_id] = now
         self._group_reaction_times.setdefault(group_id, deque()).append(now)
+        bucket = self._recent_reactions.setdefault(group_id, deque(maxlen=20))
+        bucket.append(
+            SocialReactionRecord(
+                group_id=group_id,
+                user_id=user_id,
+                target_label=target_label,
+                message_id=message_id,
+                reaction=reaction,
+                emoji_id=emoji_id,
+                created_at=now,
+            )
+        )
 
 
 def reaction_from_action(action: str, requested_reaction: str = "") -> str:
@@ -262,6 +338,24 @@ def normalize_reaction(value: str) -> str:
     }
     normalized = aliases.get(key, key)
     return normalized if normalized in DEFAULT_REACTION_EMOJI_IDS else "agree"
+
+
+def _normalize_emoji_id_config(raw: dict[str, object]) -> dict[str, tuple[str, ...]]:
+    result: dict[str, tuple[str, ...]] = {}
+    for raw_key, raw_value in raw.items():
+        key = normalize_reaction(str(raw_key))
+        values: list[str] = []
+        if isinstance(raw_value, (list, tuple, set)):
+            source = raw_value
+        else:
+            source = (raw_value,)
+        for item in source:
+            value = str(item or "").strip()
+            if value and value not in values:
+                values.append(value)
+        if values:
+            result[key] = tuple(values)
+    return result
 
 
 def _int_set(value: object) -> set[int]:

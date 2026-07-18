@@ -17,6 +17,7 @@ _MODE_SECTION_BUDGETS: dict[PipelineMode, dict[str, int]] = {
         "positive_feedback": 600,
         "style": 700,
         "raw_corpus": 1500,
+        "social_actions": 500,
     },
     # Fresh facts must not be overridden by old chat summaries or style
     # examples. The recent message window and the fresh fact pack are supplied
@@ -44,6 +45,7 @@ def assemble_generation_context(
     jargon_context: str = "",
     recall_feedback_context: str = "",
     positive_feedback_context: str = "",
+    social_action_context: str = "",
     rag_document_ids: tuple[int, ...] = (),
     rag_document_types: tuple[str, ...] = (),
     mode: PipelineMode | str = PipelineMode.CHAT,
@@ -67,6 +69,7 @@ def assemble_generation_context(
         ContextSection("jargon", jargon_context, "jargon", 75),
         ContextSection("recall_feedback", recall_feedback_context, "approval_feedback", 70),
         ContextSection("positive_feedback", positive_feedback_context, "approval_feedback", 65),
+        ContextSection("social_actions", social_action_context, "social_action_history", 60),
     ]
     candidates.sort(key=lambda item: item.priority, reverse=True)
     sections: list[ContextSection] = []

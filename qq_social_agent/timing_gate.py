@@ -25,6 +25,7 @@ class TimingDecision:
     confidence: float = 0.0
     reason: str = ""
     reaction: str = ""
+    side_reaction: str = ""
 
     def to_reply_decision(self) -> ReplyDecision:
         from .deepseek_client import ReplyDecision
@@ -48,6 +49,7 @@ class TimingDecision:
             self.reason,
             mode="chat",
             action=INTENT_TO_ACTION.get(self.intent, "reply"),
+            side_reaction=self.side_reaction,
         )
 
 
@@ -68,10 +70,26 @@ def parse_timing_decision(raw: object) -> TimingDecision:
     reaction = str(data.get("reaction", "") or "").strip().lower()
     if reaction not in {"agree", "care", "laugh", "tease", "surprise", "question", "applause", "heart"}:
         reaction = ""
+    side_reaction = str(
+        data.get("side_reaction", "")
+        or data.get("sideReaction", "")
+        or data.get("emoji_reaction", "")
+        or ""
+    ).strip().lower()
+    if side_reaction not in {"agree", "care", "laugh", "tease", "surprise", "question", "applause", "heart"}:
+        side_reaction = ""
+    if channel == OutputChannel.REACT:
+        if not reaction and side_reaction:
+            reaction = side_reaction
+        side_reaction = ""
+    elif reaction and not side_reaction:
+        side_reaction = reaction
+        reaction = ""
     return TimingDecision(
         channel=channel,
         intent=intent,
         confidence=confidence,
         reason=str(data.get("reason", "") or "")[:40],
         reaction=reaction,
+        side_reaction=side_reaction,
     )

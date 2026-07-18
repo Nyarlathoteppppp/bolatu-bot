@@ -138,6 +138,35 @@ def test_social_action_service_reacts_once_and_rate_limits() -> None:
     assert bot.calls == [("set_msg_emoji_like", {"message_id": 42, "emoji_id": "28"})]
 
 
+def test_social_action_service_rotates_configured_emoji_ids() -> None:
+    class FakeReactBot:
+        def __init__(self) -> None:
+            self.calls = []
+
+        async def call_api(self, api: str, **data):
+            self.calls.append((api, data))
+            return {}
+
+    bot = FakeReactBot()
+    service = SocialActionService(
+        emoji_ids={"laugh": ["28", "101"]},
+        per_user_cooldown_seconds=0,
+        per_group_cooldown_seconds=0,
+    )
+
+    first = asyncio.run(
+        service.react_to_message(bot, group_id=1, user_id=100, message_id=42, reaction="laugh", now=1000)
+    )
+    second = asyncio.run(
+        service.react_to_message(bot, group_id=1, user_id=101, message_id=43, reaction="laugh", now=1010)
+    )
+
+    assert first.sent
+    assert second.sent
+    assert [call[1]["emoji_id"] for call in bot.calls] == ["28", "101"]
+    assert "点了 laugh 表情" in service.recent_reaction_context(1)
+
+
 def test_reply_decision_parser_accepts_react_action() -> None:
     decision = _parse_reply_decision(
         '{"should_reply": true, "confidence": 0.8, "action": "react", '
@@ -147,6 +176,19 @@ def test_reply_decision_parser_accepts_react_action() -> None:
     assert decision.should_reply
     assert decision.action == "react"
     assert decision.reaction == "laugh"
+    assert decision.side_reaction == ""
+
+
+def test_reply_decision_parser_keeps_text_action_for_side_reaction() -> None:
+    decision = _parse_reply_decision(
+        '{"should_reply": true, "confidence": 0.8, "action": "tease", '
+        '"reaction": "laugh", "mode": "chat", "reason": "能接一句"}'
+    )
+
+    assert decision.should_reply
+    assert decision.action == "tease"
+    assert decision.reaction == ""
+    assert decision.side_reaction == "laugh"
 
 
 def test_parse_ocr_text_handles_common_payload_shapes() -> None:

@@ -27,11 +27,13 @@ def apply_decision(
     action: str,
     reason: str,
     confidence: float,
+    side_reaction: str = "",
     elapsed_ms: int | None = None,
 ) -> None:
     state.decision_action = action
     state.decision_reason = reason
     state.decision_confidence = confidence
+    state.decision_side_reaction = side_reaction
     if not should_reply:
         state.output_channel = OutputChannel.SILENT
     elif action == "react":

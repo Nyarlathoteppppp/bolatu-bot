@@ -89,13 +89,13 @@ social_actions:
   per_group_cooldown_seconds: 6
   max_per_group_hour: 60
   emoji_ids:
-    agree: "76"
-    care: "49"
-    laugh: "28"
-    tease: "101"
+    agree: ["76", "99"]
+    care: ["49", "66"]
+    laugh: ["28", "101"]
+    tease: ["101", "28"]
     surprise: "32"
-    applause: "99"
-    heart: "66"
+    applause: ["99", "76"]
+    heart: ["66", "49"]
   poke:
     enabled: true
     familiar_user_ids:

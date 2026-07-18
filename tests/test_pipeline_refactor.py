@@ -109,6 +109,25 @@ def test_timing_gate_has_small_channel_and_intent_surface() -> None:
     assert decision.reaction == "laugh"
 
 
+def test_timing_gate_converts_text_reaction_to_side_reaction() -> None:
+    timing = parse_timing_decision(
+        {
+            "channel": "text",
+            "intent": "chat",
+            "confidence": 0.7,
+            "reason": "能接一句",
+            "reaction": "laugh",
+        }
+    )
+    decision = timing.to_reply_decision()
+
+    assert timing.channel is OutputChannel.TEXT
+    assert timing.reaction == ""
+    assert timing.side_reaction == "laugh"
+    assert decision.action == "reply"
+    assert decision.side_reaction == "laugh"
+
+
 def test_tool_router_searches_academic_concept_without_asking_timing_model() -> None:
     plan = route_tools(
         "三维挂谷猜想是什么，有什么最新进展",
