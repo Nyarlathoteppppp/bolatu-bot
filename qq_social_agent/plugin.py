@@ -19,6 +19,7 @@ from nonebot.adapters.onebot.v11.exception import ActionFailed
 from nonebot.matcher import Matcher
 from nonebot.params import CommandArg
 from nonebot.rule import Rule
+from starlette.requests import Request
 from starlette.responses import HTMLResponse, JSONResponse
 
 from . import onebot_gateway
@@ -213,6 +214,7 @@ pending_group_approvals: dict[int, "PendingGroupApproval"] = {}
 recent_suppression_events: list["SuppressionEvent"] = []
 daily_review_tasks: dict[str, asyncio.Task[None]] = {}
 maintenance_tasks: dict[str, asyncio.Task[None]] = {}
+connected_onebot_bots: dict[str, Bot] = {}
 approval_processing_lock = asyncio.Lock()
 approval_choice_cooldowns: dict[int, float] = {}
 PROCESS_STARTED_AT = time.time()
@@ -263,6 +265,13 @@ if hasattr(_driver, "server_app"):
     async def _http_trace_endpoint(trace_id: str = "", limit: int = 50) -> HTMLResponse:
         snapshot = _http_trace_payload(trace_id=trace_id, limit=limit)
         return HTMLResponse(render_trace_html(snapshot, title="张风雪消息链路 Trace"))
+
+    @_driver.server_app.post("/admin/daily-review/{mode}")
+    async def _http_daily_review_endpoint(request: Request, mode: str) -> JSONResponse:
+        if not _is_local_admin_request(request):
+            return JSONResponse({"ok": False, "reason": "local_admin_only"}, status_code=403)
+        payload, status_code = await _http_daily_review_payload(mode=mode)
+        return JSONResponse(payload, status_code=status_code)
 
 MID_MEMORY_KEEP_SUMMARIES = 4
 MID_MEMORY_BATCH_SIZE = 60
@@ -647,6 +656,7 @@ def _ensure_builtin_memory_atoms() -> None:
 
 @get_driver().on_bot_connect
 async def _send_approval_rules_on_connect(bot: Bot) -> None:
+    connected_onebot_bots[str(bot.self_id)] = bot
     mark_bot_connected(int(bot.self_id))
     _record_metric_event(
         "onebot_connection",
@@ -719,6 +729,7 @@ async def _notify_active_group_mutes(bot: Bot) -> None:
 
 @get_driver().on_bot_disconnect
 async def _mark_onebot_disconnected(bot: Bot) -> None:
+    connected_onebot_bots.pop(str(bot.self_id), None)
     mark_bot_disconnected(int(bot.self_id))
     _record_metric_event(
         "onebot_connection",
@@ -2232,6 +2243,33 @@ def _http_trace_payload(*, trace_id: str = "", limit: int = 50) -> dict[str, obj
     result["trace_count"] = len(filtered)
     result["available_trace_count"] = len(filtered)
     return result
+
+
+def _is_local_admin_request(request: Request) -> bool:
+    client = getattr(request, "client", None)
+    host = str(getattr(client, "host", "") or "")
+    return host in {"127.0.0.1", "::1", "localhost"} or host.startswith("172.")
+
+
+def _first_connected_onebot_bot() -> Bot | None:
+    for bot in connected_onebot_bots.values():
+        return bot
+    return None
+
+
+async def _http_daily_review_payload(*, mode: str) -> tuple[dict[str, object], int]:
+    bot = _first_connected_onebot_bot()
+    if bot is None:
+        return {"ok": False, "reason": "onebot_disconnected"}, 503
+    normalized_mode = (mode or "today").strip().lower()
+    sent_count, total_count = await _send_manual_daily_reviews(bot, mode=normalized_mode)
+    ok = sent_count > 0
+    return {
+        "ok": ok,
+        "mode": normalized_mode,
+        "sent_count": sent_count,
+        "target_count": total_count,
+    }, 200 if ok else 503
 
 
 def _http_health_payload() -> dict[str, object]:
