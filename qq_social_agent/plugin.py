@@ -131,6 +131,7 @@ from .rag_admin import RAGAdminController
 from .rag_query import normalize_rag_query
 from .rag_retriever import RAGRetrievalResult, RAGService
 from .reference_resolver import resolve_context_reference
+from .reply_splitter import split_reply_messages
 from .social_actions import PokeContext, ReactionResult, SocialActionService, reaction_from_action
 from .tools.fresh_context import (
     FreshContextTool,
@@ -322,6 +323,9 @@ DAILY_REVIEW_HOUR = int(_daily_review_config.get("hour", 0)) % 24
 DAILY_REVIEW_MINUTE = int(_daily_review_config.get("minute", 0)) % 60
 DAILY_REVIEW_CATCH_UP_SECONDS = max(0, int(float(_daily_review_config.get("catch_up_hours", 12)) * 3600))
 DAILY_REVIEW_MESSAGE_LIMIT = max(20, int(_daily_review_config.get("message_limit", 140)))
+DAILY_REVIEW_RETRY_SECONDS = max(60, int(_daily_review_config.get("retry_seconds", 5 * 60)))
+DAILY_REVIEW_POLL_SECONDS = max(60, int(_daily_review_config.get("poll_seconds", 5 * 60)))
+DAILY_REVIEW_RESPECT_MUTE = bool(_daily_review_config.get("respect_mute", False))
 ADDRESS_REPEAT_WINDOW_SECONDS = 10 * 60
 MENTION_TARGET_LIMIT = 8
 REPEAT_MENTION_SUPPRESS_SECONDS = 10 * 60
@@ -994,12 +998,26 @@ def _ensure_daily_review_task(bot: Bot) -> None:
 async def _run_daily_review_scheduler(bot: Bot, bot_key: str) -> None:
     try:
         while True:
-            within_catch_up = _daily_review_within_catch_up_window()
-            if within_catch_up:
-                await _send_due_daily_reviews(bot)
-            delay = _seconds_until_next_daily_review()
-            if within_catch_up:
-                delay = min(delay, 5 * 60)
+            delay = DAILY_REVIEW_RETRY_SECONDS
+            try:
+                now = time.time()
+                within_catch_up = _daily_review_within_catch_up_window(now)
+                has_pending = False
+                if within_catch_up:
+                    has_pending = await _send_due_daily_reviews(bot, now=now)
+                delay = (
+                    DAILY_REVIEW_RETRY_SECONDS
+                    if within_catch_up and has_pending
+                    else min(_seconds_until_next_daily_review(time.time()), DAILY_REVIEW_POLL_SECONDS)
+                )
+            except Exception as exc:
+                logger.warning(f"qq_social_agent daily review scheduler tick failed: bot={bot_key} error={exc}")
+                _record_metric_event(
+                    "daily_review",
+                    stage="scheduler",
+                    action="tick_failed",
+                    reason=_short_notice_text(str(exc), 200),
+                )
             await asyncio.sleep(max(1.0, delay))
     except asyncio.CancelledError:
         raise
@@ -1026,32 +1044,41 @@ def _daily_review_within_catch_up_window(now: float | None = None) -> bool:
     return 0 <= current - target <= DAILY_REVIEW_CATCH_UP_SECONDS
 
 
-async def _send_due_daily_reviews(bot: Bot) -> None:
+async def _send_due_daily_reviews(bot: Bot, *, now: float | None = None) -> bool:
     if deepseek_client is None:
         logger.warning("qq_social_agent daily review skipped: deepseek_client_not_ready")
-        return
+        _record_metric_event("daily_review", stage="check", action="skipped", reason="deepseek_client_not_ready")
+        return True
     target_groups = _daily_review_target_groups()
     if not target_groups:
         logger.info("qq_social_agent daily review skipped: no_target_groups")
-        return
-    now = time.time()
-    start_at, end_at, review_label = _daily_review_window(now)
+        _record_metric_event("daily_review", stage="check", action="skipped", reason="no_target_groups")
+        return False
+    current = time.time() if now is None else now
+    start_at, end_at, review_label = _daily_review_window(current)
+    has_pending = False
     for group_id in target_groups:
-        if not _daily_review_group_enabled(group_id, now=now):
+        if not _daily_review_group_enabled(group_id, now=current):
             logger.info(f"qq_social_agent daily review skipped: group={group_id} disabled_or_muted")
+            _record_metric_event("daily_review", group_id=group_id, stage="check", action="skipped", reason="disabled_or_muted")
             continue
         sent_key = _daily_review_sent_key(group_id, review_label)
         if memory.app_kv_get(sent_key) == "sent":
             logger.info(f"qq_social_agent daily review skipped: group={group_id} already_sent date={review_label}")
             continue
-        await _send_daily_review_for_group(
+        success = await _send_daily_review_for_group(
             bot,
             group_id=group_id,
             start_at=start_at,
             end_at=end_at,
             review_label=review_label,
             sent_key=sent_key,
+            mark_sent=True,
+            source="scheduled",
         )
+        if not success:
+            has_pending = True
+    return has_pending
 
 
 async def _send_daily_review_for_group(
@@ -1061,8 +1088,10 @@ async def _send_daily_review_for_group(
     start_at: float,
     end_at: float,
     review_label: str,
-    sent_key: str,
-) -> None:
+    sent_key: str | None,
+    mark_sent: bool,
+    source: str,
+) -> bool:
     persona_id = str(memory.group_state(group_id)["persona"] or app_config.group_config(group_id).get("persona") or app_config.default_persona)
     persona = personas.get(persona_id)
     messages = memory.messages_between(
@@ -1087,7 +1116,16 @@ async def _send_daily_review_for_group(
         review = review_draft.public_reply if review_draft is not None else ""
     except Exception as exc:
         logger.warning(f"qq_social_agent daily review generation failed: group={group_id} error={exc}")
-        return
+        _record_metric_event(
+            "daily_review",
+            group_id=group_id,
+            stage="generation",
+            action="failed",
+            review_label=review_label,
+            source=source,
+            reason=_short_notice_text(str(exc), 200),
+        )
+        return False
     if review_draft is not None:
         try:
             learned_atom_ids = persist_daily_review_learning(
@@ -1122,7 +1160,16 @@ async def _send_daily_review_for_group(
         logger.info(f"qq_social_agent political guard daily review output: group={group_id}")
     parts = split_reply_messages(review, max_messages=3)
     if not parts:
-        return
+        _record_metric_event(
+            "daily_review",
+            group_id=group_id,
+            stage="send",
+            action="failed",
+            review_label=review_label,
+            source=source,
+            reason="empty_after_sanitize",
+        )
+        return False
     for index, part in enumerate(parts):
         try:
             message_id = await _send_group_message(bot, group_id, Message(part))
@@ -1141,14 +1188,36 @@ async def _send_daily_review_for_group(
                 "qq_social_agent failed sending daily review: "
                 f"group={group_id} {_action_failed_summary(exc)}"
             )
-            return
+            _record_metric_event(
+                "daily_review",
+                group_id=group_id,
+                stage="send",
+                action="failed",
+                review_label=review_label,
+                source=source,
+                reason=_short_notice_text(_action_failed_summary(exc), 200),
+            )
+            return False
         if index < len(parts) - 1:
             await asyncio.sleep(0.9)
-    memory.app_kv_set(sent_key, "sent")
+    if mark_sent and sent_key:
+        memory.app_kv_set(sent_key, "sent")
+    _record_metric_event(
+        "daily_review",
+        group_id=group_id,
+        stage="send",
+        action="sent",
+        review_label=review_label,
+        source=source,
+        message_count=len(messages),
+        part_count=len(parts),
+        mark_sent=mark_sent,
+    )
     logger.info(
         "qq_social_agent daily review sent: "
         f"group={group_id} date={review_label} messages={len(messages)} parts={len(parts)}"
     )
+    return True
 
 
 def _daily_review_feedback_context(
@@ -1192,7 +1261,9 @@ def _daily_review_group_enabled(group_id: int, *, now: float) -> bool:
     state = memory.group_state(group_id)
     if not bool(group_cfg.get("enabled", True)) or not bool(state["enabled"]):
         return False
-    return float(state["muted_until"]) <= now
+    if DAILY_REVIEW_RESPECT_MUTE:
+        return float(state["muted_until"]) <= now
+    return True
 
 
 def _daily_review_sent_key(group_id: int, today_label: str) -> str:
@@ -1207,6 +1278,49 @@ def _daily_review_window(now: float) -> tuple[float, float, str]:
     local_end = datetime.fromtimestamp(end_at - 1, DAILY_REVIEW_TIMEZONE)
     label = f"{local_end.year:04d}-{local_end.month:02d}-{local_end.day:02d}"
     return start_at, end_at, label
+
+
+def _daily_review_today_window(now: float) -> tuple[float, float, str]:
+    local_now = datetime.fromtimestamp(now, DAILY_REVIEW_TIMEZONE)
+    start_local = local_now.replace(hour=0, minute=0, second=0, microsecond=0)
+    label = f"{local_now.year:04d}-{local_now.month:02d}-{local_now.day:02d} 今日到现在"
+    return start_local.timestamp(), now, label
+
+
+async def _send_manual_daily_reviews(bot: Bot, *, mode: str) -> tuple[int, int]:
+    if deepseek_client is None:
+        logger.warning("qq_social_agent manual daily review skipped: deepseek_client_not_ready")
+        return 0, 0
+    now = time.time()
+    if mode in {"due", "补发", "scheduled", "midnight", "午夜"}:
+        start_at, end_at, review_label = _daily_review_window(now)
+        mark_sent = True
+        source = "manual_due"
+    else:
+        start_at, end_at, review_label = _daily_review_today_window(now)
+        mark_sent = False
+        source = "manual_today"
+    sent_count = 0
+    total_count = 0
+    for group_id in _daily_review_target_groups():
+        if not _daily_review_group_enabled(group_id, now=now):
+            continue
+        total_count += 1
+        sent_key = _daily_review_sent_key(group_id, review_label) if mark_sent else None
+        if mark_sent and sent_key and memory.app_kv_get(sent_key) == "sent":
+            continue
+        if await _send_daily_review_for_group(
+            bot,
+            group_id=group_id,
+            start_at=start_at,
+            end_at=end_at,
+            review_label=review_label,
+            sent_key=sent_key,
+            mark_sent=mark_sent,
+            source=source,
+        ):
+            sent_count += 1
+    return sent_count, total_count
 
 
 def _local_day_start_and_label(now: float) -> tuple[float, str]:
@@ -4162,7 +4276,7 @@ bot_command = on_command("bot", priority=10, block=True)
 
 
 @bot_command.handle()
-async def handle_bot_command(event: Event, matcher: Matcher, args: Message = CommandArg()) -> None:
+async def handle_bot_command(bot: Bot, event: Event, matcher: Matcher, args: Message = CommandArg()) -> None:
     chat_id = _command_chat_id(event)
     if chat_id is None:
         return
@@ -4187,6 +4301,10 @@ async def handle_bot_command(event: Event, matcher: Matcher, args: Message = Com
         "metrics",
         "metric",
         "统计",
+        "review",
+        "daily_review",
+        "daily-review",
+        "复盘",
     }
     if action in admin_actions and not _is_tool_admin_user(user_id):
         await matcher.finish("没权限。基础审批人只能用 A/B/C/D/X/1/2/3/取消 处理审批单。")
@@ -4250,8 +4368,14 @@ async def handle_bot_command(event: Event, matcher: Matcher, args: Message = Com
     if action in {"metrics", "metric", "统计"}:
         window = _parse_token_report_window(parts[1] if len(parts) >= 2 else "today")
         await matcher.finish(_format_metric_report(window, group_id=chat_id if chat_id > 0 else None))
+    if action in {"review", "daily_review", "daily-review", "复盘"}:
+        mode = parts[1].lower() if len(parts) >= 2 else "today"
+        sent_count, total_count = await _send_manual_daily_reviews(bot, mode=mode)
+        if sent_count:
+            await matcher.finish(f"已发送复盘：{sent_count}/{total_count} 个群。")
+        await matcher.finish(f"复盘没有发出：0/{total_count}。看后端 daily_review 日志。")
 
-    await matcher.finish("用法：/bot status|tokens 24h|tokens 2026-07-10|metrics today|blocked 20|pause|resume|reset|quiet 10m|persona <id>")
+    await matcher.finish("用法：/bot status|tokens 24h|tokens 2026-07-10|metrics today|blocked 20|review today|review due|pause|resume|reset|quiet 10m|persona <id>")
 
 
 def _parse_token_report_window(raw: str) -> TokenReportWindow:

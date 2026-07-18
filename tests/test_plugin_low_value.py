@@ -30,6 +30,7 @@ from qq_social_agent.plugin import (
     _format_member_impression_report,
     _format_raw_corpus_context,
     _format_recall_feedback_context,
+    _daily_review_today_window,
     _daily_review_window,
     _apply_backend_tool_decision,
     _compact_long_message_fallback,
@@ -840,6 +841,16 @@ def test_daily_review_timezone_and_startup_catchup_use_shanghai_midnight() -> No
     assert plugin._local_timestamp_for_today(0, 0, now=midnight + 3600) == midnight
     assert plugin._daily_review_within_catch_up_window(midnight + 3600)
     assert not plugin._daily_review_within_catch_up_window(midnight + 13 * 3600)
+
+
+def test_manual_daily_review_today_window_uses_today_so_far() -> None:
+    midnight = 1783872000.0  # 2026-07-13 00:00:00 Asia/Shanghai
+
+    start_at, end_at, label = _daily_review_today_window(midnight + 12 * 3600 + 34)
+
+    assert start_at == midnight
+    assert end_at == midnight + 12 * 3600 + 34
+    assert label == "2026-07-13 今日到现在"
 
 
 def test_meaningful_group_text_not_low_value() -> None:

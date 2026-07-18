@@ -112,6 +112,9 @@ daily_review:
   minute: 0
   catch_up_hours: 12
   message_limit: 140
+  retry_seconds: 300
+  poll_seconds: 300
+  respect_mute: false
 
 image_ocr:
   enabled: true
