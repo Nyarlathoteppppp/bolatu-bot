@@ -1086,6 +1086,7 @@ async def _send_due_daily_reviews(bot: Bot, *, now: float | None = None) -> bool
             sent_key=sent_key,
             mark_sent=True,
             source="scheduled",
+            trigger_label="午夜复盘",
         )
         if not success:
             has_pending = True
@@ -1102,6 +1103,7 @@ async def _send_daily_review_for_group(
     sent_key: str | None,
     mark_sent: bool,
     source: str,
+    trigger_label: str,
 ) -> bool:
     persona_id = str(memory.group_state(group_id)["persona"] or app_config.group_config(group_id).get("persona") or app_config.default_persona)
     persona = personas.get(persona_id)
@@ -1190,7 +1192,7 @@ async def _send_daily_review_for_group(
                 bot_reply=part,
                 trigger_user_id=0,
                 trigger_nickname="每日复盘",
-                trigger_text=f"{review_label} 午夜复盘",
+                trigger_text=f"{review_label} {trigger_label}",
                 action="daily_review",
             )
             memory.add_message(group_id, int(getattr(bot, "self_id", 0) or 0), persona.name, part, is_bot=True)
@@ -1307,10 +1309,12 @@ async def _send_manual_daily_reviews(bot: Bot, *, mode: str) -> tuple[int, int]:
         start_at, end_at, review_label = _daily_review_window(now)
         mark_sent = True
         source = "manual_due"
+        trigger_label = "补发午夜复盘"
     else:
         start_at, end_at, review_label = _daily_review_today_window(now)
         mark_sent = False
         source = "manual_today"
+        trigger_label = "即时复盘"
     sent_count = 0
     total_count = 0
     for group_id in _daily_review_target_groups():
@@ -1329,6 +1333,7 @@ async def _send_manual_daily_reviews(bot: Bot, *, mode: str) -> tuple[int, int]:
             sent_key=sent_key,
             mark_sent=mark_sent,
             source=source,
+            trigger_label=trigger_label,
         ):
             sent_count += 1
     return sent_count, total_count
