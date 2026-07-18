@@ -553,6 +553,40 @@ def test_reply_to_other_short_answer_enters_structured_context() -> None:
     assert "歌迷老蛆[#71184]回复安钰与雨与余[#56789]：南下了" in text
 
 
+def test_buffered_current_text_preserves_last_speaker_and_reply_relation() -> None:
+    reply_text = (
+        "歌迷老蛆[#71184]回复小鸟[#89072]消息【"
+        "小鸟[#89072]说：你看这个；"
+        "歌迷老蛆[#71184]回复小鸟[#89072]：行】"
+    )
+    items = [
+        plugin.BufferedGroupMessage(
+            bot=None,
+            event=None,
+            text="我着急赶地铁",
+            user_id=160236,
+            nickname="土木",
+            created_at=100,
+        ),
+        plugin.BufferedGroupMessage(
+            bot=None,
+            event=None,
+            text=reply_text,
+            user_id=1535071184,
+            nickname="歌迷老蛆",
+            created_at=101,
+        ),
+    ]
+
+    text = plugin._buffered_current_text(items)
+
+    assert plugin._buffered_current_nickname(items) == "歌迷老蛆"
+    assert "最后触发者：歌迷老蛆[#71184]" in text
+    assert "1. 土木[#60236]说：我着急赶地铁" in text
+    assert "2. 歌迷老蛆[#71184]回复小鸟[#89072]消息" in text
+    assert "歌迷老蛆[#71184]说：歌迷老蛆[#71184]回复" not in text
+
+
 def test_reply_to_other_unknown_original_uses_clear_fallback() -> None:
     event = SimpleNamespace(
         user_id=1535071184,

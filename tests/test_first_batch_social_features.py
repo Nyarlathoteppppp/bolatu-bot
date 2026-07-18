@@ -86,6 +86,27 @@ def test_history_backfill_inserts_messages_without_triggering_duplicates(tmp_pat
     assert not memory.claim_inbound_message(1, 10)
 
 
+def test_recent_messages_deduplicates_bot_live_history_echo(tmp_path) -> None:
+    memory = MemoryStore(tmp_path / "bot.sqlite3")
+
+    memory.add_message(1, 999, "张风雪", "同一句", is_bot=True, created_at=100, source_kind="live")
+    memory.add_message(
+        1,
+        999,
+        "张风雪",
+        "同一句",
+        is_bot=True,
+        created_at=100.5,
+        source_message_id=42,
+        source_kind="history",
+    )
+    memory.add_message(1, 100, "A", "后一句", created_at=101, source_message_id=43)
+
+    messages = memory.recent_messages(1, 5)
+    assert [message.text for message in messages] == ["同一句", "后一句"]
+    assert len(memory.recent_bot_replies(1, seconds=99999999999)) == 1
+
+
 def test_resolve_reply_reference_uses_get_msg_when_event_reply_has_no_text() -> None:
     class FakeReplyBot:
         async def call_api(self, api: str, **data):

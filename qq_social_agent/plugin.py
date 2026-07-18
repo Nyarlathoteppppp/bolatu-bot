@@ -1195,7 +1195,15 @@ async def _send_daily_review_for_group(
                 trigger_text=f"{review_label} {trigger_label}",
                 action="daily_review",
             )
-            memory.add_message(group_id, int(getattr(bot, "self_id", 0) or 0), persona.name, part, is_bot=True)
+            memory.add_message(
+                group_id,
+                int(getattr(bot, "self_id", 0) or 0),
+                persona.name,
+                part,
+                is_bot=True,
+                source_message_id=message_id,
+                source_kind="live",
+            )
         except ActionFailed as exc:
             logger.warning(
                 "qq_social_agent failed sending daily review: "
@@ -6006,28 +6014,41 @@ def _buffered_current_text(items: list[BufferedGroupMessage] | None) -> str:
     if len(items) == 1:
         return items[0].text
     recent_items = items[-6:]
-    lines = [f"{item.nickname}: {item.text}" for item in recent_items if item.text]
+    last_item = items[-1]
+    lines = [
+        f"【连续消息，按时间顺序；最后触发者：{_member_label(last_item.user_id, last_item.nickname)}】"
+    ]
     if len(items) > len(recent_items):
-        lines.insert(0, f"（前面还有 {len(items) - len(recent_items)} 条普通群消息）")
+        lines.append(f"（前面还有 {len(items) - len(recent_items)} 条普通群消息）")
+    for index, item in enumerate(recent_items, start=1):
+        line = _buffered_message_context_line(index, item)
+        if line:
+            lines.append(line)
     return "\n".join(lines).strip()
+
+
+def _buffered_message_context_line(index: int, item: BufferedGroupMessage) -> str:
+    text = (item.text or "").strip()
+    if not text:
+        return ""
+    label = _member_label(item.user_id, item.nickname)
+    if text.startswith(f"{label}回复") or text.startswith(f"{label}说"):
+        body = text
+    else:
+        body = f"{label}说：{text}"
+    return f"{index}. {body}"
 
 
 def _buffered_current_user_id(items: list[BufferedGroupMessage] | None) -> int:
     if not items:
         return 0
-    user_ids = {item.user_id for item in items}
-    if len(user_ids) == 1:
-        return items[-1].user_id
     return items[-1].user_id
 
 
 def _buffered_current_nickname(items: list[BufferedGroupMessage] | None) -> str:
     if not items:
         return "群友"
-    nicknames = {item.nickname for item in items}
-    if len(nicknames) == 1:
-        return items[-1].nickname
-    return "群友们"
+    return items[-1].nickname
 
 
 def _buffered_first_created_at(items: list[BufferedGroupMessage] | None) -> float:
@@ -7745,6 +7766,8 @@ async def _send_approved_group_reply_scoped(
                 approval.persona_name,
                 memory_text,
                 is_bot=True,
+                source_message_id=sent_message_id,
+                source_kind="live",
                 correlation_id=approval.correlation_id,
             )
         except ActionFailed as exc:

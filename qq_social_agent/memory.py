@@ -1092,28 +1092,22 @@ class MemoryStore:
         )
 
     def recent_messages(self, group_id: int, limit: int) -> list[ChatMessage]:
+        safe_limit = max(0, int(limit))
+        if safe_limit <= 0:
+            return []
+        fetch_limit = max(safe_limit * 4, safe_limit + 20)
         rows = self.conn.execute(
             """
             select id, group_id, user_id, nickname, text, is_bot, created_at
             from messages
             where group_id = ?
-            order by created_at desc
+            order by created_at desc, id desc
             limit ?
             """,
-            (group_id, limit),
+            (group_id, fetch_limit),
         ).fetchall()
-        return [
-            ChatMessage(
-                group_id=int(row["group_id"]),
-                user_id=int(row["user_id"]),
-                nickname=str(row["nickname"]),
-                text=str(row["text"]),
-                is_bot=bool(row["is_bot"]),
-                created_at=float(row["created_at"]),
-                id=int(row["id"]),
-            )
-            for row in reversed(rows)
-        ]
+        rows = _dedupe_recent_message_rows(rows, safe_limit)
+        return [_message_from_row(row) for row in reversed(rows)]
 
     def messages_between(
         self,
@@ -1273,22 +1267,12 @@ class MemoryStore:
             select id, group_id, user_id, nickname, text, is_bot, created_at
             from messages
             where group_id = ? and is_bot = 1 and created_at >= ?
-            order by created_at desc
+            order by created_at desc, id desc
             """,
             (group_id, since),
         ).fetchall()
-        return [
-            ChatMessage(
-                group_id=int(row["group_id"]),
-                user_id=int(row["user_id"]),
-                nickname=str(row["nickname"]),
-                text=str(row["text"]),
-                is_bot=True,
-                created_at=float(row["created_at"]),
-                id=int(row["id"]),
-            )
-            for row in rows
-        ]
+        rows = _dedupe_recent_message_rows(rows, len(rows))
+        return [_message_from_row(row) for row in rows]
 
     def messages_for_mid_summary(
         self,
@@ -3209,6 +3193,27 @@ class MemoryStore:
             (key, value, time.time()),
         )
         self.conn.commit()
+
+
+def _dedupe_recent_message_rows(rows: list[sqlite3.Row], limit: int) -> list[sqlite3.Row]:
+    selected: list[sqlite3.Row] = []
+    seen_bot_rows: list[tuple[tuple[int, int, str], float]] = []
+    for row in rows:
+        if bool(row["is_bot"]):
+            text_key = _compact_text(str(row["text"]))
+            if text_key:
+                key = (int(row["group_id"]), int(row["user_id"]), text_key)
+                created_at = float(row["created_at"])
+                if any(
+                    seen_key == key and abs(created_at - seen_at) <= 3.0
+                    for seen_key, seen_at in seen_bot_rows
+                ):
+                    continue
+                seen_bot_rows.append((key, created_at))
+        selected.append(row)
+        if len(selected) >= limit:
+            break
+    return selected
 
 
 def _message_from_row(row: sqlite3.Row) -> ChatMessage:
