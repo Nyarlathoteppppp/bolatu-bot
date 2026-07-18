@@ -219,11 +219,16 @@ class FreshContextTool:
         items: tuple[FreshItem, ...] = ()
         used_provider = providers[-1]
         deadline = time.monotonic() + self.timeout_seconds
-        for provider_name in _dedupe_strings(providers):
+        candidate_providers = _dedupe_strings(providers)
+        for index, provider_name in enumerate(candidate_providers):
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 errors.append("total_timeout")
                 break
+            provider_timeout = _provider_timeout_seconds(
+                remaining,
+                has_later_provider=index < len(candidate_providers) - 1,
+            )
             attempted.append(provider_name)
             used_provider = provider_name
             try:
@@ -232,9 +237,9 @@ class FreshContextTool:
                         provider_name,
                         normalized_query,
                         kind=normalized_kind,
-                        timeout_seconds=remaining,
+                        timeout_seconds=provider_timeout,
                     ),
-                    timeout=max(0.1, remaining),
+                    timeout=max(0.1, provider_timeout),
                 )
             except asyncio.TimeoutError:
                 errors.append(f"{provider_name}:total_timeout")
@@ -1089,6 +1094,14 @@ def _cache_query_key(query: str) -> str:
 
 def _fallback_provider(kind: str) -> str:
     return "bing_web" if kind == "web" else "google_news"
+
+
+def _provider_timeout_seconds(remaining_seconds: float, *, has_later_provider: bool) -> float:
+    remaining = max(0.1, float(remaining_seconds))
+    if not has_later_provider or remaining <= 1.0:
+        return remaining
+    reserved_for_fallback = min(2.0, max(0.5, remaining * 0.35))
+    return max(0.5, remaining - reserved_for_fallback)
 
 
 async def _invoke_provider(func: object, *args: object, **kwargs: object):

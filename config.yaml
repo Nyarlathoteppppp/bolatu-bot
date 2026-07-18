@@ -134,7 +134,7 @@ fresh_search:
   enabled: true
   provider: auto
   max_external_queries_per_minute: 4
-  timeout_seconds: 3
+  timeout_seconds: 5
   max_results: 5
   cache_max_entries: 256
   cache_ttl_seconds: 300
