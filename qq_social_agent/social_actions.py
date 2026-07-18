@@ -13,7 +13,7 @@ DEFAULT_REACTION_EMOJI_IDS = {
     "like": ("76",),
     "care": ("49",),
     "hug": ("49",),
-    "laugh": ("28",),
+    "laugh": ("182",),
     "tease": ("101",),
     "surprise": ("32",),
     "question": ("32",),

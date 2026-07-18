@@ -85,14 +85,14 @@ rate_control:
 
 social_actions:
   enabled: true
-  per_user_cooldown_seconds: 45
-  per_group_cooldown_seconds: 6
-  max_per_group_hour: 60
+  per_user_cooldown_seconds: 900
+  per_group_cooldown_seconds: 180
+  max_per_group_hour: 8
   emoji_ids:
     agree: ["76", "99"]
     care: ["49", "66"]
-    laugh: ["28", "101"]
-    tease: ["101", "28"]
+    laugh: ["182", "281"]
+    tease: ["101", "264"]
     surprise: "32"
     applause: ["99", "76"]
     heart: ["66", "49"]

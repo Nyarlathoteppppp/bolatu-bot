@@ -135,7 +135,7 @@ def test_social_action_service_reacts_once_and_rate_limits() -> None:
 
     assert first.sent
     assert second.reason == "user_cooldown"
-    assert bot.calls == [("set_msg_emoji_like", {"message_id": 42, "emoji_id": "28"})]
+    assert bot.calls == [("set_msg_emoji_like", {"message_id": 42, "emoji_id": "182"})]
 
 
 def test_social_action_service_rotates_configured_emoji_ids() -> None:
@@ -149,7 +149,7 @@ def test_social_action_service_rotates_configured_emoji_ids() -> None:
 
     bot = FakeReactBot()
     service = SocialActionService(
-        emoji_ids={"laugh": ["28", "101"]},
+        emoji_ids={"laugh": ["182", "281"]},
         per_user_cooldown_seconds=0,
         per_group_cooldown_seconds=0,
     )
@@ -163,7 +163,7 @@ def test_social_action_service_rotates_configured_emoji_ids() -> None:
 
     assert first.sent
     assert second.sent
-    assert [call[1]["emoji_id"] for call in bot.calls] == ["28", "101"]
+    assert [call[1]["emoji_id"] for call in bot.calls] == ["182", "281"]
     assert "点了 laugh 表情" in service.recent_reaction_context(1)
 
 
