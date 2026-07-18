@@ -2,9 +2,10 @@
 set -euo pipefail
 
 PROJECT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
-LOCAL_PROXY_PORT="${LOCAL_CODEX_PROXY_PORT:-7898}"
+LOCAL_PROXY_PORT="${LOCAL_CODEX_PROXY_PORT:-7897}"
 
-if ! /usr/sbin/lsof -nP -iTCP:"${LOCAL_PROXY_PORT}" -sTCP:LISTEN >/dev/null 2>&1; then
+if ! /usr/bin/nc -z 127.0.0.1 "${LOCAL_PROXY_PORT}" >/dev/null 2>&1; then
+  LOCAL_PROXY_PORT="${LOCAL_CODEX_PROXY_FALLBACK_PORT:-7898}"
   nohup /usr/bin/python3 \
     "${PROJECT_DIR}/scripts/direct_http_proxy.py" \
     --host 127.0.0.1 \
@@ -25,8 +26,11 @@ if ! /usr/bin/nc -z 127.0.0.1 "${LOCAL_PROXY_PORT}" >/dev/null 2>&1; then
   exit 1
 fi
 
-ssh qqbot-server \
-  'pids=$(lsof -tiTCP:7897 -sTCP:LISTEN 2>/dev/null || true); if [ -n "$pids" ]; then kill $pids || true; sleep 1; fi' \
+ssh \
+  -o BatchMode=yes \
+  -o ConnectTimeout=8 \
+  qqbot-server \
+  'timeout 5s sh -c '"'"'pids=$(lsof -tiTCP:7897 -sTCP:LISTEN 2>/dev/null || true); if [ -n "$pids" ]; then kill $pids || true; sleep 1; fi'"'"'' \
   >/dev/null 2>&1 || true
 
 exec /usr/bin/ssh \
