@@ -553,7 +553,7 @@ class DeepSeekClient:
         member_label: str,
         chat_label: str = "QQ 群聊",
     ) -> MemberProfileDraft:
-        context = "\n".join(_format_message(msg) for msg in messages)
+        context = "\n".join(_format_learning_source_message(msg) for msg in messages)
         if not context:
             return MemberProfileDraft("", (), "", ())
         system = self.prompts.render("member_profile", "system")
@@ -788,7 +788,7 @@ class DeepSeekClient:
     ) -> DailyReviewDraft:
         context_messages = messages[-140:]
         context = "\n".join(
-            f"[message_id:{msg.id}] {_format_message(msg)}"
+            _format_learning_source_message(msg)
             for msg in context_messages
         )
         if not context:
@@ -831,7 +831,7 @@ class DeepSeekClient:
         chat_label: str = "QQ 群聊",
     ) -> MidMemoryDraft:
         context = "\n".join(
-            f"[message_id:{msg.id}] {_format_message(msg)}"
+            _format_learning_source_message(msg)
             for msg in messages
         )
         system = self.prompts.render("mid_memory", "system")
@@ -863,7 +863,7 @@ class DeepSeekClient:
         chat_label: str = "QQ 群聊",
     ) -> tuple[StyleRuleDraft, ...]:
         context = "\n".join(
-            f"[source_id:{index}] {_format_message(msg)}"
+            _format_style_source_message(index, msg)
             for index, msg in enumerate(messages, start=1)
         )
         system = self.prompts.render("style_learning", "system")
@@ -891,6 +891,20 @@ class DeepSeekClient:
 def _format_message(msg: ChatMessage) -> str:
     speaker = "机器人" if msg.is_bot else _speaker_label(msg.user_id, msg.nickname)
     return f"{speaker}: {msg.text}"
+
+
+def _format_learning_source_message(msg: ChatMessage) -> str:
+    role = "bot" if msg.is_bot else "human"
+    message_id = msg.id if msg.id > 0 else "unknown"
+    speaker = "机器人" if msg.is_bot else _speaker_label(msg.user_id, msg.nickname)
+    return f"[message_id:{message_id}][role:{role}] {speaker}: {msg.text}"
+
+
+def _format_style_source_message(index: int, msg: ChatMessage) -> str:
+    role = "bot" if msg.is_bot else "human"
+    message_id = msg.id if msg.id > 0 else "unknown"
+    speaker = "机器人" if msg.is_bot else _speaker_label(msg.user_id, msg.nickname)
+    return f"[source_id:{index}][message_id:{message_id}][role:{role}] {speaker}: {msg.text}"
 
 
 def _format_decision_message(msg: ChatMessage) -> str:
@@ -1439,11 +1453,18 @@ def _parse_style_rules(
         style = str(item.get("style", "")).strip()
         if not situation or not style:
             continue
+        if _style_rule_leaks_specific_identity(situation, style):
+            continue
         key = (situation, style)
         if key in seen:
             continue
         seen.add(key)
-        evidence_messages = _source_messages_for_style_rule(item, source_messages)
+        evidence_messages = [
+            message for message in _source_messages_for_style_rule(item, source_messages)
+            if not message.is_bot
+        ]
+        if _style_rule_copies_evidence(situation, style, evidence_messages):
+            continue
         source_text = evidence_messages[0].text if evidence_messages else ""
         parsed.append(
             StyleRuleDraft(
@@ -1457,6 +1478,49 @@ def _parse_style_rules(
         if len(parsed) >= 8:
             break
     return tuple(parsed)
+
+
+def _style_rule_leaks_specific_identity(situation: str, style: str) -> bool:
+    text = f"{situation} {style}"
+    if "[#" in text or "QQ" in text.upper() or "source_id" in text:
+        return True
+    return bool(re.search(r"\d{5,}", text))
+
+
+def _style_rule_copies_evidence(
+    situation: str,
+    style: str,
+    evidence_messages: list[ChatMessage],
+) -> bool:
+    style_compact = re.sub(r"\s+", "", style)
+    situation_compact = re.sub(r"\s+", "", situation)
+    if not style_compact:
+        return True
+    for message in evidence_messages:
+        source_compact = re.sub(r"\s+", "", message.text)
+        if not source_compact:
+            continue
+        if style_compact == source_compact:
+            return True
+        if len(style_compact) >= 6 and style_compact in source_compact:
+            return True
+        if len(situation_compact) >= 10 and situation_compact in source_compact:
+            return True
+        if _has_common_substring(style_compact, source_compact, min_len=10):
+            return True
+    return False
+
+
+def _has_common_substring(a: str, b: str, *, min_len: int) -> bool:
+    if len(a) < min_len or len(b) < min_len:
+        return False
+    shorter, longer = (a, b) if len(a) <= len(b) else (b, a)
+    max_size = min(len(shorter), 24)
+    for size in range(max_size, min_len - 1, -1):
+        for start in range(0, len(shorter) - size + 1):
+            if shorter[start : start + size] in longer:
+                return True
+    return False
 
 
 def _source_messages_for_style_rule(

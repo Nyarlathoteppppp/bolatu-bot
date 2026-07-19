@@ -6182,7 +6182,7 @@ async def _maintain_group_learning(group_id: int) -> None:
             if draft and draft.summary:
                 memory.add_memory_summary(
                     group_id,
-                    mid_messages,
+                    summary_messages,
                     summary=draft.summary,
                     recall_cues=list(draft.recall_cues),
                 )

@@ -15,6 +15,7 @@ from qq_social_agent.deepseek_client import (
     _parse_mid_memory,
     _parse_reply_candidates,
     _parse_reply_decision,
+    _parse_style_rules,
     ReplyCandidateDraft,
     _sanitize_reply,
     _usage_value,
@@ -421,6 +422,26 @@ def test_parse_member_profile_draft() -> None:
     assert draft.interests == ("股票", "代码")
     assert draft.speaking_style == "短句吐槽"
     assert draft.representative_texts == ("股票又亏了",)
+
+
+def test_parse_style_rules_filters_literal_and_identity_leaks() -> None:
+    messages = [
+        ChatMessage(1, 100001, "甲", "这也太抽象了", False, 1000.0, id=11),
+        ChatMessage(1, 100002, "乙", "你猜呀不过你问这个是想调戏我？", False, 1001.0, id=12),
+    ]
+    content = (
+        '{"rules":['
+        '{"situation":"群友问无聊问题","style":"用轻反问接住暧昧感","support_source_ids":["2"]},'
+        '{"situation":"甲[#00001]说话时","style":"特殊照顾甲[#00001]","support_source_ids":["1"]},'
+        '{"situation":"好笑时","style":"这也太抽象了","support_source_ids":["1"]}'
+        ']}'
+    )
+
+    rules = _parse_style_rules(content, messages)
+
+    assert [(rule.situation, rule.style, rule.source_message_ids) for rule in rules] == [
+        ("群友问无聊问题", "用轻反问接住暧昧感", (12,))
+    ]
 
 
 def test_parse_mid_memory_keeps_evidence_and_maps_subject() -> None:
