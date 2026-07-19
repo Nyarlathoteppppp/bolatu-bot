@@ -121,6 +121,8 @@ python -m pytest -q
 
 Prompt 在后端启动时加载。修改 Python 代码后使用 `scripts/restart_bot.sh` 重新构建 bot；只修改 Prompt 时运行 `docker compose -p qq-social-agent -f docker-compose.server.yml restart bot` 即可，不需要重新构建镜像。
 
+`scripts/restart_bot.sh` 会在重建 bot 后自动清理 24 小时以前的 Docker 构建缓存，避免长期开发时 build cache 把 40G 系统盘吃满。
+
 ## 5. 群聊行为
 
 - 被 @、回复或点名时优先响应；实际问题由后端保证进入回答流程，即使重复追问也不能用反问或调侃代替答案。
@@ -155,4 +157,37 @@ bot工具：查看工具单
 /bot resume
 /bot reset
 /bot persona zhangxuefeng
+```
+
+## 6. 长期运维
+
+一年运行的主要风险不是内存，而是磁盘。当前消息库按每天 1000-1500 条估算，一年约 40-60 万条，SQLite 能承受；更容易失控的是 Docker build cache、SQLite 备份、NapCat 图片/日志/临时文件。
+
+日常体检：
+
+```bash
+cd /opt/qq-social-agent
+scripts/dirty_work_report.py
+scripts/system_hygiene.sh --dry-run
+```
+
+实际清理：
+
+```bash
+cd /opt/qq-social-agent
+scripts/system_hygiene.sh --apply
+```
+
+默认行为：
+
+- 跑 `scripts/db_hygiene.py`，检查 SQLite 完整性，清理失效 RAG 索引和 WAL。
+- 压缩 1 天以前的 `data/*.bak`，保留 180 天以内的压缩备份。
+- 清理 24 小时以前的 Docker build cache 和悬空镜像。
+- 清理 NapCat 14 天以前的 temp 和 30 天以前的 log。
+- 不默认删除 NapCat 图片、视频、语音缓存；需要时用 `NAPCAT_MEDIA_CLEAN=1 scripts/system_hygiene.sh --apply`，默认只删 180 天以前的媒体缓存。
+
+建议服务器 crontab：
+
+```cron
+20 4 * * * cd /opt/qq-social-agent && scripts/system_hygiene.sh --apply >> logs/system_hygiene.log 2>&1
 ```

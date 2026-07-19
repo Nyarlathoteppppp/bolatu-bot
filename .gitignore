@@ -16,4 +16,5 @@ docker-compose.server.yml.bak-*
 data/*.sqlite3-shm
 data/*.sqlite3-wal
 data/*.bak
+data/*.bak.gz
 .DS_Store
