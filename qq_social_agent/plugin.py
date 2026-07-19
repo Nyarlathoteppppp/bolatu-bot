@@ -625,16 +625,6 @@ def _ensure_builtin_memory_atoms() -> None:
             group_id=group_id,
             subject_user_id=1535071184,
             object_user_id=None,
-            content="歌迷老蛆/1535071184 是制造出张风雪的人，是张风雪的主人；他负责给张风雪 token、调试性格、改 prompt 和后端逻辑。",
-            source="builtin_owner_relation",
-            confidence=1.0,
-            importance=1.0,
-        )
-        memory.upsert_memory_atom(
-            atom_type="relation",
-            group_id=group_id,
-            subject_user_id=1535071184,
-            object_user_id=None,
             content="xbw、歌迷老蛆、奈亚子都是同一个人，QQ 是 1535071184；他是张风雪的制造者/主人，负责给张风雪 token、调试性格、改 prompt 和后端逻辑。",
             source="builtin_owner_alias_relation",
             confidence=1.0,

@@ -1243,6 +1243,33 @@ def test_builtin_memory_atoms_include_owner_alias(monkeypatch, tmp_path) -> None
     assert any("xbw、歌迷老蛆、奈亚子都是同一个人" in atom.content for atom in atoms)
 
 
+def test_builtin_memory_atoms_are_idempotent(monkeypatch, tmp_path) -> None:
+    store = _use_temp_plugin_memory(monkeypatch, tmp_path)
+
+    plugin._ensure_builtin_memory_atoms()
+    plugin._ensure_builtin_memory_atoms()
+
+    rows = store.conn.execute(
+        """
+        select source, count(*) as count
+        from memory_atoms
+        where group_id = 1026813421
+          and status = 'active'
+          and source in (
+              'builtin_owner_relation',
+              'builtin_owner_alias_relation',
+              'builtin_focused_style_user'
+          )
+        group by source
+        """
+    ).fetchall()
+    counts = {str(row["source"]): int(row["count"]) for row in rows}
+
+    assert counts.get("builtin_owner_relation", 0) == 0
+    assert counts.get("builtin_owner_alias_relation") == 1
+    assert counts.get("builtin_focused_style_user") == 1
+
+
 def test_format_member_context_includes_aliases() -> None:
     context = _format_member_context(
         [
