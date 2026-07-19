@@ -905,22 +905,22 @@ def test_passive_decision_gate_allows_after_thirty_second_gap() -> None:
     assert GROUP_PASSIVE_DECISION_GAP_SECONDS == 30
 
 
-def test_daily_review_window_uses_previous_24h_at_midnight() -> None:
-    midnight = 1783699200.0  # 2026-07-11 00:00:00 Asia/Shanghai
+def test_daily_review_window_uses_previous_24h_at_22_shanghai() -> None:
+    target = 1783778400.0  # 2026-07-11 22:00:00 Asia/Shanghai
 
-    start_at, end_at, label = _daily_review_window(midnight + 1)
+    start_at, end_at, label = _daily_review_window(target + 1)
 
-    assert start_at == midnight - 24 * 60 * 60
-    assert end_at == midnight
-    assert label == "2026-07-10"
+    assert start_at == target - 24 * 60 * 60
+    assert end_at == target
+    assert label == "2026-07-11"
 
 
-def test_daily_review_timezone_and_startup_catchup_use_shanghai_midnight() -> None:
-    midnight = 1783872000.0  # 2026-07-13 00:00:00 Asia/Shanghai
+def test_daily_review_timezone_and_startup_catchup_use_shanghai_22() -> None:
+    target = 1783951200.0  # 2026-07-13 22:00:00 Asia/Shanghai
 
-    assert plugin._local_timestamp_for_today(0, 0, now=midnight + 3600) == midnight
-    assert plugin._daily_review_within_catch_up_window(midnight + 3600)
-    assert not plugin._daily_review_within_catch_up_window(midnight + 13 * 3600)
+    assert plugin._local_timestamp_for_today(22, 0, now=target + 3600) == target
+    assert plugin._daily_review_within_catch_up_window(target + 3600)
+    assert not plugin._daily_review_within_catch_up_window(target + 13 * 3600)
 
 
 def test_manual_daily_review_today_window_uses_today_so_far() -> None:

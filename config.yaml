@@ -108,7 +108,7 @@ social_actions:
 
 daily_review:
   timezone: Asia/Shanghai
-  hour: 0
+  hour: 22
   minute: 0
   catch_up_hours: 12
   message_limit: 140

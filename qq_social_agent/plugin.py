@@ -213,6 +213,7 @@ notice_directory_refresh_tasks: dict[int, asyncio.Task[None]] = {}
 pending_group_approvals: dict[int, "PendingGroupApproval"] = {}
 recent_suppression_events: list["SuppressionEvent"] = []
 daily_review_tasks: dict[str, asyncio.Task[None]] = {}
+daily_review_send_locks: dict[tuple[int, str], asyncio.Lock] = {}
 maintenance_tasks: dict[str, asyncio.Task[None]] = {}
 connected_onebot_bots: dict[str, Bot] = {}
 approval_processing_lock = asyncio.Lock()
@@ -1065,20 +1066,21 @@ async def _send_due_daily_reviews(bot: Bot, *, now: float | None = None) -> bool
             _record_metric_event("daily_review", group_id=group_id, stage="check", action="skipped", reason="disabled_or_muted")
             continue
         sent_key = _daily_review_sent_key(group_id, review_label)
-        if memory.app_kv_get(sent_key) == "sent":
-            logger.info(f"qq_social_agent daily review skipped: group={group_id} already_sent date={review_label}")
-            continue
-        success = await _send_daily_review_for_group(
-            bot,
-            group_id=group_id,
-            start_at=start_at,
-            end_at=end_at,
-            review_label=review_label,
-            sent_key=sent_key,
-            mark_sent=True,
-            source="scheduled",
-            trigger_label="午夜复盘",
-        )
+        async with _daily_review_send_lock(group_id, review_label):
+            if memory.app_kv_get(sent_key) == "sent":
+                logger.info(f"qq_social_agent daily review skipped: group={group_id} already_sent date={review_label}")
+                continue
+            success = await _send_daily_review_for_group(
+                bot,
+                group_id=group_id,
+                start_at=start_at,
+                end_at=end_at,
+                review_label=review_label,
+                sent_key=sent_key,
+                mark_sent=True,
+                source="scheduled",
+                trigger_label="定时复盘",
+            )
         if not success:
             has_pending = True
     return has_pending
@@ -1282,6 +1284,10 @@ def _daily_review_sent_key(group_id: int, today_label: str) -> str:
     return f"daily_review_sent:{group_id}:{today_label}"
 
 
+def _daily_review_send_lock(group_id: int, review_label: str) -> asyncio.Lock:
+    return daily_review_send_locks.setdefault((group_id, review_label), asyncio.Lock())
+
+
 def _daily_review_window(now: float) -> tuple[float, float, str]:
     end_at = _local_timestamp_for_today(DAILY_REVIEW_HOUR, DAILY_REVIEW_MINUTE, now=now)
     if now < end_at:
@@ -1308,7 +1314,7 @@ async def _send_manual_daily_reviews(bot: Bot, *, mode: str) -> tuple[int, int]:
         start_at, end_at, review_label = _daily_review_window(now)
         mark_sent = True
         source = "manual_due"
-        trigger_label = "补发午夜复盘"
+        trigger_label = "补发定时复盘"
     else:
         start_at, end_at, review_label = _daily_review_today_window(now)
         mark_sent = False
@@ -1321,9 +1327,23 @@ async def _send_manual_daily_reviews(bot: Bot, *, mode: str) -> tuple[int, int]:
             continue
         total_count += 1
         sent_key = _daily_review_sent_key(group_id, review_label) if mark_sent else None
-        if mark_sent and sent_key and memory.app_kv_get(sent_key) == "sent":
-            continue
-        if await _send_daily_review_for_group(
+        if mark_sent:
+            async with _daily_review_send_lock(group_id, review_label):
+                if sent_key and memory.app_kv_get(sent_key) == "sent":
+                    continue
+                if await _send_daily_review_for_group(
+                    bot,
+                    group_id=group_id,
+                    start_at=start_at,
+                    end_at=end_at,
+                    review_label=review_label,
+                    sent_key=sent_key,
+                    mark_sent=mark_sent,
+                    source=source,
+                    trigger_label=trigger_label,
+                ):
+                    sent_count += 1
+        elif await _send_daily_review_for_group(
             bot,
             group_id=group_id,
             start_at=start_at,
