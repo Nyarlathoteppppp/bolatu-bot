@@ -594,8 +594,8 @@ def test_speaker_reference_context_explains_reply_relation() -> None:
         "歌迷老蛆[#71184]回复小鸟[#89072]：行】"
     )
     recent_messages = [
-        ChatMessage(1, 184589072, "小鸟", "你看这个", created_at=100),
-        ChatMessage(1, 1535071184, "歌迷老蛆", current_text, created_at=101),
+        ChatMessage(1, 184589072, "小鸟", "你看这个", is_bot=False, created_at=100),
+        ChatMessage(1, 1535071184, "歌迷老蛆", current_text, is_bot=False, created_at=101),
     ]
 
     context = plugin._format_speaker_reference_context(
