@@ -131,7 +131,7 @@ from .rate_limiter import RateLimiter
 from .rag_admin import RAGAdminController
 from .rag_query import normalize_rag_query
 from .rag_retriever import RAGRetrievalResult, RAGService
-from .reference_resolver import resolve_context_reference
+from .reference_resolver import ReferenceResolution, resolve_context_reference
 from .reply_splitter import split_reply_messages
 from .social_actions import PokeContext, ReactionResult, SocialActionService, reaction_from_action
 from .tools.fresh_context import (
@@ -3403,6 +3403,17 @@ async def _handle_group_message_locked(
     )
     pipeline_state.reference_user_ids = reference_resolution.user_ids
     pipeline_state.reference_reason = reference_resolution.reason
+    speaker_context = _format_speaker_reference_context(
+        current_user_id=user_id,
+        current_nickname=nickname,
+        current_text=text,
+        recent_messages=context_recent,
+        reference_resolution=reference_resolution,
+        mentioned=mentioned,
+        replied_to_bot=replied_to_bot,
+        addressed_bot=addressed_bot,
+        self_id=int(event.self_id),
+    )
     if fresh_intent is None:
         followup_fresh_intent = _infer_followup_fresh_intent(
             tool_query_text,
@@ -3540,6 +3551,7 @@ async def _handle_group_message_locked(
                 current_text=text,
                 current_nickname=_member_label(user_id, nickname),
                 chat_label="QQ 群聊",
+                speaker_context=speaker_context,
             )
             decision = timing.to_reply_decision()
         except Exception as exc:
@@ -4011,6 +4023,7 @@ async def _handle_group_message_locked(
             candidate_count=reply_candidate_limit,
             prompt_flow=prompt_flow,
             task_name=task_name,
+            speaker_context=speaker_context,
         )
     except Exception as exc:
         logger.warning(
@@ -6496,6 +6509,124 @@ def _format_member_context(profiles: list[MemberProfile | MemberImpression]) -> 
         else:
             lines.append(prefix)
     return "\n".join(lines)
+
+
+REPLY_RELATION_RE = re.compile(
+    r"(?P<speaker>[^\n【]{1,80}?\[#\d{5}\])回复(?P<target>[^\n【]{1,80}?\[#\d{5}\])消息【"
+)
+
+
+def _format_speaker_reference_context(
+    *,
+    current_user_id: int,
+    current_nickname: str,
+    current_text: str,
+    recent_messages: list[ChatMessage],
+    reference_resolution: ReferenceResolution,
+    mentioned: bool,
+    replied_to_bot: bool,
+    addressed_bot: bool,
+    self_id: int,
+) -> str:
+    current_label = _member_label(current_user_id, current_nickname)
+    lines = [
+        f"- 当前触发人：{current_label}。",
+        "- 当前消息优先级最高；最近聊天只用于理解氛围和指代，不代表当前发言人立场。",
+    ]
+    if addressed_bot:
+        addressed_parts: list[str] = []
+        if mentioned:
+            addressed_parts.append("艾特/点名了你")
+        if replied_to_bot:
+            addressed_parts.append("回复了你之前的话")
+        lines.append(f"- 当前是在和风雪互动：{'，'.join(addressed_parts) or '是'}。")
+    else:
+        lines.append("- 当前不是直接和风雪互动；判断插话时不要把群友互相回复误认为在问你。")
+
+    reply_relation = _extract_reply_relation(current_text)
+    if reply_relation is not None:
+        speaker_label, target_label = reply_relation
+        lines.append(
+            f"- 回复关系：{speaker_label} 是当前回复者/当前发言人；"
+            f"{target_label} 是被回复对象。不要把 {target_label} 的原话当成 {speaker_label} 说的。"
+        )
+
+    if reference_resolution.user_ids:
+        labels = _labels_for_user_ids(
+            reference_resolution.user_ids,
+            recent_messages,
+            current_user_id=current_user_id,
+            current_nickname=current_nickname,
+            self_id=self_id,
+        )
+        if labels:
+            label_text = "、".join(labels)
+            lines.append(
+                f"- 代词/省略句候选指向：{label_text}；"
+                f"来源={reference_resolution.reason}，置信度={reference_resolution.confidence:.2f}。"
+            )
+    elif _has_ambiguous_reference(current_text):
+        lines.append("- 当前消息含他/她/这个人/那个人等指代，但后端未能唯一解析；不确定时不要点名或套用某人画像。")
+
+    recent_speakers = _recent_human_speaker_lines(
+        recent_messages,
+        current_user_id=current_user_id,
+        current_nickname=current_nickname,
+    )
+    if recent_speakers:
+        lines.append("- 最近真人发言顺序（旧到新）：")
+        lines.extend(recent_speakers)
+    return "\n".join(lines)
+
+
+def _extract_reply_relation(text: str) -> tuple[str, str] | None:
+    match = REPLY_RELATION_RE.search(text)
+    if not match:
+        return None
+    return match.group("speaker").strip(), match.group("target").strip()
+
+
+def _has_ambiguous_reference(text: str) -> bool:
+    return bool(re.search(r"(他|她|这个人|那个人|这人|那人|这鸟|那鸟|你们说的那个)", text))
+
+
+def _labels_for_user_ids(
+    user_ids: tuple[int, ...],
+    recent_messages: list[ChatMessage],
+    *,
+    current_user_id: int,
+    current_nickname: str,
+    self_id: int,
+) -> list[str]:
+    names: dict[int, str] = {current_user_id: current_nickname}
+    for msg in reversed(recent_messages):
+        if msg.user_id not in names and msg.nickname:
+            names[msg.user_id] = msg.nickname
+    labels: list[str] = []
+    for user_id in user_ids[:4]:
+        if user_id == self_id:
+            labels.append(_member_label(user_id, "张风雪"))
+        else:
+            labels.append(_member_label(user_id, names.get(user_id, str(user_id))))
+    return labels
+
+
+def _recent_human_speaker_lines(
+    recent_messages: list[ChatMessage],
+    *,
+    current_user_id: int,
+    current_nickname: str,
+) -> list[str]:
+    ordered: list[ChatMessage] = [
+        msg for msg in recent_messages if not msg.is_bot and msg.text.strip()
+    ][-6:]
+    if not ordered:
+        return [f"  - {_member_label(current_user_id, current_nickname)}：当前消息"]
+    lines: list[str] = []
+    for msg in ordered:
+        prefix = "当前触发人" if msg.user_id == current_user_id else "群友"
+        lines.append(f"  - {prefix} {_member_label(msg.user_id, msg.nickname)}：{_short_notice_text(msg.text, 42)}")
+    return lines
 
 
 def _format_memory_atom_context(atoms: list[MemoryAtom]) -> str:

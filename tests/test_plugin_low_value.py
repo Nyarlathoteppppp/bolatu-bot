@@ -587,6 +587,52 @@ def test_buffered_current_text_preserves_last_speaker_and_reply_relation() -> No
     assert "歌迷老蛆[#71184]说：歌迷老蛆[#71184]回复" not in text
 
 
+def test_speaker_reference_context_explains_reply_relation() -> None:
+    current_text = (
+        "歌迷老蛆[#71184]回复小鸟[#89072]消息【"
+        "小鸟[#89072]说：你看这个；"
+        "歌迷老蛆[#71184]回复小鸟[#89072]：行】"
+    )
+    recent_messages = [
+        ChatMessage(1, 184589072, "小鸟", "你看这个", created_at=100),
+        ChatMessage(1, 1535071184, "歌迷老蛆", current_text, created_at=101),
+    ]
+
+    context = plugin._format_speaker_reference_context(
+        current_user_id=1535071184,
+        current_nickname="歌迷老蛆",
+        current_text=current_text,
+        recent_messages=recent_messages,
+        reference_resolution=plugin.ReferenceResolution(),
+        mentioned=False,
+        replied_to_bot=False,
+        addressed_bot=False,
+        self_id=1801507496,
+    )
+
+    assert "当前触发人：歌迷老蛆[#71184]" in context
+    assert "歌迷老蛆[#71184] 是当前回复者/当前发言人" in context
+    assert "小鸟[#89072] 是被回复对象" in context
+    assert "不要把 小鸟[#89072] 的原话当成 歌迷老蛆[#71184] 说的" in context
+
+
+def test_speaker_reference_context_warns_ambiguous_pronoun() -> None:
+    context = plugin._format_speaker_reference_context(
+        current_user_id=1535071184,
+        current_nickname="歌迷老蛆",
+        current_text="他怎么又这样了",
+        recent_messages=[],
+        reference_resolution=plugin.ReferenceResolution(),
+        mentioned=False,
+        replied_to_bot=False,
+        addressed_bot=False,
+        self_id=1801507496,
+    )
+
+    assert "后端未能唯一解析" in context
+    assert "不确定时不要点名" in context
+
+
 def test_reply_to_other_unknown_original_uses_clear_fallback() -> None:
     event = SimpleNamespace(
         user_id=1535071184,

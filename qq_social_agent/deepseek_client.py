@@ -278,6 +278,7 @@ class DeepSeekClient:
         member_context: str = "",
         memory_atoms_context: str = "",
         fresh_context_hint: str = "",
+        speaker_context: str = "",
     ) -> ReplyDecision:
         context = _format_context_with_local_focus(
             recent_messages[-30:],
@@ -301,6 +302,7 @@ class DeepSeekClient:
             chat_label=chat_label,
             interaction_state=interaction_state,
             fresh_context_hint_section=_optional_section("后端最新背景候选", fresh_context_hint),
+            speaker_context_section=_optional_section("本轮说话关系", speaker_context),
             context=context,
             memory_context_section=_optional_section("中期聊天回想", memory_context),
             member_context_section=_optional_section("当前相关群友", member_context),
@@ -333,6 +335,7 @@ class DeepSeekClient:
         current_text: str,
         current_nickname: str,
         chat_label: str = "QQ 群聊",
+        speaker_context: str = "",
     ) -> TimingDecision:
         """Decide only whether/how to surface; tools and memory route elsewhere."""
 
@@ -350,6 +353,7 @@ class DeepSeekClient:
             "timing_gate",
             "user",
             chat_label=chat_label,
+            speaker_context_section=_optional_section("本轮说话关系", speaker_context),
             context=context,
             current_nickname=current_nickname,
             current_text=current_text,
@@ -437,6 +441,7 @@ class DeepSeekClient:
         mention_targets: str = "",
         priority_context: str = "",
         include_bot_history: bool = True,
+        speaker_context: str = "",
     ) -> str:
         context_messages = _reply_context_messages(
             recent_messages,
@@ -476,6 +481,7 @@ class DeepSeekClient:
             "reply",
             "user",
             context=context,
+            speaker_context_section=_optional_section("本轮说话关系", speaker_context),
             memory_context_section=_optional_section("中期聊天回想", memory_context),
             member_context_section=_optional_section("当前相关群友", member_context),
             memory_atoms_context_section=_optional_section("长期记忆单元", memory_atoms_context),
@@ -604,6 +610,7 @@ class DeepSeekClient:
         prompt_flow: str = "reply_candidates",
         task_name: str = "reply_candidates",
         context_packet: ContextPacket | None = None,
+        speaker_context: str = "",
     ) -> tuple[ReplyCandidateDraft, ...]:
         if context_packet is not None:
             memory_context = context_packet.get("memory")
@@ -656,6 +663,7 @@ class DeepSeekClient:
             prompt_flow,
             "user",
             context=context,
+            speaker_context_section=_optional_section("本轮说话关系", speaker_context),
             memory_context_section=_optional_section("中期聊天回想", memory_context),
             member_context_section=_optional_section("当前相关群友", member_context),
             memory_atoms_context_section=_optional_section("长期记忆单元", memory_atoms_context),
