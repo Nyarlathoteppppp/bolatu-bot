@@ -336,6 +336,7 @@ DAILY_REVIEW_RETRY_SECONDS = max(60, int(_daily_review_config.get("retry_seconds
 DAILY_REVIEW_POLL_SECONDS = max(60, int(_daily_review_config.get("poll_seconds", 5 * 60)))
 DAILY_REVIEW_RESPECT_MUTE = bool(_daily_review_config.get("respect_mute", False))
 ADDRESS_REPEAT_WINDOW_SECONDS = 10 * 60
+ADDRESS_FOLLOWUP_WINDOW_SECONDS = 3 * 60
 MENTION_TARGET_LIMIT = 8
 REPEAT_MENTION_SUPPRESS_SECONDS = 10 * 60
 PRIVATE_DEBUG_OWNER_ID = 2776760548
@@ -2747,6 +2748,18 @@ async def _handle_group_message_scoped(
         or _replied_to_bot(event, bot)
         or _reply_reference_to_bot(reply_reference, bot)
     )
+    event_at = float(getattr(event, "time", 0) or time.time())
+    addressed_repeat_count_hint = _record_addressed_event(
+        group_id,
+        int(event.user_id),
+        addressed_bot,
+        now=event_at,
+    )
+    followup_addressed = (
+        group_allowed
+        and not addressed_bot
+        and _addressed_followup_active(group_id, int(event.user_id), now=event_at)
+    )
     raw_text = _message_context_text(event, bot_id=int(bot.self_id), resolved_reply=reply_reference)
     file_context = ""
     if group_allowed:
@@ -2823,7 +2836,9 @@ async def _handle_group_message_scoped(
         user_id=int(event.user_id),
         stage="group",
         action="received",
-        addressed=addressed_bot,
+        addressed=addressed_bot or followup_addressed,
+        direct_addressed=addressed_bot,
+        followup_addressed=followup_addressed,
         has_media=_message_has_context_media(event),
         has_file_context=bool(file_context),
         has_ocr=bool(ocr_context.text),
@@ -2833,7 +2848,7 @@ async def _handle_group_message_scoped(
     )
     text = raw_text
     pipeline_state.text = raw_text or plain_text
-    pipeline_state.addressed = addressed_bot
+    pipeline_state.addressed = addressed_bot or followup_addressed
     pipeline_state.mentioned = _mentioned_bot(event, bot)
     pipeline_state.replied_to_bot = _replied_to_bot(event, bot) or _reply_reference_to_bot(reply_reference, bot)
     user_policy = app_config.group_user_policy(int(event.user_id))
@@ -2953,6 +2968,7 @@ async def _handle_group_message_scoped(
         text
         and group_allowed
         and not addressed_bot
+        and not followup_addressed
         and not contextual_search_request
     ):
         if not _ordinary_user_trigger_selected(user_policy.ordinary_trigger_percent):
@@ -3002,7 +3018,7 @@ async def _handle_group_message_scoped(
                 pipeline_state=pipeline_state,
             )
         )
-    effective_addressed = addressed_bot or contextual_search_request
+    effective_addressed = addressed_bot or contextual_search_request or followup_addressed
     if effective_addressed:
         _cancel_passive_decision_retry(group_id)
         group_addressed_waiters[group_id] = group_addressed_waiters.get(group_id, 0) + 1
@@ -3015,7 +3031,10 @@ async def _handle_group_message_scoped(
                 preprocessed_text=text,
                 source_message_id=source_message_id,
                 correlation_id=correlation_id,
-                addressed_bot_hint=effective_addressed,
+                addressed_bot_hint=addressed_bot,
+                contextual_addressed_hint=contextual_search_request,
+                followup_addressed_hint=followup_addressed,
+                addressed_repeat_count_hint=addressed_repeat_count_hint,
                 trigger_sequence=inbound_sequence,
                 pipeline_state=pipeline_state,
             )
@@ -3039,6 +3058,9 @@ async def _handle_group_message_locked(
     source_message_id: str = "",
     correlation_id: str = "",
     addressed_bot_hint: bool | None = None,
+    contextual_addressed_hint: bool = False,
+    followup_addressed_hint: bool = False,
+    addressed_repeat_count_hint: int = 0,
     trigger_sequence: int = 0,
     pipeline_state: PipelineState | None = None,
 ) -> None:
@@ -3059,8 +3081,29 @@ async def _handle_group_message_locked(
     replied_to_bot = False if buffered_messages else _replied_to_bot(event, bot)
     if not buffered_messages and addressed_bot_hint and _event_has_reply_context(event):
         replied_to_bot = True
-    addressed_bot = mentioned or replied_to_bot or bool(addressed_bot_hint)
-    addressed_repeat_count = 1 if addressed_bot else 0
+    direct_addressed_bot = mentioned or replied_to_bot or bool(addressed_bot_hint)
+    synthetic_addressed_bot = bool(contextual_addressed_hint)
+    followup_addressed = (
+        not direct_addressed_bot
+        and not synthetic_addressed_bot
+        and bool(followup_addressed_hint)
+    )
+    addressed_bot = direct_addressed_bot or synthetic_addressed_bot or followup_addressed
+    event_at = (
+        _buffered_last_created_at(buffered_messages)
+        if buffered_messages
+        else float(getattr(event, "time", 0) or time.time())
+    )
+    addressed_repeat_count = (
+        addressed_repeat_count_hint
+        if addressed_repeat_count_hint > 0
+        else _record_addressed_event(
+            group_id,
+            user_id,
+            direct_addressed_bot,
+            now=event_at,
+        )
+    )
     if pipeline_state is None and buffered_messages:
         pipeline_state = buffered_messages[-1].pipeline_state
     if pipeline_state is None:
@@ -3150,6 +3193,8 @@ async def _handle_group_message_locked(
         action="recorded",
         buffered_count=len(buffered_messages) if buffered_messages else 1,
         addressed=addressed_bot,
+        direct_addressed=direct_addressed_bot,
+        followup_addressed=followup_addressed,
     )
     # Learning follows recorded messages, not whether the bot is currently
     # allowed to speak in this group.
@@ -3284,11 +3329,6 @@ async def _handle_group_message_locked(
 
     recent = memory.recent_messages(group_id, app_config.context_limit)
     context_recent = _without_current_message(recent, user_id=user_id, text=text)
-    event_at = (
-        _buffered_last_created_at(buffered_messages)
-        if buffered_messages
-        else float(getattr(event, "time", 0) or time.time())
-    )
     rate = rate_limiter.allow(group_id, mentioned=addressed_bot, event_at=event_at)
     if not rate.allowed:
         logger.info(f"qq_social_agent suppressed by rate: group={group_id} reason={rate.reason}")
@@ -3412,6 +3452,7 @@ async def _handle_group_message_locked(
         mentioned=mentioned,
         replied_to_bot=replied_to_bot,
         addressed_bot=addressed_bot,
+        followup_addressed=followup_addressed,
         self_id=int(event.self_id),
     )
     if fresh_intent is None:
@@ -3477,7 +3518,7 @@ async def _handle_group_message_locked(
         text=text,
         recent_messages=context_recent,
         persona=persona,
-        addressed_bot=addressed_bot,
+        addressed_bot=direct_addressed_bot or synthetic_addressed_bot,
         mentioned=mentioned,
         replied_to_bot=replied_to_bot,
         cue_repeat_state=cue_repeat_state,
@@ -3616,7 +3657,9 @@ async def _handle_group_message_locked(
     decision = _apply_tool_plan(decision, tool_plan)
     decision = _enforce_addressed_reply_decision(
         decision,
-        addressed_bot=addressed_bot,
+        addressed_bot=direct_addressed_bot
+        or synthetic_addressed_bot
+        or (followup_addressed and _looks_like_addressed_question(text)),
         text=text,
     )
     _pipeline_apply_decision(
@@ -6526,6 +6569,7 @@ def _format_speaker_reference_context(
     mentioned: bool,
     replied_to_bot: bool,
     addressed_bot: bool,
+    followup_addressed: bool = False,
     self_id: int,
 ) -> str:
     current_label = _member_label(current_user_id, current_nickname)
@@ -6539,7 +6583,14 @@ def _format_speaker_reference_context(
             addressed_parts.append("艾特/点名了你")
         if replied_to_bot:
             addressed_parts.append("回复了你之前的话")
+        if followup_addressed:
+            addressed_parts.append("刚才短时间内艾特/回复过你，当前可能是在延续和你的对话")
         lines.append(f"- 当前是在和风雪互动：{'，'.join(addressed_parts) or '是'}。")
+        if followup_addressed:
+            lines.append(
+                "- 这是短时互动窗口里的后续消息：如果当前消息有问题、观点、情绪或继续刚才话题，"
+                "倾向正常接住；如果只是“嗯/好/哈哈/6”这类纯确认，可以不回。"
+            )
     else:
         lines.append("- 当前不是直接和风雪互动；判断插话时不要把群友互相回复误认为在问你。")
 
@@ -8489,15 +8540,52 @@ def _replied_to_bot(event: GroupMessageEvent, bot: Bot) -> bool:
     return False
 
 
-def _record_addressed_event(group_id: int, user_id: int, addressed: bool) -> int:
-    if not addressed:
-        return 0
-    now = time.time()
+def _recent_addressed_event_times(
+    group_id: int,
+    user_id: int,
+    *,
+    now: float | None = None,
+) -> list[float]:
+    current = time.time() if now is None else now
     key = (group_id, user_id)
     recent_times = [
-        ts for ts in addressed_event_times.get(key, []) if now - ts <= ADDRESS_REPEAT_WINDOW_SECONDS
+        ts
+        for ts in addressed_event_times.get(key, [])
+        if current - ts <= ADDRESS_REPEAT_WINDOW_SECONDS
     ]
-    recent_times.append(now)
+    if recent_times:
+        addressed_event_times[key] = recent_times
+    else:
+        addressed_event_times.pop(key, None)
+    return recent_times
+
+
+def _addressed_followup_active(
+    group_id: int,
+    user_id: int,
+    *,
+    now: float | None = None,
+) -> bool:
+    current = time.time() if now is None else now
+    return any(
+        current - ts <= ADDRESS_FOLLOWUP_WINDOW_SECONDS
+        for ts in _recent_addressed_event_times(group_id, user_id, now=current)
+    )
+
+
+def _record_addressed_event(
+    group_id: int,
+    user_id: int,
+    addressed: bool,
+    *,
+    now: float | None = None,
+) -> int:
+    current = time.time() if now is None else now
+    recent_times = _recent_addressed_event_times(group_id, user_id, now=current)
+    if not addressed:
+        return len(recent_times)
+    key = (group_id, user_id)
+    recent_times.append(current)
     addressed_event_times[key] = recent_times
     return len(recent_times)
 

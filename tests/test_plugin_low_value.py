@@ -1171,6 +1171,37 @@ def test_addressed_question_cannot_be_silenced_by_llm_ignore() -> None:
     assert repeated.action == "answer"
 
 
+def test_addressed_followup_window_tracks_same_user_only() -> None:
+    plugin.addressed_event_times.clear()
+
+    assert plugin._record_addressed_event(1, 100, True, now=1000.0) == 1
+    assert plugin._addressed_followup_active(1, 100, now=1000.0 + 60)
+    assert not plugin._addressed_followup_active(1, 101, now=1000.0 + 60)
+    assert not plugin._addressed_followup_active(
+        1,
+        100,
+        now=1000.0 + plugin.ADDRESS_FOLLOWUP_WINDOW_SECONDS + 1,
+    )
+
+
+def test_speaker_context_marks_followup_window() -> None:
+    context = plugin._format_speaker_reference_context(
+        current_user_id=100,
+        current_nickname="甲",
+        current_text="那这个怎么说",
+        recent_messages=[],
+        reference_resolution=plugin.ReferenceResolution(),
+        mentioned=False,
+        replied_to_bot=False,
+        addressed_bot=True,
+        followup_addressed=True,
+        self_id=1801507496,
+    )
+
+    assert "短时互动窗口" in context
+    assert "纯确认，可以不回" in context
+
+
 def test_style_rule_filter_rejects_literal_examples() -> None:
     assert not _is_useful_style_rule("自嘲场景", "说“我完蛋了”", "我完蛋了")
     assert not _is_useful_style_rule("对离谱事吐槽", "短句接“太典了”", "太典了")
