@@ -920,7 +920,8 @@ def test_daily_review_timezone_and_startup_catchup_use_shanghai_midnight() -> No
 
     assert plugin._local_timestamp_for_today(0, 0, now=midnight + 3600) == midnight
     assert plugin._daily_review_within_catch_up_window(midnight + 3600)
-    assert not plugin._daily_review_within_catch_up_window(midnight + 13 * 3600)
+    assert plugin._daily_review_within_catch_up_window(midnight + 6 * 3600)
+    assert not plugin._daily_review_within_catch_up_window(midnight + 6 * 3600 + 1)
 
 
 def test_manual_daily_review_today_window_uses_today_so_far() -> None:

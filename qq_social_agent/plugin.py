@@ -331,7 +331,7 @@ except Exception:
     DAILY_REVIEW_TIMEZONE = ZoneInfo(DAILY_REVIEW_TIMEZONE_NAME)
 DAILY_REVIEW_HOUR = int(_daily_review_config.get("hour", 0)) % 24
 DAILY_REVIEW_MINUTE = int(_daily_review_config.get("minute", 0)) % 60
-DAILY_REVIEW_CATCH_UP_SECONDS = max(0, int(float(_daily_review_config.get("catch_up_hours", 12)) * 3600))
+DAILY_REVIEW_CATCH_UP_SECONDS = max(0, int(float(_daily_review_config.get("catch_up_hours", 6)) * 3600))
 DAILY_REVIEW_MESSAGE_LIMIT = max(20, int(_daily_review_config.get("message_limit", 140)))
 DAILY_REVIEW_RETRY_SECONDS = max(60, int(_daily_review_config.get("retry_seconds", 5 * 60)))
 DAILY_REVIEW_POLL_SECONDS = max(60, int(_daily_review_config.get("poll_seconds", 5 * 60)))
