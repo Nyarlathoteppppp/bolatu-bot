@@ -17,4 +17,5 @@ data/*.sqlite3-shm
 data/*.sqlite3-wal
 data/*.bak
 data/*.bak.gz
+data/backups/
 .DS_Store

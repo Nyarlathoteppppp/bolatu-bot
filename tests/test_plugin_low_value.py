@@ -934,6 +934,135 @@ def test_manual_daily_review_today_window_uses_today_so_far() -> None:
     assert label == "2026-07-13 今日到现在"
 
 
+def test_daily_review_skips_generation_while_self_muted(monkeypatch, tmp_path) -> None:
+    store = MemoryStore(tmp_path / "bot.sqlite3")
+    store.mute_until(1026813421, time.time() + 3600)
+    monkeypatch.setattr(plugin, "memory", store)
+
+    async def fake_refresh(bot, group_id: int, muted_until: float) -> float:
+        return muted_until
+
+    class ExplodingClient:
+        async def daily_review_draft(self, **kwargs):
+            raise AssertionError("daily review should not generate while self-muted")
+
+    monkeypatch.setattr(plugin, "_refresh_self_mute_state_if_stale", fake_refresh)
+    monkeypatch.setattr(plugin, "deepseek_client", ExplodingClient())
+
+    success = asyncio.run(
+        plugin._send_daily_review_for_group(
+            SimpleNamespace(self_id=1801507496),
+            group_id=1026813421,
+            start_at=1000.0,
+            end_at=2000.0,
+            review_label="2026-07-13",
+            sent_key="daily_review_sent:1026813421:2026-07-13",
+            mark_sent=True,
+            source="scheduled",
+            trigger_label="定时复盘",
+        )
+    )
+
+    assert not success
+    assert store.app_kv_get("daily_review_sent:1026813421:2026-07-13") is None
+
+
+def test_daily_review_does_not_persist_learning_before_successful_send(monkeypatch, tmp_path) -> None:
+    store = MemoryStore(tmp_path / "bot.sqlite3")
+    monkeypatch.setattr(plugin, "memory", store)
+
+    async def fake_refresh(bot, group_id: int, muted_until: float) -> float:
+        return 0.0
+
+    monkeypatch.setattr(plugin, "_refresh_self_mute_state_if_stale", fake_refresh)
+    monkeypatch.setattr(plugin.personas, "get", lambda persona_id: SimpleNamespace(name="张风雪"))
+    monkeypatch.setattr(plugin, "split_reply_messages", lambda text, max_messages=3: [])
+    persist_calls: list[object] = []
+    monkeypatch.setattr(plugin, "persist_daily_review_learning", lambda *args, **kwargs: persist_calls.append(kwargs) or [1])
+
+    class FakeClient:
+        async def daily_review_draft(self, **kwargs):
+            return SimpleNamespace(
+                public_reply="今天复盘一句。",
+                events=[],
+                member_changes=[],
+                jargon_candidates=[],
+                feedback_lessons=[],
+                style_observations=[],
+            )
+
+    monkeypatch.setattr(plugin, "deepseek_client", FakeClient())
+
+    success = asyncio.run(
+        plugin._send_daily_review_for_group(
+            SimpleNamespace(self_id=1801507496),
+            group_id=1026813421,
+            start_at=1000.0,
+            end_at=2000.0,
+            review_label="2026-07-13",
+            sent_key="daily_review_sent:1026813421:2026-07-13",
+            mark_sent=True,
+            source="scheduled",
+            trigger_label="定时复盘",
+        )
+    )
+
+    assert not success
+    assert persist_calls == []
+    assert store.app_kv_get("daily_review_sent:1026813421:2026-07-13") is None
+
+
+def test_daily_review_persists_learning_after_successful_send(monkeypatch, tmp_path) -> None:
+    store = MemoryStore(tmp_path / "bot.sqlite3")
+    monkeypatch.setattr(plugin, "memory", store)
+
+    async def fake_refresh(bot, group_id: int, muted_until: float) -> float:
+        return 0.0
+
+    monkeypatch.setattr(plugin, "_refresh_self_mute_state_if_stale", fake_refresh)
+    monkeypatch.setattr(plugin.personas, "get", lambda persona_id: SimpleNamespace(name="张风雪"))
+    persist_calls: list[object] = []
+    sent_parts: list[str] = []
+    monkeypatch.setattr(plugin, "persist_daily_review_learning", lambda *args, **kwargs: persist_calls.append(kwargs) or [1, 2])
+
+    async def fake_send_group_message(bot, group_id: int, message: object) -> int:
+        sent_parts.append(str(message))
+        return 12345
+
+    class FakeClient:
+        async def daily_review_draft(self, **kwargs):
+            return SimpleNamespace(
+                public_reply="今天复盘一句。",
+                events=[],
+                member_changes=[],
+                jargon_candidates=[],
+                feedback_lessons=[],
+                style_observations=[],
+            )
+
+    monkeypatch.setattr(plugin, "_send_group_message", fake_send_group_message)
+    monkeypatch.setattr(plugin, "deepseek_client", FakeClient())
+
+    success = asyncio.run(
+        plugin._send_daily_review_for_group(
+            SimpleNamespace(self_id=1801507496),
+            group_id=1026813421,
+            start_at=1000.0,
+            end_at=2000.0,
+            review_label="2026-07-13",
+            sent_key="daily_review_sent:1026813421:2026-07-13",
+            mark_sent=True,
+            source="scheduled",
+            trigger_label="定时复盘",
+        )
+    )
+
+    assert success
+    assert sent_parts == ["今天复盘一句。"]
+    assert len(persist_calls) == 1
+    assert store.app_kv_get("daily_review_sent:1026813421:2026-07-13") == "sent"
+
+
 def test_meaningful_group_text_not_low_value() -> None:
     for text in ["股票又亏了", "你用什么刮胡子", "可以去投算法岗", "哈哈这项目真离谱"]:
         assert not _is_low_value_group_text(text)
@@ -1208,6 +1337,13 @@ def test_style_rule_filter_rejects_literal_examples() -> None:
     assert not _is_useful_style_rule("对离谱事吐槽", "短句接“太典了”", "太典了")
     assert not _is_useful_style_rule("模仿对方说话", "重复对方原句", "你说啥")
     assert not _is_useful_style_rule("表示赞赏或附和", "发👍👍👍", "👍👍👍")
+    assert not _is_useful_style_rule("群友表达无奈或放弃时", "用短句结束话题", "算了")
+    assert not _is_useful_style_rule("群友分享图片或表情包时", "用简短评价回应", "[图片]")
+    assert not _is_useful_style_rule(
+        "群友引用他人发言时",
+        "用重复关键词延续话题",
+        "一只虎[#89800]回复灰機haru[#98238]消息【灰機haru[#98238]原消息内容未知，消息ID：87736905；一只虎[#89800]回复灰機haru[#98238]：玩坏了咋办】",
+    )
     assert _is_useful_style_rule("拒绝请求", "用一句损友式现实理由拒绝", "不能，你胖的不差这点")
 
 

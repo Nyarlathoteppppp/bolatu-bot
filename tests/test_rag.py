@@ -49,6 +49,15 @@ def test_reply_envelope_uses_only_current_reply_for_rag_query() -> None:
     assert with_semicolon.current_utterance == "之前聊过菲尔兹；你忘了"
 
 
+def test_media_ocr_is_compacted_before_rag_query() -> None:
+    long_ocr = "南开人更多校友服务期待您的参与共建" * 30
+    normalized = normalize_rag_query(f"邪恶科代[#56514]说：[图片] [图片OCR: {long_ocr}] 这个咋样")
+
+    assert len(normalized.text) <= 360
+    assert "南开人更多校友服务期待您的参与共建" in normalized.text
+    assert normalized.text.count("南开人更多校友服务期待您的参与共建") < 10
+
+
 def test_five_digit_context_tail_is_not_resolved_as_full_qq_id(tmp_path) -> None:
     db_path = tmp_path / "bot.sqlite3"
     memory = MemoryStore(db_path)

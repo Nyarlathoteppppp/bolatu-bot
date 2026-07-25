@@ -34,6 +34,8 @@ _RECALL_TOPIC_SUFFIX_RE = re.compile(
 )
 _QUESTION_SUFFIX_RE = re.compile(r"(?:吗|嘛|呢|来着)[？?。！!~～]*$")
 _LEADING_FILLER_RE = re.compile(r"^(?:一下|一下子|那个|这个|关于|有关|的事|的话题)+")
+_RAG_QUERY_MAX_CHARS = 360
+_MEDIA_BLOCK_RE = re.compile(r"\[(?P<label>图片OCR|转发消息摘要|语音识别)[:：]\s*(?P<body>[^\]]{80,})\]")
 
 
 @dataclass(frozen=True)
@@ -45,16 +47,25 @@ class NormalizedRAGQuery:
 
 
 def normalize_rag_query(text: str) -> NormalizedRAGQuery:
-    raw = re.sub(r"\s+", " ", str(text or "")).strip()
+    raw = _compact_rag_media_blocks(re.sub(r"\s+", " ", str(text or "")).strip())
     current, envelope_removed = _extract_current_utterance(raw)
     topic = _explicit_recall_topic(current)
     query = topic or current or raw
     return NormalizedRAGQuery(
-        text=query[:500],
-        current_utterance=(current or raw)[:500],
+        text=query[:_RAG_QUERY_MAX_CHARS],
+        current_utterance=(current or raw)[:_RAG_QUERY_MAX_CHARS],
         focused_topic=topic[:120],
         reply_envelope_removed=envelope_removed,
     )
+
+
+def _compact_rag_media_blocks(text: str) -> str:
+    def replace(match: re.Match[str]) -> str:
+        label = match.group("label")
+        body = re.sub(r"\s+", " ", match.group("body")).strip()
+        return f"[{label}: {body[:90]}…]"
+
+    return _MEDIA_BLOCK_RE.sub(replace, text)
 
 
 def _extract_current_utterance(text: str) -> tuple[str, bool]:

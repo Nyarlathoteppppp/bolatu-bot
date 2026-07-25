@@ -1133,7 +1133,22 @@ async def _send_daily_review_for_group(
     source: str,
     trigger_label: str,
 ) -> bool:
-    persona_id = str(memory.group_state(group_id)["persona"] or app_config.group_config(group_id).get("persona") or app_config.default_persona)
+    state = memory.group_state(group_id)
+    muted_until = await _refresh_self_mute_state_if_stale(bot, group_id, float(state["muted_until"] or 0))
+    if muted_until > time.time():
+        logger.info(f"qq_social_agent daily review skipped while self muted: group={group_id} until={muted_until}")
+        _record_metric_event(
+            "daily_review",
+            group_id=group_id,
+            stage="check",
+            action="skipped",
+            review_label=review_label,
+            source=source,
+            reason="self_muted",
+            muted_until=muted_until,
+        )
+        return False
+    persona_id = str(state["persona"] or app_config.group_config(group_id).get("persona") or app_config.default_persona)
     persona = personas.get(persona_id)
     messages = memory.messages_between(
         group_id,
@@ -1167,32 +1182,6 @@ async def _send_daily_review_for_group(
             reason=_short_notice_text(str(exc), 200),
         )
         return False
-    if review_draft is not None:
-        try:
-            learned_atom_ids = persist_daily_review_learning(
-                memory,
-                group_id=group_id,
-                review_label=review_label,
-                draft=review_draft,
-                messages=messages,
-            )
-            _record_metric_event(
-                "daily_review_learning",
-                group_id=group_id,
-                stage="memory",
-                action="persisted",
-                atom_count=len(learned_atom_ids),
-                event_count=len(review_draft.events),
-                member_change_count=len(review_draft.member_changes),
-                jargon_count=len(review_draft.jargon_candidates),
-                feedback_lesson_count=len(review_draft.feedback_lessons),
-                style_observation_count=len(review_draft.style_observations),
-            )
-        except Exception as exc:
-            logger.warning(
-                "qq_social_agent daily review learning persist failed: "
-                f"group={group_id} date={review_label} error={exc}"
-            )
     if not review:
         review = "今天群里没怎么留给我发挥，我先记一笔：大家还是挺能聊的。"
     review, guarded = sanitize_political_output(review)
@@ -1251,6 +1240,32 @@ async def _send_daily_review_for_group(
             await asyncio.sleep(0.9)
     if mark_sent and sent_key:
         memory.app_kv_set(sent_key, "sent")
+    if review_draft is not None:
+        try:
+            learned_atom_ids = persist_daily_review_learning(
+                memory,
+                group_id=group_id,
+                review_label=review_label,
+                draft=review_draft,
+                messages=messages,
+            )
+            _record_metric_event(
+                "daily_review_learning",
+                group_id=group_id,
+                stage="memory",
+                action="persisted",
+                atom_count=len(learned_atom_ids),
+                event_count=len(review_draft.events),
+                member_change_count=len(review_draft.member_changes),
+                jargon_count=len(review_draft.jargon_candidates),
+                feedback_lesson_count=len(review_draft.feedback_lessons),
+                style_observation_count=len(review_draft.style_observations),
+            )
+        except Exception as exc:
+            logger.warning(
+                "qq_social_agent daily review learning persist failed: "
+                f"group={group_id} date={review_label} error={exc}"
+            )
     _record_metric_event(
         "daily_review",
         group_id=group_id,
@@ -8295,6 +8310,17 @@ def _is_useful_style_rule(situation: str, style: str, source_text: str = "") -> 
         "牛逼",
         "看哭了",
         "这么先进",
+        "算了",
+        "不赖",
+        "一般",
+        "厚米",
+        "啊",
+        "有",
+        "好",
+        "回国",
+        "倒",
+        "魔了",
+        "吓哭了",
     }
     if compact in low_value_phrases:
         return False
@@ -8303,6 +8329,14 @@ def _is_useful_style_rule(situation: str, style: str, source_text: str = "") -> 
     style_compact = re.sub(r"\s+", "", style)
     source_compact = re.sub(r"\s+", "", source_text)
     if style_compact in low_value_phrases or source_compact in low_value_phrases:
+        return False
+    if source_compact and len(source_compact) <= 4:
+        return False
+    if source_compact.startswith("[图片") or "[图片OCR" in source_text:
+        return False
+    if source_compact.startswith("[长消息") and "摘要" in source_compact[:12]:
+        return False
+    if "原消息内容未知" in source_text:
         return False
     if len(style_compact) <= 3 and style_compact in {"赞同", "附和", "吐槽"}:
         return False
