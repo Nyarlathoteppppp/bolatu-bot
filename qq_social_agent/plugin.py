@@ -214,6 +214,7 @@ pending_group_approvals: dict[int, "PendingGroupApproval"] = {}
 recent_suppression_events: list["SuppressionEvent"] = []
 daily_review_tasks: dict[str, asyncio.Task[None]] = {}
 daily_review_send_locks: dict[tuple[int, str], asyncio.Lock] = {}
+last_self_mute_reconcile_at: dict[int, float] = {}
 maintenance_tasks: dict[str, asyncio.Task[None]] = {}
 connected_onebot_bots: dict[str, Bot] = {}
 approval_processing_lock = asyncio.Lock()
@@ -241,6 +242,7 @@ METRIC_RETENTION_SWEEP_SECONDS = _bounded_config_int(
     minimum=60 * 10,
     maximum=7 * 24 * 60 * 60,
 )
+SELF_MUTE_RECONCILE_WHILE_MUTED_SECONDS = 15.0
 
 _driver = get_driver()
 if hasattr(_driver, "server_app"):
@@ -667,42 +669,75 @@ async def _send_approval_rules_on_connect(bot: Bot) -> None:
 
 async def _reconcile_group_mutes(bot: Bot) -> None:
     """Refresh persisted mute deadlines in case notices arrived while bot was offline."""
-    self_id = int(bot.self_id)
-    now = time.time()
     for group_id in _runtime_target_groups():
-        try:
-            payload = await onebot_gateway.call_api(
-                bot,
-                "get_group_member_info",
+        await _reconcile_group_mute(bot, group_id, stage="startup_reconcile", notify_approvers=False)
+
+
+async def _reconcile_group_mute(
+    bot: Bot,
+    group_id: int,
+    *,
+    stage: str,
+    notify_approvers: bool,
+) -> float | None:
+    self_id = int(bot.self_id)
+    try:
+        payload = await onebot_gateway.call_api(
+            bot,
+            "get_group_member_info",
+            group_id=group_id,
+            user_id=self_id,
+            no_cache=True,
+        )
+        member = onebot_gateway.unwrap_data(payload)
+        if not isinstance(member, dict) or "shut_up_timestamp" not in member:
+            logger.warning(f"qq_social_agent mute reconcile missing state: group={group_id}")
+            return None
+        now = time.time()
+        muted_until = max(0.0, float(member.get("shut_up_timestamp") or 0))
+        if muted_until <= now:
+            muted_until = 0.0
+        previous = float(memory.group_state(group_id)["muted_until"] or 0)
+        memory.mute_until(group_id, muted_until)
+        last_self_mute_reconcile_at[group_id] = now
+        if previous != muted_until:
+            _record_metric_event(
+                "group_send_state",
                 group_id=group_id,
                 user_id=self_id,
-                no_cache=True,
+                stage=stage,
+                action="self_muted" if muted_until else "self_unmuted",
+                previous_muted_until=previous,
+                muted_until=muted_until,
             )
-            member = onebot_gateway.unwrap_data(payload)
-            if not isinstance(member, dict) or "shut_up_timestamp" not in member:
-                logger.warning(f"qq_social_agent mute reconcile missing state: group={group_id}")
-                continue
-            muted_until = max(0.0, float(member.get("shut_up_timestamp") or 0))
-            if muted_until <= now:
-                muted_until = 0.0
-            previous = float(memory.group_state(group_id)["muted_until"] or 0)
-            memory.mute_until(group_id, muted_until)
-            if previous != muted_until:
-                _record_metric_event(
-                    "group_send_state",
-                    group_id=group_id,
-                    user_id=self_id,
-                    stage="startup_reconcile",
-                    action="self_muted" if muted_until else "self_unmuted",
-                    previous_muted_until=previous,
-                    muted_until=muted_until,
-                )
-                logger.info(
-                    f"qq_social_agent mute reconciled: group={group_id} "
-                    f"previous={previous} current={muted_until}"
-                )
-        except Exception as exc:
-            logger.warning(f"qq_social_agent mute reconcile failed: group={group_id} error={exc}")
+            logger.info(
+                f"qq_social_agent mute reconciled: group={group_id} "
+                f"stage={stage} previous={previous} current={muted_until}"
+            )
+            if notify_approvers and previous > now and muted_until == 0:
+                message = f"群 {group_id} 中张风雪实际已解除禁言，后端已清除本地禁言状态并恢复生成。"
+                for approver_id in _approval_user_ids():
+                    await _send_private_text(bot, approver_id, message)
+        return muted_until
+    except Exception as exc:
+        logger.warning(f"qq_social_agent mute reconcile failed: group={group_id} stage={stage} error={exc}")
+        return None
+
+
+async def _refresh_self_mute_state_if_stale(bot: Bot, group_id: int, muted_until: float) -> float:
+    now = time.time()
+    if muted_until <= now:
+        return 0.0
+    last_checked = float(last_self_mute_reconcile_at.get(group_id, 0.0) or 0.0)
+    if now - last_checked < SELF_MUTE_RECONCILE_WHILE_MUTED_SECONDS:
+        return muted_until
+    current = await _reconcile_group_mute(
+        bot,
+        group_id,
+        stage="pre_skip_reconcile",
+        notify_approvers=True,
+    )
+    return muted_until if current is None else current
 
 
 async def _notify_active_group_mutes(bot: Bot) -> None:
@@ -2598,7 +2633,7 @@ async def _handle_self_group_ban_notice(bot: Bot, snapshot: object) -> None:
     if str(getattr(snapshot, "notice_type", "") or "").casefold() != "group_ban":
         return
     group_id = int(getattr(snapshot, "group_id", 0) or 0)
-    target_user_id = int(getattr(snapshot, "user_id", 0) or 0)
+    target_user_id = int(getattr(snapshot, "user_id", 0) or getattr(snapshot, "target_id", 0) or 0)
     self_id = int(getattr(bot, "self_id", 0) or 0)
     if not group_id or target_user_id != self_id:
         return
@@ -3217,6 +3252,7 @@ async def _handle_group_message_locked(
         logger.info(f"qq_social_agent ignored group={group_id}: disabled")
         return
     muted_until = float(state["muted_until"] or 0)
+    muted_until = await _refresh_self_mute_state_if_stale(bot, group_id, muted_until)
     if muted_until > time.time():
         logger.info(
             "qq_social_agent skipped while self muted: "

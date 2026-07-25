@@ -113,6 +113,78 @@ def test_self_group_ban_pauses_group_and_notifies_approver(monkeypatch, tmp_path
     assert "2123506373" in str(sent[0][1]["message"])
 
 
+def test_self_group_lift_ban_clears_group_and_notifies_approver(monkeypatch, tmp_path) -> None:
+    import nonebot
+
+    nonebot.init()
+    import qq_social_agent.plugin as plugin
+    from qq_social_agent.memory import MemoryStore
+
+    store = MemoryStore(tmp_path / "bot.sqlite3")
+    store.mute_until(1026813421, 9_999_999_999)
+    monkeypatch.setattr(plugin, "memory", store)
+    monkeypatch.setattr(plugin, "_approval_user_ids", lambda: (1535071184,))
+    sent: list[tuple[str, dict[str, object]]] = []
+
+    class FakeBot:
+        self_id = 1801507496
+
+        async def call_api(self, api: str, **data: object) -> dict[str, int]:
+            sent.append((api, data))
+            return {"message_id": 1}
+
+    snapshot = SimpleNamespace(
+        notice_type="group_ban",
+        sub_type="lift_ban",
+        group_id=1026813421,
+        user_id=1801507496,
+        operator_id=1535071184,
+        duration_seconds=0,
+    )
+
+    asyncio.run(plugin._handle_self_group_ban_notice(FakeBot(), snapshot))
+
+    assert store.group_state(1026813421)["muted_until"] == 0
+    assert sent[0][0] == "send_private_msg"
+    assert "已解除禁言" in str(sent[0][1]["message"])
+
+
+def test_pre_skip_reconcile_clears_missed_lift_ban(monkeypatch, tmp_path) -> None:
+    import nonebot
+
+    nonebot.init()
+    import qq_social_agent.plugin as plugin
+    from qq_social_agent.memory import MemoryStore
+
+    store = MemoryStore(tmp_path / "bot.sqlite3")
+    store.mute_until(1026813421, 9_999_999_999)
+    monkeypatch.setattr(plugin, "memory", store)
+    monkeypatch.setattr(plugin, "_approval_user_ids", lambda: (1535071184,))
+    plugin.last_self_mute_reconcile_at.clear()
+    sent: list[tuple[str, dict[str, object]]] = []
+
+    class FakeBot:
+        self_id = 1801507496
+
+        async def call_api(self, api: str, **data: object) -> dict[str, object]:
+            if api == "get_group_member_info":
+                assert data["group_id"] == 1026813421
+                assert data["user_id"] == self.self_id
+                assert data["no_cache"] is True
+                return {"data": {"user_id": self.self_id, "shut_up_timestamp": 0}}
+            sent.append((api, data))
+            return {"message_id": 1}
+
+    muted_until = asyncio.run(
+        plugin._refresh_self_mute_state_if_stale(FakeBot(), 1026813421, 9_999_999_999)
+    )
+
+    assert muted_until == 0
+    assert store.group_state(1026813421)["muted_until"] == 0
+    assert sent[0][0] == "send_private_msg"
+    assert "实际已解除禁言" in str(sent[0][1]["message"])
+
+
 def test_startup_reconcile_clears_mute_missed_while_offline(monkeypatch, tmp_path) -> None:
     import nonebot
 
