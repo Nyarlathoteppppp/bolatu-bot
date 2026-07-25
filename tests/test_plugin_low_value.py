@@ -1269,7 +1269,7 @@ def test_ai_work_intensity_time_band_defaults_and_override(monkeypatch, tmp_path
     morning = datetime(2026, 7, 14, 8, 0, tzinfo=plugin.DAILY_REVIEW_TIMEZONE)
     daytime = datetime(2026, 7, 14, 15, 0, tzinfo=plugin.DAILY_REVIEW_TIMEZONE)
 
-    assert plugin._ai_work_intensity_percent(midnight) == 100
+    assert plugin._ai_work_intensity_percent(midnight) == 50
     assert plugin._ai_work_intensity_percent(morning) == 5
     assert plugin._ai_work_intensity_percent(daytime) == 80
 

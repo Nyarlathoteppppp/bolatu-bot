@@ -1759,7 +1759,7 @@ def _ai_work_intensity_base_percent() -> int:
 def _ai_work_intensity_band(now: datetime | None = None) -> tuple[str, int | None]:
     current = now or datetime.now(DAILY_REVIEW_TIMEZONE)
     if current.hour < 2:
-        return f"{current.date().isoformat()}:00-02", 100
+        return f"{current.date().isoformat()}:00-02", 50
     if current.hour < 12:
         return f"{current.date().isoformat()}:02-12", 5
     return f"{current.date().isoformat()}:12-24", None
