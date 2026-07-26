@@ -44,18 +44,40 @@ python3 "${db_args[@]}"
 echo
 
 echo "== backup hygiene =="
-backup_compress_days="${BACKUP_COMPRESS_DAYS:-1}"
+backup_dir="${BACKUP_DIR:-data/backups}"
+backup_compress_days="${BACKUP_COMPRESS_DAYS:-0}"
 backup_delete_days="${BACKUP_DELETE_DAYS:-180}"
+mkdir -p "$backup_dir"
 if [[ "$dry_run" == "1" ]]; then
+  echo "Backup dir: $backup_dir"
   echo "Backups to compress (*.bak older than ${backup_compress_days}d):"
-  find data -maxdepth 1 -type f -name "*.bak" -mtime +"$backup_compress_days" -print || true
+  find "$backup_dir" -maxdepth 1 -type f -name "*.bak" -mtime +"$backup_compress_days" -print || true
   echo "Compressed backups to delete (*.bak.gz older than ${backup_delete_days}d):"
-  find data -maxdepth 1 -type f -name "*.bak.gz" -mtime +"$backup_delete_days" -print || true
+  find "$backup_dir" -maxdepth 1 -type f -name "*.bak.gz" -mtime +"$backup_delete_days" -print || true
 else
-  find data -maxdepth 1 -type f -name "*.bak" -mtime +"$backup_compress_days" -exec gzip -9 {} \; || true
-  find data -maxdepth 1 -type f -name "*.bak.gz" -mtime +"$backup_delete_days" -delete || true
+  find "$backup_dir" -maxdepth 1 -type f -name "*.bak" -mtime +"$backup_compress_days" -exec gzip -9 {} \; || true
+  find "$backup_dir" -maxdepth 1 -type f -name "*.bak.gz" -mtime +"$backup_delete_days" -delete || true
 fi
 echo
+
+
+if [[ "${JOURNAL_HYGIENE:-1}" == "1" ]]; then
+  echo "== journal hygiene =="
+  journal_vacuum_size="${JOURNAL_VACUUM_SIZE:-200M}"
+  if [[ "$dry_run" == "1" ]]; then
+    journalctl --disk-usage 2>/dev/null || true
+    echo "Would vacuum system journal to ${journal_vacuum_size}."
+  else
+    journalctl --disk-usage 2>/dev/null || true
+    if command -v sudo >/dev/null 2>&1; then
+      sudo journalctl --vacuum-size="$journal_vacuum_size" || true
+    else
+      journalctl --vacuum-size="$journal_vacuum_size" || true
+    fi
+    journalctl --disk-usage 2>/dev/null || true
+  fi
+  echo
+fi
 
 if [[ "${DOCKER_PRUNE:-1}" == "1" ]]; then
   echo "== docker prune =="
