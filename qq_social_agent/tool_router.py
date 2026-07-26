@@ -6,7 +6,7 @@ from typing import Iterable
 
 from .deepseek_client import ReplyDecision, ToolSymbol
 from .pipeline_types import PipelineMode, ToolKind, ToolRequest
-from .tools.fresh_context import FreshIntent
+from .tools.fresh_context import FreshIntent, detect_fresh_intent
 from .tools.market_intent import MarketIntent
 
 
@@ -146,11 +146,19 @@ def infer_followup_fresh_intent(
     the next search query.
     """
 
-    bare_command = is_contextual_followup_lookup(text)
-    if FOLLOWUP_LOOKUP_RE.search(text) is None:
+    current_text = _current_reply_text(text) or re.sub(r"\s+", " ", str(text or "")).strip()
+    bare_command = is_contextual_followup_lookup(current_text)
+    if FOLLOWUP_LOOKUP_RE.search(current_text) is None:
         return None
     if not addressed and not bare_command:
         return None
+    current_intent = detect_fresh_intent(current_text)
+    if current_intent is not None and current_intent.explicit and current_intent.query:
+        return FreshIntent(current_intent.query[:120], current_intent.kind, explicit=True, required=True)
+    reply_target = _reply_target_lookup_topic(text, current_text=current_text)
+    if reply_target and _useful_followup_topic(reply_target, current_text=current_text):
+        kind = "news" if any(token in reply_target for token in ("现在", "今天", "最新", "今年", "刚刚")) else "web"
+        return FreshIntent(reply_target[:120], kind, explicit=True, required=True)
     messages = tuple(recent_messages)
     now = float(current_at or 0.0) or max(
         (float(getattr(message, "created_at", 0.0) or 0.0) for message in messages),
@@ -170,11 +178,37 @@ def infer_followup_fresh_intent(
             if bare_command and now > 0 and message_at > 0 and now - message_at > FOLLOWUP_TOPIC_MAX_AGE_SECONDS:
                 continue
             candidate = re.sub(r"\s+", " ", str(getattr(message, "text", "") or "")).strip()
-            if not _useful_followup_topic(candidate, current_text=text):
+            if not _useful_followup_topic(candidate, current_text=current_text):
                 continue
             kind = "news" if any(token in candidate for token in ("现在", "今天", "最新", "今年", "刚刚")) else "web"
             return FreshIntent(candidate[:120], kind, explicit=True, required=True)
     return None
+
+
+def _current_reply_text(text: str) -> str:
+    value = re.sub(r"\s+", " ", str(text or "")).strip()
+    if "回复" not in value or "消息【" not in value or not value.endswith("】"):
+        return ""
+    for separator in ("：", ":"):
+        if separator not in value:
+            continue
+        current = value.rsplit(separator, 1)[-1].removesuffix("】").strip()
+        if current:
+            return current
+    return ""
+
+
+def _reply_target_lookup_topic(text: str, *, current_text: str) -> str:
+    value = re.sub(r"\s+", " ", str(text or "")).strip()
+    if "回复" not in value or "消息【" not in value or not value.endswith("】"):
+        return ""
+    if FOLLOWUP_LOOKUP_RE.search(current_text) is None:
+        return ""
+    match = re.search(r"消息【.*?说[：:](?P<target>.*?)；.*?回复.*?[：:](?P<current>.*?)】$", value)
+    if match is None:
+        return ""
+    target = re.sub(r"\s+", " ", match.group("target") or "").strip()
+    return target[:120]
 
 
 def is_contextual_followup_lookup(text: str) -> bool:

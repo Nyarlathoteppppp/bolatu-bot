@@ -317,3 +317,44 @@ def test_background_learning_uses_one_worker_and_defers_busy_group() -> None:
 
     asyncio.run(scenario())
     assert calls == [1]
+
+
+def test_followup_search_prefers_current_explicit_query_over_history() -> None:
+    messages = [
+        ChatMessage(1, 7, "歌迷老蛆", "什么是投档线", False, 100.0),
+        ChatMessage(1, 99, "张风雪", "光华现在确实是北大分数线最高的专业之一", True, 101.0),
+    ]
+
+    intent = infer_followup_fresh_intent(
+        "你去搜搜光华分数线和其他做对比",
+        messages,
+        addressed=True,
+        current_user_id=7,
+        current_at=110.0,
+    )
+
+    assert intent is not None
+    assert intent.query == "光华分数线和其他做对比"
+
+
+def test_followup_search_uses_replied_bot_claim_for_bare_fact_check() -> None:
+    messages = [
+        ChatMessage(1, 7, "歌迷老蛆", "什么是投档线", False, 100.0),
+    ]
+    wrapped = (
+        "歌迷老蛆[#71184]回复张风雪[#07496]消息【"
+        "张风雪[#07496]说：光华现在确实是北大分数线最高的专业之一，比部分理工科都高；"
+        "歌迷老蛆[#71184]回复张风雪[#07496]：真的吗你去搜搜】"
+    )
+
+    intent = infer_followup_fresh_intent(
+        wrapped,
+        messages,
+        addressed=True,
+        current_user_id=7,
+        current_at=110.0,
+    )
+
+    assert intent is not None
+    assert intent.query.startswith("光华现在确实")
+    assert "投档线" not in intent.query

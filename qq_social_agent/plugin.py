@@ -3518,7 +3518,7 @@ async def _handle_group_message_locked(
     )
     if fresh_intent is None:
         followup_fresh_intent = _infer_followup_fresh_intent(
-            tool_query_text,
+            text,
             context_recent,
             addressed=addressed_bot,
             current_user_id=user_id,
@@ -4060,6 +4060,41 @@ async def _handle_group_message_locked(
             )
         pipeline_state.add_tool_result(fresh_result)
         fresh_context = fresh_result.context
+        if str(fresh_result.status) != "ok" and not fresh_context.strip():
+            query_text = decision.fresh_query.strip() or text.strip()
+            failure_reason = fresh_result.error or fresh_result.status or "搜索工具没有返回可用结果"
+            fallback_text = f"风雪这边没搜到可靠结果，先不瞎编。关键词是“{_short_notice_text(query_text, 48)}”，刚才失败原因：{_short_notice_text(str(failure_reason), 60)}。"
+            fallback_candidates = (
+                PendingApprovalCandidate(
+                    1,
+                    fallback_text,
+                    "answer",
+                    "联网查询失败兜底，不编事实",
+                ),
+            )
+            approval_id = _new_approval_id(group_id)
+            _pipeline_apply_candidates(pipeline_state, fallback_candidates)
+            _pipeline_mark_approval_pending(pipeline_state, approval_id)
+            await _request_group_approval(
+                bot,
+                PendingGroupApproval(
+                    approval_id=approval_id,
+                    group_id=group_id,
+                    trigger_user_id=user_id,
+                    trigger_nickname=nickname,
+                    trigger_text=text,
+                    persona_name=persona.name,
+                    self_id=int(event.self_id),
+                    candidates=fallback_candidates,
+                    mention_targets={},
+                    created_at=time.time(),
+                    correlation_id=current_correlation_id(),
+                    tool_evidence="",
+                    trigger_sequence=trigger_sequence,
+                    pipeline_state=pipeline_state,
+                ),
+            )
+            return
     elif fresh_context_task is not None and not fresh_context_task.done():
         fresh_context_task.cancel()
     deep_request = tool_plan.first(ToolKind.DEEP_URL)

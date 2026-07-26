@@ -49,3 +49,12 @@ def test_approval_evidence_keeps_traceable_sources_without_prompt_noise() -> Non
     assert "状态：ok" in evidence
     assert "https://nonebot.dev/docs" in evidence
     assert "安全边界" not in evidence
+
+
+def test_detect_fresh_intent_handles_go_search_phrase() -> None:
+    intent = detect_fresh_intent("你去搜搜光华分数线和其他做对比")
+
+    assert intent is not None
+    assert intent.explicit
+    assert intent.query == "光华分数线和其他做对比"
+    assert intent.kind == "web"
