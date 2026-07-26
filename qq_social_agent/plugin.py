@@ -203,6 +203,7 @@ group_message_buffers: dict[int, list["BufferedGroupMessage"]] = {}
 group_buffer_tasks: dict[int, asyncio.Task[None]] = {}
 group_generation_inflight: set[int] = set()
 group_addressed_waiters: dict[int, int] = {}
+group_reply_flow_timestamps: dict[int, float] = {}
 group_inbound_sequences: dict[int, int] = {}
 group_passive_retry_buffers: dict[int, list["BufferedGroupMessage"]] = {}
 group_passive_retry_tasks: dict[int, asyncio.Task[None]] = {}
@@ -315,6 +316,8 @@ JARGON_CONTEXT_LOOKBACK = 4
 CUSTOM_JARGON_CONTEXT_LIMIT = 10
 GROUP_BUFFER_SECONDS = 6.0
 GROUP_INFLIGHT_BUFFER_RETRY_SECONDS = 1.0
+GROUP_REPLY_FLOW_COOLDOWN_SECONDS = 18.0
+BOT_STATUS_CARD_BASE_NAME = "张风雪"
 GROUP_PASSIVE_DECISION_GAP_SECONDS = 30
 GROUP_PASSIVE_DECISION_EVERY_MESSAGES = 3
 GROUP_DIRECTORY_SYNC_INTERVAL_SECONDS = int(app_config.raw.get("group_directory", {}).get("sync_interval_seconds", 6 * 60 * 60))
@@ -531,6 +534,8 @@ class BufferedGroupMessage:
     correlation_id: str = ""
     inbound_sequence: int = 0
     pipeline_state: PipelineState | None = None
+    addressed: bool = False
+    direct_addressed: bool = False
 
 
 @dataclass(frozen=True)
@@ -659,6 +664,7 @@ async def _send_approval_rules_on_connect(bot: Bot) -> None:
         bot_id=str(bot.self_id),
     )
     await _reconcile_group_mutes(bot)
+    await _sync_group_status_cards(bot, reason="bot_connect")
     await _send_approval_rules_to_approvers(bot, reason="bot_connect")
     await _send_changelog_notice_to_approvers(bot)
     await _notify_active_group_mutes(bot)
@@ -3076,9 +3082,38 @@ async def _handle_group_message_scoped(
                 correlation_id=correlation_id,
                 inbound_sequence=inbound_sequence,
                 pipeline_state=pipeline_state,
+                addressed=True,
+                direct_addressed=addressed_bot,
             )
         )
     effective_addressed = addressed_bot or contextual_search_request or followup_addressed
+    if group_allowed and effective_addressed and _should_defer_group_reply_flow(group_id, now=time.monotonic()):
+        _buffer_group_message(
+            bot,
+            event,
+            text,
+            source_message_id=source_message_id,
+            correlation_id=correlation_id,
+            inbound_sequence=inbound_sequence,
+            pipeline_state=pipeline_state,
+            addressed=True,
+            direct_addressed=addressed_bot,
+        )
+        logger.info(
+            "qq_social_agent deferred addressed group message by reply flow cooldown: "
+            f"group={group_id} user={int(event.user_id)} text={text!r}"
+        )
+        _record_metric_event(
+            "message_deferred",
+            group_id=group_id,
+            user_id=int(event.user_id),
+            stage="reply_flow_cooldown",
+            action="buffer",
+            addressed=effective_addressed,
+            source_message_id=source_message_id,
+            correlation_id=correlation_id,
+        )
+        return
     if effective_addressed:
         _cancel_passive_decision_retry(group_id)
         group_addressed_waiters[group_id] = group_addressed_waiters.get(group_id, 0) + 1
@@ -3137,16 +3172,18 @@ async def _handle_group_message_locked(
     if buffered_messages:
         trigger_sequence = buffered_messages[-1].inbound_sequence
     nickname = _buffered_current_nickname(buffered_messages) if buffered_messages else _nickname(event)
+    buffered_addressed = any(item.addressed for item in buffered_messages or ())
+    buffered_direct_addressed = any(item.direct_addressed for item in buffered_messages or ())
     mentioned = False if buffered_messages else _mentioned_bot(event, bot)
     replied_to_bot = False if buffered_messages else _replied_to_bot(event, bot)
     if not buffered_messages and addressed_bot_hint and _event_has_reply_context(event):
         replied_to_bot = True
-    direct_addressed_bot = mentioned or replied_to_bot or bool(addressed_bot_hint)
+    direct_addressed_bot = buffered_direct_addressed or mentioned or replied_to_bot or bool(addressed_bot_hint)
     synthetic_addressed_bot = bool(contextual_addressed_hint)
     followup_addressed = (
         not direct_addressed_bot
         and not synthetic_addressed_bot
-        and bool(followup_addressed_hint)
+        and (buffered_addressed or bool(followup_addressed_hint))
     )
     addressed_bot = direct_addressed_bot or synthetic_addressed_bot or followup_addressed
     event_at = (
@@ -4249,6 +4286,7 @@ async def _handle_group_message_locked(
         elapsed_ms=generation_elapsed_ms,
         flow_elapsed_ms=int((time.monotonic() - flow_started_at) * 1000),
     )
+    _record_group_reply_flow(group_id)
     approval_id = _new_approval_id(group_id)
     _pipeline_mark_approval_pending(pipeline_state, approval_id)
     await _request_group_approval(
@@ -6000,6 +6038,25 @@ def _append_market_intent(
     intents.append(intent)
 
 
+
+def _record_group_reply_flow(group_id: int, *, now: float | None = None) -> None:
+    group_reply_flow_timestamps[group_id] = time.monotonic() if now is None else now
+
+
+def _group_reply_flow_cooldown_remaining(group_id: int, *, now: float | None = None) -> float:
+    last_at = group_reply_flow_timestamps.get(group_id)
+    if last_at is None:
+        return 0.0
+    current = time.monotonic() if now is None else now
+    return max(0.0, GROUP_REPLY_FLOW_COOLDOWN_SECONDS - (current - last_at))
+
+
+def _should_defer_group_reply_flow(group_id: int, *, now: float | None = None) -> bool:
+    current = time.monotonic() if now is None else now
+    if group_id in group_generation_inflight or group_addressed_waiters.get(group_id, 0) > 0:
+        return True
+    return _group_reply_flow_cooldown_remaining(group_id, now=current) > 0
+
 def _contextual_followup_search_intent(
     *,
     group_id: int,
@@ -6031,6 +6088,8 @@ def _buffer_group_message(
     correlation_id: str = "",
     inbound_sequence: int = 0,
     pipeline_state: PipelineState | None = None,
+    addressed: bool = False,
+    direct_addressed: bool = False,
 ) -> None:
     group_id = int(event.group_id)
     _cancel_passive_decision_retry(group_id)
@@ -6045,6 +6104,8 @@ def _buffer_group_message(
         correlation_id=correlation_id,
         inbound_sequence=inbound_sequence,
         pipeline_state=pipeline_state,
+        addressed=addressed,
+        direct_addressed=direct_addressed,
     )
     group_message_buffers.setdefault(group_id, []).append(item)
     _schedule_group_buffer_flush(group_id)
@@ -6062,11 +6123,22 @@ def _schedule_group_buffer_flush(group_id: int, *, delay: float = GROUP_BUFFER_S
 
 async def _flush_group_buffer_after_delay(group_id: int, *, delay: float = GROUP_BUFFER_SECONDS) -> None:
     should_reschedule = False
+    reschedule_delay = GROUP_INFLIGHT_BUFFER_RETRY_SECONDS
     try:
         await asyncio.sleep(delay)
         async with _group_processing_lock(group_id):
             if group_addressed_waiters.get(group_id, 0) > 0:
                 should_reschedule = True
+                return
+            cooldown_remaining = _group_reply_flow_cooldown_remaining(group_id, now=time.monotonic())
+            if cooldown_remaining > 0:
+                logger.info(
+                    "qq_social_agent group reply flow cooldown: "
+                    f"group={group_id} buffer_deferred size={len(group_message_buffers.get(group_id, []))} "
+                    f"remaining={cooldown_remaining:.1f}s"
+                )
+                should_reschedule = True
+                reschedule_delay = min(max(cooldown_remaining, GROUP_INFLIGHT_BUFFER_RETRY_SECONDS), GROUP_REPLY_FLOW_COOLDOWN_SECONDS)
                 return
             if group_id in group_generation_inflight:
                 logger.info(
@@ -6101,7 +6173,7 @@ async def _flush_group_buffer_after_delay(group_id: int, *, delay: float = GROUP
         if group_buffer_tasks.get(group_id) is task:
             group_buffer_tasks.pop(group_id, None)
         if should_reschedule and group_message_buffers.get(group_id):
-            _schedule_group_buffer_flush(group_id, delay=GROUP_INFLIGHT_BUFFER_RETRY_SECONDS)
+            _schedule_group_buffer_flush(group_id, delay=reschedule_delay)
 
 
 def _schedule_passive_decision_retry(group_id: int, items: list[BufferedGroupMessage]) -> None:
@@ -7254,12 +7326,45 @@ def _latest_group_approval() -> PendingGroupApproval | None:
     return max(pending_group_approvals.values(), key=lambda approval: approval.created_at)
 
 
+
+def _status_group_card(enabled: bool) -> str:
+    suffix = "开启" if enabled else "关闭"
+    return f"{BOT_STATUS_CARD_BASE_NAME}（{suffix}）"
+
+
+async def _sync_group_status_cards(bot: Bot, *, reason: str) -> None:
+    self_id = int(getattr(bot, "self_id", 0) or 0)
+    if self_id <= 0:
+        return
+    for group_id in _runtime_target_groups():
+        enabled = bool(memory.group_state(group_id)["enabled"])
+        card = _status_group_card(enabled)
+        try:
+            await onebot_gateway.call_api(
+                bot,
+                "set_group_card",
+                group_id=group_id,
+                user_id=self_id,
+                card=card,
+                timeout_seconds=8,
+            )
+            logger.info(
+                "qq_social_agent group status card synced: "
+                f"group={group_id} card={card!r} reason={reason}"
+            )
+        except Exception as exc:
+            logger.warning(
+                "qq_social_agent group status card sync failed: "
+                f"group={group_id} card={card!r} reason={reason} error={exc}"
+            )
+
 async def _set_approval_group_decision_enabled(bot: Bot, user_id: int, enabled: bool) -> None:
     target_groups = sorted(app_config.allowed_groups) or sorted(pending_group_approvals)
     for group_id in target_groups:
         memory.set_group_enabled(group_id, enabled)
     if not enabled:
         pending_group_approvals.clear()
+    await _sync_group_status_cards(bot, reason="decision_switch")
     response_text = "已开启，群聊恢复进入决策。" if enabled else "已关闭，群聊不再进入决策，待审候选已清空。"
     try:
         await _send_private_message(bot, user_id=user_id, message=Message(response_text))

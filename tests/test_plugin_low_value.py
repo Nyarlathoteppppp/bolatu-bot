@@ -16,6 +16,7 @@ from qq_social_agent.plugin import (
     APPROVAL_REJECT_REASON_RE,
     GROUP_BUFFER_SECONDS,
     GROUP_INFLIGHT_BUFFER_RETRY_SECONDS,
+    GROUP_REPLY_FLOW_COOLDOWN_SECONDS,
     GROUP_PASSIVE_DECISION_EVERY_MESSAGES,
     GROUP_PASSIVE_DECISION_GAP_SECONDS,
     JARGON_ADD_RE,
@@ -41,6 +42,7 @@ from qq_social_agent.plugin import (
     _passive_decision_allowed,
     _pre_decision_gate,
     _record_user_reply,
+    _status_group_card,
     _sanitize_generated_text,
     _balanced_style_learning_messages,
     _user_reply_cooling_down,
@@ -55,8 +57,20 @@ from qq_social_agent.tools.market_intent import MarketIntent
 
 class FakeApprovalBot:
     def __init__(self) -> None:
+        self.self_id = 1801507496
         self.private_messages: list[tuple[int, str]] = []
         self.group_messages: list[tuple[int, str]] = []
+        self.api_calls: list[tuple[str, dict]] = []
+
+    async def call_api(self, api: str, **data) -> dict[str, object]:
+        self.api_calls.append((api, dict(data)))
+        if api == "send_private_msg":
+            self.private_messages.append((int(data["user_id"]), str(data["message"])))
+            return {"message_id": 1000 + len(self.private_messages)}
+        if api == "send_group_msg":
+            self.group_messages.append((int(data["group_id"]), str(data["message"])))
+            return {"message_id": 2000 + len(self.group_messages)}
+        return {"status": "ok"}
 
     async def send_private_msg(self, *, user_id: int, message: object) -> dict[str, int]:
         self.private_messages.append((user_id, str(message)))
@@ -97,6 +111,7 @@ def _use_temp_plugin_memory(monkeypatch, tmp_path) -> MemoryStore:
     plugin.group_buffer_tasks.clear()
     plugin.group_generation_inflight.clear()
     plugin.group_addressed_waiters.clear()
+    plugin.group_reply_flow_timestamps.clear()
     plugin.group_inbound_sequences.clear()
     monkeypatch.setattr(plugin, "_private_tool_reply_delay_seconds", lambda: 0.0)
     return store
@@ -140,6 +155,44 @@ def test_pad_approval_candidates_fills_to_three() -> None:
 
 def test_group_buffer_seconds_is_six() -> None:
     assert GROUP_BUFFER_SECONDS == 6.0
+
+
+def test_status_group_card_labels() -> None:
+    assert _status_group_card(True) == "张风雪（开启）"
+    assert _status_group_card(False) == "张风雪（关闭）"
+
+
+def test_group_buffer_flush_defers_during_reply_flow_cooldown(monkeypatch) -> None:
+    group_id = 1026813421
+    plugin.group_message_buffers.clear()
+    plugin.group_buffer_tasks.clear()
+    plugin.group_generation_inflight.clear()
+    plugin.group_addressed_waiters.clear()
+    plugin.group_reply_flow_timestamps.clear()
+    item = _buffered_item(group_id, "刚才生成后来的消息")
+    plugin.group_message_buffers[group_id] = [item]
+    plugin._record_group_reply_flow(group_id, now=time.monotonic())
+    handled = []
+    scheduled = []
+
+    async def fake_handle(*args, **kwargs) -> None:
+        handled.append((args, kwargs))
+
+    monkeypatch.setattr(plugin, "_handle_group_message_locked", fake_handle)
+    monkeypatch.setattr(
+        plugin,
+        "_schedule_group_buffer_flush",
+        lambda gid, *, delay=GROUP_BUFFER_SECONDS: scheduled.append((gid, delay)),
+    )
+
+    asyncio.run(plugin._flush_group_buffer_after_delay(group_id, delay=0))
+
+    assert handled == []
+    assert plugin.group_message_buffers[group_id] == [item]
+    assert scheduled
+    assert scheduled[0][0] == group_id
+    assert 0 < scheduled[0][1] <= GROUP_REPLY_FLOW_COOLDOWN_SECONDS
+    plugin.group_reply_flow_timestamps.clear()
 
 
 def test_compact_long_message_fallback_keeps_short_marker() -> None:
@@ -1859,6 +1912,7 @@ def test_approval_close_clears_pending_and_resends_rules(monkeypatch, tmp_path) 
     assert handled
     assert plugin.pending_group_approvals == {}
     assert store.group_state(1026813421)["enabled"] is False
+    assert ("set_group_card", {"group_id": 1026813421, "user_id": 1801507496, "card": "张风雪（关闭）"}) in bot.api_calls
     rule_messages = [item for item in bot.private_messages if item[1] == plugin.APPROVAL_RULES_MESSAGE]
     assert {user_id for user_id, _ in rule_messages} == set(plugin._approval_user_ids())
 
@@ -1872,6 +1926,7 @@ def test_approval_open_restores_decision_and_resends_rules(monkeypatch, tmp_path
 
     assert handled
     assert store.group_state(1026813421)["enabled"] is True
+    assert ("set_group_card", {"group_id": 1026813421, "user_id": 1801507496, "card": "张风雪（开启）"}) in bot.api_calls
     rule_messages = [item for item in bot.private_messages if item[1] == plugin.APPROVAL_RULES_MESSAGE]
     assert {user_id for user_id, _ in rule_messages} == set(plugin._approval_user_ids())
 
