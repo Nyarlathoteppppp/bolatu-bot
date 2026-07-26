@@ -115,6 +115,17 @@ else
 fi
 echo
 
+
+echo "== COSCLI output hygiene =="
+coscli_output_days="${COSCLI_OUTPUT_DAYS:-14}"
+if [[ "$dry_run" == "1" ]]; then
+  find coscli_output -type f -mtime +"$coscli_output_days" -print 2>/dev/null || true
+else
+  find coscli_output -type f -mtime +"$coscli_output_days" -delete 2>/dev/null || true
+  find coscli_output -type d -empty -delete 2>/dev/null || true
+fi
+echo
+
 echo "== docker after =="
 docker system df || true
 echo

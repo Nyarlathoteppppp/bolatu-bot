@@ -28,6 +28,11 @@ if [[ "$mode" == "--apply" ]] && ! command -v coscli >/dev/null 2>&1; then
   exit 127
 fi
 
+if [[ "$mode" == "--apply" ]] && ! command -v timeout >/dev/null 2>&1; then
+  echo "timeout command not found; refusing to run unbounded COS backup." >&2
+  exit 127
+fi
+
 dry_run=1
 if [[ "$mode" == "--apply" ]]; then
   dry_run=0
@@ -36,21 +41,38 @@ fi
 timestamp="$(date +%Y%m%d_%H%M%S)"
 backup_dir="${BACKUP_DIR:-data/backups}"
 local_keep_days="${COS_LOCAL_SNAPSHOT_KEEP_DAYS:-14}"
-mkdir -p "$backup_dir"
+coscli_timeout_seconds="${COSCLI_TIMEOUT_SECONDS:-900}"
+coscli_ntqq_timeout_seconds="${COSCLI_NTQQ_TIMEOUT_SECONDS:-7200}"
+coscli_err_retry_num="${COSCLI_ERR_RETRY_NUM:-2}"
+coscli_routines="${COSCLI_ROUTINES:-2}"
+mkdir -p "$backup_dir" logs
 
 snapshot_sqlite="$backup_dir/bot.sqlite3.cos_${timestamp}.sqlite3"
 snapshot_gz="$snapshot_sqlite.gz"
 metadata_tar="$backup_dir/project_metadata_${timestamp}.tar.gz"
 
+coscli_sync() {
+  local timeout_seconds="$1"
+  shift
+  timeout "$timeout_seconds" coscli sync "$@" \
+    --init-skip \
+    --disable-log \
+    --err-retry-num "$coscli_err_retry_num" \
+    --routines "$coscli_routines" \
+    --fail-output=false \
+    --process-log=false
+}
+
 echo "== COS backup =="
 echo "project: $project_dir"
 echo "dest:    $cos_dest"
 echo "mode:    $mode"
+echo "timeout: normal=${coscli_timeout_seconds}s ntqq=${coscli_ntqq_timeout_seconds}s"
 
 if [[ "$dry_run" == "1" ]]; then
   echo "Would create SQLite online backup: $snapshot_gz"
   echo "Would create metadata archive:      $metadata_tar"
-  echo "Would run: coscli sync $backup_dir ${cos_dest%/}/data/backups -r"
+  echo "Would sync $backup_dir to ${cos_dest%/}/data/backups"
   if [[ "${COS_INCLUDE_NAPCAT_CONFIG:-1}" == "1" ]]; then
     echo "Would sync server-data/napcat/config to ${cos_dest%/}/server-data/napcat/config"
   fi
@@ -74,23 +96,28 @@ with sqlite3.connect(src) as source, sqlite3.connect(dst) as target:
 PY
 
 gzip -9 "$snapshot_sqlite"
-tar -czf "$metadata_tar"   config.yaml prompts scripts README.md pyproject.toml   server-data/napcat/config   2>/dev/null || true
+tar -czf "$metadata_tar" \
+  config.yaml prompts scripts README.md pyproject.toml \
+  server-data/napcat/config \
+  2>/dev/null || true
 
 echo "created: $snapshot_gz"
 echo "created: $metadata_tar"
 
-coscli sync "$backup_dir" "${cos_dest%/}/data/backups" -r
+coscli_sync "$coscli_timeout_seconds" "$backup_dir" "${cos_dest%/}/data/backups" -r
 
 if [[ "${COS_INCLUDE_NAPCAT_CONFIG:-1}" == "1" ]]; then
-  coscli sync server-data/napcat/config "${cos_dest%/}/server-data/napcat/config" -r || true
+  coscli_sync "$coscli_timeout_seconds" server-data/napcat/config "${cos_dest%/}/server-data/napcat/config" -r || true
 fi
 
 if [[ "${COS_INCLUDE_NAPCAT_NTQQ:-0}" == "1" ]]; then
   echo "NapCat ntqq sync enabled. This may upload private QQ cache/media and can be large."
-  coscli sync server-data/ntqq "${cos_dest%/}/server-data/ntqq" -r || true
+  coscli_sync "$coscli_ntqq_timeout_seconds" server-data/ntqq "${cos_dest%/}/server-data/ntqq" -r || true
 fi
 
 find "$backup_dir" -maxdepth 1 -type f -name "bot.sqlite3.cos_*.sqlite3.gz" -mtime +"$local_keep_days" -delete || true
 find "$backup_dir" -maxdepth 1 -type f -name "project_metadata_*.tar.gz" -mtime +"$local_keep_days" -delete || true
+find coscli_output -type f -mtime +14 -delete 2>/dev/null || true
+find coscli_output -type d -empty -delete 2>/dev/null || true
 
 echo "COS backup done."

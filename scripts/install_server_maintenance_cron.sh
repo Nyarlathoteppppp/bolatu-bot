@@ -4,6 +4,7 @@ set -euo pipefail
 project_dir="${PROJECT_DIR:-/opt/qq-social-agent}"
 hygiene_cron="${HYGIENE_CRON_PATH:-/etc/cron.d/qq-social-agent-hygiene}"
 cos_cron="${COS_CRON_PATH:-/etc/cron.d/qq-social-agent-cos-backup}"
+health_cron="${HEALTH_CRON_PATH:-/etc/cron.d/qq-social-agent-health}"
 cos_env="${COS_ENV_PATH:-/etc/qq-social-agent/cos-backup.env}"
 
 sudo tee "$hygiene_cron" >/dev/null <<EOF
@@ -12,8 +13,15 @@ PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 # Daily local cleanup for qq-social-agent. Keeps logs, backups, Docker cache and NapCat temp files bounded.
 17 4 * * * ubuntu cd $project_dir && BACKUP_DELETE_DAYS=90 JOURNAL_VACUUM_SIZE=200M scripts/system_hygiene.sh --apply >> logs/system_hygiene_cron.log 2>&1
 EOF
-
 sudo chmod 0644 "$hygiene_cron"
+
+sudo tee "$health_cron" >/dev/null <<EOF
+SHELL=/bin/bash
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+# Weekly health report. The latest report is reports/server_health_latest.md.
+12 6 * * 1 ubuntu cd $project_dir && scripts/server_health_report.sh >> logs/server_health_cron.log 2>&1
+EOF
+sudo chmod 0644 "$health_cron"
 
 if [[ -f "$cos_env" ]]; then
   sudo tee "$cos_cron" >/dev/null <<EOF
@@ -21,6 +29,8 @@ SHELL=/bin/bash
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 # Daily COS cold backup. Configure $cos_env first.
 42 4 * * * ubuntu set -a; source $cos_env; set +a; cd $project_dir && scripts/cos_backup.sh --apply >> logs/cos_backup_cron.log 2>&1
+# Monthly NapCat ntqq cold backup. This is intentionally less frequent because it may include large QQ cache/media.
+42 5 1 * * ubuntu set -a; source $cos_env; set +a; cd $project_dir && COS_INCLUDE_NAPCAT_NTQQ=1 COSCLI_NTQQ_TIMEOUT_SECONDS=7200 scripts/cos_backup.sh --apply >> logs/cos_monthly_ntqq_cron.log 2>&1
 EOF
   sudo chmod 0644 "$cos_cron"
   echo "Installed COS backup cron: $cos_cron"
@@ -30,3 +40,4 @@ else
 fi
 
 echo "Installed hygiene cron: $hygiene_cron"
+echo "Installed health cron: $health_cron"

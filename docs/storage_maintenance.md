@@ -1,6 +1,6 @@
 # Storage Maintenance
 
-This server is intended to run the QQ bot for a long time. Keep runtime data local, and use Tencent COS as cold backup storage.
+This server is intended to run the QQ bot for a year or longer. Runtime data stays local; Tencent COS is used as cold backup storage.
 
 ## Current Layout
 
@@ -9,102 +9,92 @@ This server is intended to run the QQ bot for a long time. Keep runtime data loc
 - `/opt/qq-social-agent/server-data`: NapCat and QQ runtime data.
 - `/swapfile`: 2G disk-backed swap for memory spikes.
 
-COS is object storage, not a mounted block disk. Use it for backups and old artifacts, not live SQLite writes.
+COS is object storage, not a mounted block disk. Use it for backup and recovery, not live SQLite writes.
 
-## Local Hygiene
+## Automatic Schedule
 
-Install the daily cron:
-
-```bash
-cd /opt/qq-social-agent
-scripts/install_server_maintenance_cron.sh
-```
-
-The cron runs daily at 04:17:
-
-```bash
-BACKUP_DELETE_DAYS=90 JOURNAL_VACUUM_SIZE=200M scripts/system_hygiene.sh --apply
-```
-
-It bounds:
-
-- database/RAG garbage
-- local compressed backups
-- system journal
-- Docker unused cache/images
-- NapCat temp/log files
-
-NapCat media cleanup is disabled by default because QQ media can be useful history. Run deliberately:
-
-```bash
-cd /opt/qq-social-agent
-NAPCAT_MEDIA_CLEAN=1 NAPCAT_MEDIA_DAYS=180 scripts/system_hygiene.sh --dry-run
-NAPCAT_MEDIA_CLEAN=1 NAPCAT_MEDIA_DAYS=180 scripts/system_hygiene.sh --apply
-```
-
-## COS Backup
-
-Install COSCLI:
-
-```bash
-cd /opt/qq-social-agent
-scripts/install_coscli.sh
-```
-
-Configure COSCLI interactively:
-
-```bash
-coscli config init
-```
-
-Create COS backup env:
-
-```bash
-sudo mkdir -p /etc/qq-social-agent
-sudo cp scripts/cos-backup.env.example /etc/qq-social-agent/cos-backup.env
-sudo chmod 600 /etc/qq-social-agent/cos-backup.env
-sudo nano /etc/qq-social-agent/cos-backup.env
-```
-
-Set at least:
-
-```bash
-COS_BACKUP_DEST=cos://your-bucket-1250000000/qq-social-agent
-```
-
-Then enable daily COS cron:
+Install or refresh cron files:
 
 ```bash
 cd /opt/qq-social-agent
 scripts/install_server_maintenance_cron.sh
 ```
 
-Manual preview and upload:
+Installed jobs:
+
+- Daily 04:17: local cleanup with `scripts/system_hygiene.sh --apply`.
+- Daily 04:42: COS backup with `scripts/cos_backup.sh --apply`.
+- Weekly Monday 06:12: health report with `scripts/server_health_report.sh`.
+- Monthly day 1 05:42: NapCat `server-data/ntqq` cold sync to COS.
+
+## What Is Backed Up
+
+Daily COS backup:
+
+- online SQLite snapshot: messages, memory, RAG, approval data, member profiles, feedback
+- project metadata archive: `config.yaml`, `prompts`, `scripts`, docs and project metadata
+- `server-data/napcat/config`
+
+Monthly COS cold sync:
+
+- `server-data/ntqq`
+
+`server-data/ntqq` may contain private QQ cache/media and is large, so it is monthly rather than daily.
+
+## Timeout Policy
+
+COS commands are bounded so maintenance does not hang forever:
+
+- Normal COS sync: `COSCLI_TIMEOUT_SECONDS=900`
+- Monthly NapCat ntqq sync: `COSCLI_NTQQ_TIMEOUT_SECONDS=7200`
+- Health-check COS listing: `HEALTH_COS_TIMEOUT_SECONDS=60`
+
+## Manual Commands
+
+Preview daily COS backup:
 
 ```bash
 cd /opt/qq-social-agent
 set -a; source /etc/qq-social-agent/cos-backup.env; set +a
 scripts/cos_backup.sh --dry-run
+```
+
+Run daily COS backup now:
+
+```bash
+cd /opt/qq-social-agent
+set -a; source /etc/qq-social-agent/cos-backup.env; set +a
 scripts/cos_backup.sh --apply
 ```
 
-Default COS backup includes:
-
-- online SQLite snapshot
-- project metadata archive
-- `server-data/napcat/config`
-
-Full `server-data/ntqq` sync is disabled by default because it can include private QQ cache/media and grows quickly. Enable only for deliberate cold backups:
+Run monthly NapCat cold sync now:
 
 ```bash
-COS_INCLUDE_NAPCAT_NTQQ=1 scripts/cos_backup.sh --apply
+cd /opt/qq-social-agent
+set -a; source /etc/qq-social-agent/cos-backup.env; set +a
+COS_INCLUDE_NAPCAT_NTQQ=1 COSCLI_NTQQ_TIMEOUT_SECONDS=7200 scripts/cos_backup.sh --apply
+```
+
+Generate health report now:
+
+```bash
+cd /opt/qq-social-agent
+scripts/server_health_report.sh
+```
+
+Latest report:
+
+```bash
+/opt/qq-social-agent/reports/server_health_latest.md
 ```
 
 ## Year-Long Policy
 
 - Keep live DB local for correctness and speed.
 - Keep local DB backups for about 90 days.
-- Upload DB snapshots and metadata to COS daily after credentials are configured.
+- Upload DB snapshots and metadata to COS daily.
 - Keep local COS upload snapshots for 14 days after upload.
+- Sync full NapCat `ntqq` monthly, not daily.
+- Keep COS objects for the year; bucket space is enough for this project.
 - Clean old VSCode server versions manually when `.vscode-server` exceeds a few GB.
 - Do not delete `server-data/ntqq` blindly; it contains QQ runtime/login/cache data.
