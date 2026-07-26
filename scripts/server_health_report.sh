@@ -67,7 +67,7 @@ safe_sizes() {
 
   section "Recent Logs"
   printf '```text\n'
-  for file in logs/system_hygiene_cron.log logs/cos_backup_cron.log logs/cos_monthly_ntqq_cron.log logs/server_health_cron.log; do
+  for file in logs/system_hygiene_cron.log logs/cos_backup_cron.log logs/cos_ntqq_gradual_cron.log logs/server_health_cron.log; do
     if [[ -f "$file" ]]; then
       echo "--- $file"
       tail -40 "$file"
@@ -86,6 +86,7 @@ safe_sizes() {
     if command -v coscli >/dev/null 2>&1 && [[ -n "${COS_BACKUP_DEST:-}" ]]; then
       timeout "$cos_timeout" coscli ls "${COS_BACKUP_DEST%/}/data/backups/" --limit 20 --init-skip --disable-log 2>&1 || echo "cos_backup_list_failed_or_timed_out"
       timeout "$cos_timeout" coscli ls "${COS_BACKUP_DEST%/}/server-data/napcat/config/" --limit 20 --init-skip --disable-log 2>&1 || echo "cos_napcat_config_list_failed_or_timed_out"
+      timeout "$cos_timeout" coscli ls "${COS_BACKUP_DEST%/}/server-data/ntqq/" --limit 20 --init-skip --disable-log 2>&1 || echo "cos_ntqq_list_failed_or_timed_out"
     else
       echo "coscli_or_dest_missing"
     fi

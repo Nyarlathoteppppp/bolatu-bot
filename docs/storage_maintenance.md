@@ -25,7 +25,7 @@ Installed jobs:
 - Daily 04:17: local cleanup with `scripts/system_hygiene.sh --apply`.
 - Daily 04:42: COS backup with `scripts/cos_backup.sh --apply`.
 - Weekly Monday 06:12: health report with `scripts/server_health_report.sh`.
-- Monthly day 1 05:42: NapCat `server-data/ntqq` cold sync to COS.
+- Daily 05:42: gradual NapCat `server-data/ntqq` cold backup to COS, bounded by file count and bytes.
 
 ## What Is Backed Up
 
@@ -35,18 +35,18 @@ Daily COS backup:
 - project metadata archive: `config.yaml`, `prompts`, `scripts`, docs and project metadata
 - `server-data/napcat/config`
 
-Monthly COS cold sync:
+Gradual COS cold backup:
 
-- `server-data/ntqq`
+- `server-data/ntqq`, uploaded in bounded daily batches.
 
-`server-data/ntqq` may contain private QQ cache/media and is large, so it is monthly rather than daily.
+`server-data/ntqq` may contain private QQ cache/media and is large, so it is not synced all at once. The gradual script keeps a cursor in `data/maintenance/ntqq_gradual_state.json` and uploads at most `COS_NTQQ_MAX_BYTES` / `COS_NTQQ_MAX_FILES` per run. Temp/log/crash files are excluded by default via `COS_NTQQ_EXCLUDE_GLOBS`.
 
 ## Timeout Policy
 
 COS commands are bounded so maintenance does not hang forever:
 
 - Normal COS sync: `COSCLI_TIMEOUT_SECONDS=900`
-- Monthly NapCat ntqq sync: `COSCLI_NTQQ_TIMEOUT_SECONDS=7200`
+- Gradual NapCat ntqq file upload: `COS_NTQQ_FILE_TIMEOUT_SECONDS=300` per file
 - Health-check COS listing: `HEALTH_COS_TIMEOUT_SECONDS=60`
 
 ## Manual Commands
@@ -67,12 +67,20 @@ set -a; source /etc/qq-social-agent/cos-backup.env; set +a
 scripts/cos_backup.sh --apply
 ```
 
-Run monthly NapCat cold sync now:
+Preview gradual NapCat cold backup:
 
 ```bash
 cd /opt/qq-social-agent
 set -a; source /etc/qq-social-agent/cos-backup.env; set +a
-COS_INCLUDE_NAPCAT_NTQQ=1 COSCLI_NTQQ_TIMEOUT_SECONDS=7200 scripts/cos_backup.sh --apply
+scripts/cos_ntqq_gradual_backup.sh --dry-run
+```
+
+Run one gradual NapCat batch now:
+
+```bash
+cd /opt/qq-social-agent
+set -a; source /etc/qq-social-agent/cos-backup.env; set +a
+scripts/cos_ntqq_gradual_backup.sh --apply
 ```
 
 Generate health report now:
@@ -94,7 +102,7 @@ Latest report:
 - Keep local DB backups for about 90 days.
 - Upload DB snapshots and metadata to COS daily.
 - Keep local COS upload snapshots for 14 days after upload.
-- Sync full NapCat `ntqq` monthly, not daily.
+- Sync full NapCat `ntqq` gradually in bounded daily batches, not in one large monthly burst.
 - Keep COS objects for the year; bucket space is enough for this project.
 - Clean old VSCode server versions manually when `.vscode-server` exceeds a few GB.
 - Do not delete `server-data/ntqq` blindly; it contains QQ runtime/login/cache data.

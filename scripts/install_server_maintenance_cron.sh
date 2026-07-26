@@ -29,8 +29,8 @@ SHELL=/bin/bash
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 # Daily COS cold backup. Configure $cos_env first.
 42 4 * * * ubuntu set -a; source $cos_env; set +a; cd $project_dir && scripts/cos_backup.sh --apply >> logs/cos_backup_cron.log 2>&1
-# Monthly NapCat ntqq cold backup. This is intentionally less frequent because it may include large QQ cache/media.
-42 5 1 * * ubuntu set -a; source $cos_env; set +a; cd $project_dir && COS_INCLUDE_NAPCAT_NTQQ=1 COSCLI_NTQQ_TIMEOUT_SECONDS=7200 scripts/cos_backup.sh --apply >> logs/cos_monthly_ntqq_cron.log 2>&1
+# Daily gradual NapCat ntqq cold backup. Uploads only a bounded file batch each run.
+42 5 * * * ubuntu set -a; source $cos_env; set +a; cd $project_dir && scripts/cos_ntqq_gradual_backup.sh --apply >> logs/cos_ntqq_gradual_cron.log 2>&1
 EOF
   sudo chmod 0644 "$cos_cron"
   echo "Installed COS backup cron: $cos_cron"
