@@ -25,6 +25,7 @@ Installed jobs:
 - Daily 04:17: local cleanup with `scripts/system_hygiene.sh --apply`.
 - Daily 04:42: COS backup with `scripts/cos_backup.sh --apply`.
 - Weekly Monday 06:12: health report with `scripts/server_health_report.sh`.
+- Daily 00:20: raw chat archive and deterministic historical memory library with `HISTORY_MEMORY_ROUTE=utility scripts/daily_history_archive.sh --date yesterday --skip-llm`.
 - Daily 05:42: gradual NapCat `server-data/ntqq` cold backup to COS, bounded by file count and bytes.
 
 ## What Is Backed Up
@@ -34,6 +35,12 @@ Daily COS backup:
 - online SQLite snapshot: messages, memory, RAG, approval data, member profiles, feedback
 - project metadata archive: `config.yaml`, `prompts`, `scripts`, docs and project metadata
 - `server-data/napcat/config`
+
+Daily history archive:
+
+- `data/history/raw/daily_raw_YYYY-MM-DD.jsonl.gz`: canonical chat text preserved from SQLite.
+- `data/history/memory/daily_memory_YYYY-MM-DD.json`: deterministic historical recall JSON with speaker attribution, source message ids, active members, long-message entry points and bot samples. LLM enhancement can be run manually when needed.
+- `data/history/manifests/daily_history_YYYY-MM-DD_manifest.json`: count, checksum and file metadata.
 
 Gradual COS cold backup:
 
@@ -83,6 +90,16 @@ set -a; source /etc/qq-social-agent/cos-backup.env; set +a
 scripts/cos_ntqq_gradual_backup.sh --apply
 ```
 
+Run daily history archive now:
+
+```bash
+cd /opt/qq-social-agent
+set -a; source /etc/qq-social-agent/cos-backup.env; set +a
+scripts/daily_history_archive.sh --date yesterday
+# If memory route is slow, use a faster route:
+# HISTORY_MEMORY_ROUTE=utility scripts/daily_history_archive.sh --date yesterday
+```
+
 Generate health report now:
 
 ```bash
@@ -100,7 +117,7 @@ Latest report:
 
 - Keep live DB local for correctness and speed.
 - Keep local DB backups for about 90 days.
-- Upload DB snapshots and metadata to COS daily.
+- Upload DB snapshots, metadata, raw daily chat archives and historical memory JSON to COS daily.
 - Keep local COS upload snapshots for 14 days after upload.
 - Sync full NapCat `ntqq` gradually in bounded daily batches, not in one large monthly burst.
 - Keep COS objects for the year; bucket space is enough for this project.

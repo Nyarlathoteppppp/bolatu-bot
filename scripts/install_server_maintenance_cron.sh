@@ -5,6 +5,7 @@ project_dir="${PROJECT_DIR:-/opt/qq-social-agent}"
 hygiene_cron="${HYGIENE_CRON_PATH:-/etc/cron.d/qq-social-agent-hygiene}"
 cos_cron="${COS_CRON_PATH:-/etc/cron.d/qq-social-agent-cos-backup}"
 health_cron="${HEALTH_CRON_PATH:-/etc/cron.d/qq-social-agent-health}"
+history_cron="${HISTORY_CRON_PATH:-/etc/cron.d/qq-social-agent-history-archive}"
 cos_env="${COS_ENV_PATH:-/etc/qq-social-agent/cos-backup.env}"
 
 sudo tee "$hygiene_cron" >/dev/null <<EOF
@@ -22,6 +23,14 @@ PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 12 6 * * 1 ubuntu cd $project_dir && scripts/server_health_report.sh >> logs/server_health_cron.log 2>&1
 EOF
 sudo chmod 0644 "$health_cron"
+
+sudo tee "$history_cron" >/dev/null <<EOF
+SHELL=/bin/bash
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+# Daily raw chat archive and historical memory library. Runs after midnight review.
+20 0 * * * ubuntu set -a; source $cos_env 2>/dev/null || true; set +a; cd $project_dir && timeout 210 env HISTORY_MEMORY_ROUTE=utility scripts/daily_history_archive.sh --date yesterday --skip-llm >> logs/daily_history_archive_cron.log 2>&1
+EOF
+sudo chmod 0644 "$history_cron"
 
 if [[ -f "$cos_env" ]]; then
   sudo tee "$cos_cron" >/dev/null <<EOF
@@ -41,3 +50,4 @@ fi
 
 echo "Installed hygiene cron: $hygiene_cron"
 echo "Installed health cron: $health_cron"
+echo "Installed history archive cron: $history_cron"

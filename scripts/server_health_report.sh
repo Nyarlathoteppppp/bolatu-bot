@@ -63,16 +63,37 @@ safe_sizes() {
   cat /etc/cron.d/qq-social-agent-hygiene 2>/dev/null || true
   cat /etc/cron.d/qq-social-agent-cos-backup 2>/dev/null || true
   cat /etc/cron.d/qq-social-agent-health 2>/dev/null || true
+  cat /etc/cron.d/qq-social-agent-history-archive 2>/dev/null || true
   printf '```\n'
 
   section "Recent Logs"
   printf '```text\n'
-  for file in logs/system_hygiene_cron.log logs/cos_backup_cron.log logs/cos_ntqq_gradual_cron.log logs/server_health_cron.log; do
+  for file in logs/system_hygiene_cron.log logs/cos_backup_cron.log logs/cos_ntqq_gradual_cron.log logs/daily_history_archive_cron.log logs/server_health_cron.log; do
     if [[ -f "$file" ]]; then
       echo "--- $file"
       tail -40 "$file"
     fi
   done
+  printf '```\n'
+
+
+
+  section "History Archive"
+  printf '```text\n'
+  if compgen -G "data/history/manifests/daily_history_*_manifest.json" >/dev/null; then
+    latest_manifest="$(ls -1t data/history/manifests/daily_history_*_manifest.json | head -1)"
+    echo "latest_manifest=$latest_manifest"
+    python3 - "$latest_manifest" <<'PY'
+import json, sys
+path = sys.argv[1]
+with open(path, 'r', encoding='utf-8') as fh:
+    data = json.load(fh)
+print(f"date={data.get('archive_date')} messages={data.get('message_count')} bot={data.get('bot_message_count')} raw_bytes={data.get('raw_archive',{}).get('bytes')} memory_bytes={data.get('memory_archive',{}).get('bytes')}")
+PY
+  else
+    echo "no_history_manifest_yet"
+  fi
+  du -sh data/history 2>/dev/null || true
   printf '```\n'
 
   section "COS"

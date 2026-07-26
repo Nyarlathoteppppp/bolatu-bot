@@ -20,3 +20,5 @@ data/*.bak.gz
 data/backups/
 .DS_Store
 data/maintenance/
+
+data/history/
