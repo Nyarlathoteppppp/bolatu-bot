@@ -318,6 +318,12 @@ GROUP_BUFFER_SECONDS = 6.0
 GROUP_INFLIGHT_BUFFER_RETRY_SECONDS = 1.0
 GROUP_REPLY_FLOW_COOLDOWN_SECONDS = 30.0
 BOT_STATUS_CARD_BASE_NAME = "张风雪"
+BLOCKED_BACKEND_FALLBACK_TEXTS = {
+    "风雪觉得先按这个方向看，别把关键点漏了。",
+    "风雪觉得这句可以先轻轻放着。",
+    "那先看他后面怎么说。",
+    "这句接一下可以，但别聊太满。",
+}
 GROUP_PASSIVE_DECISION_GAP_SECONDS = 30
 GROUP_PASSIVE_DECISION_EVERY_MESSAGES = 3
 GROUP_DIRECTORY_SYNC_INTERVAL_SECONDS = int(app_config.raw.get("group_directory", {}).get("sync_interval_seconds", 6 * 60 * 60))
@@ -4217,6 +4223,20 @@ async def _handle_group_message_locked(
             ),
         )
     if not reply_candidates:
+        if direct_single_reply:
+            logger.info(
+                "qq_social_agent skipped group reply: "
+                f"group={group_id} reason=empty_model_reply_direct_single addressed={addressed_bot}"
+            )
+            _record_metric_event(
+                "reply_suppressed",
+                group_id=group_id,
+                user_id=user_id,
+                stage="generation",
+                action="empty_model_reply_direct_single",
+                addressed=addressed_bot,
+            )
+            return
         if addressed_bot:
             reply_candidates = (
                 PendingApprovalCandidate(
@@ -4240,6 +4260,12 @@ async def _handle_group_message_locked(
         candidate_text = _sanitize_generated_text(candidate_text)
         if guarded:
             logger.info(f"qq_social_agent political guard output: group={group_id} candidate={index}")
+        if candidate_text in BLOCKED_BACKEND_FALLBACK_TEXTS:
+            logger.info(
+                "qq_social_agent dropped blocked backend fallback candidate: "
+                f"group={group_id} candidate={index} text={candidate_text!r}"
+            )
+            continue
         if not candidate_text:
             continue
         approval_candidates.append(
@@ -7272,9 +7298,8 @@ def _fallback_approval_candidate_texts(action: str) -> tuple[str, ...]:
         )
     if action == "answer":
         return (
-            "风雪觉得先按这个方向看，别把关键点漏了。",
-            "简单说，这事要看成本和后果。",
-            "先别绕，核心就是值不值。",
+            "这句风雪没接稳，先不乱答。",
+            "这个要看具体上下文，风雪先不瞎判。",
         )
     if action == "tease":
         return (
@@ -7289,9 +7314,8 @@ def _fallback_approval_candidate_texts(action: str) -> tuple[str, ...]:
             "你这句重点是问结果，还是问态度？",
         )
     return (
-        "风雪觉得这句可以先轻轻放着。",
-        "那先看他后面怎么说。",
-        "这句接一下可以，但别聊太满。",
+        "这句风雪先不硬接。",
+        "先放一下，别乱插。",
     )
 
 
