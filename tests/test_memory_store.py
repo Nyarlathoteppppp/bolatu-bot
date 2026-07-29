@@ -500,3 +500,29 @@ def test_app_kv_round_trip(tmp_path) -> None:
     memory.app_kv_set("notice:1", "sent")
 
     assert memory.app_kv_get("notice:1") == "sent"
+
+
+def test_message_chain_storage_round_trip(tmp_path) -> None:
+    memory = MemoryStore(tmp_path / "bot.sqlite3")
+
+    assert memory.add_message(
+        1,
+        100,
+        "甲",
+        "风雪你看",
+        source_message_id="m1",
+        session_id="group:1",
+        message_segments_json='[{"type":"at","data":{"qq":"1801507496"}},{"type":"text","data":{"text":"风雪你看"}}]',
+        raw_message_json='{"message_id":"m1"}',
+        sender_json='{"card":"甲"}',
+    )
+
+    row = memory.admin_recent_messages(group_id=1, limit=1)[0]
+    assert row["session_id"] == "group:1"
+    assert "\"type\":\"at\"" in row["message_segments_json"]
+    assert row["raw_message_json"] == '{"message_id":"m1"}'
+    assert row["sender_json"] == '{"card":"甲"}'
+
+    recent = memory.recent_messages(1, 1)[0]
+    assert recent.session_id == "group:1"
+    assert "\"type\":\"at\"" in recent.message_segments_json

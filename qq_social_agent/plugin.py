@@ -20,7 +20,7 @@ from nonebot.matcher import Matcher
 from nonebot.params import CommandArg
 from nonebot.rule import Rule
 from starlette.requests import Request
-from starlette.responses import HTMLResponse, JSONResponse
+from starlette.responses import HTMLResponse, JSONResponse, RedirectResponse
 
 from . import onebot_gateway
 
@@ -40,6 +40,7 @@ from .approval_rules import (
     JARGON_LIST_RE,
     TOKEN_REPORT_COMMAND_ALIASES,
 )
+from .admin_ui import render_admin_dashboard, render_memory_audit_page
 from .approval_models import PendingApprovalCandidate, PendingGroupApproval
 from .background_learning import BackgroundLearningCoordinator
 from .config import load_config
@@ -276,6 +277,62 @@ if hasattr(_driver, "server_app"):
             return JSONResponse({"ok": False, "reason": "local_admin_only"}, status_code=403)
         payload, status_code = await _http_daily_review_payload(mode=mode)
         return JSONResponse(payload, status_code=status_code)
+
+    @_driver.server_app.get("/admin")
+    async def _http_admin_endpoint(request: Request, group_id: int | None = None) -> HTMLResponse:
+        if not _is_local_admin_request(request):
+            return HTMLResponse("local admin only", status_code=403)
+        return HTMLResponse(
+            render_admin_dashboard(
+                memory=memory,
+                groups=_runtime_target_groups(),
+                selected_group_id=group_id,
+                ready=_http_ready_payload(),
+                health=_http_health_payload(),
+                status=_http_status_payload(),
+                model_routes=_status_model_routes(),
+                pending_approvals=list(pending_group_approvals.values()),
+            )
+        )
+
+    @_driver.server_app.get("/admin/memory")
+    async def _http_admin_memory_endpoint(
+        request: Request,
+        group_id: int | None = None,
+        status: str = "active",
+        limit: int = 80,
+        notice: str = "",
+    ) -> HTMLResponse:
+        if not _is_local_admin_request(request):
+            return HTMLResponse("local admin only", status_code=403)
+        return HTMLResponse(
+            render_memory_audit_page(
+                memory=memory,
+                groups=_runtime_target_groups(),
+                selected_group_id=group_id,
+                status=status,
+                limit=limit,
+                notice=notice,
+            )
+        )
+
+    @_driver.server_app.get("/admin/memory/action")
+    async def _http_admin_memory_action_endpoint(
+        request: Request,
+        atom_id: int,
+        action: str,
+        group_id: int | None = None,
+        status: str = "active",
+    ):
+        if not _is_local_admin_request(request):
+            return HTMLResponse("local admin only", status_code=403)
+        ok = memory.admin_review_memory_atom(atom_id, action=action, actor_user_id=0)
+        notice = "已更新" if ok else "没有找到记忆或动作无效"
+        group_q = f"&group_id={group_id}" if group_id is not None else ""
+        return RedirectResponse(
+            url=f"/admin/memory?status={status}{group_q}&notice={notice}",
+            status_code=303,
+        )
 
 MID_MEMORY_KEEP_SUMMARIES = 4
 MID_MEMORY_BATCH_SIZE = 60
@@ -542,6 +599,10 @@ class BufferedGroupMessage:
     pipeline_state: PipelineState | None = None
     addressed: bool = False
     direct_addressed: bool = False
+    session_id: str = ""
+    message_segments_json: str = ""
+    raw_message_json: str = ""
+    sender_json: str = ""
 
 
 @dataclass(frozen=True)
@@ -1876,6 +1937,76 @@ def _looks_like_addressed_question(text: str) -> bool:
     return bool(re.search(r"(?:吗|嘛|么|呢)[呀啊吧呐~～!！。.]?$", clean_text))
 
 
+def _json_safe_value(value: object) -> object:
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, dict):
+        return {str(key): _json_safe_value(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [_json_safe_value(item) for item in value]
+    return str(value)
+
+
+def _event_message_storage_kwargs(
+    event: GroupMessageEvent | PrivateMessageEvent,
+    *,
+    bot: Bot | None = None,
+) -> dict[str, str]:
+    segments: list[dict[str, object]] = []
+    for index, segment in enumerate(event.message):
+        segment_type, data = segment_type_and_data(segment)
+        segments.append({
+            "index": index,
+            "type": segment_type,
+            "data": _json_safe_value(data),
+        })
+    sender = getattr(event, "sender", None)
+    sender_payload = {
+        "user_id": int(getattr(event, "user_id", 0) or 0),
+        "nickname": str(getattr(sender, "nickname", "") or ""),
+        "card": str(getattr(sender, "card", "") or ""),
+        "role": str(getattr(sender, "role", "") or ""),
+        "title": str(getattr(sender, "title", "") or ""),
+    }
+    group_id = getattr(event, "group_id", None)
+    session_id = f"group:{int(group_id)}" if group_id is not None else f"private:{int(getattr(event, 'user_id', 0) or 0)}"
+    raw_payload = {
+        "message_id": str(event_message_source_id(event) or ""),
+        "message_type": str(getattr(event, "message_type", "") or ""),
+        "sub_type": str(getattr(event, "sub_type", "") or ""),
+        "self_id": int(getattr(event, "self_id", getattr(bot, "self_id", 0)) or 0),
+        "time": float(getattr(event, "time", 0) or 0),
+        "raw_message": str(getattr(event, "raw_message", "") or ""),
+        "message": str(getattr(event, "message", "") or ""),
+    }
+    return {
+        "session_id": session_id,
+        "message_segments_json": json.dumps(segments, ensure_ascii=False, separators=(",", ":")),
+        "raw_message_json": json.dumps(raw_payload, ensure_ascii=False, separators=(",", ":")),
+        "sender_json": json.dumps(sender_payload, ensure_ascii=False, separators=(",", ":")),
+    }
+
+
+def _add_group_event_memory(
+    event: GroupMessageEvent,
+    bot: Bot,
+    *,
+    text: str,
+    source_message_id: str,
+    correlation_id: str,
+) -> bool:
+    return memory.add_message(
+        int(event.group_id),
+        int(event.user_id),
+        _nickname(event),
+        text,
+        is_bot=False,
+        source_message_id=source_message_id,
+        correlation_id=correlation_id,
+        **_event_message_storage_kwargs(event, bot=bot),
+    )
+
+
 def _record_policy_suppressed_group_message(
     *,
     group_id: int,
@@ -1886,6 +2017,7 @@ def _record_policy_suppressed_group_message(
     correlation_id: str,
     reason: str,
     trigger_percent: int | None = None,
+    storage_kwargs: dict[str, str] | None = None,
 ) -> None:
     memory.add_message(
         group_id,
@@ -1895,6 +2027,7 @@ def _record_policy_suppressed_group_message(
         is_bot=False,
         source_message_id=source_message_id,
         correlation_id=correlation_id,
+        **(storage_kwargs or {}),
     )
     _record_metric_event(
         "suppression",
@@ -2874,6 +3007,7 @@ async def _handle_group_message_scoped(
                 correlation_id=correlation_id,
             )
     raw_text = _message_context_text(event, bot_id=int(bot.self_id), resolved_reply=reply_reference)
+    message_storage_kwargs = _event_message_storage_kwargs(event, bot=bot)
     file_context = ""
     if group_allowed:
         file_context = await file_metadata_context_for_event(bot, event)
@@ -2997,12 +3131,10 @@ async def _handle_group_message_scoped(
             content_context.text if content_context is not None else "",
         ),
     ):
-        memory.add_message(
-            group_id,
-            int(event.user_id),
-            _nickname(event),
-            raw_text or plain_text or "[不可见媒体]",
-            is_bot=False,
+        _add_group_event_memory(
+            event,
+            bot,
+            text=raw_text or plain_text or "[不可见媒体]",
             source_message_id=source_message_id,
             correlation_id=correlation_id,
         )
@@ -3041,6 +3173,7 @@ async def _handle_group_message_scoped(
             source_message_id=source_message_id,
             correlation_id=correlation_id,
             reason="memory_only",
+            storage_kwargs=message_storage_kwargs,
         )
         logger.info(
             "qq_social_agent user policy stored without trigger: "
@@ -3054,12 +3187,10 @@ async def _handle_group_message_scoped(
         and raw_text == plain_text
         and _is_low_value_group_text(plain_text)
     ):
-        memory.add_message(
-            group_id,
-            int(event.user_id),
-            _nickname(event),
-            plain_text,
-            is_bot=False,
+        _add_group_event_memory(
+            event,
+            bot,
+            text=plain_text,
             source_message_id=source_message_id,
             correlation_id=correlation_id,
         )
@@ -3094,6 +3225,7 @@ async def _handle_group_message_scoped(
                 correlation_id=correlation_id,
                 reason="ordinary_trigger_probability",
                 trigger_percent=user_policy.ordinary_trigger_percent,
+                storage_kwargs=message_storage_kwargs,
             )
             logger.info(
                 "qq_social_agent user policy trigger sample missed: "
@@ -3131,6 +3263,7 @@ async def _handle_group_message_scoped(
                 pipeline_state=pipeline_state,
                 addressed=True,
                 direct_addressed=addressed_bot,
+                **message_storage_kwargs,
             )
         )
     effective_addressed = addressed_bot or contextual_search_request or followup_addressed
@@ -3279,12 +3412,10 @@ async def _handle_group_message_locked(
     if not buffered_messages and replied_to_bot and _is_low_value_reply_to_bot_event(event):
         plain_reply_text = _plain_text(event)
         if not skip_memory_record:
-            memory.add_message(
-                group_id,
-                user_id,
-                nickname,
-                plain_reply_text or text,
-                is_bot=False,
+            _add_group_event_memory(
+                event,
+                bot,
+                text=plain_reply_text or text,
                 source_message_id=source_message_id or event_message_source_id(event),
                 correlation_id=correlation_id,
             )
@@ -3320,14 +3451,16 @@ async def _handle_group_message_locked(
                     is_bot=False,
                     source_message_id=item.source_message_id,
                     correlation_id=item.correlation_id,
+                    session_id=item.session_id or None,
+                    message_segments_json=item.message_segments_json or None,
+                    raw_message_json=item.raw_message_json or None,
+                    sender_json=item.sender_json or None,
                 )
         else:
-            memory.add_message(
-                group_id,
-                user_id,
-                nickname,
-                text,
-                is_bot=False,
+            _add_group_event_memory(
+                event,
+                bot,
+                text=text,
                 source_message_id=source_message_id or event_message_source_id(event),
                 correlation_id=correlation_id,
             )
@@ -6249,6 +6382,7 @@ def _buffer_group_message(
         pipeline_state=pipeline_state,
         addressed=addressed,
         direct_addressed=direct_addressed,
+        **_event_message_storage_kwargs(event, bot=bot),
     )
     group_message_buffers.setdefault(group_id, []).append(item)
     _schedule_group_buffer_flush(group_id)

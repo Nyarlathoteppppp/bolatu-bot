@@ -28,6 +28,11 @@ class ChatMessage:
     is_bot: bool
     created_at: float
     id: int = 0
+    source_message_id: str = ""
+    session_id: str = ""
+    message_segments_json: str = ""
+    raw_message_json: str = ""
+    sender_json: str = ""
 
 
 @dataclass(frozen=True)
@@ -298,7 +303,11 @@ class MemoryStore:
               created_at real not null,
               source_message_id text,
               source_kind text not null default 'live',
-              correlation_id text
+              correlation_id text,
+              session_id text,
+              message_segments_json text,
+              raw_message_json text,
+              sender_json text
             );
 
             create index if not exists idx_messages_group_time
@@ -600,6 +609,14 @@ class MemoryStore:
             self.conn.execute("alter table messages add column source_kind text not null default 'live'")
         if "correlation_id" not in columns:
             self.conn.execute("alter table messages add column correlation_id text")
+        if "session_id" not in columns:
+            self.conn.execute("alter table messages add column session_id text")
+        if "message_segments_json" not in columns:
+            self.conn.execute("alter table messages add column message_segments_json text")
+        if "raw_message_json" not in columns:
+            self.conn.execute("alter table messages add column raw_message_json text")
+        if "sender_json" not in columns:
+            self.conn.execute("alter table messages add column sender_json text")
         self.conn.execute(
             """
             create unique index if not exists idx_messages_group_source_message
@@ -872,6 +889,10 @@ class MemoryStore:
         source_message_id: int | str | None = None,
         source_kind: str = "live",
         correlation_id: str | None = None,
+        session_id: str | None = None,
+        message_segments_json: str | None = None,
+        raw_message_json: str | None = None,
+        sender_json: str | None = None,
     ) -> bool:
         created = created_at or time.time()
         source_key = _source_message_key(source_message_id)
@@ -879,9 +900,10 @@ class MemoryStore:
             """
             insert or ignore into messages(
               group_id, user_id, nickname, text, is_bot, created_at,
-              source_message_id, source_kind, correlation_id
+              source_message_id, source_kind, correlation_id, session_id,
+              message_segments_json, raw_message_json, sender_json
             )
-            values (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 group_id,
@@ -893,6 +915,10 @@ class MemoryStore:
                 source_key,
                 source_kind.strip()[:32] or "live",
                 correlation_id.strip()[:160] if correlation_id else None,
+                session_id.strip()[:160] if session_id else None,
+                message_segments_json if message_segments_json else None,
+                raw_message_json if raw_message_json else None,
+                sender_json if sender_json else None,
             ),
         )
         if cursor.rowcount <= 0:
@@ -909,6 +935,167 @@ class MemoryStore:
             )
         self.conn.commit()
         return True
+
+    def admin_recent_messages(self, *, group_id: int | None = None, limit: int = 80) -> list[sqlite3.Row]:
+        bounded = max(1, min(300, int(limit)))
+        where = ""
+        params: list[object] = []
+        if group_id is not None:
+            where = "where group_id = ?"
+            params.append(int(group_id))
+        rows = self.conn.execute(
+            f"""
+            select id, group_id, user_id, nickname, text, is_bot, created_at,
+                   source_message_id, source_kind, correlation_id, session_id,
+                   message_segments_json, raw_message_json, sender_json
+            from messages
+            {where}
+            order by id desc
+            limit ?
+            """,
+            (*params, bounded),
+        ).fetchall()
+        return list(rows)
+
+    def admin_recent_metric_events(
+        self,
+        *,
+        event_types: tuple[str, ...] = (),
+        group_id: int | None = None,
+        limit: int = 80,
+    ) -> list[sqlite3.Row]:
+        bounded = max(1, min(300, int(limit)))
+        clauses: list[str] = []
+        params: list[object] = []
+        if event_types:
+            placeholders = ",".join("?" for _ in event_types)
+            clauses.append(f"event_type in ({placeholders})")
+            params.extend(event_types)
+        if group_id is not None:
+            clauses.append("group_id = ?")
+            params.append(int(group_id))
+        where = "where " + " and ".join(clauses) if clauses else ""
+        rows = self.conn.execute(
+            f"""
+            select id, event_type, group_id, user_id, stage, action, metadata_json, created_at
+            from bot_metric_events
+            {where}
+            order by id desc
+            limit ?
+            """,
+            (*params, bounded),
+        ).fetchall()
+        return list(rows)
+
+    def admin_recent_memory_atoms(
+        self,
+        *,
+        group_id: int | None = None,
+        status: str = "active",
+        limit: int = 80,
+    ) -> list[MemoryAtom]:
+        bounded = max(1, min(300, int(limit)))
+        clauses: list[str] = []
+        params: list[object] = []
+        clean_status = status.strip().casefold()
+        if group_id is not None:
+            clauses.append("group_id = ?")
+            params.append(int(group_id))
+        if clean_status and clean_status != "all":
+            clauses.append("status = ?")
+            params.append(_normalize_memory_atom_status(clean_status))
+        where = "where " + " and ".join(clauses) if clauses else ""
+        rows = self.conn.execute(
+            f"""
+            select {_MEMORY_ATOM_SELECT_COLUMNS}
+            from memory_atoms
+            {where}
+            order by status = 'active' desc, importance desc, updated_at desc, id desc
+            limit ?
+            """,
+            (*params, bounded),
+        ).fetchall()
+        return [_memory_atom_from_row(row) for row in rows]
+
+    def admin_review_memory_atom(
+        self,
+        atom_id: int,
+        *,
+        action: str,
+        actor_user_id: int | None = None,
+        note: str = "",
+    ) -> bool:
+        atom = self.memory_atom(atom_id)
+        if atom is None:
+            return False
+        clean_action = action.strip().casefold()
+        now = time.time()
+        detail = note.strip()[:420]
+        try:
+            if clean_action in {"expire", "expired", "delete"}:
+                return self.expire_memory_atom(
+                    atom_id,
+                    reason=detail or "admin memory audit expired",
+                    source="admin_ui",
+                    actor_user_id=actor_user_id,
+                )
+            if clean_action in {"wrong_person", "dispute", "disputed"}:
+                self.conn.execute(
+                    "update memory_atoms set status = 'disputed', updated_at = ? where id = ?",
+                    (now, atom_id),
+                )
+                audit_action = "marked_wrong_person" if clean_action == "wrong_person" else "disputed"
+            elif clean_action in {"keep", "preserve", "active"}:
+                self.conn.execute(
+                    """
+                    update memory_atoms
+                    set status = 'active', expires_at = null, valid_to = null, updated_at = ?
+                    where id = ?
+                    """,
+                    (now, atom_id),
+                )
+                audit_action = "review_preserved"
+            elif clean_action in {"boost", "important", "high"}:
+                self.conn.execute(
+                    """
+                    update memory_atoms
+                    set importance = min(1.0, importance + 0.15),
+                        confidence = max(confidence, 0.82),
+                        updated_at = ?
+                    where id = ?
+                    """,
+                    (now, atom_id),
+                )
+                audit_action = "importance_boosted"
+            elif clean_action in {"freeze", "pin"}:
+                self.conn.execute(
+                    """
+                    update memory_atoms
+                    set status = 'active', expires_at = null, valid_to = null,
+                        importance = max(importance, 0.86), confidence = max(confidence, 0.84),
+                        updated_at = ?
+                    where id = ?
+                    """,
+                    (now, atom_id),
+                )
+                audit_action = "pinned"
+            else:
+                return False
+            self._insert_memory_atom_audit_event(
+                atom_id=atom_id,
+                action=audit_action,
+                evidence_type="manual",
+                source="admin_ui",
+                source_message_id=None,
+                actor_user_id=actor_user_id,
+                detail=detail or audit_action,
+                observed_at=now,
+            )
+            self.conn.commit()
+            return True
+        except Exception:
+            self.conn.rollback()
+            raise
 
     def message_source_exists(self, group_id: int, source_message_id: int | str | None) -> bool:
         source_key = _source_message_key(source_message_id)
@@ -1098,7 +1285,7 @@ class MemoryStore:
         fetch_limit = max(safe_limit * 4, safe_limit + 20)
         rows = self.conn.execute(
             """
-            select id, group_id, user_id, nickname, text, is_bot, created_at
+            select id, group_id, user_id, nickname, text, is_bot, created_at, source_message_id, session_id, message_segments_json, raw_message_json, sender_json
             from messages
             where group_id = ?
             order by created_at desc, id desc
@@ -1119,7 +1306,7 @@ class MemoryStore:
     ) -> list[ChatMessage]:
         rows = self.conn.execute(
             """
-            select id, group_id, user_id, nickname, text, is_bot, created_at
+            select id, group_id, user_id, nickname, text, is_bot, created_at, source_message_id, session_id, message_segments_json, raw_message_json, sender_json
             from messages
             where group_id = ? and created_at >= ? and created_at < ?
             order by created_at desc, id desc
@@ -1132,7 +1319,7 @@ class MemoryStore:
     def messages_before(self, group_id: int, *, before_at: float, limit: int) -> list[ChatMessage]:
         rows = self.conn.execute(
             """
-            select id, group_id, user_id, nickname, text, is_bot, created_at
+            select id, group_id, user_id, nickname, text, is_bot, created_at, source_message_id, session_id, message_segments_json, raw_message_json, sender_json
             from messages
             where group_id = ? and created_at < ?
             order by created_at desc, id desc
@@ -1160,7 +1347,7 @@ class MemoryStore:
     ) -> list[RawCorpusExample]:
         rows = self.conn.execute(
             """
-            select id, group_id, user_id, nickname, text, is_bot, created_at
+            select id, group_id, user_id, nickname, text, is_bot, created_at, source_message_id, session_id, message_segments_json, raw_message_json, sender_json
             from messages
             where group_id = ? and is_bot = 0 and length(trim(text)) >= 2
             order by id desc
@@ -1237,7 +1424,7 @@ class MemoryStore:
             return [], []
         before_rows = self.conn.execute(
             """
-            select id, group_id, user_id, nickname, text, is_bot, created_at
+            select id, group_id, user_id, nickname, text, is_bot, created_at, source_message_id, session_id, message_segments_json, raw_message_json, sender_json
             from messages
             where group_id = ? and id < ?
             order by id desc
@@ -1247,7 +1434,7 @@ class MemoryStore:
         ).fetchall()
         after_rows = self.conn.execute(
             """
-            select id, group_id, user_id, nickname, text, is_bot, created_at
+            select id, group_id, user_id, nickname, text, is_bot, created_at, source_message_id, session_id, message_segments_json, raw_message_json, sender_json
             from messages
             where group_id = ? and id > ?
             order by id asc
@@ -1264,7 +1451,7 @@ class MemoryStore:
         since = time.time() - seconds
         rows = self.conn.execute(
             """
-            select id, group_id, user_id, nickname, text, is_bot, created_at
+            select id, group_id, user_id, nickname, text, is_bot, created_at, source_message_id, session_id, message_segments_json, raw_message_json, sender_json
             from messages
             where group_id = ? and is_bot = 1 and created_at >= ?
             order by created_at desc, id desc
@@ -1302,7 +1489,7 @@ class MemoryStore:
         bot_filter = "" if include_bot else "and is_bot = 0"
         rows = self.conn.execute(
             f"""
-            select id, group_id, user_id, nickname, text, is_bot, created_at
+            select id, group_id, user_id, nickname, text, is_bot, created_at, source_message_id, session_id, message_segments_json, raw_message_json, sender_json
             from messages
             where group_id = ? and id > ? and id <= ? {bot_filter}
             order by id asc
@@ -1404,7 +1591,7 @@ class MemoryStore:
     ) -> list[ChatMessage]:
         rows = self.conn.execute(
             """
-            select id, group_id, user_id, nickname, text, is_bot, created_at
+            select id, group_id, user_id, nickname, text, is_bot, created_at, source_message_id, session_id, message_segments_json, raw_message_json, sender_json
             from messages
             where group_id = ? and is_bot = 0 and length(trim(text)) >= 2
             order by id desc
@@ -1791,7 +1978,7 @@ class MemoryStore:
     ) -> list[ChatMessage]:
         rows = self.conn.execute(
             """
-            select id, group_id, user_id, nickname, text, is_bot, created_at
+            select id, group_id, user_id, nickname, text, is_bot, created_at, source_message_id, session_id, message_segments_json, raw_message_json, sender_json
             from messages
             where group_id = ?
               and user_id = ?
@@ -3217,6 +3404,7 @@ def _dedupe_recent_message_rows(rows: list[sqlite3.Row], limit: int) -> list[sql
 
 
 def _message_from_row(row: sqlite3.Row) -> ChatMessage:
+    keys = set(row.keys())
     return ChatMessage(
         group_id=int(row["group_id"]),
         user_id=int(row["user_id"]),
@@ -3225,6 +3413,11 @@ def _message_from_row(row: sqlite3.Row) -> ChatMessage:
         is_bot=bool(row["is_bot"]),
         created_at=float(row["created_at"]),
         id=int(row["id"]),
+        source_message_id=str(row["source_message_id"] or "") if "source_message_id" in keys else "",
+        session_id=str(row["session_id"] or "") if "session_id" in keys else "",
+        message_segments_json=str(row["message_segments_json"] or "") if "message_segments_json" in keys else "",
+        raw_message_json=str(row["raw_message_json"] or "") if "raw_message_json" in keys else "",
+        sender_json=str(row["sender_json"] or "") if "sender_json" in keys else "",
     )
 
 
