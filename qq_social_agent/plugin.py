@@ -545,6 +545,25 @@ class BufferedGroupMessage:
 
 
 @dataclass(frozen=True)
+class MessageRelationFacts:
+    current_label: str
+    target_scope: str
+    target_note: str
+    mentioned_bot: bool
+    replied_to_bot: bool
+    addressed_bot: bool
+    followup_addressed: bool
+    self_name_mentioned: bool
+    reply_speaker_label: str = ""
+    reply_target_label: str = ""
+    reply_target_is_bot: bool = False
+    ambiguous_reference: bool = False
+    reference_user_ids: tuple[int, ...] = ()
+    reference_reason: str = ""
+    reference_confidence: float = 0.0
+
+
+@dataclass(frozen=True)
 class PassiveDecisionState:
     last_decision_at: float
     waiting_count: int
@@ -2815,11 +2834,11 @@ async def _handle_group_message_scoped(
         elapsed_ms=int((time.monotonic() - history_started_at) * 1000),
         source_message_id=source_message_id,
     )
-    addressed_bot = (
-        _mentioned_bot(event, bot)
-        or _replied_to_bot(event, bot)
-        or _reply_reference_to_bot(reply_reference, bot)
-    )
+    mentioned_bot = _mentioned_bot(event, bot)
+    event_replied_to_bot = _replied_to_bot(event, bot)
+    reference_replied_to_bot = _reply_reference_to_bot(reply_reference, bot)
+    replied_to_bot_direct = event_replied_to_bot or reference_replied_to_bot
+    addressed_bot = mentioned_bot or replied_to_bot_direct
     event_at = float(getattr(event, "time", 0) or time.time())
     addressed_repeat_count_hint = _record_addressed_event(
         group_id,
@@ -2943,8 +2962,8 @@ async def _handle_group_message_scoped(
     text = raw_text
     pipeline_state.text = raw_text or plain_text
     pipeline_state.addressed = addressed_bot or followup_addressed
-    pipeline_state.mentioned = _mentioned_bot(event, bot)
-    pipeline_state.replied_to_bot = _replied_to_bot(event, bot) or _reply_reference_to_bot(reply_reference, bot)
+    pipeline_state.mentioned = mentioned_bot
+    pipeline_state.replied_to_bot = replied_to_bot_direct
     user_policy = app_config.group_user_policy(int(event.user_id))
     contextual_search_intent = (
         _contextual_followup_search_intent(
@@ -3155,6 +3174,7 @@ async def _handle_group_message_scoped(
                 source_message_id=source_message_id,
                 correlation_id=correlation_id,
                 addressed_bot_hint=addressed_bot,
+                replied_to_bot_hint=replied_to_bot_direct,
                 contextual_addressed_hint=contextual_search_request,
                 followup_addressed_hint=followup_addressed,
                 addressed_repeat_count_hint=addressed_repeat_count_hint,
@@ -3181,6 +3201,7 @@ async def _handle_group_message_locked(
     source_message_id: str = "",
     correlation_id: str = "",
     addressed_bot_hint: bool | None = None,
+    replied_to_bot_hint: bool = False,
     contextual_addressed_hint: bool = False,
     followup_addressed_hint: bool = False,
     addressed_repeat_count_hint: int = 0,
@@ -3203,9 +3224,9 @@ async def _handle_group_message_locked(
     buffered_addressed = any(item.addressed for item in buffered_messages or ())
     buffered_direct_addressed = any(item.direct_addressed for item in buffered_messages or ())
     mentioned = False if buffered_messages else _mentioned_bot(event, bot)
-    replied_to_bot = False if buffered_messages else _replied_to_bot(event, bot)
-    if not buffered_messages and addressed_bot_hint and _event_has_reply_context(event):
-        replied_to_bot = True
+    replied_to_bot = False if buffered_messages else (
+        _replied_to_bot(event, bot) or bool(replied_to_bot_hint)
+    )
     direct_addressed_bot = buffered_direct_addressed or mentioned or replied_to_bot or bool(addressed_bot_hint)
     synthetic_addressed_bot = bool(contextual_addressed_hint)
     followup_addressed = (
@@ -3569,6 +3590,17 @@ async def _handle_group_message_locked(
     )
     pipeline_state.reference_user_ids = reference_resolution.user_ids
     pipeline_state.reference_reason = reference_resolution.reason
+    relation_facts = _message_relation_facts(
+        current_user_id=user_id,
+        current_nickname=nickname,
+        current_text=text,
+        reference_resolution=reference_resolution,
+        mentioned=mentioned,
+        replied_to_bot=replied_to_bot,
+        addressed_bot=addressed_bot,
+        followup_addressed=followup_addressed,
+        self_id=int(event.self_id),
+    )
     speaker_context = _format_speaker_reference_context(
         current_user_id=user_id,
         current_nickname=nickname,
@@ -3580,6 +3612,21 @@ async def _handle_group_message_locked(
         addressed_bot=addressed_bot,
         followup_addressed=followup_addressed,
         self_id=int(event.self_id),
+        relation_facts=relation_facts,
+    )
+    _record_metric_event(
+        "message_relation",
+        group_id=group_id,
+        user_id=user_id,
+        stage="relation",
+        action=relation_facts.target_scope,
+        target_note=relation_facts.target_note,
+        reply_target=relation_facts.reply_target_label,
+        reply_target_is_bot=relation_facts.reply_target_is_bot,
+        ambiguous_reference=relation_facts.ambiguous_reference,
+        reference_user_ids=list(relation_facts.reference_user_ids),
+        reference_reason=relation_facts.reference_reason,
+        reference_confidence=relation_facts.reference_confidence,
     )
     if fresh_intent is None:
         followup_fresh_intent = _infer_followup_fresh_intent(
@@ -6835,21 +6882,40 @@ def _format_speaker_reference_context(
     addressed_bot: bool,
     followup_addressed: bool = False,
     self_id: int,
+    relation_facts: MessageRelationFacts | None = None,
 ) -> str:
     current_label = _member_label(current_user_id, current_nickname)
+    facts = relation_facts or _message_relation_facts(
+        current_user_id=current_user_id,
+        current_nickname=current_nickname,
+        current_text=current_text,
+        reference_resolution=reference_resolution,
+        mentioned=mentioned,
+        replied_to_bot=replied_to_bot,
+        addressed_bot=addressed_bot,
+        followup_addressed=followup_addressed,
+        self_id=self_id,
+    )
     lines = [
         f"- 当前触发人：{current_label}。",
         "- 当前消息优先级最高；最近聊天只用于理解氛围和指代，不代表当前发言人立场。",
+        _format_message_relation_summary(facts),
     ]
     if addressed_bot:
-        addressed_parts: list[str] = []
-        if mentioned:
-            addressed_parts.append("艾特/点名了你")
-        if replied_to_bot:
-            addressed_parts.append("回复了你之前的话")
-        if followup_addressed:
-            addressed_parts.append("刚才短时间内艾特/回复过你，当前可能是在延续和你的对话")
-        lines.append(f"- 当前是在和风雪互动：{'，'.join(addressed_parts) or '是'}。")
+        if facts.target_scope == "reply_to_other_mentions_bot":
+            lines.append(
+                "- 当前消息提到了风雪，但回复对象是其他群友；"
+                "只有回复正文明确要求风雪接话时，才按在叫你处理。"
+            )
+        else:
+            addressed_parts: list[str] = []
+            if mentioned:
+                addressed_parts.append("艾特/点名了你")
+            if replied_to_bot:
+                addressed_parts.append("回复了你之前的话")
+            if followup_addressed:
+                addressed_parts.append("刚才短时间内艾特/回复过你，当前可能是在延续和你的对话")
+            lines.append(f"- 当前是在和风雪互动：{'，'.join(addressed_parts) or '是'}。")
         if followup_addressed:
             lines.append(
                 "- 这是短时互动窗口里的后续消息：当前消息通过了后端指向检查，可能是在继续和风雪说话；"
@@ -6865,6 +6931,13 @@ def _format_speaker_reference_context(
             f"- 回复关系：{speaker_label} 是当前回复者/当前发言人；"
             f"{target_label} 是被回复对象。不要把 {target_label} 的原话当成 {speaker_label} 说的。"
         )
+        if facts.reply_target_is_bot:
+            lines.append("- 指代规则：这条是在回复风雪，所以当前回复里的“你”通常指风雪。")
+        else:
+            lines.append(
+                f"- 指代规则：这条首先是在对 {target_label} 说；除非回复正文明确点名风雪，"
+                "不要把里面的“你/他/她”自动当成风雪。"
+            )
 
     if reference_resolution.user_ids:
         labels = _labels_for_user_ids(
@@ -6899,6 +6972,91 @@ def _extract_reply_relation(text: str) -> tuple[str, str] | None:
     if not match:
         return None
     return match.group("speaker").strip(), match.group("target").strip()
+
+
+def _label_is_bot_self(label: str, self_id: int) -> bool:
+    if not label:
+        return False
+    if f"#{str(self_id)[-5:]}" in label:
+        return True
+    return any(alias in label for alias in BOT_SELF_NAME_ALIASES)
+
+
+def _message_relation_facts(
+    *,
+    current_user_id: int,
+    current_nickname: str,
+    current_text: str,
+    reference_resolution: ReferenceResolution,
+    mentioned: bool,
+    replied_to_bot: bool,
+    addressed_bot: bool,
+    followup_addressed: bool,
+    self_id: int,
+) -> MessageRelationFacts:
+    current_label = _member_label(current_user_id, current_nickname)
+    reply_relation = _extract_reply_relation(current_text)
+    reply_speaker_label = reply_relation[0] if reply_relation is not None else ""
+    reply_target_label = reply_relation[1] if reply_relation is not None else ""
+    reply_target_is_bot = replied_to_bot or _label_is_bot_self(reply_target_label, self_id)
+    self_name_mentioned = _mentions_bot_self_name(current_text)
+    ambiguous_reference = _has_ambiguous_reference(current_text) and not reference_resolution.user_ids
+
+    if replied_to_bot or reply_target_is_bot:
+        target_scope = "reply_to_bot"
+        target_note = "当前消息正在回复风雪之前的话"
+    elif reply_target_label and mentioned:
+        target_scope = "reply_to_other_mentions_bot"
+        target_note = f"当前消息在回复 {reply_target_label}，同时提到风雪"
+    elif followup_addressed:
+        target_scope = "followup_bot"
+        target_note = "短时互动窗口判断为可能延续风雪对话"
+    elif mentioned:
+        target_scope = "mention_bot"
+        target_note = "当前消息提到或艾特了风雪"
+    elif reply_target_label:
+        target_scope = "reply_to_other"
+        target_note = f"当前消息首先是在回复 {reply_target_label}"
+    elif ambiguous_reference:
+        target_scope = "ambiguous"
+        target_note = "当前消息有人称/省略指代但后端未能唯一解析"
+    else:
+        target_scope = "group_chat"
+        target_note = "普通群聊消息，未直接指向风雪"
+
+    return MessageRelationFacts(
+        current_label=current_label,
+        target_scope=target_scope,
+        target_note=target_note,
+        mentioned_bot=mentioned,
+        replied_to_bot=replied_to_bot,
+        addressed_bot=addressed_bot,
+        followup_addressed=followup_addressed,
+        self_name_mentioned=self_name_mentioned,
+        reply_speaker_label=reply_speaker_label,
+        reply_target_label=reply_target_label,
+        reply_target_is_bot=reply_target_is_bot,
+        ambiguous_reference=ambiguous_reference,
+        reference_user_ids=reference_resolution.user_ids,
+        reference_reason=reference_resolution.reason,
+        reference_confidence=reference_resolution.confidence,
+    )
+
+
+def _format_message_relation_summary(facts: MessageRelationFacts) -> str:
+    pieces = [
+        f"target={facts.target_scope}",
+        f"说明={facts.target_note}",
+        f"mentioned_bot={str(facts.mentioned_bot).lower()}",
+        f"replied_to_bot={str(facts.replied_to_bot).lower()}",
+        f"followup={str(facts.followup_addressed).lower()}",
+    ]
+    if facts.reply_target_label:
+        pieces.append(f"reply_target={facts.reply_target_label}")
+    if facts.reference_user_ids:
+        refs = ",".join(str(user_id) for user_id in facts.reference_user_ids[:4])
+        pieces.append(f"resolved_refs={refs}")
+    return "- 后端关系摘要：" + "；".join(pieces) + "。"
 
 
 def _has_ambiguous_reference(text: str) -> bool:

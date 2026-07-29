@@ -664,9 +664,11 @@ def test_speaker_reference_context_explains_reply_relation() -> None:
     )
 
     assert "当前触发人：歌迷老蛆[#71184]" in context
+    assert "target=reply_to_other" in context
     assert "歌迷老蛆[#71184] 是当前回复者/当前发言人" in context
     assert "小鸟[#89072] 是被回复对象" in context
     assert "不要把 小鸟[#89072] 的原话当成 歌迷老蛆[#71184] 说的" in context
+    assert "这条首先是在对 小鸟[#89072] 说" in context
 
 
 def test_speaker_reference_context_warns_ambiguous_pronoun() -> None:
@@ -684,6 +686,55 @@ def test_speaker_reference_context_warns_ambiguous_pronoun() -> None:
 
     assert "后端未能唯一解析" in context
     assert "不确定时不要点名" in context
+
+
+def test_speaker_reference_context_marks_reply_to_bot_target() -> None:
+    current_text = (
+        "歌迷老蛆[#71184]回复张风雪[#07496]消息【"
+        "张风雪[#07496]说：风雪觉得这个有点离谱；"
+        "歌迷老蛆[#71184]回复张风雪[#07496]：你自己也知道啊】"
+    )
+
+    context = plugin._format_speaker_reference_context(
+        current_user_id=1535071184,
+        current_nickname="歌迷老蛆",
+        current_text=current_text,
+        recent_messages=[],
+        reference_resolution=plugin.ReferenceResolution(),
+        mentioned=False,
+        replied_to_bot=True,
+        addressed_bot=True,
+        self_id=1801507496,
+    )
+
+    assert "target=reply_to_bot" in context
+    assert "这条是在回复风雪" in context
+    assert "当前回复里的“你”通常指风雪" in context
+
+
+def test_speaker_reference_context_reply_to_other_mentions_bot_not_reply_to_bot() -> None:
+    current_text = (
+        "歌迷老蛆[#71184]回复安钰与雨与余[#56789]消息【"
+        "安钰与雨与余[#56789]说：这个选择怎么样；"
+        "歌迷老蛆[#71184]回复安钰与雨与余[#56789]：问问风雪呗】"
+    )
+
+    context = plugin._format_speaker_reference_context(
+        current_user_id=1535071184,
+        current_nickname="歌迷老蛆",
+        current_text=current_text,
+        recent_messages=[],
+        reference_resolution=plugin.ReferenceResolution(),
+        mentioned=True,
+        replied_to_bot=False,
+        addressed_bot=True,
+        self_id=1801507496,
+    )
+
+    assert "target=reply_to_other_mentions_bot" in context
+    assert "replied_to_bot=false" in context
+    assert "当前消息提到了风雪，但回复对象是其他群友" in context
+    assert "这条首先是在对 安钰与雨与余[#56789] 说" in context
 
 
 def test_reply_to_other_unknown_original_uses_clear_fallback() -> None:
