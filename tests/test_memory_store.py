@@ -28,6 +28,65 @@ def test_add_memory_summary_advances_state(tmp_path) -> None:
     assert memory.messages_for_mid_summary(1, keep_recent=3, batch_size=10) == []
 
 
+def test_admin_memory_summary_update_lock_archive_and_recall(tmp_path) -> None:
+    memory = MemoryStore(tmp_path / "bot.sqlite3")
+    for index in range(8):
+        memory.add_message(1, index, f"u{index}", f"m{index}", created_at=100 + index)
+    batch = memory.messages_for_mid_summary(1, keep_recent=0, batch_size=8)
+    memory.add_memory_summary(1, batch, summary="旧回想", recall_cues=["旧"])
+    summary_id = memory.recent_memory_summaries(1, 3)[0].id
+
+    assert memory.admin_update_memory_summary(
+        summary_id,
+        summary="人工改过的回想：小鸟要温柔回复。",
+        recall_cues=["小鸟", "温柔"],
+        locked=True,
+    )
+    edited = memory.memory_summary(summary_id)
+    assert edited is not None
+    assert edited.locked is True
+    assert edited.status == "active"
+    assert edited.recall_cues == ("小鸟", "温柔")
+    assert memory.relevant_memory_summaries(1, "小鸟", limit=1)[0].id == summary_id
+
+    assert memory.admin_set_memory_summary_state(summary_id, action="archive")
+    assert memory.recent_memory_summaries(1, 3) == []
+    archived = memory.admin_recent_memory_summaries(group_id=1, status="archived", limit=10)
+    assert [item.id for item in archived] == [summary_id]
+
+
+def test_old_memory_summary_schema_is_migrated(tmp_path) -> None:
+    db_path = tmp_path / "bot.sqlite3"
+    conn = sqlite3.connect(db_path)
+    conn.executescript(
+        """
+        create table memory_summaries (
+          id integer primary key autoincrement,
+          group_id integer not null,
+          start_message_id integer not null,
+          end_message_id integer not null,
+          start_at real not null,
+          end_at real not null,
+          summary text not null,
+          recall_cues_json text not null,
+          created_at real not null
+        );
+        insert into memory_summaries(group_id, start_message_id, end_message_id, start_at, end_at, summary, recall_cues_json, created_at)
+        values (1, 1, 2, 100, 200, '旧库摘要', '["旧库"]', 300);
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    memory = MemoryStore(db_path)
+    summary = memory.recent_memory_summaries(1, 1)[0]
+
+    assert summary.summary == "旧库摘要"
+    assert summary.status == "active"
+    assert summary.locked is False
+    assert summary.updated_at == 300
+
+
 def test_relevant_memory_summaries_match_query_cues(tmp_path) -> None:
     memory = MemoryStore(tmp_path / "bot.sqlite3")
     for index in range(8):

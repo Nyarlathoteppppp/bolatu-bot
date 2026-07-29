@@ -1,6 +1,9 @@
 from qq_social_agent.admin_ui import (
+    render_admin_edit_page,
     render_memory_atom_detail_page,
     render_memory_audit_page,
+    render_memory_summaries_page,
+    render_memory_summary_detail_page,
     render_message_detail_page,
 )
 from qq_social_agent.memory import MemoryStore
@@ -108,3 +111,46 @@ def test_admin_can_merge_memory_atoms(tmp_path) -> None:
     assert target_atom is not None and target_atom.importance >= 0.8
     assert [event.action for event in memory.memory_atom_audit_trail(source)][-1] == "merged_into"
     assert [event.action for event in memory.memory_atom_audit_trail(target)][-1] == "merged_from"
+
+def test_admin_edit_and_memory_summary_pages_render(tmp_path) -> None:
+    memory = MemoryStore(tmp_path / "bot.sqlite3")
+    for index in range(6):
+        memory.add_message(1026813421, 100 + index, f"u{index}", f"m{index}", created_at=100 + index)
+    batch = memory.messages_for_mid_summary(1026813421, keep_recent=0, batch_size=6)
+    memory.add_memory_summary(
+        1026813421,
+        batch,
+        summary="群里聊过小鸟和风雪的相处。",
+        recall_cues=["小鸟", "风雪"],
+    )
+    summary_id = memory.recent_memory_summaries(1026813421, 3)[0].id
+
+    edit_html = render_admin_edit_page(
+        editable_files=[
+            {
+                "key": "prompt",
+                "label": "人格 / Prompt",
+                "description": "保存后热重载",
+            }
+        ],
+        selected_key="prompt",
+        content="persona:\n  id: zhangfengxue\n",
+    )
+    list_html = render_memory_summaries_page(
+        memory=memory,
+        groups=(1026813421,),
+        selected_group_id=1026813421,
+        status="active",
+        limit=20,
+    )
+    detail_html = render_memory_summary_detail_page(
+        memory=memory,
+        summary_id=summary_id,
+        groups=(1026813421,),
+    )
+
+    assert "保存并校验" in edit_html
+    assert "新增人工回想" in list_html
+    assert "编辑并保留" in detail_html
+    assert "群里聊过小鸟" in detail_html
+

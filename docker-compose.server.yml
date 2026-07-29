@@ -11,11 +11,13 @@ services:
       HOST: 0.0.0.0
       PORT: 8080
     volumes:
+      - ./qq_social_agent:/app/qq_social_agent
       - ./data:/app/data
       - ./logs:/app/logs
       - ./prompts:/app/prompts
+      - ./plugins:/app/plugins
       - ./server-data/ntqq:/app/.config/QQ:ro
-      - ./config.yaml:/app/config.yaml:ro
+      - ./config.yaml:/app/config.yaml
     ports:
       - "127.0.0.1:8080:8080"
     healthcheck:

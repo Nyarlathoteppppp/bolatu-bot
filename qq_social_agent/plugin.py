@@ -12,6 +12,8 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 from urllib.parse import parse_qs, urlencode
 
+import yaml
+
 from dotenv import load_dotenv
 from nonebot import get_driver, logger, on_command, on_message, on_notice
 from nonebot.adapters import Event
@@ -43,14 +45,17 @@ from .approval_rules import (
 )
 from .admin_ui import (
     render_admin_dashboard,
+    render_admin_edit_page,
     render_memory_audit_page,
     render_memory_atom_detail_page,
+    render_memory_summaries_page,
+    render_memory_summary_detail_page,
     render_message_detail_page,
     render_plugins_page,
 )
 from .approval_models import PendingApprovalCandidate, PendingGroupApproval
 from .background_learning import BackgroundLearningCoordinator
-from .config import load_config
+from .config import PROJECT_ROOT, load_config
 from .context_assembler import assemble_generation_context
 from .content_ingestion import ContentIngestionService, explicit_file_read_requested
 from .cue_patterns import CuePatternTracker, CueRepeatState
@@ -115,6 +120,7 @@ from .observability import (
 )
 from .persona import PersonaRegistry
 from .plugin_runtime import LocalPluginRegistry
+from .prompts import PromptRegistry
 from .pipeline_types import (
     OutputChannel,
     PipelineMode,
@@ -192,6 +198,23 @@ rag_admin = RAGAdminController(rag_service)
 tool_registry = ToolRegistry()
 local_plugin_registry = LocalPluginRegistry(Path(__file__).resolve().parent.parent / "plugins")
 local_plugin_registry.reload()
+ADMIN_EDITABLE_FILES: tuple[dict[str, object], ...] = (
+    {
+        "key": "prompt",
+        "label": "人格 / Prompt",
+        "path": PROJECT_ROOT / "prompts" / "zhangfengxue.yaml",
+        "description": "集中人格、action_guides 和所有 LLM flow。保存后会立即热重载到当前 bot。",
+        "reload": "prompt",
+    },
+    {
+        "key": "config",
+        "label": "后端配置 config.yaml",
+        "path": PROJECT_ROOT / "config.yaml",
+        "description": "工作强度、模型、白名单、搜索、频率等配置。保存会校验 YAML；多数配置需要重启后端才完整生效。",
+        "reload": "restart_required",
+    },
+)
+ADMIN_BACKUP_DIR = PROJECT_ROOT / "data" / "admin_backups"
 TOOL_ROUTER_SHADOW_SAMPLE_LIMIT = 200
 tool_router_shadow_samples = memory.metric_event_count("tool_router_shadow")
 _jargon_selection_config = app_config.raw.get("jargon_selection", {})
@@ -303,6 +326,146 @@ if hasattr(_driver, "server_app"):
                 model_routes=_status_model_routes(),
                 pending_approvals=list(pending_group_approvals.values()),
                 plugins=local_plugin_registry.summary(),
+            )
+        )
+
+    @_driver.server_app.get("/admin/edit")
+    async def _http_admin_edit_endpoint(request: Request, file: str = "prompt", notice: str = "") -> HTMLResponse:
+        if not _is_local_admin_request(request):
+            return HTMLResponse("local admin only", status_code=403)
+        item = _admin_editable_file(file)
+        content, read_notice = _admin_read_editable_file(str(item["key"]))
+        merged_notice = notice or read_notice
+        return HTMLResponse(
+            render_admin_edit_page(
+                editable_files=_admin_editable_files_summary(),
+                selected_key=str(item["key"]),
+                content=content,
+                notice=merged_notice,
+            )
+        )
+
+    @_driver.server_app.post("/admin/edit/save")
+    async def _http_admin_edit_save_endpoint(request: Request):
+        if not _is_local_admin_request(request):
+            return HTMLResponse("local admin only", status_code=403)
+        form = await _admin_form_data(request)
+        key = form.get("file", "prompt").strip() or "prompt"
+        content = form.get("content", "")
+        item = _admin_editable_file(key)
+        try:
+            notice = _admin_save_editable_file(str(item["key"]), content)
+        except Exception as exc:
+            return HTMLResponse(
+                render_admin_edit_page(
+                    editable_files=_admin_editable_files_summary(),
+                    selected_key=str(item["key"]),
+                    content=content,
+                    notice=f"保存失败：{exc}",
+                ),
+                status_code=400,
+            )
+        return RedirectResponse(url=_admin_edit_url(str(item["key"]), notice=notice), status_code=303)
+
+    @_driver.server_app.get("/admin/summaries")
+    async def _http_admin_summaries_endpoint(
+        request: Request,
+        group_id: int | None = None,
+        status: str = "active",
+        limit: int = 80,
+        q: str = "",
+        notice: str = "",
+    ) -> HTMLResponse:
+        if not _is_local_admin_request(request):
+            return HTMLResponse("local admin only", status_code=403)
+        return HTMLResponse(
+            render_memory_summaries_page(
+                memory=memory,
+                groups=_runtime_target_groups(),
+                selected_group_id=group_id,
+                status=status,
+                limit=limit,
+                q=q,
+                notice=notice,
+            )
+        )
+
+    @_driver.server_app.get("/admin/summaries/action")
+    async def _http_admin_summary_action_endpoint(
+        request: Request,
+        summary_id: int,
+        action: str,
+        group_id: int | None = None,
+        status: str = "active",
+        limit: int = 80,
+        q: str = "",
+    ):
+        if not _is_local_admin_request(request):
+            return HTMLResponse("local admin only", status_code=403)
+        ok = memory.admin_set_memory_summary_state(summary_id, action=action)
+        notice = "已更新回想状态" if ok else "没有找到回想或动作无效"
+        return RedirectResponse(
+            url=_admin_summaries_url(group_id=group_id, status=status, limit=limit, q=q, notice=notice),
+            status_code=303,
+        )
+
+    @_driver.server_app.post("/admin/summaries/add")
+    async def _http_admin_summary_add_endpoint(request: Request):
+        if not _is_local_admin_request(request):
+            return HTMLResponse("local admin only", status_code=403)
+        form = await _admin_form_data(request)
+        group_id = _admin_form_int(form, "group_id")
+        if group_id is None:
+            return RedirectResponse(
+                url=_admin_summaries_url(notice="新增失败：需要填写群号"),
+                status_code=303,
+            )
+        summary = form.get("summary", "")
+        recall_cues = _split_admin_cues(form.get("recall_cues", ""))
+        locked = form.get("locked") == "1"
+        summary_id = memory.admin_add_memory_summary(
+            group_id=group_id,
+            summary=summary,
+            recall_cues=recall_cues,
+            locked=locked,
+        )
+        if not summary_id:
+            return RedirectResponse(
+                url=_admin_summaries_url(group_id=group_id, notice="新增失败：回想内容为空"),
+                status_code=303,
+            )
+        return RedirectResponse(url=_admin_summary_detail_url(summary_id, notice="已新增人工回想"), status_code=303)
+
+    @_driver.server_app.post("/admin/summaries/save")
+    async def _http_admin_summary_save_endpoint(request: Request):
+        if not _is_local_admin_request(request):
+            return HTMLResponse("local admin only", status_code=403)
+        form = await _admin_form_data(request)
+        summary_id = _admin_form_int(form, "summary_id") or 0
+        ok = memory.admin_update_memory_summary(
+            summary_id,
+            summary=form.get("summary", ""),
+            recall_cues=_split_admin_cues(form.get("recall_cues", "")),
+            status=form.get("status", "active"),
+            locked=form.get("locked") == "1",
+        )
+        notice = "已保存回想" if ok else "保存失败：回想不存在或内容为空"
+        return RedirectResponse(url=_admin_summary_detail_url(summary_id, notice=notice), status_code=303)
+
+    @_driver.server_app.get("/admin/summaries/{summary_id}")
+    async def _http_admin_summary_detail_endpoint(
+        request: Request,
+        summary_id: int,
+        notice: str = "",
+    ) -> HTMLResponse:
+        if not _is_local_admin_request(request):
+            return HTMLResponse("local admin only", status_code=403)
+        return HTMLResponse(
+            render_memory_summary_detail_page(
+                memory=memory,
+                summary_id=summary_id,
+                groups=_runtime_target_groups(),
+                notice=notice,
             )
         )
 
@@ -2640,6 +2803,196 @@ def _admin_memory_url(
 def _admin_memory_detail_url(atom_id: int, *, notice: str = "") -> str:
     params = {"notice": notice.strip()} if notice.strip() else {}
     return f"/admin/memory/{int(atom_id)}" + ("?" + urlencode(params) if params else "")
+
+
+def _admin_editable_files_summary() -> list[dict[str, str]]:
+    return [
+        {
+            "key": str(item.get("key", "")),
+            "label": str(item.get("label", item.get("key", ""))),
+            "description": str(item.get("description", "")),
+        }
+        for item in ADMIN_EDITABLE_FILES
+    ]
+
+
+def _admin_editable_file(key: str) -> dict[str, object]:
+    clean_key = (key or "").strip()
+    for item in ADMIN_EDITABLE_FILES:
+        if str(item.get("key")) == clean_key:
+            return item
+    return ADMIN_EDITABLE_FILES[0]
+
+
+def _admin_edit_url(key: str, *, notice: str = "") -> str:
+    params: dict[str, object] = {"file": key}
+    if notice.strip():
+        params["notice"] = notice.strip()
+    return "/admin/edit?" + urlencode(params)
+
+
+def _admin_read_editable_file(key: str) -> tuple[str, str]:
+    item = _admin_editable_file(key)
+    path = Path(item["path"])
+    try:
+        return path.read_text(encoding="utf-8"), ""
+    except OSError as exc:
+        return "", f"读取失败：{exc}"
+
+
+def _admin_save_editable_file(key: str, content: str) -> str:
+    item = _admin_editable_file(key)
+    path = Path(item["path"])
+    _ensure_admin_path_allowed(path)
+    if not path.exists():
+        raise ValueError(f"文件不存在：{path}")
+    _validate_editable_content(item, content)
+    backup_path = _backup_admin_file(path)
+    tmp_path = path.with_name(f".{path.name}.admin_tmp")
+    tmp_path.write_text(content, encoding="utf-8")
+    try:
+        tmp_path.replace(path)
+    except OSError as exc:
+        # Docker single-file bind mounts cannot be atomically replaced. Keep the
+        # backup and fall back to an in-place overwrite so WebUI config edits work.
+        if getattr(exc, "errno", None) != 16:
+            raise
+        path.write_text(content, encoding="utf-8")
+        try:
+            tmp_path.unlink()
+        except OSError:
+            pass
+    reload_mode = str(item.get("reload", ""))
+    if reload_mode == "prompt":
+        _reload_prompt_runtime()
+        return f"已保存并热重载：{item.get('label')}；备份 {backup_path.name}"
+    return f"已保存：{item.get('label')}；备份 {backup_path.name}。这个配置多数需要重启后端生效。"
+
+
+def _ensure_admin_path_allowed(path: Path) -> None:
+    root = PROJECT_ROOT.resolve()
+    resolved = path.resolve()
+    try:
+        allowed = resolved.is_relative_to(root)
+    except AttributeError:
+        allowed = str(resolved).startswith(str(root) + "/") or resolved == root
+    if not allowed:
+        raise ValueError("拒绝编辑项目目录外的文件")
+
+
+def _backup_admin_file(path: Path) -> Path:
+    ADMIN_BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+    now = time.time()
+    timestamp = time.strftime("%Y%m%d_%H%M%S", time.localtime(now)) + f"_{int((now % 1) * 1000):03d}"
+    try:
+        rel = path.resolve().relative_to(PROJECT_ROOT.resolve()).as_posix()
+    except ValueError:
+        rel = path.name
+    safe_name = re.sub(r"[^A-Za-z0-9_.-]+", "__", rel)
+    backup_path = ADMIN_BACKUP_DIR / f"{timestamp}_{safe_name}"
+    suffix = 1
+    while backup_path.exists():
+        backup_path = ADMIN_BACKUP_DIR / f"{timestamp}_{suffix}_{safe_name}"
+        suffix += 1
+    backup_path.write_text(path.read_text(encoding="utf-8"), encoding="utf-8")
+    return backup_path
+
+
+def _validate_editable_content(item: dict[str, object], content: str) -> None:
+    try:
+        raw = yaml.safe_load(content)
+    except yaml.YAMLError as exc:
+        raise ValueError(f"YAML 解析失败：{exc}") from exc
+    if raw is not None and not isinstance(raw, dict):
+        raise ValueError("YAML 顶层必须是对象")
+    key = str(item.get("key", ""))
+    if key == "prompt":
+        _validate_prompt_content(content, raw or {})
+    elif key == "config":
+        _validate_config_content(content)
+
+
+def _validate_prompt_content(content: str, raw: dict[str, object]) -> None:
+    persona_raw = raw.get("persona")
+    if not isinstance(persona_raw, dict) or not str(persona_raw.get("id", "")).strip():
+        raise ValueError("Prompt 文件需要 persona.id")
+    if not str(persona_raw.get("prompt", "")).strip():
+        raise ValueError("Prompt 文件需要 persona.prompt")
+    ADMIN_BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+    tmp_path = ADMIN_BACKUP_DIR / f".validate_prompt_{int(time.time() * 1000)}.yaml"
+    tmp_path.write_text(content, encoding="utf-8")
+    try:
+        registry = PromptRegistry(tmp_path)
+        required_flows = (
+            "timing_gate",
+            "decision",
+            "reply",
+            "reply_candidates",
+            "reply_direct",
+            "mid_memory",
+            "style_learning",
+            "member_profile",
+            "daily_review",
+        )
+        for flow in required_flows:
+            section = registry.flows.get(flow)
+            if not isinstance(section, dict):
+                raise ValueError(f"Prompt 文件缺少 flows.{flow}")
+            if not str(section.get("system", "")).strip() or not str(section.get("user", "")).strip():
+                raise ValueError(f"flows.{flow} 需要 system 和 user")
+    finally:
+        try:
+            tmp_path.unlink()
+        except OSError:
+            pass
+
+
+def _validate_config_content(content: str) -> None:
+    ADMIN_BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+    tmp_path = ADMIN_BACKUP_DIR / f".validate_config_{int(time.time() * 1000)}.yaml"
+    tmp_path.write_text(content, encoding="utf-8")
+    try:
+        load_config(tmp_path)
+    finally:
+        try:
+            tmp_path.unlink()
+        except OSError:
+            pass
+
+
+def _reload_prompt_runtime() -> None:
+    global personas
+    personas = PersonaRegistry(app_config.persona_dir)
+    if deepseek_client is not None:
+        deepseek_client.prompts = PromptRegistry()
+    logger.info("qq_social_agent admin prompt reloaded")
+
+
+def _split_admin_cues(text: str) -> list[str]:
+    return [part.strip() for part in re.split(r"[,，、;；\n]+", text or "") if part.strip()][:12]
+
+
+def _admin_summaries_url(
+    *,
+    group_id: int | None = None,
+    status: str = "active",
+    limit: int = 80,
+    q: str = "",
+    notice: str = "",
+) -> str:
+    params: dict[str, object] = {"status": status or "active", "limit": limit}
+    if group_id is not None:
+        params["group_id"] = group_id
+    if q.strip():
+        params["q"] = q.strip()
+    if notice.strip():
+        params["notice"] = notice.strip()
+    return "/admin/summaries?" + urlencode(params)
+
+
+def _admin_summary_detail_url(summary_id: int, *, notice: str = "") -> str:
+    params = {"notice": notice.strip()} if notice.strip() else {}
+    return f"/admin/summaries/{int(summary_id)}" + ("?" + urlencode(params) if params else "")
 
 
 def _is_local_admin_request(request: Request) -> bool:

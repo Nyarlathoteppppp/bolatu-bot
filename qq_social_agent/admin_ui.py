@@ -7,7 +7,7 @@ from dataclasses import asdict, is_dataclass
 from typing import Any
 from urllib.parse import urlencode
 
-from .memory import MemoryAtom, MemoryStore
+from .memory import MemoryAtom, MemoryStore, MemorySummary
 
 
 def render_admin_dashboard(
@@ -170,6 +170,86 @@ def render_memory_atom_detail_page(
 
 
 
+def render_admin_edit_page(
+    *,
+    editable_files: list[dict[str, str]],
+    selected_key: str,
+    content: str,
+    notice: str = "",
+) -> str:
+    selected = next((item for item in editable_files if item.get('key') == selected_key), editable_files[0] if editable_files else {})
+    body = f"""
+    {_header('编辑 Prompt / 规则')}
+    <main>
+      {_notice(notice)}
+      <section class="panel wide"><h2>选择文件</h2>{_editable_file_tabs(editable_files, selected_key)}</section>
+      <section class="panel wide"><h2>{_e(selected.get('label', selected_key))}</h2>{_editable_file_form(selected_key=selected_key, content=content, description=selected.get('description', ''))}</section>
+    </main>
+    {_footer()}
+    """
+    return _page('编辑 Prompt / 规则', body)
+
+
+
+def render_memory_summaries_page(
+    *,
+    memory: MemoryStore,
+    groups: tuple[int, ...],
+    selected_group_id: int | None,
+    status: str,
+    limit: int,
+    q: str = "",
+    notice: str = "",
+) -> str:
+    group_id = selected_group_id or (groups[0] if groups else None)
+    summaries = memory.admin_recent_memory_summaries(group_id=group_id, status=status, limit=limit, query=q)
+    body = f"""
+    {_header('聊天回想')}
+    <main>
+      {_group_nav(groups, group_id, path='/admin/summaries')}
+      {_notice(notice)}
+      <section class="panel wide"><h2>筛选</h2>{_summary_filter_form(group_id=group_id, status=status, limit=limit, q=q)}</section>
+      <section class="grid two">
+        {_panel('新增人工回想', _summary_add_form(group_id=group_id))}
+        {_panel('说明', '<p class="muted">锁定后的回想仍会进入上下文和 RAG，但你手动改过的内容会保留为人工版本。归档/过期的回想不会进入正常召回。</p>')}
+      </section>
+      <section class="panel wide"><h2>回想列表 <span class="muted small">{len(summaries)} 条</span></h2>{_summary_table(summaries, group_id=group_id, status=status, limit=limit, q=q)}</section>
+    </main>
+    {_footer()}
+    """
+    return _page('聊天回想', body)
+
+
+
+def render_memory_summary_detail_page(
+    *,
+    memory: MemoryStore,
+    summary_id: int,
+    groups: tuple[int, ...],
+    notice: str = "",
+) -> str:
+    summary = memory.memory_summary(summary_id)
+    if summary is None:
+        body = f"""
+        {_header('回想详情')}
+        <main><section class="panel wide"><h2>回想不存在</h2><p class="muted">没有找到回想 #{_e(summary_id)}。</p></section></main>
+        {_footer()}
+        """
+        return _page('回想详情', body)
+    body = f"""
+    {_header('回想详情')}
+    <main>
+      {_group_nav(groups, summary.group_id, path='/admin/summaries')}
+      {_notice(notice)}
+      <section class="panel wide"><h2>回想 #{summary.id}</h2>{_summary_detail(summary)}</section>
+      <section class="panel wide"><h2>编辑并保留</h2>{_summary_edit_form(summary)}</section>
+    </main>
+    {_footer()}
+    """
+    return _page('回想详情', body)
+
+
+
 def render_plugins_page(
     *,
     plugins: list[dict[str, Any]],
@@ -206,7 +286,7 @@ code,pre {{ font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; }}
 
 
 def _header(title: str) -> str:
-    return f'<header><h1>{_e(title)}</h1><nav><a href="/admin">概览</a><a href="/admin/memory">记忆审计</a><a href="/admin/plugins">插件</a><a href="/trace">Trace</a><a href="/readyz">Ready JSON</a></nav></header>'
+    return f'<header><h1>{_e(title)}</h1><nav><a href="/admin">概览</a><a href="/admin/edit">编辑</a><a href="/admin/summaries">回想</a><a href="/admin/memory">记忆审计</a><a href="/admin/plugins">插件</a><a href="/trace">Trace</a><a href="/readyz">Ready JSON</a></nav></header>'
 
 
 def _footer() -> str:
@@ -247,6 +327,129 @@ def _approval_card(pending: list[object]) -> str:
         items.append(f'<li><b>{_e(str(getattr(approval, "approval_id", "")))}</b> 群 {getattr(approval, "group_id", "")} 触发：{_e(str(getattr(approval, "trigger_nickname", "")))}<br><span class="muted">{_e(_trim(str(getattr(approval, "trigger_text", "")), 120))}</span></li>')
     return f'<section class="card"><h2>审批队列：{len(pending)}</h2><ul>{"".join(items)}</ul></section>'
 
+
+
+def _editable_file_tabs(editable_files: list[dict[str, str]], selected_key: str) -> str:
+    if not editable_files:
+        return '<p class="muted">没有可编辑文件。</p>'
+    links = []
+    for item in editable_files:
+        key = item.get('key', '')
+        cls = 'active' if key == selected_key else ''
+        links.append(f'<a class="{cls}" href="/admin/edit?file={_e(key)}">{_e(item.get("label", key))}</a>')
+    return '<nav class="tabs">' + ''.join(links) + '</nav>'
+
+
+def _editable_file_form(*, selected_key: str, content: str, description: str) -> str:
+    return (
+        f'<p class="muted">{_e(description)}</p>'
+        '<form method="post" action="/admin/edit/save">'
+        f'<input type="hidden" name="file" value="{_e(selected_key)}">'
+        '<div class="field"><label>内容</label>'
+        f'<textarea name="content" style="min-height:620px;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;">{_e(content)}</textarea></div>'
+        '<p class="muted small">保存时会先备份原文件并校验 YAML。Prompt 文件保存后立即热重载；config.yaml 多数配置仍需重启后端。</p>'
+        '<button type="submit">保存并校验</button>'
+        '</form>'
+    )
+
+
+def _summary_filter_form(*, group_id: int | None, status: str, limit: int, q: str) -> str:
+    group_value = '' if group_id is None else str(group_id)
+    status_options = ''.join(
+        f'<option value="{_e(item)}" {"selected" if item == status else ""}>{_e(item)}</option>'
+        for item in ('active', 'archived', 'expired', 'all')
+    )
+    return (
+        '<form class="filters" method="get" action="/admin/summaries">'
+        f'<div class="field"><label>群号</label><input name="group_id" value="{_e(group_value)}"></div>'
+        f'<div class="field"><label>状态</label><select name="status">{status_options}</select></div>'
+        f'<div class="field"><label>关键词</label><input name="q" value="{_e(q)}" placeholder="summary/cue/id"></div>'
+        f'<div class="field"><label>数量</label><input name="limit" value="{_e(limit)}"></div>'
+        '<div class="field"><button type="submit">筛选</button></div>'
+        '</form>'
+    )
+
+
+def _summary_add_form(*, group_id: int | None) -> str:
+    group_value = '' if group_id is None else str(group_id)
+    return (
+        '<form method="post" action="/admin/summaries/add">'
+        f'<div class="field"><label>群号</label><input name="group_id" value="{_e(group_value)}"></div>'
+        '<div class="field"><label>回想内容</label><textarea name="summary" placeholder="手动加入一条长期聊天回想"></textarea></div>'
+        '<div class="field"><label>召回关键词，逗号分隔</label><input name="recall_cues" placeholder="小鸟, Claude, 旧梗"></div>'
+        '<label class="small"><input type="checkbox" name="locked" value="1" checked> 锁定保留</label><br>'
+        '<button type="submit">新增回想</button>'
+        '</form>'
+    )
+
+
+def _summary_table(
+    summaries: list[MemorySummary],
+    *,
+    group_id: int | None,
+    status: str,
+    limit: int,
+    q: str,
+) -> str:
+    if not summaries:
+        return '<p class="muted">暂无回想。</p>'
+    params = _summary_filter_params(group_id=group_id, status=status, limit=limit, q=q)
+    out = ['<table><tr><th>ID</th><th>时间</th><th>状态</th><th>关键词</th><th>摘要</th><th>操作</th></tr>']
+    for summary in summaries:
+        action_links = [f'<a class="btn" href="/admin/summaries/{summary.id}{_query_suffix(params)}">详情/编辑</a>']
+        for action, label in (("lock", "锁定"), ("unlock", "解锁"), ("active", "恢复"), ("archive", "归档"), ("expire", "过期")):
+            cls = 'btn danger' if action in {'archive', 'expire'} else 'btn'
+            action_links.append(f'<a class="{cls}" href="/admin/summaries/action{_query_suffix({**params, "summary_id": summary.id, "action": action})}">{label}</a>')
+        out.append(
+            f'<tr><td><a href="/admin/summaries/{summary.id}">#{summary.id}</a></td>'
+            f'<td class="small">{_fmt_time(summary.start_at)} - {_fmt_time(summary.end_at)}<br>更新 {_fmt_time(summary.updated_at)}</td>'
+            '<td>' + _e(summary.status) + (' <span class="badge">locked</span>' if summary.locked else '') + '</td>'
+            f'<td>{_e(", ".join(summary.recall_cues))}</td>'
+            f'<td>{_e(_trim(summary.summary, 220))}</td>'
+            f'<td><div class="actions">{"".join(action_links)}</div></td></tr>'
+        )
+    out.append('</table>')
+    return ''.join(out)
+
+
+def _summary_filter_params(*, group_id: int | None, status: str, limit: int, q: str) -> dict[str, object]:
+    params: dict[str, object] = {'status': status or 'active', 'limit': limit}
+    if group_id is not None:
+        params['group_id'] = group_id
+    if q.strip():
+        params['q'] = q.strip()
+    return params
+
+
+def _summary_detail(summary: MemorySummary) -> str:
+    rows = [
+        ('群号', summary.group_id),
+        ('状态', f'{summary.status} locked={summary.locked}'),
+        ('时间', f'{_fmt_time(summary.start_at)} - {_fmt_time(summary.end_at)}'),
+        ('创建/更新', f'{_fmt_time(summary.created_at)} / {_fmt_time(summary.updated_at)}'),
+        ('关键词', ', '.join(summary.recall_cues)),
+        ('内容', summary.summary),
+    ]
+    return '<table>' + ''.join(f'<tr><th>{_e(key)}</th><td>{_e(value)}</td></tr>' for key, value in rows) + '</table>'
+
+
+def _summary_edit_form(summary: MemorySummary) -> str:
+    cues = ', '.join(summary.recall_cues)
+    status_options = ''.join(
+        f'<option value="{_e(item)}" {"selected" if item == summary.status else ""}>{_e(item)}</option>'
+        for item in ('active', 'archived', 'expired')
+    )
+    locked_checked = 'checked' if summary.locked else ''
+    return (
+        '<form method="post" action="/admin/summaries/save">'
+        f'<input type="hidden" name="summary_id" value="{summary.id}">'
+        f'<div class="field"><label>内容</label><textarea name="summary">{_e(summary.summary)}</textarea></div>'
+        f'<div class="field"><label>召回关键词，逗号分隔</label><input name="recall_cues" value="{_e(cues)}"></div>'
+        f'<div class="field"><label>状态</label><select name="status">{status_options}</select></div>'
+        f'<label class="small"><input type="checkbox" name="locked" value="1" {locked_checked}> 锁定保留这条人工回想</label><br>'
+        '<button type="submit">保存回想</button>'
+        '</form>'
+    )
 
 
 def _plugin_card(plugins: list[dict[str, Any]]) -> str:
