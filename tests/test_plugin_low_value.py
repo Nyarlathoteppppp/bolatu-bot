@@ -499,8 +499,8 @@ def test_reply_to_bot_context_marks_zhangfengxue_as_self() -> None:
 
     text = plugin._message_context_text(event, bot_id=1801507496)
 
-    assert "张风雪和风雪都是你自己" in text
-    assert "群友回复张风雪/风雪，就是在回复你之前说的话" in text
+    assert "当前正在回复风雪/张风雪之前的话" in text
+    assert "这里的‘你’大概率指风雪" in text
     assert "歌迷老蛆[#71184]回复张风雪[#07496]消息" in text
     assert "张风雪[#07496]说：风雪觉得这个有点离谱" in text
 
@@ -518,7 +518,7 @@ def test_plain_mention_of_fengxue_marks_self_context() -> None:
 
     text = plugin._message_context_text(event, bot_id=1801507496)
 
-    assert text.startswith("注：张风雪和风雪都是你自己")
+    assert text.startswith("注：风雪和张风雪都是你自己")
     assert "风雪你怎么看这个" in text
 
 
@@ -541,7 +541,7 @@ def test_reply_to_other_that_mentions_fengxue_marks_self_context() -> None:
 
     text = plugin._message_context_text(event, bot_id=1801507496)
 
-    assert "张风雪和风雪都是你自己" in text
+    assert "风雪和张风雪都是你自己" in text
     assert "歌迷老蛆[#71184]回复安钰与雨与余[#56789]" in text
     assert "歌迷老蛆[#71184]回复安钰与雨与余[#56789]：问问风雪呗" in text
 
@@ -1367,6 +1367,80 @@ def test_addressed_followup_window_tracks_same_user_only() -> None:
     )
 
 
+def test_followup_addressed_rejects_reply_to_other_user() -> None:
+    bot = SimpleNamespace(self_id=1801507496)
+    event = SimpleNamespace(
+        self_id=1801507496,
+        user_id=1535071184,
+        reply=SimpleNamespace(
+            user_id=123456789,
+            sender=SimpleNamespace(card="安钰与雨与余", nickname=""),
+            message=SimpleNamespace(extract_plain_text=lambda: "原话"),
+        ),
+        message=[
+            SimpleNamespace(type="reply", data={"id": "42"}),
+            SimpleNamespace(type="text", data={"text": "你这个说法不对"}),
+        ],
+        get_plaintext=lambda: "你这个说法不对",
+    )
+
+    allowed, reason = plugin._followup_addressed_allowed(event, bot)
+
+    assert not allowed
+    assert reason == "reply_to_other"
+
+
+def test_followup_addressed_allows_plain_followup_question() -> None:
+    bot = SimpleNamespace(self_id=1801507496)
+    event = SimpleNamespace(
+        self_id=1801507496,
+        user_id=1535071184,
+        reply=None,
+        message=[SimpleNamespace(type="text", data={"text": "那你怎么看这个学校"})],
+        get_plaintext=lambda: "那你怎么看这个学校",
+    )
+
+    allowed, reason = plugin._followup_addressed_allowed(event, bot)
+
+    assert allowed
+    assert reason == "followup_text"
+
+
+def test_followup_addressed_rejects_plain_group_chatter() -> None:
+    bot = SimpleNamespace(self_id=1801507496)
+    event = SimpleNamespace(
+        self_id=1801507496,
+        user_id=1535071184,
+        reply=None,
+        message=[SimpleNamespace(type="text", data={"text": "我今天刚到"})],
+        get_plaintext=lambda: "我今天刚到",
+    )
+
+    allowed, reason = plugin._followup_addressed_allowed(event, bot)
+
+    assert not allowed
+    assert reason == "not_directed"
+
+
+def test_followup_addressed_rejects_at_other_user() -> None:
+    bot = SimpleNamespace(self_id=1801507496)
+    event = SimpleNamespace(
+        self_id=1801507496,
+        user_id=1535071184,
+        reply=None,
+        message=[
+            SimpleNamespace(type="at", data={"qq": "123456789"}),
+            SimpleNamespace(type="text", data={"text": "你看看"}),
+        ],
+        get_plaintext=lambda: "你看看",
+    )
+
+    allowed, reason = plugin._followup_addressed_allowed(event, bot)
+
+    assert not allowed
+    assert reason == "mentions_other_user"
+
+
 def test_speaker_context_marks_followup_window() -> None:
     context = plugin._format_speaker_reference_context(
         current_user_id=100,
@@ -1382,7 +1456,7 @@ def test_speaker_context_marks_followup_window() -> None:
     )
 
     assert "短时互动窗口" in context
-    assert "纯确认，可以不回" in context
+    assert "不要强行代入自己" in context
 
 
 def test_style_rule_filter_rejects_literal_examples() -> None:

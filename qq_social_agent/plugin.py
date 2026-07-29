@@ -2827,11 +2827,33 @@ async def _handle_group_message_scoped(
         addressed_bot,
         now=event_at,
     )
-    followup_addressed = (
+    followup_active = (
         group_allowed
         and not addressed_bot
         and _addressed_followup_active(group_id, int(event.user_id), now=event_at)
     )
+    followup_addressed = False
+    if followup_active:
+        followup_addressed, followup_reject_reason = _followup_addressed_allowed(
+            event,
+            bot,
+            reply_reference=reply_reference,
+        )
+        if not followup_addressed:
+            logger.info(
+                "qq_social_agent followup addressed rejected: "
+                f"group={group_id} user={int(event.user_id)} reason={followup_reject_reason}"
+            )
+            _record_metric_event(
+                "followup_addressed_rejected",
+                group_id=group_id,
+                user_id=int(event.user_id),
+                stage="group",
+                action="reject",
+                reason=followup_reject_reason,
+                source_message_id=source_message_id,
+                correlation_id=correlation_id,
+            )
     raw_text = _message_context_text(event, bot_id=int(bot.self_id), resolved_reply=reply_reference)
     file_context = ""
     if group_allowed:
@@ -5121,6 +5143,54 @@ def _reply_reference_to_bot(reply_reference: ReplyReference | None, bot: Bot) ->
     )
 
 
+def _message_mentions_non_bot_user(event: GroupMessageEvent | PrivateMessageEvent, bot: Bot) -> bool:
+    bot_ids = {str(bot.self_id), str(getattr(event, "self_id", bot.self_id))}
+    for segment in event.message:
+        segment_type, data = segment_type_and_data(segment)
+        if segment_type == "at" and str(data.get("qq")) not in bot_ids:
+            return True
+    return False
+
+
+def _followup_text_suggests_bot_target(text: str) -> bool:
+    compact = re.sub(r"\s+", "", text or "")
+    if not compact:
+        return False
+    if _mentions_bot_self_name(compact):
+        return True
+    if _is_low_value_group_text(compact):
+        return False
+    if _looks_like_addressed_question(compact):
+        return True
+    if re.search(r"(?:你|妳).{0,18}(?:觉得|知道|看|说|能|会|是不是|有没有|要不要|咋|怎么|为什么|吗|呢|吧)", compact):
+        return True
+    if re.search(r"^(?:那|所以|然后|但是|可是|不过)?(?:你|妳)(?:呢|咋说|怎么看|觉得呢|说呢)?$", compact):
+        return True
+    if any(token in compact for token in ("怎么办", "咋办", "救命", "完了", "崩溃", "难受", "害怕", "怕了")):
+        return True
+    return False
+
+
+def _followup_addressed_allowed(
+    event: GroupMessageEvent | PrivateMessageEvent,
+    bot: Bot,
+    *,
+    reply_reference: ReplyReference | None = None,
+) -> tuple[bool, str]:
+    plain_text = _event_plain_text(event)
+    if _mentions_bot_self_name(plain_text):
+        return True, "mentions_self_name"
+    if _event_has_reply_context(event):
+        if _replied_to_bot(event, bot) or _reply_reference_to_bot(reply_reference, bot):
+            return True, "reply_to_bot"
+        return False, "reply_to_other"
+    if _message_mentions_non_bot_user(event, bot):
+        return False, "mentions_other_user"
+    if _followup_text_suggests_bot_target(plain_text):
+        return True, "followup_text"
+    return False, "not_directed"
+
+
 def _is_weak_media_caption(text: str) -> bool:
     compact = re.sub(r"[^\w\u4e00-\u9fff]+", "", text).casefold()
     if not compact:
@@ -5203,7 +5273,7 @@ def _event_reply_context(
     current_reply = _short_notice_text(reply_text, 100) if reply_text else "空消息"
     self_identity_hint = ""
     if bot_id is not None and user_id is not None and int(user_id) == int(bot_id):
-        self_identity_hint = "注：张风雪和风雪都是你自己；群友回复张风雪/风雪，就是在回复你之前说的话。"
+        self_identity_hint = "注：当前正在回复风雪/张风雪之前的话，这里的‘你’大概率指风雪；普通未引用消息里的‘你/她/这个人’不要自动代入。"
     elif bot_id is not None and _mentions_bot_self_name(current_reply):
         self_identity_hint = _bot_self_name_mention_hint()
     if message_text:
@@ -6782,8 +6852,8 @@ def _format_speaker_reference_context(
         lines.append(f"- 当前是在和风雪互动：{'，'.join(addressed_parts) or '是'}。")
         if followup_addressed:
             lines.append(
-                "- 这是短时互动窗口里的后续消息：如果当前消息有问题、观点、情绪或继续刚才话题，"
-                "倾向正常接住；如果只是“嗯/好/哈哈/6”这类纯确认，可以不回。"
+                "- 这是短时互动窗口里的后续消息：当前消息通过了后端指向检查，可能是在继续和风雪说话；"
+                "如果上下文显示他其实在回复别人或指代不明，不要强行代入自己。"
             )
     else:
         lines.append("- 当前不是直接和风雪互动；判断插话时不要把群友互相回复误认为在问你。")
@@ -7006,7 +7076,10 @@ def _mentions_bot_self_name(text: str) -> bool:
 
 
 def _bot_self_name_mention_hint() -> str:
-    return "注：张风雪和风雪都是你自己；群友提到张风雪/风雪，就是在说你。"
+    return (
+        "注：风雪和张风雪都是你自己；只有明确提到、艾特或回复风雪/张风雪时才是在说你，"
+        "普通“你/她/这个人”不要自动代入。"
+    )
 
 
 def _format_cue_repeat_context(state: CueRepeatState | None) -> str:
