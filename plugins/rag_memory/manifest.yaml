@@ -1,0 +1,29 @@
+id: rag_memory
+name: RAG 与记忆管理
+version: 0.1.0
+enabled: true
+description: 管理知识源、原文语料、记忆单元、群友画像和相关上下文召回。
+entrypoint: qq_social_agent.rag_admin
+permissions:
+  - tool.rag
+  - memory.manage
+capabilities:
+  commands:
+    - command: RAG 管理命令
+      description: 私聊工具单里添加、查看、删除知识源。
+      permission: tool.rag
+    - command: 查看近期记忆
+      description: 查看近期 memory_atoms、画像、风格学习。
+      permission: memory.read
+  tools:
+    - name: rag_retrieval
+      handler: qq_social_agent.rag_retriever.RAGService
+      description: 回复生成时检索相关历史、原文和知识。
+  web_routes:
+    - route: /admin/memory
+      description: 人工审计记忆。
+      permission: local_admin
+  scheduled_tasks: []
+  event_handlers: []
+settings:
+  corpus_context_limit: 6

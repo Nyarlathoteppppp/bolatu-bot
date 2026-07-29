@@ -40,7 +40,7 @@ from .approval_rules import (
     JARGON_LIST_RE,
     TOKEN_REPORT_COMMAND_ALIASES,
 )
-from .admin_ui import render_admin_dashboard, render_memory_audit_page
+from .admin_ui import render_admin_dashboard, render_memory_audit_page, render_plugins_page
 from .approval_models import PendingApprovalCandidate, PendingGroupApproval
 from .background_learning import BackgroundLearningCoordinator
 from .config import load_config
@@ -107,6 +107,7 @@ from .observability import (
     render_trace_html,
 )
 from .persona import PersonaRegistry
+from .plugin_runtime import LocalPluginRegistry
 from .pipeline_types import (
     OutputChannel,
     PipelineMode,
@@ -182,6 +183,8 @@ deep_content_tool = DeepContentTool.from_config(
 rag_service = RAGService(app_config.data_path, app_config.raw.get("rag", {}))
 rag_admin = RAGAdminController(rag_service)
 tool_registry = ToolRegistry()
+local_plugin_registry = LocalPluginRegistry(Path(__file__).resolve().parent.parent / "plugins")
+local_plugin_registry.reload()
 TOOL_ROUTER_SHADOW_SAMPLE_LIMIT = 200
 tool_router_shadow_samples = memory.metric_event_count("tool_router_shadow")
 _jargon_selection_config = app_config.raw.get("jargon_selection", {})
@@ -292,6 +295,19 @@ if hasattr(_driver, "server_app"):
                 status=_http_status_payload(),
                 model_routes=_status_model_routes(),
                 pending_approvals=list(pending_group_approvals.values()),
+                plugins=local_plugin_registry.summary(),
+            )
+        )
+
+    @_driver.server_app.get("/admin/plugins")
+    async def _http_admin_plugins_endpoint(request: Request) -> HTMLResponse:
+        if not _is_local_admin_request(request):
+            return HTMLResponse("local admin only", status_code=403)
+        local_plugin_registry.reload()
+        return HTMLResponse(
+            render_plugins_page(
+                plugins=local_plugin_registry.summary(),
+                errors=[error.to_summary() for error in local_plugin_registry.errors],
             )
         )
 
@@ -654,6 +670,13 @@ async def _init_client() -> None:
     global deepseek_client, learning_coordinator
     set_usage_recorder(_record_llm_usage if app_config.deepseek.usage_tracking_enabled else None)
     deepseek_client = DeepSeekClient(app_config.deepseek)
+    local_plugin_registry.reload()
+    if local_plugin_registry.errors:
+        logger.warning(
+            f"Local plugin manifest load errors: {[error.to_summary() for error in local_plugin_registry.errors]}"
+        )
+    else:
+        logger.info(f"Loaded {len(local_plugin_registry.enabled_plugins())} local plugin manifests")
     tool_registry.register(
         ToolSpec(
             ToolKind.FRESH_SEARCH,
@@ -2420,6 +2443,7 @@ def _http_status_payload() -> dict[str, object]:
             if learning_coordinator is not None
             else {"running": False, "pending_groups": []}
         ),
+        "plugins": local_plugin_registry.status_payload(),
         "pipeline": {
             "timing_gate": "active",
             "tool_router": "active",
@@ -5453,7 +5477,7 @@ def _event_reply_context(
     current_reply = _short_notice_text(reply_text, 100) if reply_text else "空消息"
     self_identity_hint = ""
     if bot_id is not None and user_id is not None and int(user_id) == int(bot_id):
-        self_identity_hint = "注：当前正在回复风雪/张风雪之前的话，这里的‘你’大概率指风雪；普通未引用消息里的‘你/她/这个人’不要自动代入。"
+        self_identity_hint = "注：张风雪和风雪都是你自己。当前正在回复风雪/张风雪之前的话，这里的‘你’大概率指风雪；普通未引用消息里的‘你/她/这个人’不要自动代入。"
     elif bot_id is not None and _mentions_bot_self_name(current_reply):
         self_identity_hint = _bot_self_name_mention_hint()
     if message_text:

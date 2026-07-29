@@ -1,0 +1,25 @@
+id: admin_ui
+name: WebUI 管理台
+version: 0.1.0
+enabled: true
+description: 本地管理台，查看审批、决策、RAG、记忆、画像、模型状态和插件清单。
+entrypoint: qq_social_agent.admin_ui
+permissions:
+  - local_admin
+capabilities:
+  web_routes:
+    - route: /admin
+      description: 管理台概览。
+      permission: local_admin
+    - route: /admin/memory
+      description: 记忆审计和人工纠错。
+      permission: local_admin
+    - route: /admin/plugins
+      description: 本地插件清单。
+      permission: local_admin
+  commands: []
+  tools: []
+  scheduled_tasks: []
+  event_handlers: []
+settings:
+  public_access: false

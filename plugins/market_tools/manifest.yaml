@@ -1,0 +1,23 @@
+id: market_tools
+name: 行情工具
+version: 0.1.0
+enabled: true
+description: 查询美股和加密货币行情，结果交给回复模型短评，不编价格。
+entrypoint: qq_social_agent.tools.market
+permissions:
+  - tool.market
+capabilities:
+  tools:
+    - name: market_lookup
+      handler: qq_social_agent.tools.market.MarketTool
+      description: 美股、ETF、加密货币行情查询。
+      permission: tool.market
+  commands:
+    - command: 行情/股票/币价
+      description: 私聊或群聊触发行情工具。
+      permission: tool.market
+  scheduled_tasks: []
+  web_routes: []
+  event_handlers: []
+settings:
+  external_queries_per_minute: 2

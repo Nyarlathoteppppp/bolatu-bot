@@ -11,6 +11,7 @@ COPY pyproject.toml README.md ./
 COPY bot.py config.yaml ./
 COPY qq_social_agent ./qq_social_agent
 COPY prompts ./prompts
+COPY plugins ./plugins
 
 RUN python -m pip install --upgrade pip \
   && python -m pip install --no-cache-dir -e "."

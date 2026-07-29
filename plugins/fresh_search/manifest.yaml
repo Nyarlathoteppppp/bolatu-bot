@@ -1,0 +1,24 @@
+id: fresh_search
+name: 最新背景搜索
+version: 0.1.0
+enabled: true
+description: 在模型判断需要最新背景时调用搜索/网页读取，压缩成背景信息再生成聊天回复。
+entrypoint: qq_social_agent.tools.fresh_context
+permissions:
+  - tool.search
+capabilities:
+  tools:
+    - name: fresh_context
+      handler: qq_social_agent.tools.fresh_context.FreshContextTool
+      description: Tavily/搜索背景查询。
+      permission: tool.search
+    - name: deep_url_reader
+      handler: qq_social_agent.tools.deep_content.DeepContentTool
+      description: 安全读取群友明确发来的网页正文。
+      permission: tool.deep_url
+  commands: []
+  scheduled_tasks: []
+  web_routes: []
+  event_handlers: []
+settings:
+  search_only_when_llm_requests: true

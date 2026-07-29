@@ -1,0 +1,23 @@
+id: social_actions
+name: 社交动作
+version: 0.1.0
+enabled: true
+description: 管理 QQ 表情回应、戳一戳、艾特和附加社交动作，避免表情替代文字回复。
+entrypoint: qq_social_agent.social_actions
+permissions:
+  - social.send_action
+capabilities:
+  tools:
+    - name: reaction
+      handler: qq_social_agent.social_actions.SocialActionService
+      description: 点表情、附加 reaction，并记录最近动作。
+      permission: social.send_action
+  event_handlers:
+    - event: outgoing_social_action
+      handler: qq_social_agent.plugin._send_social_actions
+      description: 发送并记录社交动作。
+  commands: []
+  scheduled_tasks: []
+  web_routes: []
+settings:
+  standalone_reaction_rare: true

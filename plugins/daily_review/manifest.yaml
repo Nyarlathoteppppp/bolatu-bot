@@ -1,0 +1,24 @@
+id: daily_review
+name: 每日复盘
+version: 0.1.0
+enabled: true
+description: 北京时间 24 点自动复盘 24h 群聊和自己的发言，补发只允许 0-6 点窗口。
+entrypoint: qq_social_agent.plugin.daily_review
+permissions:
+  - scheduled.send_group
+capabilities:
+  scheduled_tasks:
+    - task: daily_review_midnight
+      description: 每天 00:00 自动发送群聊复盘。
+      permission: scheduled.send_group
+  commands:
+    - command: 复盘/今日复盘/补发复盘
+      description: 私聊手动触发每日复盘。
+      permission: tool.admin
+  tools: []
+  web_routes: []
+  event_handlers: []
+settings:
+  timezone: Asia/Shanghai
+  hour: 0
+  catch_up_window: 0-6

@@ -19,6 +19,7 @@ def render_admin_dashboard(
     status: dict[str, object],
     model_routes: dict[str, str],
     pending_approvals: list[object],
+    plugins: list[dict[str, Any]] | None = None,
 ) -> str:
     group_id = selected_group_id or (groups[0] if groups else None)
     recent_messages = memory.admin_recent_messages(group_id=group_id, limit=40)
@@ -39,6 +40,7 @@ def render_admin_dashboard(
         {_status_card('Health', health)}
         {_model_card(model_routes)}
         {_approval_card(pending_approvals)}
+        {_plugin_card(plugins or [])}
       </section>
       <section class="grid two">
         {_panel('最近关系判断', _metric_table(relation_events, show_meta=True))}
@@ -91,6 +93,23 @@ def render_memory_audit_page(
     return _page('张风雪记忆审计', body)
 
 
+
+def render_plugins_page(
+    *,
+    plugins: list[dict[str, Any]],
+    errors: list[dict[str, str]] | None = None,
+) -> str:
+    body = f"""
+    {_header('本地插件')}
+    <main>
+      <section class="panel wide"><h2>插件清单</h2>{_plugin_table(plugins, full=True)}</section>
+      <section class="panel wide"><h2>加载错误</h2>{_plugin_error_table(errors or [])}</section>
+    </main>
+    {_footer()}
+    """
+    return _page('张风雪本地插件', body)
+
+
 def _page(title: str, body: str) -> str:
     return f"""<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>{_e(title)}</title><style>
 :root {{ color-scheme: light dark; --bg:#f6f7f9; --fg:#20242a; --muted:#667085; --line:#d8dde6; --panel:#ffffff; --accent:#2f6fed; --bad:#b42318; --ok:#027a48; }}
@@ -110,7 +129,7 @@ code,pre {{ font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; }}
 
 
 def _header(title: str) -> str:
-    return f'<header><h1>{_e(title)}</h1><nav><a href="/admin">概览</a><a href="/admin/memory">记忆审计</a><a href="/trace">Trace</a><a href="/readyz">Ready JSON</a></nav></header>'
+    return f'<header><h1>{_e(title)}</h1><nav><a href="/admin">概览</a><a href="/admin/memory">记忆审计</a><a href="/admin/plugins">插件</a><a href="/trace">Trace</a><a href="/readyz">Ready JSON</a></nav></header>'
 
 
 def _footer() -> str:
@@ -150,6 +169,76 @@ def _approval_card(pending: list[object]) -> str:
     for approval in pending[:6]:
         items.append(f'<li><b>{_e(str(getattr(approval, "approval_id", "")))}</b> 群 {getattr(approval, "group_id", "")} 触发：{_e(str(getattr(approval, "trigger_nickname", "")))}<br><span class="muted">{_e(_trim(str(getattr(approval, "trigger_text", "")), 120))}</span></li>')
     return f'<section class="card"><h2>审批队列：{len(pending)}</h2><ul>{"".join(items)}</ul></section>'
+
+
+
+def _plugin_card(plugins: list[dict[str, Any]]) -> str:
+    enabled = [plugin for plugin in plugins if plugin.get('enabled')]
+    if not plugins:
+        return '<section class="card"><h2>本地插件</h2><p class="muted">暂无插件 manifest。</p></section>'
+    items = []
+    for plugin in enabled[:6]:
+        items.append(
+            f'<li><b>{_e(plugin.get("name") or plugin.get("id"))}</b> '
+            f'<span class="muted small">{_capability_count_badges(plugin)}</span></li>'
+        )
+    more = f'<p class="muted small">启用 {len(enabled)} / 总计 {len(plugins)}</p>'
+    return f'<section class="card"><h2>本地插件</h2><ul>{"".join(items)}</ul>{more}<p><a class="btn" href="/admin/plugins">查看插件</a></p></section>'
+
+
+def _plugin_table(plugins: list[dict[str, Any]], *, full: bool) -> str:
+    if not plugins:
+        return '<p class="muted">暂无插件 manifest。</p>'
+    out = ['<table><tr><th>状态</th><th>插件</th><th>能力</th><th>权限</th><th>入口/说明</th></tr>']
+    for plugin in sorted(plugins, key=lambda item: str(item.get('id') or '')):
+        enabled = bool(plugin.get('enabled'))
+        status = '<span class="ok">启用</span>' if enabled else '<span class="muted">关闭</span>'
+        permissions = plugin.get('permissions') if isinstance(plugin.get('permissions'), list) else []
+        permission_badges = ''.join(f'<span class="badge">{_e(item)}</span>' for item in permissions) or '<span class="muted small">无</span>'
+        detail = _e(plugin.get('description') or '')
+        if full:
+            detail += f'<pre>entrypoint={_e(plugin.get("entrypoint") or "")}\npath={_e(plugin.get("path") or "")}</pre>'
+        out.append(
+            '<tr>'
+            f'<td>{status}</td>'
+            f'<td><b>{_e(plugin.get("name") or plugin.get("id"))}</b><br><span class="muted small">{_e(plugin.get("id"))} v{_e(plugin.get("version"))}</span></td>'
+            f'<td>{_capability_count_badges(plugin)}</td>'
+            f'<td>{permission_badges}</td>'
+            f'<td>{detail}</td>'
+            '</tr>'
+        )
+    out.append('</table>')
+    return ''.join(out)
+
+
+def _plugin_error_table(errors: list[dict[str, str]]) -> str:
+    if not errors:
+        return '<p class="muted">暂无加载错误。</p>'
+    out = ['<table><tr><th>文件</th><th>错误</th></tr>']
+    for error in errors:
+        out.append(f'<tr><td>{_e(error.get("path"))}</td><td class="bad">{_e(error.get("error"))}</td></tr>')
+    out.append('</table>')
+    return ''.join(out)
+
+
+def _capability_count_badges(plugin: dict[str, Any]) -> str:
+    counts = plugin.get('capability_counts')
+    if not isinstance(counts, dict):
+        capabilities = plugin.get('capabilities') if isinstance(plugin.get('capabilities'), dict) else {}
+        counts = {str(key): len(value) for key, value in capabilities.items() if isinstance(value, list)}
+    labels = {
+        'commands': '命令',
+        'tools': '工具',
+        'scheduled_tasks': '定时',
+        'web_routes': '页面',
+        'event_handlers': '事件',
+    }
+    badges = []
+    for key, label in labels.items():
+        count = int(counts.get(key, 0) or 0)
+        if count:
+            badges.append(f'<span class="badge">{label}×{count}</span>')
+    return ''.join(badges) or '<span class="muted small">无能力声明</span>'
 
 
 def _panel(title: str, inner: str) -> str:

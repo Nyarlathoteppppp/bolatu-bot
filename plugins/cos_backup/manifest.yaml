@@ -1,0 +1,26 @@
+id: cos_backup
+name: COS 备份与历史归档
+version: 0.1.0
+enabled: true
+description: 把数据库、日志、聊天原文归档和历史回忆库同步到腾讯云 COS，降低本地磁盘压力。
+entrypoint: scripts.cos_backup
+permissions:
+  - storage.backup
+capabilities:
+  scheduled_tasks:
+    - task: daily_cos_backup
+      description: 每日轻量备份数据库、配置、日志和归档产物。
+      permission: storage.backup
+    - task: monthly_large_backup
+      description: 分批上传 server-data/ntqq 等大文件。
+      permission: storage.backup
+  commands:
+    - command: 备份状态
+      description: 查看最近 COS 备份情况。
+      permission: tool.admin
+  tools: []
+  web_routes: []
+  event_handlers: []
+settings:
+  bucket: qqbot-1452790988
+  region: ap-shanghai

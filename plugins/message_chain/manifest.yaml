@@ -1,0 +1,19 @@
+id: message_chain
+name: 完整消息链
+version: 0.1.0
+enabled: true
+description: 保存 OneBot 消息段、reply、at、图片、语音、转发等结构化上下文，辅助判断谁在说谁。
+entrypoint: qq_social_agent.message_segments
+permissions:
+  - message.read
+capabilities:
+  event_handlers:
+    - event: group_message_received
+      handler: qq_social_agent.plugin._handle_group_message
+      description: 保存 message_segments_json/raw_message_json/sender_json。
+  commands: []
+  tools: []
+  scheduled_tasks: []
+  web_routes: []
+settings:
+  store_raw_message: true
