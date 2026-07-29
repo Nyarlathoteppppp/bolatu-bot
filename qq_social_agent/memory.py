@@ -957,6 +957,35 @@ class MemoryStore:
         ).fetchall()
         return list(rows)
 
+    def admin_message(self, message_id: int) -> sqlite3.Row | None:
+        return self.conn.execute(
+            """
+            select id, group_id, user_id, nickname, text, is_bot, created_at,
+                   source_message_id, source_kind, correlation_id, session_id,
+                   message_segments_json, raw_message_json, sender_json
+            from messages
+            where id = ?
+            """,
+            (int(message_id),),
+        ).fetchone()
+
+    def admin_message_by_source(self, group_id: int, source_message_id: int | str | None) -> sqlite3.Row | None:
+        source_key = _source_message_key(source_message_id)
+        if not source_key:
+            return None
+        return self.conn.execute(
+            """
+            select id, group_id, user_id, nickname, text, is_bot, created_at,
+                   source_message_id, source_kind, correlation_id, session_id,
+                   message_segments_json, raw_message_json, sender_json
+            from messages
+            where group_id = ? and source_message_id = ?
+            order by id desc
+            limit 1
+            """,
+            (int(group_id), source_key),
+        ).fetchone()
+
     def admin_recent_metric_events(
         self,
         *,
@@ -993,8 +1022,11 @@ class MemoryStore:
         group_id: int | None = None,
         status: str = "active",
         limit: int = 80,
+        user_id: int | None = None,
+        atom_type: str = "",
+        query: str = "",
     ) -> list[MemoryAtom]:
-        bounded = max(1, min(300, int(limit)))
+        bounded = max(1, min(500, int(limit)))
         clauses: list[str] = []
         params: list[object] = []
         clean_status = status.strip().casefold()
@@ -1004,6 +1036,20 @@ class MemoryStore:
         if clean_status and clean_status != "all":
             clauses.append("status = ?")
             params.append(_normalize_memory_atom_status(clean_status))
+        if user_id is not None:
+            clauses.append("(subject_user_id = ? or object_user_id = ?)")
+            params.extend((int(user_id), int(user_id)))
+        clean_type = atom_type.strip()
+        if clean_type and clean_type.casefold() != "all":
+            clauses.append("atom_type = ?")
+            params.append(clean_type[:32])
+        clean_query = re.sub(r"\s+", " ", query).strip()
+        if clean_query:
+            like = f"%{clean_query[:120]}%"
+            clauses.append(
+                "(content like ? or source like ? or coalesce(source_message_id, '') like ? or cast(id as text) = ?)"
+            )
+            params.extend((like, like, like, clean_query))
         where = "where " + " and ".join(clauses) if clauses else ""
         rows = self.conn.execute(
             f"""
@@ -1090,6 +1136,69 @@ class MemoryStore:
                 actor_user_id=actor_user_id,
                 detail=detail or audit_action,
                 observed_at=now,
+            )
+            self.conn.commit()
+            return True
+        except Exception:
+            self.conn.rollback()
+            raise
+
+    def admin_merge_memory_atoms(
+        self,
+        source_atom_id: int,
+        target_atom_id: int,
+        *,
+        actor_user_id: int | None = None,
+        note: str = "",
+    ) -> bool:
+        source = self.memory_atom(source_atom_id)
+        target = self.memory_atom(target_atom_id)
+        if source is None or target is None or source.id == target.id:
+            return False
+        if source.group_id != target.group_id:
+            return False
+        if source.status not in {"active", "disputed"} or target.status not in {"active", "disputed"}:
+            return False
+        now = time.time()
+        detail = note.strip()[:420] or f"merged #{source.id} into #{target.id}"
+        try:
+            self.conn.execute(
+                """
+                update memory_atoms
+                set status = 'superseded', valid_to = ?, expires_at = ?, supersedes_id = ?, updated_at = ?
+                where id = ?
+                """,
+                (now, now, target.id, now, source.id),
+            )
+            self.conn.execute(
+                """
+                update memory_atoms
+                set importance = max(importance, ?), confidence = max(confidence, ?), updated_at = ?
+                where id = ?
+                """,
+                (min(1.0, max(target.importance, source.importance)), min(1.0, max(target.confidence, source.confidence)), now, target.id),
+            )
+            self._insert_memory_atom_audit_event(
+                atom_id=source.id,
+                action="merged_into",
+                evidence_type="manual",
+                source="admin_ui",
+                source_message_id=None,
+                actor_user_id=actor_user_id,
+                detail=detail,
+                observed_at=now,
+                metadata={"target_atom_id": target.id},
+            )
+            self._insert_memory_atom_audit_event(
+                atom_id=target.id,
+                action="merged_from",
+                evidence_type="manual",
+                source="admin_ui",
+                source_message_id=None,
+                actor_user_id=actor_user_id,
+                detail=detail,
+                observed_at=now,
+                metadata={"source_atom_id": source.id},
             )
             self.conn.commit()
             return True

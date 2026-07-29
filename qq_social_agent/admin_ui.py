@@ -5,6 +5,7 @@ import json
 import time
 from dataclasses import asdict, is_dataclass
 from typing import Any
+from urllib.parse import urlencode
 
 from .memory import MemoryAtom, MemoryStore
 
@@ -72,9 +73,19 @@ def render_memory_audit_page(
     status: str,
     limit: int,
     notice: str = "",
+    user_id: int | None = None,
+    atom_type: str = "",
+    q: str = "",
 ) -> str:
     group_id = selected_group_id or (groups[0] if groups else None)
-    atoms = memory.admin_recent_memory_atoms(group_id=group_id, status=status, limit=limit)
+    atoms = memory.admin_recent_memory_atoms(
+        group_id=group_id,
+        status=status,
+        limit=limit,
+        user_id=user_id,
+        atom_type=atom_type,
+        query=q,
+    )
     body = f"""
     {_header('记忆审计')}
     <main>
@@ -86,11 +97,76 @@ def render_memory_audit_page(
         {_tab('/admin/memory', 'expired', group_id, status == 'expired')}
         {_tab('/admin/memory', 'all', group_id, status == 'all')}
       </nav>
-      <section class="panel wide"><h2>记忆单元</h2>{_memory_atom_table(atoms, group_id=group_id, status=status)}</section>
+      <section class="panel wide"><h2>筛选</h2>{_memory_filter_form(group_id=group_id, status=status, limit=limit, user_id=user_id, atom_type=atom_type, q=q)}</section>
+      <section class="panel wide"><h2>记忆单元 <span class="muted small">{len(atoms)} 条</span></h2>{_memory_atom_table(atoms, group_id=group_id, status=status, limit=limit, user_id=user_id, atom_type=atom_type, q=q)}</section>
     </main>
     {_footer()}
     """
     return _page('张风雪记忆审计', body)
+
+
+
+def render_message_detail_page(
+    *,
+    memory: MemoryStore,
+    message_id: int,
+) -> str:
+    row = memory.admin_message(message_id)
+    if row is None:
+        body = f"""
+        {_header('消息链详情')}
+        <main><section class="panel wide"><h2>消息不存在</h2><p class="muted">没有找到消息 #{_e(message_id)}。</p></section></main>
+        {_footer()}
+        """
+        return _page('消息链详情', body)
+    body = f"""
+    {_header('消息链详情')}
+    <main>
+      <section class="panel wide"><h2>消息 #{_row(row, 'id')}</h2>{_message_detail_summary(row)}</section>
+      <section class="grid two">
+        {_panel('Message Segments', _segment_table(_row(row, 'message_segments_json')))}
+        {_panel('Sender', _json_block(_row(row, 'sender_json')))}
+      </section>
+      <section class="panel wide"><h2>Raw Message</h2>{_json_block(_row(row, 'raw_message_json'))}</section>
+    </main>
+    {_footer()}
+    """
+    return _page('消息链详情', body)
+
+
+
+def render_memory_atom_detail_page(
+    *,
+    memory: MemoryStore,
+    atom_id: int,
+    groups: tuple[int, ...],
+    notice: str = "",
+) -> str:
+    atom = memory.memory_atom(atom_id)
+    if atom is None:
+        body = f"""
+        {_header('记忆详情')}
+        <main><section class="panel wide"><h2>记忆不存在</h2><p class="muted">没有找到记忆 #{_e(atom_id)}。</p></section></main>
+        {_footer()}
+        """
+        return _page('记忆详情', body)
+    events = memory.memory_atom_audit_trail(atom.id, limit=120)
+    source_message = memory.admin_message_by_source(atom.group_id, atom.source_message_id) if atom.source_message_id else None
+    body = f"""
+    {_header('记忆详情')}
+    <main>
+      {_group_nav(groups, atom.group_id, path='/admin/memory')}
+      {_notice(notice)}
+      <section class="panel wide"><h2>记忆 #{atom.id}</h2>{_memory_atom_detail(atom, source_message)}</section>
+      <section class="grid two">
+        {_panel('纠正这条记忆', _memory_correction_form(atom))}
+        {_panel('合并到另一条记忆', _memory_merge_form(atom))}
+      </section>
+      <section class="panel wide"><h2>审计轨迹</h2>{_memory_audit_table(events)}</section>
+    </main>
+    {_footer()}
+    """
+    return _page('记忆详情', body)
 
 
 
@@ -125,6 +201,7 @@ code,pre {{ font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; }}
 .badge {{ display:inline-block; padding:2px 6px; border:1px solid var(--line); border-radius:999px; color:var(--muted); margin:0 4px 4px 0; font-size:12px; }}
 .tabs,.groupnav {{ display:flex; gap:8px; flex-wrap:wrap; margin:0 0 14px; }} .tabs a,.groupnav a,.btn {{ display:inline-block; padding:6px 9px; border:1px solid var(--line); border-radius:6px; background:var(--panel); }} .tabs a.active,.groupnav a.active {{ border-color:var(--accent); color:var(--accent); }}
 .actions {{ display:flex; gap:5px; flex-wrap:wrap; }} .danger {{ color:var(--bad); }} .notice {{ padding:10px 12px; background:var(--panel); border:1px solid var(--line); border-radius:8px; margin-bottom:14px; }} .small {{ font-size:12px; }}
+.filters {{ display:grid; grid-template-columns:repeat(6,minmax(120px,1fr)); gap:10px; align-items:end; }} .field label {{ display:block; color:var(--muted); font-size:12px; margin-bottom:4px; }} input,select,textarea {{ width:100%; padding:7px 8px; border:1px solid var(--line); border-radius:6px; background:var(--panel); color:var(--fg); }} textarea {{ min-height:96px; }} button {{ padding:7px 10px; border:1px solid var(--accent); border-radius:6px; background:var(--accent); color:white; cursor:pointer; }} @media(max-width:1000px) {{ .filters {{ grid-template-columns:1fr 1fr; }} }}
 </style></head><body>{body}</body></html>"""
 
 
@@ -271,9 +348,16 @@ def _metric_summary(meta: dict[str, Any]) -> str:
 def _message_table(rows: list[Any]) -> str:
     if not rows:
         return '<p class="muted">暂无消息。</p>'
-    out = ['<table><tr><th>ID</th><th>时间</th><th>说话人</th><th>内容</th><th>Segments</th></tr>']
+    out = ['<table><tr><th>ID</th><th>时间</th><th>说话人</th><th>内容</th><th>链路</th></tr>']
     for row in rows:
-        out.append(f'<tr><td>{_row(row,"id")}</td><td class="small">{_fmt_time(_row(row,"created_at"))}</td><td>{_e(_row(row,"nickname"))}<br><span class="muted small">#{_row(row,"user_id")}</span></td><td>{_e(_trim(_row(row,"text"), 160))}</td><td>{_segment_badges(_row(row,"message_segments_json"))}</td></tr>')
+        message_id = _row(row, "id")
+        out.append(
+            f'<tr><td><a href="/admin/messages/{_e(message_id)}">#{_e(message_id)}</a></td>'
+            f'<td class="small">{_fmt_time(_row(row,"created_at"))}<br><span class="muted">{_e(_row(row,"session_id"))}</span></td>'
+            f'<td>{_e(_row(row,"nickname"))}<br><span class="muted small">#{_row(row,"user_id")}</span></td>'
+            f'<td>{_e(_trim(_row(row,"text"), 160))}</td>'
+            f'<td>{_segment_badges(_row(row,"message_segments_json"))}<br><span class="muted small">source={_e(_row(row,"source_message_id"))}</span></td></tr>'
+        )
     out.append('</table>')
     return ''.join(out)
 
@@ -287,7 +371,16 @@ def _memory_atom_list(atoms: list[MemoryAtom]) -> str:
     return '<ul>' + ''.join(items) + '</ul><p><a class="btn" href="/admin/memory">打开记忆审计</a></p>'
 
 
-def _memory_atom_table(atoms: list[MemoryAtom], *, group_id: int | None, status: str) -> str:
+def _memory_atom_table(
+    atoms: list[MemoryAtom],
+    *,
+    group_id: int | None,
+    status: str,
+    limit: int = 80,
+    user_id: int | None = None,
+    atom_type: str = "",
+    q: str = "",
+) -> str:
     if not atoms:
         return '<p class="muted">没有符合条件的记忆。</p>'
     out = ['<table><tr><th>ID</th><th>类型/主体</th><th>内容</th><th>分数</th><th>状态</th><th>操作</th></tr>']
@@ -297,21 +390,205 @@ def _memory_atom_table(atoms: list[MemoryAtom], *, group_id: int | None, status:
             subject.append(f'subject={atom.subject_user_id}')
         if atom.object_user_id is not None:
             subject.append(f'object={atom.object_user_id}')
-        out.append(f'<tr><td>#{atom.id}</td><td><span class="badge">{_e(atom.atom_type)}</span><br><span class="muted small">{_e(" / ".join(subject))}</span></td><td>{_e(atom.content)}<br><span class="muted small">source={_e(atom.source)} updated={_fmt_time(atom.updated_at)}</span></td><td>conf {atom.confidence:.2f}<br>imp {atom.importance:.2f}</td><td>{_e(atom.status)}</td><td><div class="actions">{_memory_actions(atom.id, group_id=group_id, status=status)}</div></td></tr>')
+        detail_href = f'/admin/memory/{atom.id}' + _query_suffix(_memory_filter_params(group_id=group_id, status=status, limit=limit, user_id=user_id, atom_type=atom_type, q=q))
+        out.append(
+            f'<tr><td><a href="{detail_href}">#{atom.id}</a></td>'
+            f'<td><span class="badge">{_e(atom.atom_type)}</span><br><span class="muted small">{_e(" / ".join(subject))}</span></td>'
+            f'<td>{_e(atom.content)}<br><span class="muted small">source={_e(atom.source)} updated={_fmt_time(atom.updated_at)}</span></td>'
+            f'<td>conf {atom.confidence:.2f}<br>imp {atom.importance:.2f}</td><td>{_e(atom.status)}</td>'
+            f'<td><div class="actions">{_memory_actions(atom.id, group_id=group_id, status=status, limit=limit, user_id=user_id, atom_type=atom_type, q=q)}</div></td></tr>'
+        )
     out.append('</table>')
     return ''.join(out)
 
 
-def _memory_actions(atom_id: int, *, group_id: int | None, status: str) -> str:
-    base = f'/admin/memory/action?atom_id={atom_id}&status={status}'
-    if group_id is not None:
-        base += f'&group_id={group_id}'
+def _memory_actions(
+    atom_id: int,
+    *,
+    group_id: int | None,
+    status: str,
+    limit: int = 80,
+    user_id: int | None = None,
+    atom_type: str = "",
+    q: str = "",
+) -> str:
+    params = _memory_filter_params(group_id=group_id, status=status, limit=limit, user_id=user_id, atom_type=atom_type, q=q)
     specs = [('keep','保留'), ('boost','提权'), ('freeze','冻结'), ('wrong_person','错人'), ('expire','过期')]
-    links = []
+    links = [f'<a class="btn" href="/admin/memory/{atom_id}{_query_suffix(params)}">详情</a>']
     for action, label in specs:
         cls = 'btn danger' if action in {'wrong_person', 'expire'} else 'btn'
-        links.append(f'<a class="{cls}" href="{base}&action={action}">{label}</a>')
+        action_params = {**params, 'atom_id': atom_id, 'action': action}
+        links.append(f'<a class="{cls}" href="/admin/memory/action{_query_suffix(action_params)}">{label}</a>')
     return ''.join(links)
+
+
+def _memory_filter_form(
+    *,
+    group_id: int | None,
+    status: str,
+    limit: int,
+    user_id: int | None,
+    atom_type: str,
+    q: str,
+) -> str:
+    group_value = '' if group_id is None else str(group_id)
+    user_value = '' if user_id is None else str(user_id)
+    status_options = ''.join(
+        f'<option value="{_e(item)}" {"selected" if item == status else ""}>{_e(item)}</option>'
+        for item in ('active', 'disputed', 'expired', 'superseded', 'all')
+    )
+    return (
+        '<form class="filters" method="get" action="/admin/memory">'
+        f'<div class="field"><label>群号</label><input name="group_id" value="{_e(group_value)}" placeholder="1026813421"></div>'
+        f'<div class="field"><label>状态</label><select name="status">{status_options}</select></div>'
+        f'<div class="field"><label>用户 QQ</label><input name="user_id" value="{_e(user_value)}" placeholder="subject/object"></div>'
+        f'<div class="field"><label>类型</label><input name="atom_type" value="{_e(atom_type)}" placeholder="fact/relation/preference"></div>'
+        f'<div class="field"><label>关键词</label><input name="q" value="{_e(q)}" placeholder="内容/来源/消息ID"></div>'
+        f'<div class="field"><label>数量</label><input name="limit" value="{_e(limit)}"></div>'
+        '<div class="field"><button type="submit">筛选</button></div>'
+        '</form>'
+    )
+
+
+def _memory_filter_params(
+    *,
+    group_id: int | None,
+    status: str,
+    limit: int,
+    user_id: int | None,
+    atom_type: str,
+    q: str,
+) -> dict[str, object]:
+    params: dict[str, object] = {'status': status or 'active', 'limit': limit}
+    if group_id is not None:
+        params['group_id'] = group_id
+    if user_id is not None:
+        params['user_id'] = user_id
+    if atom_type.strip():
+        params['atom_type'] = atom_type.strip()
+    if q.strip():
+        params['q'] = q.strip()
+    return params
+
+
+def _query_suffix(params: dict[str, object]) -> str:
+    clean = {str(key): value for key, value in params.items() if value not in (None, '')}
+    encoded = urlencode(clean)
+    return f'?{encoded}' if encoded else ''
+
+
+def _message_detail_summary(row: Any) -> str:
+    rows = [
+        ('群/会话', f'{_row(row, "group_id")} / {_row(row, "session_id")}'),
+        ('说话人', f'{_row(row, "nickname")} #{_row(row, "user_id")}'),
+        ('时间', _fmt_time(_row(row, 'created_at'))),
+        ('source', f'{_row(row, "source_kind")} / {_row(row, "source_message_id")}'),
+        ('correlation', _row(row, 'correlation_id')),
+        ('文本', _row(row, 'text')),
+    ]
+    return '<table>' + ''.join(f'<tr><th>{_e(k)}</th><td>{_e(v)}</td></tr>' for k, v in rows) + '</table>'
+
+
+def _segment_table(raw: str) -> str:
+    segments = _loads_json_list(raw)
+    if not segments:
+        return '<p class="muted">没有保存 message segments。</p>'
+    out = ['<table><tr><th>#</th><th>type</th><th>data</th></tr>']
+    for index, segment in enumerate(segments):
+        if isinstance(segment, dict):
+            typ = segment.get('type') or 'unknown'
+            data = segment.get('data')
+            seg_index = segment.get('index', index)
+        else:
+            typ = 'unknown'
+            data = segment
+            seg_index = index
+        out.append(f'<tr><td>{_e(seg_index)}</td><td><span class="badge">{_e(typ)}</span></td><td><pre>{_e(_short_json(data, 1600))}</pre></td></tr>')
+    out.append('</table>')
+    return ''.join(out)
+
+
+def _json_block(raw: str) -> str:
+    if not raw:
+        return '<p class="muted">无。</p>'
+    try:
+        parsed = json.loads(raw)
+        text = json.dumps(parsed, ensure_ascii=False, indent=2)
+    except Exception:
+        text = raw
+    return f'<pre>{_e(_trim(text, 12000))}</pre>'
+
+
+def _memory_atom_detail(atom: MemoryAtom, source_message: Any | None) -> str:
+    source = _e(atom.source_message_id or '')
+    if source_message is not None:
+        source = f'<a href="/admin/messages/{_row(source_message, "id")}">{_e(atom.source_message_id)}</a>'
+    rows = [
+        ('类型', atom.atom_type),
+        ('主体/对象', f'subject={atom.subject_user_id or ""} object={atom.object_user_id or ""}'),
+        ('内容', atom.content),
+        ('状态', atom.status),
+        ('分数', f'confidence={atom.confidence:.2f} importance={atom.importance:.2f}'),
+        ('证据', f'{atom.evidence_type} / {atom.source} / {source}'),
+        ('时间', f'observed={_fmt_time(atom.observed_at)} valid_from={_fmt_time(atom.valid_from)} valid_to={_fmt_time(atom.valid_to)} updated={_fmt_time(atom.updated_at)}'),
+        ('替代关系', f'supersedes={atom.supersedes_id or ""}'),
+    ]
+    out = ['<table>']
+    for key, value in rows:
+        if key == '证据':
+            out.append(f'<tr><th>{_e(key)}</th><td>{value}</td></tr>')
+        else:
+            out.append(f'<tr><th>{_e(key)}</th><td>{_e(value)}</td></tr>')
+    out.append('</table>')
+    return ''.join(out)
+
+
+def _memory_correction_form(atom: MemoryAtom) -> str:
+    return (
+        '<form method="post" action="/admin/memory/correct">'
+        f'<input type="hidden" name="atom_id" value="{atom.id}">'
+        f'<div class="field"><label>新内容</label><textarea name="content">{_e(atom.content)}</textarea></div>'
+        '<div class="filters" style="margin-top:10px;">'
+        f'<div class="field"><label>类型</label><input name="atom_type" value="{_e(atom.atom_type)}"></div>'
+        f'<div class="field"><label>subject_user_id</label><input name="subject_user_id" value="{_e(atom.subject_user_id or "")}"></div>'
+        f'<div class="field"><label>object_user_id</label><input name="object_user_id" value="{_e(atom.object_user_id or "")}"></div>'
+        '<div class="field"><label>原因</label><input name="reason" value="WebUI 手动纠正"></div>'
+        '<div class="field"><button type="submit">封存旧记忆并创建新记忆</button></div>'
+        '</div></form>'
+    )
+
+
+def _memory_merge_form(atom: MemoryAtom) -> str:
+    return (
+        '<form method="post" action="/admin/memory/merge">'
+        f'<input type="hidden" name="source_atom_id" value="{atom.id}">'
+        '<div class="field"><label>合并到目标记忆 ID</label><input name="target_atom_id" placeholder="例如 123"></div>'
+        '<div class="field"><label>原因</label><input name="reason" value="WebUI 合并重复记忆"></div>'
+        f'<p class="muted small">当前 #{atom.id} 会被标为 superseded，目标记忆保留并提取较高置信/重要度。</p>'
+        '<button type="submit">合并</button>'
+        '</form>'
+    )
+
+
+def _memory_audit_table(events: list[Any]) -> str:
+    if not events:
+        return '<p class="muted">暂无审计事件。</p>'
+    out = ['<table><tr><th>时间</th><th>动作</th><th>证据</th><th>操作者</th><th>详情</th></tr>']
+    for event in events:
+        evidence = f'{getattr(event, "evidence_type", "")} / {getattr(event, "source", "")}'
+        if getattr(event, 'source_message_id', None):
+            evidence += f' / {getattr(event, "source_message_id")}'
+        meta = getattr(event, 'metadata', {}) or {}
+        detail = getattr(event, 'detail', '')
+        if meta:
+            detail += '\n' + json.dumps(meta, ensure_ascii=False)
+        out.append(
+            f'<tr><td class="small">{_fmt_time(getattr(event, "created_at", 0))}</td>'
+            f'<td>{_e(getattr(event, "action", ""))}</td><td>{_e(evidence)}</td>'
+            f'<td>{_e(getattr(event, "actor_user_id", "") or "")}</td><td><pre>{_e(detail)}</pre></td></tr>'
+        )
+    out.append('</table>')
+    return ''.join(out)
 
 
 def _style_rule_list(rules: list[Any]) -> str:
@@ -327,7 +604,10 @@ def _profile_list(profiles: list[Any]) -> str:
     items = []
     for profile in profiles:
         summary = getattr(profile, 'ai_summary', '') or '暂无 AI 摘要'
-        items.append(f'<li><b>{_e(getattr(profile,"display_name", ""))}</b> <span class="muted small">#{getattr(profile,"user_id", "")}</span><br>{_e(_trim(summary, 120))}</li>')
+        group_id = getattr(profile, "group_id", "")
+        user_id = getattr(profile, "user_id", "")
+        link = f'/admin/memory?group_id={_e(group_id)}&status=all&user_id={_e(user_id)}' if group_id and user_id else '/admin/memory'
+        items.append(f'<li><b><a href="{link}">{_e(getattr(profile,"display_name", ""))}</a></b> <span class="muted small">#{user_id}</span><br>{_e(_trim(summary, 120))}</li>')
     return '<ul>' + ''.join(items) + '</ul>'
 
 

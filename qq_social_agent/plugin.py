@@ -10,6 +10,7 @@ from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
+from urllib.parse import parse_qs, urlencode
 
 from dotenv import load_dotenv
 from nonebot import get_driver, logger, on_command, on_message, on_notice
@@ -40,7 +41,13 @@ from .approval_rules import (
     JARGON_LIST_RE,
     TOKEN_REPORT_COMMAND_ALIASES,
 )
-from .admin_ui import render_admin_dashboard, render_memory_audit_page, render_plugins_page
+from .admin_ui import (
+    render_admin_dashboard,
+    render_memory_audit_page,
+    render_memory_atom_detail_page,
+    render_message_detail_page,
+    render_plugins_page,
+)
 from .approval_models import PendingApprovalCandidate, PendingGroupApproval
 from .background_learning import BackgroundLearningCoordinator
 from .config import load_config
@@ -311,6 +318,12 @@ if hasattr(_driver, "server_app"):
             )
         )
 
+    @_driver.server_app.get("/admin/messages/{message_id}")
+    async def _http_admin_message_detail_endpoint(request: Request, message_id: int) -> HTMLResponse:
+        if not _is_local_admin_request(request):
+            return HTMLResponse("local admin only", status_code=403)
+        return HTMLResponse(render_message_detail_page(memory=memory, message_id=message_id))
+
     @_driver.server_app.get("/admin/memory")
     async def _http_admin_memory_endpoint(
         request: Request,
@@ -318,6 +331,9 @@ if hasattr(_driver, "server_app"):
         status: str = "active",
         limit: int = 80,
         notice: str = "",
+        user_id: int | None = None,
+        atom_type: str = "",
+        q: str = "",
     ) -> HTMLResponse:
         if not _is_local_admin_request(request):
             return HTMLResponse("local admin only", status_code=403)
@@ -329,6 +345,9 @@ if hasattr(_driver, "server_app"):
                 status=status,
                 limit=limit,
                 notice=notice,
+                user_id=user_id,
+                atom_type=atom_type,
+                q=q,
             )
         )
 
@@ -339,15 +358,86 @@ if hasattr(_driver, "server_app"):
         action: str,
         group_id: int | None = None,
         status: str = "active",
+        limit: int = 80,
+        user_id: int | None = None,
+        atom_type: str = "",
+        q: str = "",
     ):
         if not _is_local_admin_request(request):
             return HTMLResponse("local admin only", status_code=403)
         ok = memory.admin_review_memory_atom(atom_id, action=action, actor_user_id=0)
         notice = "已更新" if ok else "没有找到记忆或动作无效"
-        group_q = f"&group_id={group_id}" if group_id is not None else ""
         return RedirectResponse(
-            url=f"/admin/memory?status={status}{group_q}&notice={notice}",
+            url=_admin_memory_url(
+                group_id=group_id,
+                status=status,
+                limit=limit,
+                user_id=user_id,
+                atom_type=atom_type,
+                q=q,
+                notice=notice,
+            ),
             status_code=303,
+        )
+
+    @_driver.server_app.post("/admin/memory/correct")
+    async def _http_admin_memory_correct_endpoint(request: Request):
+        if not _is_local_admin_request(request):
+            return HTMLResponse("local admin only", status_code=403)
+        form = await _admin_form_data(request)
+        atom_id = _admin_form_int(form, "atom_id") or 0
+        content = form.get("content", "").strip()
+        atom_type = form.get("atom_type", "").strip() or None
+        subject_user_id = _admin_form_int(form, "subject_user_id")
+        object_user_id = _admin_form_int(form, "object_user_id")
+        reason = form.get("reason", "").strip() or "WebUI 手动纠正"
+        new_atom_id = memory.correct_memory_atom(
+            atom_id,
+            content=content,
+            source="admin_ui",
+            actor_user_id=0,
+            reason=reason,
+            confidence=1.0,
+            atom_type=atom_type,
+            subject_user_id=subject_user_id,
+            object_user_id=object_user_id,
+        )
+        target_id = new_atom_id or atom_id
+        notice = f"已创建纠正记忆 #{new_atom_id}" if new_atom_id else "纠正失败：没有找到有效记忆或内容为空"
+        return RedirectResponse(url=_admin_memory_detail_url(target_id, notice=notice), status_code=303)
+
+    @_driver.server_app.post("/admin/memory/merge")
+    async def _http_admin_memory_merge_endpoint(request: Request):
+        if not _is_local_admin_request(request):
+            return HTMLResponse("local admin only", status_code=403)
+        form = await _admin_form_data(request)
+        source_atom_id = _admin_form_int(form, "source_atom_id") or 0
+        target_atom_id = _admin_form_int(form, "target_atom_id") or 0
+        reason = form.get("reason", "").strip() or "WebUI 合并重复记忆"
+        ok = memory.admin_merge_memory_atoms(
+            source_atom_id,
+            target_atom_id,
+            actor_user_id=0,
+            note=reason,
+        )
+        notice = f"已将 #{source_atom_id} 合并到 #{target_atom_id}" if ok else "合并失败：检查 ID、群号、状态是否有效"
+        return RedirectResponse(url=_admin_memory_detail_url(target_atom_id or source_atom_id, notice=notice), status_code=303)
+
+    @_driver.server_app.get("/admin/memory/{atom_id}")
+    async def _http_admin_memory_detail_endpoint(
+        request: Request,
+        atom_id: int,
+        notice: str = "",
+    ) -> HTMLResponse:
+        if not _is_local_admin_request(request):
+            return HTMLResponse("local admin only", status_code=403)
+        return HTMLResponse(
+            render_memory_atom_detail_page(
+                memory=memory,
+                atom_id=atom_id,
+                groups=_runtime_target_groups(),
+                notice=notice,
+            )
         )
 
 MID_MEMORY_KEEP_SUMMARIES = 4
@@ -2505,6 +2595,51 @@ def _http_trace_payload(*, trace_id: str = "", limit: int = 50) -> dict[str, obj
     result["trace_count"] = len(filtered)
     result["available_trace_count"] = len(filtered)
     return result
+
+
+async def _admin_form_data(request: Request) -> dict[str, str]:
+    body = await request.body()
+    parsed = parse_qs(body.decode("utf-8", errors="ignore"), keep_blank_values=True)
+    return {key: values[-1] if values else "" for key, values in parsed.items()}
+
+
+def _admin_form_int(form: dict[str, str], key: str) -> int | None:
+    value = form.get(key, "").strip()
+    if not value:
+        return None
+    try:
+        return int(value)
+    except ValueError:
+        return None
+
+
+def _admin_memory_url(
+    *,
+    group_id: int | None = None,
+    status: str = "active",
+    limit: int = 80,
+    user_id: int | None = None,
+    atom_type: str = "",
+    q: str = "",
+    notice: str = "",
+) -> str:
+    params: dict[str, object] = {"status": status or "active", "limit": limit}
+    if group_id is not None:
+        params["group_id"] = group_id
+    if user_id is not None:
+        params["user_id"] = user_id
+    if atom_type.strip():
+        params["atom_type"] = atom_type.strip()
+    if q.strip():
+        params["q"] = q.strip()
+    if notice.strip():
+        params["notice"] = notice.strip()
+    return "/admin/memory?" + urlencode(params)
+
+
+def _admin_memory_detail_url(atom_id: int, *, notice: str = "") -> str:
+    params = {"notice": notice.strip()} if notice.strip() else {}
+    return f"/admin/memory/{int(atom_id)}" + ("?" + urlencode(params) if params else "")
 
 
 def _is_local_admin_request(request: Request) -> bool:
