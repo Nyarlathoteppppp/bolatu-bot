@@ -46,6 +46,7 @@ from .approval_rules import (
 from .admin_ui import (
     render_admin_dashboard,
     render_admin_edit_page,
+    render_admin_tools_page,
     render_memory_audit_page,
     render_memory_atom_detail_page,
     render_memory_summaries_page,
@@ -328,6 +329,60 @@ if hasattr(_driver, "server_app"):
                 plugins=local_plugin_registry.summary(),
             )
         )
+
+    @_driver.server_app.get("/admin/tools")
+    async def _http_admin_tools_endpoint(
+        request: Request,
+        group_id: int | None = None,
+        notice: str = "",
+    ) -> HTMLResponse:
+        if not _is_local_admin_request(request):
+            return HTMLResponse("local admin only", status_code=403)
+        selected_group_id = _admin_selected_group_id(group_id)
+        return HTMLResponse(
+            render_admin_tools_page(
+                state=_admin_tools_state(selected_group_id),
+                selected_group_id=selected_group_id,
+                notice=notice,
+            )
+        )
+
+    @_driver.server_app.get("/admin/tools/report")
+    async def _http_admin_tools_report_endpoint(
+        request: Request,
+        kind: str = "metrics",
+        group_id: int | None = None,
+        limit: int = 20,
+        window: str = "today",
+        query: str = "",
+    ) -> HTMLResponse:
+        if not _is_local_admin_request(request):
+            return HTMLResponse("local admin only", status_code=403)
+        selected_group_id = _admin_selected_group_id(group_id)
+        title, report = await _admin_tools_report(
+            kind=kind,
+            group_id=selected_group_id,
+            limit=limit,
+            window=window,
+            query=query,
+        )
+        return HTMLResponse(
+            render_admin_tools_page(
+                state=_admin_tools_state(selected_group_id),
+                selected_group_id=selected_group_id,
+                report_title=title,
+                report_text=report,
+            )
+        )
+
+    @_driver.server_app.post("/admin/tools/action")
+    async def _http_admin_tools_action_endpoint(request: Request):
+        if not _is_local_admin_request(request):
+            return HTMLResponse("local admin only", status_code=403)
+        form = await _admin_form_data(request)
+        group_id = _admin_selected_group_id(_admin_form_int(form, "group_id"))
+        notice = await _admin_apply_tool_action(form, group_id=group_id)
+        return RedirectResponse(url=_admin_tools_url(group_id=group_id, notice=notice), status_code=303)
 
     @_driver.server_app.get("/admin/edit")
     async def _http_admin_edit_endpoint(request: Request, file: str = "prompt", notice: str = "") -> HTMLResponse:
@@ -2993,6 +3048,263 @@ def _admin_summaries_url(
 def _admin_summary_detail_url(summary_id: int, *, notice: str = "") -> str:
     params = {"notice": notice.strip()} if notice.strip() else {}
     return f"/admin/summaries/{int(summary_id)}" + ("?" + urlencode(params) if params else "")
+
+
+def _admin_selected_group_id(group_id: int | None = None) -> int | None:
+    if group_id is not None:
+        return int(group_id)
+    groups = _runtime_target_groups()
+    return groups[0] if groups else None
+
+
+def _admin_tools_url(*, group_id: int | None = None, notice: str = "") -> str:
+    params: dict[str, object] = {}
+    if group_id is not None:
+        params["group_id"] = group_id
+    if notice.strip():
+        params["notice"] = notice.strip()
+    return "/admin/tools" + ("?" + urlencode(params) if params else "")
+
+
+def _admin_tools_state(group_id: int | None) -> dict[str, object]:
+    overrides = _model_route_overrides()
+    model_rows: list[dict[str, object]] = []
+    for route_name, title, flow in MODEL_ROUTE_INFOS:
+        configured = app_config.deepseek.routes[route_name].label
+        fallback = app_config.deepseek.fallback_routes[route_name].label
+        active = deepseek_client.current_route(route_name).label if deepseek_client is not None else overrides.get(route_name, configured)
+        model_rows.append(
+            {
+                "route": route_name,
+                "title": title,
+                "flow": flow,
+                "active": active,
+                "configured": configured,
+                "fallback": fallback,
+                "overridden": route_name in overrides,
+            }
+        )
+    jargon_entries = []
+    if group_id is not None:
+        jargon_entries = [
+            {
+                "term": entry.term,
+                "explanation": entry.explanation,
+                "created_by": entry.created_by,
+                "created_at": entry.created_at,
+            }
+            for entry in memory.custom_jargon_entries(group_id)
+        ]
+    return {
+        "selected_group_id": group_id,
+        "groups": _status_groups(),
+        "approval": {
+            "review_enabled": _approval_review_enabled(),
+            "mode": "人工审查" if _approval_review_enabled() else "免审直发",
+            "auto_send_percent": _approval_auto_send_percent(),
+            "pending_count": len(pending_group_approvals),
+            "owners": list(OWNER_USER_IDS),
+            "basic_users": sorted(_basic_approval_user_ids()),
+            "all_users": list(_approval_user_ids()),
+        },
+        "work_intensity": {
+            "current_percent": _ai_work_intensity_percent(),
+            "base_percent": _ai_work_intensity_base_percent(),
+            "band": _ai_work_intensity_band()[0],
+        },
+        "private_chat": {
+            "config_ids": sorted(app_config.allowed_private_users),
+            "runtime_ids": sorted(_runtime_private_whitelist()),
+            "implicit_chat_ids": sorted(set(TOOL_ADMIN_USER_IDS) - set(COMMAND_ONLY_PRIVATE_USER_IDS)),
+            "command_only_ids": sorted(COMMAND_ONLY_PRIVATE_USER_IDS),
+            "force_obey_enabled": _private_force_obey_enabled(PRIVATE_DEBUG_OWNER_ID),
+        },
+        "models": model_rows,
+        "model_catalog": [
+            {
+                "label": route.label,
+                "source": f"{_provider_key_source(route.provider)} / {app_config.deepseek.providers[route.provider].api_key_env}",
+            }
+            for route in app_config.deepseek.model_catalog
+        ],
+        "jargon_entries": jargon_entries,
+        "tool_docs": {
+            "目录": BOT_TOOL_INDEX_MESSAGE,
+            **BOT_TOOL_SECTION_MESSAGES,
+        },
+    }
+
+
+async def _admin_apply_tool_action(form: dict[str, str], *, group_id: int | None) -> str:
+    action = form.get("action", "").strip()
+    if action == "group_decision":
+        if group_id is None:
+            return "没有目标群。"
+        enabled = form.get("enabled") == "1"
+        memory.set_group_enabled(group_id, enabled)
+        if not enabled:
+            pending_group_approvals.pop(group_id, None)
+        bot = _first_connected_onebot_bot()
+        if bot is not None:
+            await _sync_group_status_cards(bot, reason="admin_tools")
+        return "已开启群聊决策。" if enabled else "已关闭群聊决策，并清空该群待审候选。"
+    if action == "review_enabled":
+        enabled = form.get("enabled") == "1"
+        _set_approval_review_enabled_value(enabled)
+        if not enabled:
+            pending_group_approvals.clear()
+        return "已开启人工审查。" if enabled else "已关闭人工审查，待审候选已清空。"
+    if action == "approval_auto_send":
+        percent = _set_approval_auto_send_percent(_safe_admin_percent(form.get("percent"), default=_approval_auto_send_percent()))
+        return f"已设置免审自动发送概率：{percent}%。"
+    if action == "work_intensity":
+        percent = _set_ai_work_intensity_percent(_safe_admin_percent(form.get("percent"), default=_ai_work_intensity_percent()))
+        return f"已设置当前时段 AI 工作强度：{percent}%。"
+    if action == "quiet_group":
+        if group_id is None:
+            return "没有目标群。"
+        minutes = max(0, min(24 * 60, _safe_admin_int(form.get("minutes"), default=10)))
+        memory.mute_until(group_id, 0 if minutes <= 0 else time.time() + minutes * 60)
+        return "已解除闭嘴。" if minutes <= 0 else f"已设置闭嘴 {minutes} 分钟。"
+    if action == "approval_user":
+        user_id = _safe_admin_user_id(form.get("user_id"))
+        if user_id is None:
+            return "审批人 QQ 号无效。"
+        basic = _basic_approval_user_ids()
+        if form.get("op") == "delete":
+            basic.discard(user_id)
+            _save_basic_approval_user_ids(basic)
+            return f"已删除基础审批人：{user_id}。"
+        if user_id in OWNER_USER_IDS:
+            return "这个号已经是主人权限。"
+        basic.add(user_id)
+        _save_basic_approval_user_ids(basic)
+        return f"已添加基础审批人：{user_id}。"
+    if action == "private_whitelist":
+        user_id = _safe_admin_user_id(form.get("user_id"))
+        if user_id is None:
+            return "私聊 QQ 号无效。"
+        runtime_ids = _runtime_private_whitelist()
+        if form.get("op") == "delete":
+            runtime_ids.discard(user_id)
+            _save_runtime_private_whitelist(runtime_ids)
+            return f"已删除运行时私聊白名单：{user_id}。"
+        runtime_ids.add(user_id)
+        _save_runtime_private_whitelist(runtime_ids)
+        return f"已添加运行时私聊白名单：{user_id}。"
+    if action == "force_obey":
+        enabled = form.get("enabled") == "1"
+        ok = _set_private_force_obey_enabled(PRIVATE_DEBUG_OWNER_ID, enabled)
+        if not ok:
+            return "强服从设置失败。"
+        return "已开启测试号强服从。" if enabled else "已关闭测试号强服从。"
+    if action == "model_reset":
+        _save_model_route_overrides({})
+        if deepseek_client is not None:
+            for route_name in MODEL_ROUTE_STORAGE_NAMES:
+                deepseek_client.set_route_override(route_name, None)
+        return "已清除模型覆盖，恢复 config.yaml 默认模型。"
+    if action == "model_route":
+        if deepseek_client is None:
+            return "模型客户端还没初始化。"
+        route_name = form.get("route", "").strip()
+        route_label = form.get("model", "").strip()
+        if route_name not in (*MODEL_ROUTE_NAMES, "utility_group"):
+            return "未知模型流程。"
+        try:
+            route = deepseek_client.parse_model_route(route_label, default_provider="siliconflow")
+        except Exception as exc:
+            return f"模型路由解析失败：{exc}"
+        target_routes = UTILITY_GROUP_ROUTE_NAMES if route_name == "utility_group" else (route_name,)
+        overrides = _model_route_overrides()
+        for target_route in target_routes:
+            deepseek_client.set_route_override(target_route, route)
+            overrides[target_route] = route.label
+        _save_model_route_overrides(overrides)
+        return f"已切换模型：{', '.join(target_routes)} -> {route.label}。"
+    if action == "jargon_add":
+        if group_id is None:
+            return "没有目标群。"
+        term = form.get("term", "").strip()
+        meaning = form.get("meaning", "").strip()
+        if not term or not meaning:
+            return "黑话词和解释都要填。"
+        memory.upsert_custom_jargon(group_id=group_id, term=term, explanation=meaning, created_by=0)
+        return f"已写入黑话：{term}。"
+    if action == "jargon_delete":
+        if group_id is None:
+            return "没有目标群。"
+        term = form.get("term", "").strip()
+        if not term:
+            return "要填写删除词。"
+        return "已删除黑话。" if memory.delete_custom_jargon(group_id, term) else "没有找到这条黑话。"
+    if action == "daily_review":
+        mode = form.get("mode", "today").strip() or "today"
+        payload, _ = await _http_daily_review_payload(mode=mode)
+        return f"复盘发送结果：{payload}"
+    return "未知工具动作。"
+
+
+async def _admin_tools_report(
+    *,
+    kind: str,
+    group_id: int | None,
+    limit: int,
+    window: str,
+    query: str,
+) -> tuple[str, str]:
+    safe_limit = max(1, min(80, int(limit or 20)))
+    clean_kind = (kind or "metrics").strip().casefold()
+    if clean_kind == "blocked":
+        return "最近拦截", _format_suppression_report(safe_limit)
+    if clean_kind == "metrics":
+        return "Bot 统计", _format_metric_report(_parse_token_report_window(window or "today"), group_id=group_id)
+    if clean_kind == "token":
+        return "Token 用量", _token_usage_report_for_window(_parse_token_report_window(window or "24h"))
+    if clean_kind == "memory":
+        return "近期回想", _format_recent_memory_report(group_id, min(safe_limit, 30))
+    if clean_kind == "style":
+        return "近期风格", _format_recent_style_report(group_id, min(safe_limit, 30))
+    if clean_kind == "members":
+        return "群友画像", _format_member_impression_report(group_id, min(safe_limit, 30))
+    if clean_kind == "atoms":
+        return "记忆单元", _format_memory_atom_report(group_id, min(safe_limit, 50))
+    if clean_kind == "rag_status":
+        return "RAG 状态", rag_admin.status_report()
+    if clean_kind == "rag_test":
+        if not query.strip():
+            return "RAG 测试", "请输入 query。"
+        result = await rag_admin.handle(f"RAG测试 {query.strip()}", group_id=group_id, operator_id=0)
+        return "RAG 测试", result.text
+    if clean_kind == "rag_knowledge":
+        result = await rag_admin.handle("RAG知识库", group_id=group_id, operator_id=0)
+        return "RAG 知识库", result.text
+    if clean_kind == "rag_feedback":
+        result = await rag_admin.handle("RAG反馈列表", group_id=group_id, operator_id=0)
+        return "RAG 反馈", result.text
+    if clean_kind == "rag_eval":
+        result = await rag_admin.handle("RAG评测列表", group_id=group_id, operator_id=0)
+        return "RAG 评测", result.text
+    return "未知报告", f"未知 kind={kind}"
+
+
+def _safe_admin_percent(value: str | None, *, default: int) -> int:
+    return max(0, min(100, _safe_admin_int(value, default=default)))
+
+
+def _safe_admin_int(value: str | None, *, default: int) -> int:
+    try:
+        return int(str(value or "").strip())
+    except (TypeError, ValueError):
+        return default
+
+
+def _safe_admin_user_id(value: str | None) -> int | None:
+    try:
+        user_id = int(str(value or "").strip())
+    except (TypeError, ValueError):
+        return None
+    return user_id if 10000 <= user_id <= 999999999999 else None
 
 
 def _is_local_admin_request(request: Request) -> bool:

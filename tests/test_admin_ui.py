@@ -1,5 +1,6 @@
 from qq_social_agent.admin_ui import (
     render_admin_edit_page,
+    render_admin_tools_page,
     render_memory_atom_detail_page,
     render_memory_audit_page,
     render_memory_summaries_page,
@@ -153,4 +154,53 @@ def test_admin_edit_and_memory_summary_pages_render(tmp_path) -> None:
     assert "新增人工回想" in list_html
     assert "编辑并保留" in detail_html
     assert "群里聊过小鸟" in detail_html
+
+def test_admin_tools_page_renders_controls_and_docs() -> None:
+    state = {
+        "groups": [{"group_id": 1026813421, "enabled": True, "persona": "zhangxuefeng", "muted_left_seconds": 0}],
+        "approval": {
+            "review_enabled": True,
+            "mode": "人工审查",
+            "auto_send_percent": 30,
+            "pending_count": 0,
+            "owners": [1535071184],
+            "basic_users": [3370998238],
+            "all_users": [1535071184, 3370998238],
+        },
+        "work_intensity": {"current_percent": 8, "base_percent": 8, "band": "day"},
+        "private_chat": {
+            "config_ids": [2776760548],
+            "runtime_ids": [3115344487],
+            "command_only_ids": [1535071184],
+            "force_obey_enabled": False,
+        },
+        "models": [
+            {
+                "route": "reply",
+                "title": "回复",
+                "flow": "生成回复",
+                "active": "siliconflow/MiniMaxAI/MiniMax-M2.5",
+                "configured": "siliconflow/MiniMaxAI/MiniMax-M2.5",
+                "fallback": "deepseek/deepseek-v4-flash",
+                "overridden": False,
+            }
+        ],
+        "model_catalog": [
+            {"label": "siliconflow/MiniMaxAI/MiniMax-M2.5", "source": "硅基流动"}
+        ],
+        "jargon_entries": [
+            {"term": "咱妈", "explanation": "中国", "created_by": 1535071184, "created_at": 100}
+        ],
+        "tool_docs": {"目录": "工具目录"},
+    }
+
+    html = render_admin_tools_page(state=state, selected_group_id=1026813421, report_title="报告", report_text="内容")
+
+    assert "工具控制台" in html
+    assert "免审概率" in html
+    assert "模型路由" in html
+    assert "黑话词典" in html
+    assert "RAG状态" in html
+    assert "pending_count" in html and ">0<" in html
+    assert "工具目录" in html
 

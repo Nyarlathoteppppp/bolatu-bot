@@ -65,6 +65,41 @@ def render_admin_dashboard(
     return _page('张风雪 Admin', body)
 
 
+def render_admin_tools_page(
+    *,
+    state: dict[str, Any],
+    selected_group_id: int | None,
+    notice: str = "",
+    report_title: str = "",
+    report_text: str = "",
+) -> str:
+    body = f"""
+    {_header('工具控制台')}
+    <main>
+      {_notice(notice)}
+      <section class="grid cards">
+        {_tools_status_card('群聊决策', state.get('groups', []))}
+        {_tools_kv_card('审查/审批', state.get('approval', {}))}
+        {_tools_kv_card('工作强度', state.get('work_intensity', {}))}
+        {_tools_private_card(state.get('private_chat', {}))}
+      </section>
+      <section class="grid two">
+        {_panel('运行开关', _tools_switch_forms(state))}
+        {_panel('审批人 / 私聊 / 强服从', _tools_user_forms(state))}
+      </section>
+      <section class="grid two">
+        {_panel('模型路由', _tools_model_forms(state))}
+        {_panel('黑话词典', _tools_jargon_forms(state, selected_group_id))}
+      </section>
+      <section class="panel wide"><h2>报告与调试</h2>{_tools_report_links(selected_group_id)}{_report_block(report_title, report_text)}</section>
+      <section class="panel wide"><h2>QQ 工具单说明</h2>{_tool_docs(state.get('tool_docs', {}))}</section>
+    </main>
+    {_footer()}
+    """
+    return _page('张风雪工具控制台', body)
+
+
+
 def render_memory_audit_page(
     *,
     memory: MemoryStore,
@@ -280,13 +315,13 @@ table {{ border-collapse:collapse; width:100%; }} th,td {{ border-bottom:1px sol
 code,pre {{ font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; }} pre {{ white-space:pre-wrap; margin:6px 0 0; color:var(--muted); font-size:12px; }}
 .badge {{ display:inline-block; padding:2px 6px; border:1px solid var(--line); border-radius:999px; color:var(--muted); margin:0 4px 4px 0; font-size:12px; }}
 .tabs,.groupnav {{ display:flex; gap:8px; flex-wrap:wrap; margin:0 0 14px; }} .tabs a,.groupnav a,.btn {{ display:inline-block; padding:6px 9px; border:1px solid var(--line); border-radius:6px; background:var(--panel); }} .tabs a.active,.groupnav a.active {{ border-color:var(--accent); color:var(--accent); }}
-.actions {{ display:flex; gap:5px; flex-wrap:wrap; }} .danger {{ color:var(--bad); }} .notice {{ padding:10px 12px; background:var(--panel); border:1px solid var(--line); border-radius:8px; margin-bottom:14px; }} .small {{ font-size:12px; }}
+.actions {{ display:flex; gap:5px; flex-wrap:wrap; }} .danger {{ color:var(--bad); }} .notice {{ padding:10px 12px; background:var(--panel); border:1px solid var(--line); border-radius:8px; margin-bottom:14px; }} .small {{ font-size:12px; }} .mini {{ max-width:160px; }} .inline {{ display:inline-flex; gap:6px; align-items:end; flex-wrap:wrap; margin:4px 8px 8px 0; }} details {{ margin:8px 0; }} summary {{ cursor:pointer; color:var(--accent); }}
 .filters {{ display:grid; grid-template-columns:repeat(6,minmax(120px,1fr)); gap:10px; align-items:end; }} .field label {{ display:block; color:var(--muted); font-size:12px; margin-bottom:4px; }} input,select,textarea {{ width:100%; padding:7px 8px; border:1px solid var(--line); border-radius:6px; background:var(--panel); color:var(--fg); }} textarea {{ min-height:96px; }} button {{ padding:7px 10px; border:1px solid var(--accent); border-radius:6px; background:var(--accent); color:white; cursor:pointer; }} @media(max-width:1000px) {{ .filters {{ grid-template-columns:1fr 1fr; }} }}
 </style></head><body>{body}</body></html>"""
 
 
 def _header(title: str) -> str:
-    return f'<header><h1>{_e(title)}</h1><nav><a href="/admin">概览</a><a href="/admin/edit">编辑</a><a href="/admin/summaries">回想</a><a href="/admin/memory">记忆审计</a><a href="/admin/plugins">插件</a><a href="/trace">Trace</a><a href="/readyz">Ready JSON</a></nav></header>'
+    return f'<header><h1>{_e(title)}</h1><nav><a href="/admin">概览</a><a href="/admin/tools">工具</a><a href="/admin/edit">编辑</a><a href="/admin/summaries">回想</a><a href="/admin/memory">记忆审计</a><a href="/admin/plugins">插件</a><a href="/trace">Trace</a><a href="/readyz">Ready JSON</a></nav></header>'
 
 
 def _footer() -> str:
@@ -327,6 +362,206 @@ def _approval_card(pending: list[object]) -> str:
         items.append(f'<li><b>{_e(str(getattr(approval, "approval_id", "")))}</b> 群 {getattr(approval, "group_id", "")} 触发：{_e(str(getattr(approval, "trigger_nickname", "")))}<br><span class="muted">{_e(_trim(str(getattr(approval, "trigger_text", "")), 120))}</span></li>')
     return f'<section class="card"><h2>审批队列：{len(pending)}</h2><ul>{"".join(items)}</ul></section>'
 
+
+
+
+
+def _tools_status_card(title: str, groups: object) -> str:
+    rows = groups if isinstance(groups, list) else []
+    if not rows:
+        return f'<section class="card"><h2>{_e(title)}</h2><p class="muted">没有目标群。</p></section>'
+    enabled = sum(1 for row in rows if isinstance(row, dict) and row.get('enabled'))
+    lines = ''.join(
+        f'<li>群 {_e(row.get("group_id"))}: {"开启" if row.get("enabled") else "关闭"}<br><span class="muted small">persona={_e(row.get("persona"))} muted_left={_e(_join_display(row.get("muted_left_seconds", 0)))}s</span></li>'
+        for row in rows if isinstance(row, dict)
+    )
+    return f'<section class="card"><h2>{_e(title)}</h2><p><b>{enabled}/{len(rows)}</b> 开启</p><ul>{lines}</ul></section>'
+
+
+def _tools_kv_card(title: str, payload: object) -> str:
+    data = payload if isinstance(payload, dict) else {}
+    rows = ''.join(f'<tr><th>{_e(key)}</th><td>{_e(_join_display(value))}</td></tr>' for key, value in data.items())
+    return f'<section class="card"><h2>{_e(title)}</h2><table>{rows}</table></section>'
+
+
+def _tools_private_card(payload: object) -> str:
+    data = payload if isinstance(payload, dict) else {}
+    rows = [
+        ('固定白名单', _join_display(data.get('config_ids'))),
+        ('运行时白名单', _join_display(data.get('runtime_ids'))),
+        ('命令专用', _join_display(data.get('command_only_ids'))),
+        ('强服从', '开启' if data.get('force_obey_enabled') else '关闭'),
+    ]
+    return '<section class="card"><h2>私聊</h2><table>' + ''.join(f'<tr><th>{_e(k)}</th><td>{_e(v)}</td></tr>' for k, v in rows) + '</table></section>'
+
+
+def _tools_switch_forms(state: dict[str, Any]) -> str:
+    groups = state.get('groups') if isinstance(state.get('groups'), list) else []
+    group_options = ''.join(f'<option value="{_e(row.get("group_id"))}">群 {_e(row.get("group_id"))}</option>' for row in groups if isinstance(row, dict))
+    group_form = (
+        '<form class="inline" method="post" action="/admin/tools/action">'
+        '<input type="hidden" name="action" value="group_decision">'
+        f'<div class="field"><label>群</label><select name="group_id">{group_options}</select></div>'
+        '<div class="field"><label>状态</label><select name="enabled"><option value="1">开启群聊决策</option><option value="0">关闭群聊决策</option></select></div>'
+        '<button type="submit">应用</button></form>'
+    )
+    review = state.get('approval') if isinstance(state.get('approval'), dict) else {}
+    review_form = (
+        '<form class="inline" method="post" action="/admin/tools/action">'
+        '<input type="hidden" name="action" value="review_enabled">'
+        '<div class="field"><label>人工审查</label><select name="enabled"><option value="1">开启审查</option><option value="0">关闭审查</option></select></div>'
+        '<button type="submit">应用</button></form>'
+    )
+    auto_form = (
+        '<form class="inline" method="post" action="/admin/tools/action">'
+        '<input type="hidden" name="action" value="approval_auto_send">'
+        f'<div class="field"><label>免审概率%</label><input class="mini" name="percent" value="{_e(review.get("auto_send_percent", 0))}"></div>'
+        '<button type="submit">设置</button></form>'
+    )
+    work = state.get('work_intensity') if isinstance(state.get('work_intensity'), dict) else {}
+    work_form = (
+        '<form class="inline" method="post" action="/admin/tools/action">'
+        '<input type="hidden" name="action" value="work_intensity">'
+        f'<div class="field"><label>工作强度%</label><input class="mini" name="percent" value="{_e(work.get("current_percent", 0))}"></div>'
+        '<button type="submit">设置</button></form>'
+    )
+    quiet_form = (
+        '<form class="inline" method="post" action="/admin/tools/action">'
+        '<input type="hidden" name="action" value="quiet_group">'
+        f'<div class="field"><label>群</label><select name="group_id">{group_options}</select></div>'
+        '<div class="field"><label>闭嘴分钟，0 为解除</label><input class="mini" name="minutes" value="10"></div>'
+        '<button type="submit">设置</button></form>'
+    )
+    review_now = (
+        '<form class="inline" method="post" action="/admin/tools/action">'
+        '<input type="hidden" name="action" value="daily_review">'
+        '<div class="field"><label>复盘</label><select name="mode"><option value="today">今天到现在</option><option value="due">补发到期</option></select></div>'
+        '<button type="submit">发送复盘</button></form>'
+    )
+    return group_form + review_form + auto_form + work_form + quiet_form + review_now
+
+
+def _tools_user_forms(state: dict[str, Any]) -> str:
+    approval = state.get('approval') if isinstance(state.get('approval'), dict) else {}
+    private = state.get('private_chat') if isinstance(state.get('private_chat'), dict) else {}
+    approval_report = (
+        f'<p><b>主人：</b>{_e(_join_display(approval.get("owners")))}<br>'
+        f'<b>基础审批：</b>{_e(_join_display(approval.get("basic_users")))}<br>'
+        f'<b>接收审批单：</b>{_e(_join_display(approval.get("all_users")))}</p>'
+    )
+    approver_form = (
+        '<form class="inline" method="post" action="/admin/tools/action">'
+        '<input type="hidden" name="action" value="approval_user">'
+        '<div class="field"><label>基础审批人 QQ</label><input name="user_id" class="mini"></div>'
+        '<div class="field"><label>动作</label><select name="op"><option value="add">添加</option><option value="delete">删除</option></select></div>'
+        '<button type="submit">应用</button></form>'
+    )
+    private_report = f'<p><b>运行时私聊：</b>{_e(_join_display(private.get("runtime_ids")))}</p>'
+    private_form = (
+        '<form class="inline" method="post" action="/admin/tools/action">'
+        '<input type="hidden" name="action" value="private_whitelist">'
+        '<div class="field"><label>私聊 QQ</label><input name="user_id" class="mini"></div>'
+        '<div class="field"><label>动作</label><select name="op"><option value="add">添加</option><option value="delete">删除</option></select></div>'
+        '<button type="submit">应用</button></form>'
+    )
+    force_form = (
+        '<form class="inline" method="post" action="/admin/tools/action">'
+        '<input type="hidden" name="action" value="force_obey">'
+        '<div class="field"><label>测试号强服从</label><select name="enabled"><option value="1">开启</option><option value="0">关闭</option></select></div>'
+        '<button type="submit">应用</button></form>'
+    )
+    return approval_report + approver_form + private_report + private_form + force_form
+
+
+def _tools_model_forms(state: dict[str, Any]) -> str:
+    routes = state.get('models') if isinstance(state.get('models'), list) else []
+    catalog = state.get('model_catalog') if isinstance(state.get('model_catalog'), list) else []
+    route_options = ''.join(f'<option value="{_e(row.get("route"))}">{_e(row.get("title"))} ({_e(row.get("route"))})</option>' for row in routes if isinstance(row, dict))
+    model_options = ''.join(f'<option value="{_e(row.get("label"))}">{_e(row.get("label"))} - {_e(row.get("source"))}</option>' for row in catalog if isinstance(row, dict))
+    form = (
+        '<form class="inline" method="post" action="/admin/tools/action">'
+        '<input type="hidden" name="action" value="model_route">'
+        f'<div class="field"><label>流程</label><select name="route">{route_options}<option value="utility_group">工具组</option></select></div>'
+        f'<div class="field"><label>模型</label><select name="model">{model_options}</select></div>'
+        '<button type="submit">切换</button></form>'
+        '<form class="inline" method="post" action="/admin/tools/action"><input type="hidden" name="action" value="model_reset"><button type="submit">清模型覆盖</button></form>'
+    )
+    table = ['<table><tr><th>流程</th><th>当前</th><th>config</th><th>fallback</th></tr>']
+    for row in routes:
+        if not isinstance(row, dict):
+            continue
+        suffix = ' <span class="badge">覆盖</span>' if row.get('overridden') else ''
+        table.append(f'<tr><td>{_e(row.get("title"))}<br><span class="muted small">{_e(row.get("flow"))}</span></td><td>{_e(row.get("active"))}{suffix}</td><td>{_e(row.get("configured"))}</td><td>{_e(row.get("fallback"))}</td></tr>')
+    table.append('</table>')
+    return form + ''.join(table)
+
+
+def _tools_jargon_forms(state: dict[str, Any], selected_group_id: int | None) -> str:
+    group_id = selected_group_id or state.get('selected_group_id')
+    entries = state.get('jargon_entries') if isinstance(state.get('jargon_entries'), list) else []
+    form = (
+        '<form class="inline" method="post" action="/admin/tools/action">'
+        '<input type="hidden" name="action" value="jargon_add">'
+        f'<input type="hidden" name="group_id" value="{_e(group_id or "")}">'
+        '<div class="field"><label>词</label><input name="term" class="mini"></div>'
+        '<div class="field"><label>解释</label><input name="meaning" placeholder="指代：中国"></div>'
+        '<button type="submit">添加/更新</button></form>'
+        '<form class="inline" method="post" action="/admin/tools/action">'
+        '<input type="hidden" name="action" value="jargon_delete">'
+        f'<input type="hidden" name="group_id" value="{_e(group_id or "")}">'
+        '<div class="field"><label>删除词</label><input name="term" class="mini"></div>'
+        '<button type="submit">删除</button></form>'
+    )
+    if not entries:
+        return form + '<p class="muted">暂无自定义黑话。</p>'
+    rows = ''.join(f'<tr><td>{_e(row.get("term"))}</td><td>{_e(row.get("explanation"))}</td><td>{_e(row.get("created_by"))}</td><td>{_fmt_time(row.get("created_at"))}</td></tr>' for row in entries if isinstance(row, dict))
+    return form + '<table><tr><th>词</th><th>解释</th><th>创建者</th><th>时间</th></tr>' + rows + '</table>'
+
+
+def _tools_report_links(group_id: int | None) -> str:
+    params = {'group_id': group_id} if group_id is not None else {}
+    specs = [
+        ('blocked', '拦截20'), ('metrics', '统计今日'), ('token', 'Token'), ('memory', '回想20'),
+        ('style', '风格20'), ('members', '群友画像20'), ('atoms', '记忆单元20'),
+        ('rag_status', 'RAG状态'), ('rag_knowledge', 'RAG知识库'), ('rag_feedback', 'RAG反馈'), ('rag_eval', 'RAG评测'),
+    ]
+    links = []
+    for kind, label in specs:
+        query = dict(params)
+        query.update({'kind': kind, 'limit': 20, 'window': 'today'})
+        links.append(f'<a class="btn" href="/admin/tools/report{_query_suffix(query)}">{_e(label)}</a>')
+    rag_test = (
+        '<form class="inline" method="get" action="/admin/tools/report">'
+        '<input type="hidden" name="kind" value="rag_test">'
+        f'<input type="hidden" name="group_id" value="{_e(group_id or "")}">'
+        '<div class="field"><label>RAG测试 query</label><input name="query" placeholder="以前谁聊过..."></div>'
+        '<button type="submit">测试</button></form>'
+    )
+    return '<div class="actions">' + ''.join(links) + '</div>' + rag_test
+
+
+def _report_block(title: str, text: str) -> str:
+    if not text:
+        return ''
+    return f'<section class="panel wide" style="margin-top:12px"><h2>{_e(title or "报告")}</h2><pre>{_e(text)}</pre></section>'
+
+
+def _tool_docs(docs: object) -> str:
+    data = docs if isinstance(docs, dict) else {}
+    if not data:
+        return '<p class="muted">暂无工具说明。</p>'
+    out = []
+    for key, text in data.items():
+        out.append(f'<details><summary>{_e(key)}</summary><pre>{_e(text)}</pre></details>')
+    return ''.join(out)
+
+
+def _join_display(value: object) -> str:
+    if isinstance(value, (list, tuple, set)):
+        return '、'.join(str(item) for item in value) or '无'
+    if value in (None, ''):
+        return '无'
+    return str(value)
 
 
 def _editable_file_tabs(editable_files: list[dict[str, str]], selected_key: str) -> str:
@@ -586,8 +821,8 @@ def _memory_atom_table(
 ) -> str:
     if not atoms:
         return '<p class="muted">没有符合条件的记忆。</p>'
-    out = ['<table><tr><th>ID</th><th>类型/主体</th><th>内容</th><th>分数</th><th>状态</th><th>操作</th></tr>']
-    for atom in atoms:
+    out = ['<p class="muted small">No. 是当前筛选结果里的显示序号；真实 ID 是数据库主键，会因纠正、合并、过期和新建而跳号，这是正常的审计设计。</p><table><tr><th>No.</th><th>真实 ID</th><th>类型/主体</th><th>内容</th><th>分数</th><th>状态</th><th>操作</th></tr>']
+    for number, atom in enumerate(atoms, start=1):
         subject = []
         if atom.subject_user_id is not None:
             subject.append(f'subject={atom.subject_user_id}')
@@ -595,7 +830,7 @@ def _memory_atom_table(
             subject.append(f'object={atom.object_user_id}')
         detail_href = f'/admin/memory/{atom.id}' + _query_suffix(_memory_filter_params(group_id=group_id, status=status, limit=limit, user_id=user_id, atom_type=atom_type, q=q))
         out.append(
-            f'<tr><td><a href="{detail_href}">#{atom.id}</a></td>'
+            f'<tr><td>{number}</td><td><a href="{detail_href}">#{atom.id}</a></td>'
             f'<td><span class="badge">{_e(atom.atom_type)}</span><br><span class="muted small">{_e(" / ".join(subject))}</span></td>'
             f'<td>{_e(atom.content)}<br><span class="muted small">source={_e(atom.source)} updated={_fmt_time(atom.updated_at)}</span></td>'
             f'<td>conf {atom.confidence:.2f}<br>imp {atom.importance:.2f}</td><td>{_e(atom.status)}</td>'
@@ -889,4 +1124,4 @@ def _trim(text: str, limit: int) -> str:
 
 
 def _e(value: object) -> str:
-    return html.escape(str(value or ''), quote=True)
+    return "" if value is None else html.escape(str(value), quote=True)
