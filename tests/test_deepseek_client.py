@@ -31,6 +31,18 @@ def test_sanitize_empty_string_markers() -> None:
     assert _sanitize_reply('"（空字符串）"', 120) == ""
 
 
+def test_sanitize_removes_json_artifact_fragments() -> None:
+    text = '你问我才答的嘛~咋了，突然聊贝叶斯也觉得奇怪？"}]} 格式：{'
+
+    assert _sanitize_reply(text, 120) == "你问我才答的嘛~咋了，突然聊贝叶斯也觉得奇怪？"
+
+
+def test_sanitize_removes_backend_json_instructions_but_keeps_qq_at() -> None:
+    text = '[[at:123456]] 你来讲吧 candidates 请严格按照JSON输出，不要代码块 {}[]'
+
+    assert _sanitize_reply(text, 120) == "[[at:123456]] 你来讲吧"
+
+
 def test_context_marks_only_contiguous_recent_topic_as_high_priority() -> None:
     messages = [
         ChatMessage(1, 1, "A", "在人均弱智的教室只有我智力正常", False, 100.0),

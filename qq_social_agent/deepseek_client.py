@@ -1616,13 +1616,49 @@ def _parse_tool_symbols(raw_symbols: object) -> tuple[ToolSymbol, ...]:
     return tuple(parsed)
 
 
+_REPLY_JSON_ARTIFACT_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"(?i)response_format\s*[:=]\s*\{?\s*[\"']?type[\"']?\s*[:=]\s*[\"']?json_object[\"']?\s*\}?"),
+    re.compile(r"(?i)please\s+respond\s+in\s+json[^，。！？!?\n]*"),
+    re.compile(r"(?i)valid\s+json[^，。！？!?\n]*"),
+    re.compile(r"请严格按照\s*JSON(?:格式)?输出?"),
+    re.compile(r"必须输出合法\s*JSON"),
+    re.compile(r"不要代码块"),
+    re.compile(r"不要输出\s*JSON\s*以外的任何文字"),
+    re.compile(r"格式\s*[:：]\s*\{?"),
+    re.compile(r"(?i)\bcandidates\b"),
+)
+
+
+def _strip_reply_json_artifacts(text: str) -> str:
+    at_placeholders: list[str] = []
+
+    def protect_at(match: re.Match[str]) -> str:
+        at_placeholders.append(match.group(0))
+        return f"__QQ_AT_PLACEHOLDER_{len(at_placeholders) - 1}__"
+
+    cleaned = re.sub(r"\[\[at:\d+\]\]", protect_at, text)
+    cleaned = re.sub(r"```(?:json)?|```", "", cleaned, flags=re.IGNORECASE)
+    for pattern in _REPLY_JSON_ARTIFACT_PATTERNS:
+        cleaned = pattern.sub("", cleaned)
+    cleaned = cleaned.translate(str.maketrans({"{": "", "}": "", "[": "", "]": ""}))
+    for idx, placeholder in enumerate(at_placeholders):
+        cleaned = cleaned.replace(f"__QQ_AT_PLACEHOLDER_{idx}__", placeholder)
+    cleaned = re.sub(r"[\"'“”‘’]+\s*$", "", cleaned)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    cleaned = re.sub(r"\s+([，。！？!?；;：:])", r"\1", cleaned)
+    cleaned = re.sub(r"[，,；;：:]+\s*$", "", cleaned)
+    return cleaned.strip()
+
+
 def _sanitize_reply(content: str, max_chars: int) -> str:
     text = content.strip().strip("\"'")
+    text = _strip_reply_json_artifacts(text).strip("\"'")
     marker = re.sub(r"[\s\"'`“”‘’()（）\[\]【】{}<>《》。.!！?？:：;；,，、-]+", "", text)
     if marker in {"", "空字符串", "无", "不回复", "空", "null", "None"}:
         return ""
     if len(text) > max_chars:
         text = _trim_to_sentence(text, max_chars)
+        text = _strip_reply_json_artifacts(text).strip("\"'")
     return text
 
 
