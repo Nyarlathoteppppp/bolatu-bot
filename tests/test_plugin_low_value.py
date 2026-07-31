@@ -136,7 +136,7 @@ def _pending_approval() -> plugin.PendingGroupApproval:
     )
 
 
-def test_pad_approval_candidates_fills_to_three() -> None:
+def test_backend_approval_candidates_are_not_padded() -> None:
     candidates = [
         plugin.PendingApprovalCandidate(
             index=1,
@@ -146,11 +146,9 @@ def test_pad_approval_candidates_fills_to_three() -> None:
         )
     ]
 
-    plugin._pad_approval_candidates(candidates, action="tease", limit=3)
-
-    assert len(candidates) == 3
-    assert [candidate.index for candidate in candidates] == [1, 2, 3]
-    assert candidates[1].style.startswith("后端补齐")
+    assert len(candidates) == 1
+    assert candidates[0].style == "模型原始候选"
+    assert not hasattr(plugin, "_pad_approval_candidates")
 
 
 def test_group_buffer_seconds_is_six() -> None:
@@ -1933,7 +1931,8 @@ def test_approval_token_report_command_does_not_consume_pending(monkeypatch, tmp
 
     assert handled
     assert plugin.pending_group_approvals[approval.group_id] == approval
-    assert "Token 用量统计：已关闭" in bot.private_messages[-1][1]
+    assert "Token 用量报告" in bot.private_messages[-1][1]
+    assert "decision / deepseek-v4-flash" in bot.private_messages[-1][1]
 
 
 def test_basic_approver_cannot_use_token_tool(monkeypatch, tmp_path) -> None:
@@ -2022,7 +2021,8 @@ def test_approval_token_report_date_command(monkeypatch, tmp_path) -> None:
 
     assert handled
     assert plugin.pending_group_approvals[approval.group_id] == approval
-    assert "Token 用量统计：已关闭" in bot.private_messages[-1][1]
+    assert "Token 用量报告（2026-07-10）" in bot.private_messages[-1][1]
+    assert "decision / deepseek-v4-flash" in bot.private_messages[-1][1]
     assert "old / deepseek-v4-flash" not in bot.private_messages[-1][1]
 
 

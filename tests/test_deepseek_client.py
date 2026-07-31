@@ -43,6 +43,65 @@ def test_sanitize_removes_backend_json_instructions_but_keeps_qq_at() -> None:
     assert _sanitize_reply(text, 120) == "[[at:123456]] 你来讲吧"
 
 
+def test_parse_reply_candidates_drops_non_json_without_text_fallback() -> None:
+    candidates = _parse_reply_candidates(
+        "人在，直接说事。",
+        max_chars=120,
+        fallback_action="reply",
+        limit=1,
+    )
+
+    assert candidates == ()
+
+
+def test_reply_candidates_returns_partial_without_backend_padding() -> None:
+    client = DeepSeekClient.__new__(DeepSeekClient)
+    client.config = SimpleNamespace(
+        max_tokens=300,
+        thinking="disabled",
+        reasoning_effort="low",
+        temperature=0.6,
+    )
+    client.prompts = PromptRegistry()
+    calls = 0
+
+    async def fake_chat_completion(*, task: str, route_name: str, request: dict[str, object]) -> object:
+        nonlocal calls
+        calls += 1
+        return SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(content='{"candidates":[{"text":"唯一一条","style":"自然","action":"reply"}]}'),
+                )
+            ]
+        )
+
+    client._chat_completion = fake_chat_completion
+    persona = Persona(
+        id="test",
+        name="张风雪",
+        description="",
+        prompt="人格",
+        decision_prompt="决策人格",
+        max_reply_chars=120,
+        passive_reply_probability=0.5,
+    )
+
+    candidates = asyncio.run(
+        client.reply_candidates(
+            persona=persona,
+            recent_messages=[],
+            current_text="有人吗",
+            current_nickname="A[#11111]",
+            mentioned=False,
+            candidate_count=3,
+        )
+    )
+
+    assert [candidate.text for candidate in candidates] == ["唯一一条"]
+    assert calls == 2
+
+
 def test_context_marks_only_contiguous_recent_topic_as_high_priority() -> None:
     messages = [
         ChatMessage(1, 1, "A", "在人均弱智的教室只有我智力正常", False, 100.0),

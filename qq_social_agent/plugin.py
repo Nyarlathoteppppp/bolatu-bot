@@ -5238,16 +5238,7 @@ async def _handle_group_message_locked(
             "qq_social_agent reply candidate generation failed: "
             f"group={group_id} addressed={addressed_bot} error={exc}"
         )
-        if not addressed_bot:
-            return
-        reply_candidates = (
-            PendingApprovalCandidate(
-                1,
-                "人在。刚才这句没接稳，你直接说重点。",
-                "reply",
-                "模型异常时的兜底短回复",
-            ),
-        )
+        return
     if not reply_candidates:
         if direct_single_reply:
             logger.info(
@@ -5263,19 +5254,8 @@ async def _handle_group_message_locked(
                 addressed=addressed_bot,
             )
             return
-        if addressed_bot:
-            reply_candidates = (
-                PendingApprovalCandidate(
-                    1,
-                    "我是个美少女人家不知道呢。",
-                    "reply",
-                    "空回复兜底，要求对方补清楚",
-                ),
-            )
-            logger.info(f"qq_social_agent fallback reply: group={group_id} reason=empty_model_reply")
-        else:
-            logger.info(f"qq_social_agent skipped group={group_id}: empty_model_reply")
-            return
+        logger.info(f"qq_social_agent skipped group={group_id}: empty_model_reply")
+        return
 
     approval_candidates: list[PendingApprovalCandidate] = []
     for index, draft in enumerate(reply_candidates, start=1):
@@ -5307,8 +5287,6 @@ async def _handle_group_message_locked(
     if not approval_candidates:
         logger.info(f"qq_social_agent skipped group={group_id}: empty_candidate_after_guard")
         return
-    if len(approval_candidates) < reply_candidate_limit:
-        _pad_approval_candidates(approval_candidates, action=decision.action, limit=reply_candidate_limit)
     generation_elapsed_ms = int((time.monotonic() - generation_started_at) * 1000)
     _pipeline_apply_candidates(
         pipeline_state,
@@ -5537,10 +5515,10 @@ async def _handle_private_message_scoped(
         )
     except Exception as exc:
         logger.warning(f"qq_social_agent private reply generation failed: user={user_id} error={exc}")
-        reply = "我在。刚才模型没接上，你再发一遍重点。"
+        return
     if not reply:
-        reply = "我是个美少女人家不知道呢。"
-        logger.info(f"qq_social_agent fallback private reply: user={user_id} reason=empty_model_reply")
+        logger.info(f"qq_social_agent skipped private reply: user={user_id} reason=empty_model_reply")
+        return
     reply, guarded = sanitize_political_output(reply)
     reply = _sanitize_generated_text(reply)
     if guarded:
@@ -8446,66 +8424,6 @@ def _approval_side_reaction(approval: PendingGroupApproval) -> str:
     if pipeline_state is None:
         return ""
     return str(pipeline_state.decision_side_reaction or "").strip()
-
-
-def _pad_approval_candidates(
-    candidates: list[PendingApprovalCandidate],
-    *,
-    action: str,
-    limit: int,
-) -> None:
-    seen = {re.sub(r"\s+", "", candidate.text) for candidate in candidates}
-    for text in _fallback_approval_candidate_texts(action):
-        compact = re.sub(r"\s+", "", text)
-        if not compact or compact in seen:
-            continue
-        seen.add(compact)
-        candidates.append(
-            PendingApprovalCandidate(
-                index=len(candidates) + 1,
-                text=text,
-                action=action or "reply",
-                style="后端补齐：模型或清洗后候选不足时的保守备选",
-            )
-        )
-        if len(candidates) >= limit:
-            break
-
-
-def _fallback_approval_candidate_texts(action: str) -> tuple[str, ...]:
-    if action == "care":
-        return (
-            "风雪觉得这事先别急，慢慢捋清楚比较好。",
-            "先缓一下，别把自己逼太紧。",
-            "这个先别硬扛，能少受点罪就少受点。",
-        )
-    if action == "agree":
-        return (
-            "风雪觉得这个说法有点道理。",
-            "这句方向没跑偏，至少抓到重点了。",
-            "这个判断还行，不算乱说。",
-        )
-    if action == "answer":
-        return (
-            "这句风雪没接稳，先不乱答。",
-            "这个要看具体上下文，风雪先不瞎判。",
-        )
-    if action == "tease":
-        return (
-            "风雪觉得这事有点抽象。",
-            "这也太会给自己加戏了。",
-            "先别急着上强度，路都快走歪了。",
-        )
-    if action == "ask_back":
-        return (
-            "风雪有点好奇，你这是认真问还是在钓我？",
-            "那你自己先说，你到底想听哪种答案？",
-            "你这句重点是问结果，还是问态度？",
-        )
-    return (
-        "这句风雪先不硬接。",
-        "先放一下，别乱插。",
-    )
 
 
 def _approval_candidate_by_index(

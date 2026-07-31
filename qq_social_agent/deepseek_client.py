@@ -746,15 +746,7 @@ class DeepSeekClient:
         except Exception as exc:
             logger.warning(f"qq_social_agent reply candidates retry failed: error={exc}")
             retry_candidates = ()
-        merged = _merge_reply_candidates(candidates, retry_candidates, limit=candidate_count)
-        if len(merged) >= candidate_count:
-            return merged
-        return _pad_reply_candidates(
-            merged,
-            fallback_action=normalized_action,
-            max_chars=persona.max_reply_chars,
-            limit=candidate_count,
-        )
+        return _merge_reply_candidates(candidates, retry_candidates, limit=candidate_count)
 
     async def daily_review(
         self,
@@ -1673,22 +1665,13 @@ def _parse_reply_candidates(
     try:
         raw = _loads_json_object(content)
     except json.JSONDecodeError:
-        text = _sanitize_reply(content, max_chars)
-        if not text:
-            _log_reply_candidate_parse_diagnostic(
-                raw_count=0,
-                parsed_count=0,
-                limit=limit,
-                dropped_reasons=("invalid_json_empty",),
-            )
-            return ()
         _log_reply_candidate_parse_diagnostic(
             raw_count=0,
-            parsed_count=1,
+            parsed_count=0,
             limit=limit,
-            dropped_reasons=("non_json_fallback",),
+            dropped_reasons=("invalid_json",),
         )
-        return (ReplyCandidateDraft(text=text, action=fallback_action, style="模型返回非 JSON，按原回复处理"),)
+        return ()
 
     raw_candidates = raw.get("candidates", [])
     if not isinstance(raw_candidates, list):
@@ -1817,72 +1800,6 @@ def _merge_reply_candidates(
         if len(merged) >= limit:
             break
     return tuple(merged)
-
-
-def _pad_reply_candidates(
-    candidates: tuple[ReplyCandidateDraft, ...],
-    *,
-    fallback_action: str,
-    max_chars: int,
-    limit: int,
-) -> tuple[ReplyCandidateDraft, ...]:
-    padded = list(candidates)
-    seen = {re.sub(r"\s+", "", candidate.text) for candidate in padded}
-    fallback_texts = _fallback_candidate_texts(fallback_action)
-    for text in fallback_texts:
-        clean_text = _sanitize_reply(text, max_chars)
-        compact_text = re.sub(r"\s+", "", clean_text)
-        if not clean_text or compact_text in seen:
-            continue
-        seen.add(compact_text)
-        padded.append(
-            ReplyCandidateDraft(
-                text=clean_text,
-                action=fallback_action,
-                style="后端补齐：模型候选不足时的保守备选",
-            )
-        )
-        if len(padded) >= limit:
-            break
-    return tuple(padded[:limit])
-
-
-def _fallback_candidate_texts(action: str) -> tuple[str, ...]:
-    if action == "care":
-        return (
-            "风雪觉得这事先别急，慢慢捋清楚比较好。",
-            "先缓一下，别把自己逼太紧。",
-            "这个先别硬扛，能少受点罪就少受点。",
-        )
-    if action == "agree":
-        return (
-            "风雪觉得这个说法有点道理。",
-            "这句方向没跑偏，至少抓到重点了。",
-            "这个判断还行，不算乱说。",
-        )
-    if action == "answer":
-        return (
-            "风雪觉得先按这个方向看，别把关键点漏了。",
-            "简单说，这事要看成本和后果。",
-            "先别绕，核心就是值不值。",
-        )
-    if action == "tease":
-        return (
-            "风雪觉得这事有点抽象。",
-            "这也太会给自己加戏了。",
-            "先别急着上强度，路都快走歪了。",
-        )
-    if action == "ask_back":
-        return (
-            "风雪有点好奇，你这是认真问还是在钓我？",
-            "那你自己先说，你到底想听哪种答案？",
-            "你这句重点是问结果，还是问态度？",
-        )
-    return (
-        "风雪觉得这句可以先轻轻放着。",
-        "那先看他后面怎么说。",
-        "这句接一下可以，但别聊太满。",
-    )
 
 
 def _log_reply_candidate_parse_diagnostic(

@@ -55,7 +55,7 @@ deepseek:
     style: deepseek/deepseek-v4-flash
     member_profile: deepseek/deepseek-v4-flash
   thinking: disabled
-  usage_tracking_enabled: false
+  usage_tracking_enabled: true
   reasoning_effort: high
   temperature: 0.72
   max_tokens: 260
