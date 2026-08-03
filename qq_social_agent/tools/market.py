@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 import time
 from dataclasses import dataclass
 from datetime import datetime
@@ -160,10 +161,16 @@ def _failure_chat_line(lookup: MarketLookup) -> str:
 
 
 def _fetch_stock_snapshot(intent: MarketIntent) -> MarketSnapshot | None:
-    snapshot = _fetch_stock_snapshot_from_yahoo_chart(intent)
-    if snapshot is not None:
-        return snapshot
-    return _fetch_stock_snapshot_from_yfinance(intent)
+    for fetcher in (
+        _fetch_stock_snapshot_from_yahoo_chart,
+        _fetch_stock_snapshot_from_eastmoney,
+        _fetch_stock_snapshot_from_sina,
+        _fetch_stock_snapshot_from_yfinance,
+    ):
+        snapshot = fetcher(intent)
+        if snapshot is not None:
+            return snapshot
+    return None
 
 
 def _fetch_stock_snapshot_from_yahoo_chart(intent: MarketIntent) -> MarketSnapshot | None:
@@ -218,6 +225,92 @@ def _fetch_stock_snapshot_from_yahoo_chart(intent: MarketIntent) -> MarketSnapsh
         return None
 
 
+def _fetch_stock_snapshot_from_eastmoney(intent: MarketIntent) -> MarketSnapshot | None:
+    url = "https://push2.eastmoney.com/api/qt/stock/get"
+    params = {
+        "secid": f"105.{intent.symbol.upper()}",
+        "fields": "f43,f47,f48,f57,f58,f60,f86,f170",
+    }
+    try:
+        with httpx.Client(timeout=8, follow_redirects=True) as client:
+            response = client.get(
+                url,
+                params=params,
+                headers={"User-Agent": "Mozilla/5.0 qq-social-agent/0.1"},
+            )
+            response.raise_for_status()
+        data = (response.json() or {}).get("data") or {}
+        price = _scaled_market_value(data.get("f43"), scale=1000)
+        if price is None or price <= 0:
+            return None
+        previous_close = _scaled_market_value(data.get("f60"), scale=1000)
+        change_percent = _scaled_market_value(data.get("f170"), scale=100)
+        if change_percent is None and previous_close:
+            change_percent = (price - previous_close) / previous_close * 100
+        updated_at = None
+        timestamp = data.get("f86")
+        if isinstance(timestamp, (int, float)) and timestamp > 0:
+            updated_at = datetime.fromtimestamp(timestamp).strftime("%Y-%m-%d %H:%M")
+        symbol = str(data.get("f57") or intent.symbol).upper()
+        display_name = intent.display_name or str(data.get("f58") or symbol)
+        return MarketSnapshot(
+            kind="stock",
+            symbol=symbol,
+            display_name=display_name,
+            price=price,
+            currency="USD",
+            change_percent=change_percent,
+            volume=_as_float(data.get("f47")),
+            market_cap=None,
+            source="东方财富",
+            updated_at=updated_at,
+        )
+    except Exception:
+        return None
+
+
+def _fetch_stock_snapshot_from_sina(intent: MarketIntent) -> MarketSnapshot | None:
+    symbol = intent.symbol.lower()
+    url = f"https://hq.sinajs.cn/list=gb_{symbol}"
+    try:
+        with httpx.Client(timeout=8, follow_redirects=True) as client:
+            response = client.get(
+                url,
+                headers={
+                    "User-Agent": "Mozilla/5.0 qq-social-agent/0.1",
+                    "Referer": "https://finance.sina.com.cn/",
+                },
+            )
+            response.raise_for_status()
+        match = re.search(r'="(.*)"', response.text)
+        if match is None:
+            return None
+        fields = match.group(1).split(",")
+        if len(fields) < 4 or not fields[0]:
+            return None
+        price = _as_float(fields[1])
+        change_percent = _as_float(fields[2])
+        if price is None or price <= 0:
+            return None
+        updated_at = fields[3] if len(fields) > 3 and fields[3] else None
+        volume = _as_float(fields[10]) if len(fields) > 10 else None
+        market_cap = _as_float(fields[12]) if len(fields) > 12 else None
+        return MarketSnapshot(
+            kind="stock",
+            symbol=intent.symbol.upper(),
+            display_name=intent.display_name or fields[0] or intent.symbol.upper(),
+            price=price,
+            currency="USD",
+            change_percent=change_percent,
+            volume=volume,
+            market_cap=market_cap,
+            source="新浪财经",
+            updated_at=updated_at,
+        )
+    except Exception:
+        return None
+
+
 def _fetch_stock_snapshot_from_yfinance(intent: MarketIntent) -> MarketSnapshot | None:
     import yfinance as yf
 
@@ -247,6 +340,13 @@ def _fetch_stock_snapshot_from_yfinance(intent: MarketIntent) -> MarketSnapshot 
 
 
 async def _fetch_crypto_snapshot(intent: MarketIntent) -> MarketSnapshot | None:
+    snapshot = await _fetch_crypto_snapshot_from_coingecko(intent)
+    if snapshot is not None:
+        return snapshot
+    return await _fetch_crypto_snapshot_from_gate(intent)
+
+
+async def _fetch_crypto_snapshot_from_coingecko(intent: MarketIntent) -> MarketSnapshot | None:
     url = "https://api.coingecko.com/api/v3/simple/price"
     params = {
         "ids": intent.symbol,
@@ -282,6 +382,61 @@ async def _fetch_crypto_snapshot(intent: MarketIntent) -> MarketSnapshot | None:
     except Exception:
         return None
 
+
+
+
+GATE_CRYPTO_PAIRS = {
+    "bitcoin": ("BTC_USDT", "BTC"),
+    "ethereum": ("ETH_USDT", "ETH"),
+    "solana": ("SOL_USDT", "SOL"),
+    "dogecoin": ("DOGE_USDT", "DOGE"),
+    "binancecoin": ("BNB_USDT", "BNB"),
+    "ripple": ("XRP_USDT", "XRP"),
+    "cardano": ("ADA_USDT", "ADA"),
+    "sui": ("SUI_USDT", "SUI"),
+}
+
+
+async def _fetch_crypto_snapshot_from_gate(intent: MarketIntent) -> MarketSnapshot | None:
+    pair, display = GATE_CRYPTO_PAIRS.get(intent.symbol, ("", intent.display_name or intent.symbol))
+    if not pair:
+        return None
+    url = "https://api.gateio.ws/api/v4/spot/tickers"
+    try:
+        async with httpx.AsyncClient(timeout=8, follow_redirects=True) as client:
+            response = await client.get(
+                url,
+                params={"currency_pair": pair},
+                headers={"User-Agent": "Mozilla/5.0 qq-social-agent/0.1"},
+            )
+            response.raise_for_status()
+        raw_list = response.json()
+        if not isinstance(raw_list, list) or not raw_list:
+            return None
+        raw = raw_list[0]
+        price = _as_float(raw.get("last"))
+        if price is None or price <= 0:
+            return None
+        return MarketSnapshot(
+            kind="crypto",
+            symbol=display,
+            display_name=intent.display_name or display,
+            price=price,
+            currency="USD",
+            change_percent=_as_float(raw.get("change_percentage")),
+            volume=_as_float(raw.get("quote_volume")),
+            market_cap=None,
+            source="Gate.io",
+        )
+    except Exception:
+        return None
+
+
+def _scaled_market_value(value: Any, *, scale: float) -> float | None:
+    number = _as_float(value)
+    if number is None:
+        return None
+    return number / scale
 
 def _fast_get(source: Any, *keys: str) -> Any:
     for key in keys:
