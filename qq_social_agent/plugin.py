@@ -67,7 +67,7 @@ from .decision_gate import (
     is_low_value_group_text as _is_low_value_group_text,
     pre_decision_gate as _pre_decision_gate,
 )
-from .deepseek_client import DeepSeekClient, MemberProfileDraft, ReplyDecision, set_usage_recorder
+from .deepseek_client import DeepSeekClient, MemberProfileDraft, ReplyDecision, ToolSymbol, set_usage_recorder
 from .delivery import build_delivery_plan
 from .group_jargon import (
     GroupJargonEntry,
@@ -5087,7 +5087,7 @@ async def _handle_group_message_locked(
         group_id=group_id,
         user_id=user_id,
         stage="routing",
-        action="active",
+        action="deterministic",
         pipeline_mode=pipeline_state.mode.value,
         requests=[
             {
@@ -5182,17 +5182,39 @@ async def _handle_group_message_locked(
         fresh_intent=fresh_intent,
     )
     decision = _apply_tool_plan(decision, tool_plan)
-    decision = await _apply_fresh_search_router(
+    decision, tool_plan = await _apply_tool_use_router(
         decision,
+        tool_plan=tool_plan,
         persona=persona,
         context_recent=context_recent,
         text=text,
         nickname=nickname,
         addressed_bot=addressed_bot,
         fresh_intent=fresh_intent,
+        market_intents=market_intents,
         speaker_context=speaker_context,
         group_id=group_id,
         user_id=user_id,
+        source_message_id=source_message_id,
+    )
+    pipeline_state.mode = _tool_route_mode(tool_plan)
+    pipeline_state.tool_requests = tool_plan.requests
+    _record_metric_event(
+        "tool_route_plan",
+        group_id=group_id,
+        user_id=user_id,
+        stage="routing",
+        action="final",
+        pipeline_mode=pipeline_state.mode.value,
+        requests=[
+            {
+                "kind": request.kind.value,
+                "required": request.required,
+                "reason": request.reason,
+                "query": _short_notice_text(request.query, 80),
+            }
+            for request in pipeline_state.tool_requests
+        ],
     )
     decision = _enforce_addressed_reply_decision(
         decision,
@@ -7217,37 +7239,60 @@ def _reaction_target_message_id(
     return source_message_id or event_message_source_id(event)
 
 
-def _fresh_router_backend_hint(intent: object | None) -> str:
-    if intent is None:
-        return ""
-    query = str(getattr(intent, "query", "") or "").strip()
-    kind = str(getattr(intent, "kind", "web") or "web").strip()
-    explicit = bool(getattr(intent, "explicit", False))
-    required = bool(getattr(intent, "required", False))
-    if not query:
-        return ""
-    signals: list[str] = []
-    if explicit:
-        signals.append("显式搜索")
-    if required:
-        signals.append("需要核验最新事实")
-    if not signals:
-        signals.append("可能涉及最新背景")
-    return f"{'/'.join(signals)}；候选 query={query}；kind={kind}"
+def _tool_router_backend_hint(
+    fresh_intent: object | None,
+    market_intents: list[MarketIntent],
+    tool_plan: ToolRoutePlan,
+) -> str:
+    parts: list[str] = []
+    if fresh_intent is not None:
+        query = str(getattr(fresh_intent, "query", "") or "").strip()
+        kind = str(getattr(fresh_intent, "kind", "web") or "web").strip()
+        explicit = bool(getattr(fresh_intent, "explicit", False))
+        required = bool(getattr(fresh_intent, "required", False))
+        if query:
+            signals: list[str] = []
+            if explicit:
+                signals.append("显式搜索")
+            if required:
+                signals.append("需要核验最新事实")
+            if not signals:
+                signals.append("可能涉及最新背景")
+            parts.append(f"{'/'.join(signals)}；候选 query={query}；kind={kind}")
+    if market_intents:
+        symbols = ", ".join(
+            f"{item.display_name or item.symbol}({item.kind}:{item.symbol})"
+            for item in market_intents[:2]
+        )
+        if symbols:
+            parts.append(f"行情候选：{symbols}")
+    if tool_plan.requests:
+        planned = ", ".join(
+            f"{request.kind.value}:{_short_notice_text(request.query, 48)}"
+            for request in tool_plan.requests
+        )
+        parts.append(f"后端确定性计划：{planned}")
+    return "；".join(part for part in parts if part)
 
 
-def _fresh_router_should_run(
+def _tool_router_should_run(
     decision: ReplyDecision,
     *,
     text: str,
     addressed_bot: bool,
     fresh_intent: object | None,
+    market_intents: list[MarketIntent],
+    tool_plan: ToolRoutePlan,
 ) -> bool:
     if not decision.should_reply:
         return False
-    if decision.need_fresh_context or fresh_intent is not None:
+    if decision.need_fresh_context or decision.need_tool or tool_plan.requests:
+        return True
+    if fresh_intent is not None or market_intents:
         return True
     if addressed_bot:
+        return True
+    if re.search(r"https?://", text, re.IGNORECASE):
         return True
     compact = re.sub(r"\s+", "", text.casefold())
     proactive_terms = (
@@ -7270,47 +7315,138 @@ def _fresh_router_should_run(
         "政策",
         "发生什么",
         "怎么了",
+        "股票",
+        "美股",
+        "币价",
+        "比特币",
+        "以太坊",
     )
     return any(term in compact for term in proactive_terms)
 
 
-async def _apply_fresh_search_router(
+def _tool_request_from_llm_route(route: object, *, fallback_text: str) -> ToolRequest | None:
+    tool = str(getattr(route, "tool", "none") or "none").strip().lower()
+    query = str(getattr(route, "query", "") or "").strip()
+    reason = str(getattr(route, "reason", "") or "").strip() or "llm_tool_router"
+    try:
+        confidence = float(getattr(route, "confidence", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        confidence = 0.0
+    confidence = max(0.0, min(1.0, confidence))
+    if tool == "fresh_search":
+        if not query:
+            return None
+        kind = str(getattr(route, "kind", "web") or "web").strip().lower()
+        if kind not in {"news", "sports", "web"}:
+            kind = "web"
+        return ToolRequest(
+            ToolKind.FRESH_SEARCH,
+            query=query[:160],
+            reason=f"llm_tool_router:{reason}"[:120],
+            confidence=confidence,
+            required=True,
+            arguments={"kind": kind},
+        )
+    if tool == "market":
+        raw_symbols = tuple(getattr(route, "symbols", ()) or ())
+        symbols = tuple(
+            {
+                "kind": str(getattr(item, "kind", "") or ""),
+                "symbol": str(getattr(item, "symbol", "") or ""),
+                "display": str(getattr(item, "display", "") or getattr(item, "symbol", "") or ""),
+            }
+            for item in raw_symbols
+            if str(getattr(item, "symbol", "") or "").strip()
+        )
+        if not symbols:
+            return None
+        return ToolRequest(
+            ToolKind.MARKET,
+            query=query[:160] or fallback_text[:160],
+            reason=f"llm_tool_router:{reason}"[:120],
+            confidence=confidence,
+            required=True,
+            arguments={"symbols": symbols},
+        )
+    if tool == "deep_url":
+        if not query:
+            query = fallback_text
+        if re.search(r"https?://", query, re.IGNORECASE) is None:
+            return None
+        return ToolRequest(
+            ToolKind.DEEP_URL,
+            query=query[:500],
+            reason=f"llm_tool_router:{reason}"[:120],
+            confidence=confidence,
+            required=False,
+            arguments={},
+        )
+    return None
+
+
+def _merge_tool_route_plans(base: ToolRoutePlan, extra: ToolRoutePlan) -> ToolRoutePlan:
+    if not extra.requests:
+        return base
+    requests = list(base.requests)
+    for request in extra.requests:
+        replaced = False
+        for index, existing in enumerate(requests):
+            if existing.kind is not request.kind:
+                continue
+            if existing.required and not request.required:
+                replaced = True
+                break
+            requests[index] = request
+            replaced = True
+            break
+        if not replaced:
+            requests.append(request)
+    source = extra.source if not base.requests else f"{base.source}+{extra.source}"
+    return ToolRoutePlan(tuple(requests), source=source)
+
+
+async def _apply_tool_use_router(
     decision: ReplyDecision,
     *,
+    tool_plan: ToolRoutePlan,
     persona: object,
     context_recent: list[ChatMessage],
     text: str,
     nickname: str,
     addressed_bot: bool,
     fresh_intent: object | None,
+    market_intents: list[MarketIntent],
     speaker_context: str,
     group_id: int,
     user_id: int,
-) -> ReplyDecision:
-    router_should_run = _fresh_router_should_run(
+    source_message_id: str,
+) -> tuple[ReplyDecision, ToolRoutePlan]:
+    router_should_run = _tool_router_should_run(
         decision,
         text=text,
         addressed_bot=addressed_bot,
         fresh_intent=fresh_intent,
+        market_intents=market_intents,
+        tool_plan=tool_plan,
     )
     if deepseek_client is None or not router_should_run:
         _record_metric_event(
-            "fresh_router",
+            "tool_router",
             group_id=group_id,
             user_id=user_id,
             stage="routing",
             action="not_run",
-            need_search=False,
+            routed_tool="none",
             decision_should_reply=decision.should_reply,
             decision_need_fresh=decision.need_fresh_context,
-            fresh_kind=decision.fresh_kind,
-            fresh_query_preview=_short_notice_text(decision.fresh_query, 120),
+            decision_need_tool=decision.need_tool,
+            existing_requests=list(tool_plan.kinds),
             reason="client_not_ready" if deepseek_client is None else "router_gate_false",
         )
-        return decision
-    backend_hint = _fresh_router_backend_hint(fresh_intent)
+        return decision, tool_plan
+    backend_hint = _tool_router_backend_hint(fresh_intent, market_intents, tool_plan)
     try:
-        routed = await deepseek_client.route_fresh_search(
+        routed = await deepseek_client.route_tool_use(
             persona=persona,
             recent_messages=context_recent,
             current_text=text,
@@ -7324,51 +7460,78 @@ async def _apply_fresh_search_router(
         )
     except Exception as exc:
         logger.warning(
-            "qq_social_agent fresh router failed: "
+            "qq_social_agent tool router failed: "
             f"group={group_id} error={exc}"
         )
         _record_metric_event(
-            "fresh_router",
+            "tool_router",
             group_id=group_id,
             user_id=user_id,
             stage="routing",
             action="failed",
-            need_search=False,
+            routed_tool="none",
             decision_should_reply=decision.should_reply,
-            decision_need_fresh=decision.need_fresh_context,
             error=_short_notice_text(str(exc), 200),
+            backend_hint=backend_hint,
         )
-        return decision
+        return decision, tool_plan
+    request = _tool_request_from_llm_route(routed, fallback_text=text)
+    final_plan = tool_plan
+    if request is not None:
+        routed_plan = _tool_plan_with_runtime_context(
+            ToolRoutePlan((request,), source="llm_tool_router"),
+            addressed=addressed_bot,
+            group_id=group_id,
+            user_id=user_id,
+            source_message_id=source_message_id,
+        )
+        final_plan = _merge_tool_route_plans(tool_plan, routed_plan)
     _record_metric_event(
-        "fresh_router",
+        "tool_router",
         group_id=group_id,
         user_id=user_id,
         stage="routing",
-        action="search" if routed.need_search else "skip",
-        need_search=routed.need_search,
-        kind=routed.kind,
-        query_preview=_short_notice_text(routed.query, 80),
-        confidence=round(routed.confidence, 3),
-        reason=routed.reason,
+        action=str(getattr(routed, "tool", "none") or "none"),
+        routed_tool=str(getattr(routed, "tool", "none") or "none"),
+        query_preview=_short_notice_text(str(getattr(routed, "query", "") or ""), 80),
+        kind=str(getattr(routed, "kind", "web") or "web"),
+        confidence=round(float(getattr(routed, "confidence", 0.0) or 0.0), 3),
+        reason=str(getattr(routed, "reason", "") or ""),
         backend_hint=backend_hint,
+        accepted=request is not None,
+        final_requests=list(final_plan.kinds),
     )
-    if routed.need_search and routed.query.strip():
-        return replace(
+    fresh_request = final_plan.first(ToolKind.FRESH_SEARCH)
+    market_request = final_plan.first(ToolKind.MARKET)
+    if fresh_request is not None and fresh_request.required:
+        decision = replace(
             decision,
             need_fresh_context=True,
-            fresh_query=routed.query.strip()[:120],
-            fresh_kind=routed.kind if routed.kind in {"news", "sports", "web"} else "web",
+            fresh_query=fresh_request.query[:120],
+            fresh_kind=str(fresh_request.arguments.get("kind", "web") or "web"),
         )
-    if decision.need_fresh_context and fresh_intent is not None and (
-        bool(getattr(fresh_intent, "explicit", False)) or bool(getattr(fresh_intent, "required", False))
-    ):
-        query = str(getattr(fresh_intent, "query", "") or "").strip()
-        kind = str(getattr(fresh_intent, "kind", decision.fresh_kind) or decision.fresh_kind)
-        if query:
-            return replace(decision, fresh_query=query[:120], fresh_kind=kind)
-    if decision.need_fresh_context and not decision.fresh_query.strip():
-        return replace(decision, need_fresh_context=False, fresh_kind="web")
-    return decision
+    elif decision.need_fresh_context and str(getattr(routed, "tool", "none") or "none") == "none":
+        decision = replace(decision, need_fresh_context=False, fresh_query="", fresh_kind="web")
+    if market_request is not None and market_request.required:
+        symbols = tuple(
+            ToolSymbol(
+                kind=str(item.get("kind", "")),
+                symbol=str(item.get("symbol", "")),
+                display=str(item.get("display", "")),
+            )
+            for item in tuple(market_request.arguments.get("symbols", ()))
+            if isinstance(item, dict) and item.get("symbol")
+        )
+        decision = replace(
+            decision,
+            should_reply=True,
+            action="market_check",
+            need_tool=True,
+            tool="market",
+            symbols=symbols,
+            comment_after_tool=bool(getattr(routed, "comment_after_tool", decision.comment_after_tool)),
+        )
+    return decision, final_plan
 
 
 def _format_fresh_context_hint(intent: object | None) -> str:

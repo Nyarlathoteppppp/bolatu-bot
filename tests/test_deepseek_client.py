@@ -16,6 +16,7 @@ from qq_social_agent.deepseek_client import (
     _parse_reply_candidates,
     _parse_reply_decision,
     _parse_fresh_search_decision,
+    _parse_tool_routing_decision,
     _parse_style_rules,
     ReplyCandidateDraft,
     _sanitize_reply,
@@ -859,3 +860,31 @@ def test_parse_fresh_search_decision_requires_query() -> None:
     )
 
     assert not decision.need_search
+
+def test_parse_tool_routing_decision_fresh_search() -> None:
+    decision = _parse_tool_routing_decision(
+        '{"tool":"fresh_search","kind":"news","query":"美国伊朗冲突 最新","confidence":0.81,"reason":"需要最新背景"}'
+    )
+
+    assert decision.tool == "fresh_search"
+    assert decision.kind == "news"
+    assert decision.query == "美国伊朗冲突 最新"
+    assert decision.confidence == 0.81
+
+
+def test_parse_tool_routing_decision_market() -> None:
+    decision = _parse_tool_routing_decision(
+        '{"tool":"market","symbols":[{"kind":"stock","symbol":"tsla","display":"特斯拉"}],"confidence":0.9}'
+    )
+
+    assert decision.tool == "market"
+    assert len(decision.symbols) == 1
+    assert decision.symbols[0].kind == "stock"
+    assert decision.symbols[0].symbol == "TSLA"
+    assert decision.symbols[0].display == "特斯拉"
+
+
+def test_parse_tool_routing_decision_requires_valid_arguments() -> None:
+    assert _parse_tool_routing_decision('{"tool":"fresh_search","query":""}').tool == "none"
+    assert _parse_tool_routing_decision('{"tool":"market","symbols":[]}').tool == "none"
+    assert _parse_tool_routing_decision('{"tool":"deep_url","query":"没有链接"}').tool == "none"

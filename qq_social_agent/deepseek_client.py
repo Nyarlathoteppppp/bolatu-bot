@@ -54,6 +54,17 @@ class FreshSearchDecision:
 
 
 @dataclass(frozen=True)
+class ToolRoutingDecision:
+    tool: str = "none"
+    query: str = ""
+    kind: str = "web"
+    symbols: tuple[ToolSymbol, ...] = ()
+    confidence: float = 0.0
+    reason: str = ""
+    comment_after_tool: bool = True
+
+
+@dataclass(frozen=True)
 class MemoryFactDraft:
     kind: str
     content: str
@@ -388,6 +399,59 @@ class DeepSeekClient:
             },
         )
         return _parse_fresh_search_decision(response.choices[0].message.content or "")
+
+    async def route_tool_use(
+        self,
+        *,
+        persona: Persona,
+        recent_messages: list[ChatMessage],
+        current_text: str,
+        current_nickname: str,
+        addressed: bool,
+        decision_action: str,
+        decision_reason: str,
+        backend_hint: str = "",
+        chat_label: str = "QQ 群聊",
+        speaker_context: str = "",
+    ) -> ToolRoutingDecision:
+        context = _format_context_with_local_focus(
+            recent_messages[-10:],
+            formatter=_format_decision_message,
+            local_limit=5,
+        ) or "（暂无更多上下文）"
+        system = self.prompts.render(
+            "tool_router",
+            "system",
+            persona_name=persona.name,
+            persona_decision_prompt=persona.decision_prompt,
+        )
+        user = self.prompts.render(
+            "tool_router",
+            "user",
+            chat_label=chat_label,
+            addressed="true" if addressed else "false",
+            decision_action=decision_action,
+            decision_reason=decision_reason,
+            backend_hint=backend_hint or "无",
+            speaker_context_section=_optional_section("本轮说话关系", speaker_context),
+            context=context,
+            current_nickname=current_nickname,
+            current_text=current_text,
+        )
+        response = await self._chat_completion(
+            task="tool_router",
+            route_name="search",
+            request={
+                "temperature": 0.1,
+                "max_tokens": 240,
+                "response_format": {"type": "json_object"},
+                "messages": [
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user},
+                ],
+            },
+        )
+        return _parse_tool_routing_decision(response.choices[0].message.content or "")
 
     async def timing_gate(
         self,
@@ -1062,6 +1126,76 @@ def _parse_fresh_search_decision(content: str) -> FreshSearchDecision:
         kind=kind,
         confidence=max(0.0, min(1.0, confidence)),
         reason=reason[:60],
+    )
+
+
+def _parse_tool_routing_decision(content: str) -> ToolRoutingDecision:
+    try:
+        raw = _loads_json_object(content)
+    except json.JSONDecodeError:
+        return ToolRoutingDecision(reason="invalid_json")
+    tool = str(raw.get("tool", raw.get("tool_name", "")) or "").strip().lower()
+    if bool(raw.get("need_search", raw.get("need_fresh_context", False))):
+        tool = "fresh_search"
+    if bool(raw.get("need_tool", False)) and not tool:
+        tool = str(raw.get("tool_name", raw.get("name", "")) or "").strip().lower()
+    aliases = {
+        "": "none",
+        "none": "none",
+        "ignore": "none",
+        "no_tool": "none",
+        "fresh_search": "fresh_search",
+        "search": "fresh_search",
+        "web_search": "fresh_search",
+        "fresh": "fresh_search",
+        "fresh_context": "fresh_search",
+        "news": "fresh_search",
+        "sports": "fresh_search",
+        "market": "market",
+        "market_check": "market",
+        "quote": "market",
+        "stock": "market",
+        "crypto": "market",
+        "url": "deep_url",
+        "webpage": "deep_url",
+        "deep_url": "deep_url",
+    }
+    tool = aliases.get(tool, "none")
+    query = re.sub(
+        r"\s+",
+        " ",
+        str(raw.get("query", raw.get("fresh_query", raw.get("url", ""))) or ""),
+    ).strip()
+    kind = str(raw.get("kind", raw.get("fresh_kind", "web")) or "web").strip().lower()
+    if kind not in {"news", "sports", "web"}:
+        kind = "web"
+    symbols = _parse_tool_symbols(raw.get("symbols", []))
+    try:
+        confidence = float(raw.get("confidence", 0.0))
+    except (TypeError, ValueError):
+        confidence = 0.0
+    reason = str(raw.get("reason", "") or "").strip()
+    comment_after_tool = bool(raw.get("comment_after_tool", True))
+    if tool == "fresh_search" and not query:
+        tool = "none"
+        reason = reason or "empty_query"
+    if tool == "deep_url" and not re.search(r"https?://", query, re.IGNORECASE):
+        tool = "none"
+        reason = reason or "missing_url"
+    if tool == "market" and not symbols:
+        tool = "none"
+        reason = reason or "missing_symbols"
+    if tool == "none":
+        query = ""
+        symbols = ()
+    return ToolRoutingDecision(
+        tool=tool,
+        query=query[:160],
+        kind=kind,
+        symbols=symbols,
+        confidence=max(0.0, min(1.0, confidence)),
+        reason=reason[:80],
+        comment_after_tool=comment_after_tool,
     )
 
 
