@@ -58,3 +58,28 @@ def test_detect_fresh_intent_handles_go_search_phrase() -> None:
     assert intent.explicit
     assert intent.query == "光华分数线和其他做对比"
     assert intent.kind == "web"
+
+
+def test_detect_fresh_intent_extracts_search_line_from_buffered_batch() -> None:
+    intent = detect_fresh_intent(
+        "1. 邪恶科代[#56514]说：你联网搜索一下，讲讲滚石的新专辑\n"
+        "2. linbar说：滑跪了"
+    )
+
+    assert intent is not None
+    assert intent.explicit
+    assert intent.kind == "web"
+    assert intent.query == "滚石的新专辑"
+
+
+def test_detect_fresh_intent_embedded_search_from_reply_summary() -> None:
+    intent = detect_fresh_intent("用户回复张风雪，称在搜索梅西最近的新闻")
+
+    assert intent is not None
+    assert intent.explicit
+    assert intent.kind == "news"
+    assert intent.query == "梅西最近的新闻"
+
+
+def test_detect_fresh_intent_does_not_search_feature_complaint() -> None:
+    assert detect_fresh_intent("搜索功能好像坏了") is None

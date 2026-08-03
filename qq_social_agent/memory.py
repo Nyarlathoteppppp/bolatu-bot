@@ -317,6 +317,9 @@ class MemoryStore:
             create index if not exists idx_messages_group_time
               on messages(group_id, created_at);
 
+            create index if not exists idx_messages_time
+              on messages(created_at);
+
             create index if not exists idx_messages_group_id
               on messages(group_id, id);
 
@@ -468,6 +471,12 @@ class MemoryStore:
               created_at real not null,
               primary key(group_id, message_id)
             );
+
+            create index if not exists idx_bot_sent_messages_time
+              on bot_sent_messages(created_at);
+
+            create index if not exists idx_bot_sent_messages_group_time
+              on bot_sent_messages(group_id, created_at);
 
             create table if not exists recalled_reply_feedback (
               id integer primary key autoincrement,

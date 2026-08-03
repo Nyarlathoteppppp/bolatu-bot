@@ -2,7 +2,7 @@
 
 This directory declares the bot capabilities that should gradually move out of `qq_social_agent/plugin.py`.
 
-Current scope is metadata-only: manifests are loaded by `qq_social_agent.plugin_runtime.LocalPluginRegistry`, but plugin code is not dynamically imported or sandboxed yet. This keeps startup safe while giving commands, tools, scheduled tasks, web routes, and event handlers a clear home.
+Current scope is manifest-driven but allowlisted: manifests are loaded by `qq_social_agent.plugin_runtime.LocalPluginRegistry`, the registry builds an execution plan, and `qq_social_agent.plugin` binds known targets to local implementations. Plugin code is not dynamically imported or sandboxed yet, so startup remains safe while commands, tools, scheduled tasks, web routes, and event handlers have a clear home.
 
 ## Manifest shape
 
@@ -33,5 +33,6 @@ settings: {}
 
 1. Add or update the manifest first.
 2. Expose the capability in `/admin/plugins`.
-3. Move implementation code out of `qq_social_agent/plugin.py` only after tests exist.
-4. Keep runtime execution explicit; do not dynamically import arbitrary plugin code until a permission model and lifecycle hooks are ready.
+3. Runtime registration must check the manifest capability before enabling tools or scheduled tasks.
+4. Move implementation code out of `qq_social_agent/plugin.py` only after tests exist.
+5. Keep runtime execution explicit; do not dynamically import arbitrary plugin code until a permission model and lifecycle hooks are ready.

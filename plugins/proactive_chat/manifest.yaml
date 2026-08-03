@@ -1,0 +1,21 @@
+id: proactive_chat
+name: 主动聊天
+version: 0.1.0
+enabled: true
+description: 每隔约45分钟按概率让张风雪根据最近群聊主动发起一句聊天，不走审批。
+entrypoint: qq_social_agent.plugin.proactive_chat
+permissions:
+  - scheduled.send_group
+capabilities:
+  scheduled_tasks:
+    - task: hourly_random_proactive_chat
+      description: 每隔约45分钟随机掷骰，白天 20%，01:00-08:00 为 8%，命中后直接发群。
+      permission: scheduled.send_group
+  commands: []
+  tools: []
+  web_routes: []
+  event_handlers: []
+settings:
+  timezone: Asia/Shanghai
+  daytime_probability_percent: 15
+  quiet_probability_percent: 8

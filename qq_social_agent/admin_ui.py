@@ -438,7 +438,13 @@ def _tools_switch_forms(state: dict[str, Any]) -> str:
         '<div class="field"><label>复盘</label><select name="mode"><option value="today">今天到现在</option><option value="due">补发到期</option></select></div>'
         '<button type="submit">发送复盘</button></form>'
     )
-    return group_form + review_form + auto_form + work_form + quiet_form + review_now
+    proactive_now = (
+        '<form class="inline" method="post" action="/admin/tools/action">'
+        '<input type="hidden" name="action" value="proactive_chat">'
+        f'<div class="field"><label>主动发言群</label><select name="group_id">{group_options}</select></div>'
+        '<button type="submit">主动发言一次</button></form>'
+    )
+    return group_form + review_form + auto_form + work_form + quiet_form + review_now + proactive_now
 
 
 def _tools_user_forms(state: dict[str, Any]) -> str:
@@ -712,6 +718,7 @@ def _plugin_table(plugins: list[dict[str, Any]], *, full: bool) -> str:
         permission_badges = ''.join(f'<span class="badge">{_e(item)}</span>' for item in permissions) or '<span class="muted small">无</span>'
         detail = _e(plugin.get('description') or '')
         if full:
+            detail += _capability_detail_list(plugin)
             detail += f'<pre>entrypoint={_e(plugin.get("entrypoint") or "")}\npath={_e(plugin.get("path") or "")}</pre>'
         out.append(
             '<tr>'
@@ -734,6 +741,42 @@ def _plugin_error_table(errors: list[dict[str, str]]) -> str:
         out.append(f'<tr><td>{_e(error.get("path"))}</td><td class="bad">{_e(error.get("error"))}</td></tr>')
     out.append('</table>')
     return ''.join(out)
+
+
+def _capability_detail_list(plugin: dict[str, Any]) -> str:
+    capabilities = plugin.get('capabilities') if isinstance(plugin.get('capabilities'), dict) else {}
+    labels = {
+        'commands': '命令',
+        'tools': '工具',
+        'scheduled_tasks': '定时',
+        'web_routes': '页面',
+        'event_handlers': '事件',
+    }
+    rows: list[str] = []
+    for key, label in labels.items():
+        items = capabilities.get(key)
+        if not isinstance(items, list) or not items:
+            continue
+        rows.append(f'<b>{label}</b>')
+        rows.append('<ul class=small>')
+        for item in items:
+            if not isinstance(item, dict):
+                rows.append(f'<li>{_e(str(item))}</li>')
+                continue
+            name = item.get('name') or item.get('command') or item.get('task') or item.get('route') or item.get('event') or item.get('handler') or ''
+            target = item.get('target') or item.get('handler') or item.get('tool') or item.get('command') or item.get('task') or item.get('route') or item.get('event') or ''
+            permission = item.get('permission') or ''
+            desc = item.get('description') or ''
+            rows.append(
+                '<li>'
+                f'<code>{_e(str(name))}</code> '
+                f'<span class=muted>target={_e(str(target))}</span> '
+                f'<span class=badge>{_e(str(permission) or "no-permission")}</span><br>'
+                f'<span class=muted>{_e(str(desc))}</span>'
+                '</li>'
+            )
+        rows.append('</ul>')
+    return ''.join(rows)
 
 
 def _capability_count_badges(plugin: dict[str, Any]) -> str:

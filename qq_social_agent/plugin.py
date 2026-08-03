@@ -249,6 +249,7 @@ notice_directory_refresh_tasks: dict[int, asyncio.Task[None]] = {}
 pending_group_approvals: dict[int, "PendingGroupApproval"] = {}
 recent_suppression_events: list["SuppressionEvent"] = []
 daily_review_tasks: dict[str, asyncio.Task[None]] = {}
+proactive_chat_tasks: dict[str, asyncio.Task[None]] = {}
 daily_review_send_locks: dict[tuple[int, str], asyncio.Lock] = {}
 last_self_mute_reconcile_at: dict[int, float] = {}
 maintenance_tasks: dict[str, asyncio.Task[None]] = {}
@@ -311,6 +312,51 @@ if hasattr(_driver, "server_app"):
             return JSONResponse({"ok": False, "reason": "local_admin_only"}, status_code=403)
         payload, status_code = await _http_daily_review_payload(mode=mode)
         return JSONResponse(payload, status_code=status_code)
+
+    @_driver.server_app.post("/admin/proactive-chat")
+    async def _http_proactive_chat_endpoint(request: Request) -> JSONResponse:
+        if not _is_local_admin_request(request):
+            return JSONResponse({"ok": False, "reason": "local_admin_only"}, status_code=403)
+        try:
+            payload = await request.json()
+        except Exception:
+            payload = {}
+        try:
+            group_id = int(str(payload.get("group_id") or "").strip())
+        except (TypeError, ValueError):
+            group_id = None
+        payload, status_code = await _http_proactive_chat_payload(group_id=group_id)
+        return JSONResponse(payload, status_code=status_code)
+
+    @_driver.server_app.post("/admin/send-group")
+    async def _http_admin_send_group_endpoint(request: Request) -> JSONResponse:
+        if not _is_local_admin_request(request):
+            return JSONResponse({"ok": False, "reason": "local_admin_only"}, status_code=403)
+        try:
+            payload = await request.json()
+        except Exception:
+            payload = {}
+        try:
+            group_id = int(str(payload.get("group_id") or "").strip())
+        except (TypeError, ValueError):
+            group_id = None
+        message_text = str(payload.get("message") or "").strip()
+        if group_id is None or not message_text:
+            return JSONResponse({"ok": False, "reason": "missing_group_id_or_message"}, status_code=400)
+        bot = _first_connected_onebot_bot()
+        if bot is None:
+            return JSONResponse({"ok": False, "reason": "onebot_disconnected"}, status_code=503)
+        message_id = await _send_group_message(bot, group_id, Message(message_text))
+        _record_bot_sent_message(
+            group_id=group_id,
+            message_id=message_id,
+            bot_reply=message_text,
+            trigger_user_id=0,
+            trigger_nickname="Codex手动发起",
+            trigger_text=str(payload.get("reason") or "manual proactive topic")[:500],
+            action="manual_proactive",
+        )
+        return JSONResponse({"ok": True, "group_id": group_id, "message_id": message_id})
 
     @_driver.server_app.get("/admin")
     async def _http_admin_endpoint(request: Request, group_id: int | None = None) -> HTMLResponse:
@@ -728,8 +774,26 @@ DAILY_REVIEW_MESSAGE_LIMIT = max(20, int(_daily_review_config.get("message_limit
 DAILY_REVIEW_RETRY_SECONDS = max(60, int(_daily_review_config.get("retry_seconds", 5 * 60)))
 DAILY_REVIEW_POLL_SECONDS = max(60, int(_daily_review_config.get("poll_seconds", 5 * 60)))
 DAILY_REVIEW_RESPECT_MUTE = bool(_daily_review_config.get("respect_mute", False))
+_proactive_chat_config = app_config.raw.get("proactive_chat", {})
+if not isinstance(_proactive_chat_config, dict):
+    _proactive_chat_config = {}
+PROACTIVE_CHAT_ENABLED = bool(_proactive_chat_config.get("enabled", False))
+PROACTIVE_CHAT_TIMEZONE_NAME = str(_proactive_chat_config.get("timezone", DAILY_REVIEW_TIMEZONE_NAME))
+try:
+    PROACTIVE_CHAT_TIMEZONE = ZoneInfo(PROACTIVE_CHAT_TIMEZONE_NAME)
+except Exception:
+    PROACTIVE_CHAT_TIMEZONE_NAME = DAILY_REVIEW_TIMEZONE_NAME
+    PROACTIVE_CHAT_TIMEZONE = DAILY_REVIEW_TIMEZONE
+PROACTIVE_CHAT_DAYTIME_PERCENT = max(0, min(100, int(_proactive_chat_config.get("daytime_probability_percent", 15))))
+PROACTIVE_CHAT_QUIET_PERCENT = max(0, min(100, int(_proactive_chat_config.get("quiet_probability_percent", 8))))
+PROACTIVE_CHAT_QUIET_START_HOUR = int(_proactive_chat_config.get("quiet_start_hour", 1)) % 24
+PROACTIVE_CHAT_QUIET_END_HOUR = int(_proactive_chat_config.get("quiet_end_hour", 8)) % 24
+PROACTIVE_CHAT_INTERVAL_SECONDS = max(60.0, min(24 * 3600.0, float(_proactive_chat_config.get("interval_minutes", 45)) * 60.0))
+PROACTIVE_CHAT_POLL_JITTER_SECONDS = max(0.0, min(300.0, float(_proactive_chat_config.get("poll_jitter_seconds", 45))))
+PROACTIVE_CHAT_CONTEXT_LIMIT = max(6, min(60, int(_proactive_chat_config.get("context_limit", app_config.context_limit))))
+PROACTIVE_CHAT_MAX_MESSAGES = max(1, min(3, int(_proactive_chat_config.get("max_messages", 2))))
 ADDRESS_REPEAT_WINDOW_SECONDS = 10 * 60
-ADDRESS_FOLLOWUP_WINDOW_SECONDS = 3 * 60
+ADDRESS_FOLLOWUP_WINDOW_SECONDS = 90
 MENTION_TARGET_LIMIT = 8
 REPEAT_MENTION_SUPPRESS_SECONDS = 10 * 60
 PRIVATE_DEBUG_OWNER_ID = 2776760548
@@ -898,7 +962,7 @@ CHANGELOG_NOTICE_MESSAGE = """张风雪后端更新记录：
 1. 1535071184 改为命令专用号：只处理审批/工具命令，不走普通私聊生成。
 2. 工具命令兼容“bot 工具 审批”这种带空格写法。
 3. LLM 路由拆细：决策、回复、黑话、记忆、风格都可以单独切模型。
-4. 群聊风格学习默认改为 siliconflow/MiniMaxAI/MiniMax-M2.5。
+4. 群聊风格学习默认改为 siliconflow/deepseek-ai/DeepSeek-V4-Flash。
 5. 可切换模型目录新增 siliconflow/Pro/moonshotai/Kimi-K2.6。
 6. 模型状态会显示可切换部分、当前模型、fallback、API key 来源和可切换模型清单。
 7. 切工具模型 <模型> 保留为兼容批量命令，会同时切黑话/记忆/风格/画像。
@@ -985,27 +1049,7 @@ async def _init_client() -> None:
         )
     else:
         logger.info(f"Loaded {len(local_plugin_registry.enabled_plugins())} local plugin manifests")
-    tool_registry.register(
-        ToolSpec(
-            ToolKind.FRESH_SEARCH,
-            "查询最新新闻、网页、赛程或其他时效信息",
-            _execute_registered_fresh_search,
-        )
-    )
-    tool_registry.register(
-        ToolSpec(
-            ToolKind.MARKET,
-            "查询美股或加密资产行情并生成可核验的工具报告",
-            _execute_registered_market,
-        )
-    )
-    tool_registry.register(
-        ToolSpec(
-            ToolKind.DEEP_URL,
-            "安全读取群友明确发来的网页正文",
-            _execute_registered_deep_url,
-        )
-    )
+    _register_plugin_runtime_tools()
     _apply_model_route_overrides()
     _ensure_builtin_memory_atoms()
     _run_metric_retention_once("startup")
@@ -1025,6 +1069,83 @@ async def _init_client() -> None:
     learning_coordinator.start()
     for group_id in sorted(app_config.allowed_groups):
         rag_service.ensure_default_evaluation_cases(group_id)
+
+
+PLUGIN_TOOL_BINDINGS: tuple[tuple[str, str, ToolKind, str, str, str], ...] = (
+    (
+        "fresh_search",
+        "fresh_context",
+        ToolKind.FRESH_SEARCH,
+        "查询最新新闻、网页、赛程或其他时效信息",
+        "_execute_registered_fresh_search",
+        "tool.search",
+    ),
+    (
+        "market_tools",
+        "market_lookup",
+        ToolKind.MARKET,
+        "查询美股或加密资产行情并生成可核验的工具报告",
+        "_execute_registered_market",
+        "tool.market",
+    ),
+    (
+        "fresh_search",
+        "deep_url_reader",
+        ToolKind.DEEP_URL,
+        "安全读取群友明确发来的网页正文",
+        "_execute_registered_deep_url",
+        "tool.deep_url",
+    ),
+)
+
+
+def _register_plugin_runtime_tools() -> None:
+    tool_registry.clear()
+    registered: list[str] = []
+    skipped: list[str] = []
+    for plugin_id, capability_name, tool_kind, description, handler_name, permission in PLUGIN_TOOL_BINDINGS:
+        if _plugin_capability_enabled("tools", plugin_id=plugin_id, name=capability_name):
+            handler = globals().get(handler_name)
+            if handler is None:
+                skipped.append(f"{plugin_id}:{capability_name}:missing_handler")
+                continue
+            tool_registry.register(
+                ToolSpec(
+                    tool_kind,
+                    description,
+                    handler,
+                    plugin_id=plugin_id,
+                    permission=permission,
+                )
+            )
+            registered.append(f"{plugin_id}:{capability_name}")
+        else:
+            skipped.append(f"{plugin_id}:{capability_name}")
+    logger.info(
+        "qq_social_agent plugin tool registry: "
+        f"registered={registered} skipped={skipped}"
+    )
+
+
+def _plugin_capability_enabled(
+    kind: str,
+    *,
+    plugin_id: str = "",
+    name: str = "",
+    target: str = "",
+    permission: str = "",
+) -> bool:
+    return local_plugin_registry.capability_enabled(
+        kind,
+        plugin_id=plugin_id,
+        name=name,
+        target=target,
+        permission=permission,
+    )
+
+
+def _plugin_task_enabled(plugin_id: str, task_name: str) -> bool:
+    return _plugin_capability_enabled("scheduled_tasks", plugin_id=plugin_id, name=task_name)
 
 
 def _record_llm_usage(
@@ -1086,6 +1207,7 @@ async def _send_approval_rules_on_connect(bot: Bot) -> None:
     await _send_changelog_notice_to_approvers(bot)
     await _notify_active_group_mutes(bot)
     _ensure_daily_review_task(bot)
+    _ensure_proactive_chat_task(bot)
     _ensure_group_directory_task(bot)
     _ensure_history_backfill_task(bot)
 
@@ -1194,6 +1316,7 @@ async def _mark_onebot_disconnected(bot: Bot) -> None:
 async def _shutdown_background_tasks() -> None:
     await _cancel_task_registries(
         daily_review_tasks,
+        proactive_chat_tasks,
         group_directory_tasks,
         history_backfill_tasks,
         notice_directory_refresh_tasks,
@@ -1216,7 +1339,7 @@ async def _shutdown_background_tasks() -> None:
 
 async def _cancel_bot_lifecycle_tasks(bot_key: str) -> None:
     tasks: list[asyncio.Task[object]] = []
-    for registry in (daily_review_tasks, group_directory_tasks, history_backfill_tasks):
+    for registry in (daily_review_tasks, proactive_chat_tasks, group_directory_tasks, history_backfill_tasks):
         task = registry.pop(bot_key, None)
         if task is not None and not task.done():
             task.cancel()
@@ -1448,6 +1571,9 @@ def _changelog_notice_marker(marker_key: str, approver_id: int) -> str:
 
 
 def _ensure_daily_review_task(bot: Bot) -> None:
+    if not _plugin_task_enabled("daily_review", "daily_review_midnight"):
+        logger.info("qq_social_agent daily review scheduler disabled by plugin manifest")
+        return
     bot_key = str(getattr(bot, "self_id", "default"))
     task = daily_review_tasks.get(bot_key)
     if task is not None and not task.done():
@@ -1487,6 +1613,255 @@ async def _run_daily_review_scheduler(bot: Bot, bot_key: str) -> None:
     finally:
         if daily_review_tasks.get(bot_key) is asyncio.current_task():
             daily_review_tasks.pop(bot_key, None)
+
+
+def _ensure_proactive_chat_task(bot: Bot) -> None:
+    if not PROACTIVE_CHAT_ENABLED:
+        return
+    if not _plugin_task_enabled("proactive_chat", "hourly_random_proactive_chat"):
+        logger.info("qq_social_agent proactive chat scheduler disabled by plugin manifest")
+        return
+    bot_key = str(getattr(bot, "self_id", "default"))
+    task = proactive_chat_tasks.get(bot_key)
+    if task is not None and not task.done():
+        return
+    proactive_chat_tasks[bot_key] = asyncio.create_task(_run_proactive_chat_scheduler(bot, bot_key))
+    logger.info(
+        "qq_social_agent proactive chat scheduler started: "
+        f"bot={bot_key} interval={int(PROACTIVE_CHAT_INTERVAL_SECONDS)}s "
+        f"daytime={PROACTIVE_CHAT_DAYTIME_PERCENT}% quiet={PROACTIVE_CHAT_QUIET_PERCENT}%"
+    )
+
+
+async def _run_proactive_chat_scheduler(bot: Bot, bot_key: str) -> None:
+    try:
+        if PROACTIVE_CHAT_POLL_JITTER_SECONDS > 0:
+            await asyncio.sleep(random.uniform(1.0, PROACTIVE_CHAT_POLL_JITTER_SECONDS))
+        while True:
+            await asyncio.sleep(_seconds_until_next_proactive_chat_tick())
+            now = time.time()
+            probability = _proactive_chat_probability_percent(now)
+            for group_id in _runtime_target_groups():
+                roll = random.uniform(0.0, 100.0)
+                if roll >= probability:
+                    logger.info(
+                        "qq_social_agent proactive chat skipped by probability: "
+                        f"group={group_id} probability={probability} roll={roll:.2f}"
+                    )
+                    _record_metric_event(
+                        "proactive_chat",
+                        group_id=group_id,
+                        stage="probability",
+                        action="skipped",
+                        probability=probability,
+                        roll=round(roll, 2),
+                    )
+                    continue
+                await _send_proactive_chat_for_group(bot, group_id=group_id, probability=probability, roll=roll)
+                await asyncio.sleep(0.5)
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        logger.warning(f"qq_social_agent proactive chat scheduler stopped: bot={bot_key} error={exc}")
+    finally:
+        if proactive_chat_tasks.get(bot_key) is asyncio.current_task():
+            proactive_chat_tasks.pop(bot_key, None)
+
+
+def _seconds_until_next_proactive_chat_tick(now: float | None = None) -> float:
+    base = PROACTIVE_CHAT_INTERVAL_SECONDS
+    jitter = random.uniform(0.0, PROACTIVE_CHAT_POLL_JITTER_SECONDS) if PROACTIVE_CHAT_POLL_JITTER_SECONDS > 0 else 0.0
+    return max(1.0, base + jitter)
+
+
+def _proactive_chat_probability_percent(now: float | None = None) -> int:
+    current = time.time() if now is None else now
+    hour = datetime.fromtimestamp(current, PROACTIVE_CHAT_TIMEZONE).hour
+    if _hour_in_range(hour, PROACTIVE_CHAT_QUIET_START_HOUR, PROACTIVE_CHAT_QUIET_END_HOUR):
+        return PROACTIVE_CHAT_QUIET_PERCENT
+    return PROACTIVE_CHAT_DAYTIME_PERCENT
+
+
+def _hour_in_range(hour: int, start: int, end: int) -> bool:
+    if start == end:
+        return True
+    if start < end:
+        return start <= hour < end
+    return hour >= start or hour < end
+
+
+async def _send_proactive_chat_for_group(
+    bot: Bot,
+    *,
+    group_id: int,
+    probability: int,
+    roll: float,
+) -> bool:
+    if deepseek_client is None:
+        _record_metric_event("proactive_chat", group_id=group_id, stage="generation", action="skipped", reason="deepseek_client_not_ready")
+        return False
+    if group_id in group_generation_inflight:
+        _record_metric_event("proactive_chat", group_id=group_id, stage="generation", action="skipped", reason="group_generation_inflight")
+        return False
+    if group_id in pending_group_approvals:
+        _record_metric_event("proactive_chat", group_id=group_id, stage="generation", action="skipped", reason="pending_approval_exists")
+        return False
+    now = time.time()
+    state = memory.group_state(group_id)
+    group_cfg = app_config.group_config(group_id)
+    if not app_config.group_allowed(group_id) or not bool(group_cfg.get("enabled", True)) or not bool(state["enabled"]):
+        _record_metric_event("proactive_chat", group_id=group_id, stage="check", action="skipped", reason="group_disabled")
+        return False
+    muted_until = await _refresh_self_mute_state_if_stale(bot, group_id, float(state["muted_until"] or 0))
+    if muted_until > now:
+        _record_metric_event("proactive_chat", group_id=group_id, stage="check", action="skipped", reason="self_muted", muted_until=muted_until)
+        return False
+    persona_id = str(state["persona"] or group_cfg.get("persona") or app_config.default_persona)
+    persona = personas.get(persona_id) or personas.get(app_config.default_persona)
+    if persona is None:
+        _record_metric_event("proactive_chat", group_id=group_id, stage="generation", action="skipped", reason="persona_not_found", persona=persona_id)
+        return False
+    group_generation_inflight.add(group_id)
+    try:
+        recent_messages = memory.recent_messages(group_id, PROACTIVE_CHAT_CONTEXT_LIMIT)
+        context_query = _proactive_chat_context_query(recent_messages)
+        related_user_ids = _related_member_user_ids(recent_messages, current_user_id=0)
+        memory_context = _format_memory_context(
+            memory.relevant_memory_summaries(group_id, context_query, limit=MID_MEMORY_KEEP_SUMMARIES)
+        )
+        member_context = _format_member_context(
+            memory.member_impressions_for_context(group_id, related_user_ids, limit=MEMBER_IMPRESSION_CONTEXT_LIMIT)
+        )
+        memory_atoms_context = _format_memory_atom_context(
+            memory.relevant_memory_atoms(
+                group_id,
+                context_query,
+                subject_user_ids=related_user_ids,
+                relationship_user_ids=related_user_ids,
+                limit=MEMORY_ATOM_CONTEXT_LIMIT,
+            )
+        )
+        style_context = _format_style_context(
+            memory.relevant_style_rules(group_id, context_query, limit=STYLE_RULE_CONTEXT_LIMIT)
+        )
+        raw_corpus_context = _format_raw_corpus_context(
+            memory.relevant_raw_corpus_examples(
+                group_id,
+                context_query,
+                limit=RAW_CORPUS_CONTEXT_LIMIT,
+                candidate_limit=RAW_CORPUS_CANDIDATE_LIMIT,
+                context_radius=RAW_CORPUS_CONTEXT_RADIUS,
+                exclude_user_id=int(bot.self_id),
+                per_user_limit=1,
+            )
+        )
+        jargon_context = await _selected_group_jargon_context(
+            group_id,
+            recent_messages,
+            current_text=context_query,
+            current_nickname="风雪主动发起",
+        )
+        social_action_context = social_action_service.recent_reaction_context(group_id)
+        context_packet = assemble_generation_context(
+            memory_context=memory_context,
+            member_context=member_context,
+            memory_atoms_context=memory_atoms_context,
+            style_context=style_context,
+            raw_corpus_context=raw_corpus_context,
+            jargon_context=jargon_context,
+            social_action_context=social_action_context,
+        )
+        prompt_text = (
+            "这是风雪按固定间隔随机主动发起聊天。根据最近群聊氛围，直接自然插一句或开个轻话题；"
+            "不要解释自己为什么突然说话，不要像公告，不要总结全场。"
+        )
+        drafts = await deepseek_client.reply_candidates(
+            persona=persona,
+            recent_messages=recent_messages,
+            current_text=prompt_text,
+            current_nickname="风雪主动发起",
+            mentioned=False,
+            action="reply",
+            chat_label="QQ 群聊",
+            context_packet=context_packet,
+            include_bot_history=True,
+            context_message_limit=PROACTIVE_CHAT_CONTEXT_LIMIT,
+            candidate_count=1,
+            prompt_flow="reply_direct",
+            task_name="proactive_chat",
+        )
+        if not drafts:
+            _record_metric_event("proactive_chat", group_id=group_id, stage="generation", action="skipped", reason="empty_model_reply")
+            return False
+        reply = _sanitize_generated_text(drafts[0].text)
+        reply, guarded = sanitize_political_output(reply)
+        reply = _sanitize_generated_text(reply)
+        if guarded:
+            logger.info(f"qq_social_agent political guard proactive output: group={group_id}")
+        if not reply or reply in BLOCKED_BACKEND_FALLBACK_TEXTS:
+            _record_metric_event("proactive_chat", group_id=group_id, stage="generation", action="skipped", reason="empty_after_guard")
+            return False
+        parts = split_reply_messages(reply, max_messages=PROACTIVE_CHAT_MAX_MESSAGES)
+        if not parts:
+            _record_metric_event("proactive_chat", group_id=group_id, stage="generation", action="skipped", reason="empty_after_split")
+            return False
+        sent_ids: list[int] = []
+        for part in parts:
+            message_id = await _send_group_message(bot, group_id, Message(part))
+            _record_bot_sent_message(
+                group_id=group_id,
+                message_id=message_id,
+                bot_reply=part,
+                trigger_user_id=0,
+                trigger_nickname="风雪主动发起",
+                trigger_text=f"interval_random probability={probability} roll={roll:.2f}",
+                action="proactive_chat",
+            )
+            memory.add_message(
+                group_id,
+                int(bot.self_id),
+                persona.name,
+                part,
+                is_bot=True,
+                source_message_id=message_id,
+                source_kind="proactive_chat",
+                correlation_id=f"proactive:{group_id}:{int(now)}",
+            )
+            if message_id is not None:
+                sent_ids.append(message_id)
+            await asyncio.sleep(random.uniform(0.8, 1.8))
+        logger.info(
+            "qq_social_agent proactive chat sent: "
+            f"group={group_id} parts={len(parts)} message_ids={sent_ids} probability={probability} roll={roll:.2f}"
+        )
+        _record_metric_event(
+            "proactive_chat",
+            group_id=group_id,
+            stage="send",
+            action="sent",
+            probability=probability,
+            roll=round(roll, 2),
+            message_count=len(parts),
+            message_ids=sent_ids,
+        )
+        return True
+    except ActionFailed as exc:
+        logger.warning(f"qq_social_agent proactive chat send failed: group={group_id} {_action_failed_summary(exc)}")
+        _record_metric_event("proactive_chat", group_id=group_id, stage="send", action="failed", error=_action_failed_summary(exc))
+        return False
+    except Exception as exc:
+        logger.warning(f"qq_social_agent proactive chat failed: group={group_id} error={exc}")
+        _record_metric_event("proactive_chat", group_id=group_id, stage="generation", action="failed", error=_short_notice_text(str(exc), 200))
+        return False
+    finally:
+        group_generation_inflight.discard(group_id)
+
+
+def _proactive_chat_context_query(recent_messages: list[ChatMessage]) -> str:
+    lines = [message.text.strip() for message in recent_messages[-8:] if message.text and message.text.strip()]
+    if not lines:
+        return "风雪主动发起轻松群聊话题"
+    return "\n".join(lines)[-800:]
 
 
 def _seconds_until_next_daily_review(now: float | None = None) -> float:
@@ -2423,7 +2798,7 @@ def _format_model_route_status() -> str:
         provider = app_config.deepseek.providers[route.provider]
         lines.append(f"- {route.label}（{_provider_key_source(provider.name)} / {provider.api_key_env}）")
     lines.append("")
-    lines.append("命令示例：切回复模型 siliconflow/MiniMaxAI/MiniMax-M2.5；切搜索模型 siliconflow/Qwen/Qwen3.5-35B-A3B；切决策模型 siliconflow/Qwen/Qwen3.5-35B-A3B；清模型覆盖。")
+    lines.append("命令示例：切回复模型 siliconflow/deepseek-ai/DeepSeek-V4-Flash；切搜索模型 siliconflow/deepseek-ai/DeepSeek-V4-Flash；切决策模型 siliconflow/deepseek-ai/DeepSeek-V4-Flash；清模型覆盖。")
     return "\n".join(lines)
 
 
@@ -2756,6 +3131,7 @@ def _http_status_payload() -> dict[str, object]:
             "timing_gate": "active",
             "tool_router": "active",
             "registered_tools": [spec.kind.value for spec in tool_registry.available()],
+            "registered_tool_details": tool_registry.summaries(),
             "shadow_audit": "legacy_comparison_only",
             "tool_router_shadow_samples": tool_router_shadow_samples,
             "tool_router_shadow_target": TOOL_ROUTER_SHADOW_SAMPLE_LIMIT,
@@ -3242,6 +3618,11 @@ async def _admin_apply_tool_action(form: dict[str, str], *, group_id: int | None
         mode = form.get("mode", "today").strip() or "today"
         payload, _ = await _http_daily_review_payload(mode=mode)
         return f"复盘发送结果：{payload}"
+    if action == "proactive_chat":
+        if group_id is None:
+            return "没有目标群。"
+        payload, _ = await _http_proactive_chat_payload(group_id=group_id)
+        return f"主动发言触发结果：{payload}"
     return "未知工具动作。"
 
 
@@ -3332,6 +3713,27 @@ async def _http_daily_review_payload(*, mode: str) -> tuple[dict[str, object], i
         "sent_count": sent_count,
         "target_count": total_count,
     }, 200 if ok else 503
+
+async def _http_proactive_chat_payload(*, group_id: int | None) -> tuple[dict[str, object], int]:
+    bot = _first_connected_onebot_bot()
+    if bot is None:
+        return {"ok": False, "reason": "onebot_disconnected"}, 503
+    target_groups = (group_id,) if group_id is not None else _runtime_target_groups()
+    sent = 0
+    results: list[dict[str, object]] = []
+    for target_group_id in target_groups:
+        if not app_config.group_allowed(int(target_group_id)):
+            results.append({"group_id": int(target_group_id), "ok": False, "reason": "group_not_allowed"})
+            continue
+        ok = await _send_proactive_chat_for_group(
+            bot,
+            group_id=int(target_group_id),
+            probability=100,
+            roll=0.0,
+        )
+        sent += 1 if ok else 0
+        results.append({"group_id": int(target_group_id), "ok": bool(ok)})
+    return {"ok": sent > 0, "sent_count": sent, "target_count": len(tuple(target_groups)), "results": results}, 200 if sent > 0 else 503
 
 
 def _http_health_payload() -> dict[str, object]:
@@ -3748,6 +4150,8 @@ async def _handle_group_message_scoped(
         self_id=int(event.self_id),
         trigger_sequence=0,
     )
+    if not group_allowed:
+        return
     _record_metric_event(
         "pipeline_receive",
         group_id=group_id,
@@ -4627,17 +5031,10 @@ async def _handle_group_message_locked(
     rag_context_applied = False
     fresh_context_task: asyncio.Task[ToolResult] | None = None
     market_context_task: asyncio.Task[ToolResult] | None = None
-    if fresh_intent is not None and (fresh_intent.explicit or fresh_intent.required):
-        fresh_request = tool_plan.first(ToolKind.FRESH_SEARCH) or ToolRequest(
-            ToolKind.FRESH_SEARCH,
-            query=fresh_intent.query,
-            reason="backend_fresh_prefetch",
-            required=True,
-            arguments={"kind": fresh_intent.kind},
-        )
-        fresh_context_task = asyncio.create_task(
-            _execute_fresh_tool_request(fresh_request, metric_stage="fresh_context")
-        )
+    # External fresh-context lookup is intentionally delayed until after the
+    # reply decision is confirmed. The pre-decision path may use LLM routing
+    # hints, but it must not spend Tavily/search calls for messages we will not
+    # answer.
     prefetched_market_request = tool_plan.first(ToolKind.MARKET)
     if prefetched_market_request is not None and prefetched_market_request.required:
         market_context_task = asyncio.create_task(
@@ -4785,6 +5182,18 @@ async def _handle_group_message_locked(
         fresh_intent=fresh_intent,
     )
     decision = _apply_tool_plan(decision, tool_plan)
+    decision = await _apply_fresh_search_router(
+        decision,
+        persona=persona,
+        context_recent=context_recent,
+        text=text,
+        nickname=nickname,
+        addressed_bot=addressed_bot,
+        fresh_intent=fresh_intent,
+        speaker_context=speaker_context,
+        group_id=group_id,
+        user_id=user_id,
+    )
     decision = _enforce_addressed_reply_decision(
         decision,
         addressed_bot=direct_addressed_bot
@@ -4821,6 +5230,8 @@ async def _handle_group_message_locked(
         stage="llm" if pre_decision.decision is None else "backend",
         action=decision.action,
         should_reply=decision.should_reply,
+        fresh_query=_short_notice_text(decision.fresh_query, 120),
+        fresh_kind=decision.fresh_kind,
         confidence=round(decision.confidence, 3),
         decision_reason=decision.reason,
         side_reaction=decision.side_reaction,
@@ -5126,6 +5537,8 @@ async def _handle_group_message_locked(
                     arguments={"kind": decision.fresh_kind},
                 ),
                 metric_stage="fresh_context",
+                group_id=group_id,
+                user_id=user_id,
             )
         pipeline_state.add_tool_result(fresh_result)
         fresh_context = fresh_result.context
@@ -5576,6 +5989,10 @@ async def handle_bot_command(bot: Bot, event: Event, matcher: Matcher, args: Mes
         "daily_review",
         "daily-review",
         "复盘",
+        "proactive",
+        "proactive_chat",
+        "主动",
+        "主动发言",
     }
     if action in admin_actions and not _is_tool_admin_user(user_id):
         await matcher.finish("没权限。基础审批人只能用 A/B/C/D/X/1/2/3/取消 处理审批单。")
@@ -5645,8 +6062,14 @@ async def handle_bot_command(bot: Bot, event: Event, matcher: Matcher, args: Mes
         if sent_count:
             await matcher.finish(f"已发送复盘：{sent_count}/{total_count} 个群。")
         await matcher.finish(f"复盘没有发出：0/{total_count}。看后端 daily_review 日志。")
+    if action in {"proactive", "proactive_chat", "主动", "主动发言"}:
+        target_group_id = chat_id if chat_id in app_config.allowed_groups else _private_jargon_group_id()
+        if target_group_id is None:
+            await matcher.finish("没有目标群。")
+        ok = await _send_proactive_chat_for_group(bot, group_id=target_group_id, probability=100, roll=0.0)
+        await matcher.finish("已触发主动发言。" if ok else "主动发言没有发出，看 proactive_chat 日志。")
 
-    await matcher.finish("用法：/bot status|tokens 24h|tokens 2026-07-10|metrics today|blocked 20|review today|review due|pause|resume|reset|quiet 10m|persona <id>")
+    await matcher.finish("用法：/bot status|tokens 24h|tokens 2026-07-10|metrics today|blocked 20|review today|review due|proactive|pause|resume|reset|quiet 10m|persona <id>")
 
 
 def _parse_token_report_window(raw: str) -> TokenReportWindow:
@@ -6150,6 +6573,8 @@ def _followup_text_suggests_bot_target(text: str) -> bool:
         return True
     if any(token in compact for token in ("怎么办", "咋办", "救命", "完了", "崩溃", "难受", "害怕", "怕了")):
         return True
+    if len(compact) >= 4:
+        return True
     return False
 
 
@@ -6425,6 +6850,8 @@ async def _execute_fresh_tool_request(
     request: ToolRequest,
     *,
     metric_stage: str,
+    group_id: int | None = None,
+    user_id: int | None = None,
 ) -> ToolResult:
     tool_result = await tool_registry.execute(request)
     search_status = dict(tool_result.metadata)
@@ -6436,9 +6863,13 @@ async def _execute_fresh_tool_request(
     )
     _record_metric_event(
         "tool_call",
+        group_id=group_id,
+        user_id=user_id,
         stage=metric_stage,
         action=str(request.arguments.get("kind", "web")),
         tool_kind=request.kind.value,
+        request_query_preview=_short_notice_text(request.query, 120),
+        request_required=request.required,
         success=tool_result.ok,
         status=tool_result.status,
         provider=search_status.get("provider", ""),
@@ -6786,6 +7217,160 @@ def _reaction_target_message_id(
     return source_message_id or event_message_source_id(event)
 
 
+def _fresh_router_backend_hint(intent: object | None) -> str:
+    if intent is None:
+        return ""
+    query = str(getattr(intent, "query", "") or "").strip()
+    kind = str(getattr(intent, "kind", "web") or "web").strip()
+    explicit = bool(getattr(intent, "explicit", False))
+    required = bool(getattr(intent, "required", False))
+    if not query:
+        return ""
+    signals: list[str] = []
+    if explicit:
+        signals.append("显式搜索")
+    if required:
+        signals.append("需要核验最新事实")
+    if not signals:
+        signals.append("可能涉及最新背景")
+    return f"{'/'.join(signals)}；候选 query={query}；kind={kind}"
+
+
+def _fresh_router_should_run(
+    decision: ReplyDecision,
+    *,
+    text: str,
+    addressed_bot: bool,
+    fresh_intent: object | None,
+) -> bool:
+    if not decision.should_reply:
+        return False
+    if decision.need_fresh_context or fresh_intent is not None:
+        return True
+    if addressed_bot:
+        return True
+    compact = re.sub(r"\s+", "", text.casefold())
+    proactive_terms = (
+        "最近",
+        "最新",
+        "现在",
+        "今年",
+        "今天",
+        "刚刚",
+        "刚才",
+        "新闻",
+        "新专辑",
+        "新歌",
+        "新版本",
+        "发布",
+        "官宣",
+        "赛程",
+        "比分",
+        "结果",
+        "政策",
+        "发生什么",
+        "怎么了",
+    )
+    return any(term in compact for term in proactive_terms)
+
+
+async def _apply_fresh_search_router(
+    decision: ReplyDecision,
+    *,
+    persona: object,
+    context_recent: list[ChatMessage],
+    text: str,
+    nickname: str,
+    addressed_bot: bool,
+    fresh_intent: object | None,
+    speaker_context: str,
+    group_id: int,
+    user_id: int,
+) -> ReplyDecision:
+    router_should_run = _fresh_router_should_run(
+        decision,
+        text=text,
+        addressed_bot=addressed_bot,
+        fresh_intent=fresh_intent,
+    )
+    if deepseek_client is None or not router_should_run:
+        _record_metric_event(
+            "fresh_router",
+            group_id=group_id,
+            user_id=user_id,
+            stage="routing",
+            action="not_run",
+            need_search=False,
+            decision_should_reply=decision.should_reply,
+            decision_need_fresh=decision.need_fresh_context,
+            fresh_kind=decision.fresh_kind,
+            fresh_query_preview=_short_notice_text(decision.fresh_query, 120),
+            reason="client_not_ready" if deepseek_client is None else "router_gate_false",
+        )
+        return decision
+    backend_hint = _fresh_router_backend_hint(fresh_intent)
+    try:
+        routed = await deepseek_client.route_fresh_search(
+            persona=persona,
+            recent_messages=context_recent,
+            current_text=text,
+            current_nickname=_member_label(user_id, nickname),
+            addressed=addressed_bot,
+            decision_action=decision.action,
+            decision_reason=decision.reason,
+            backend_hint=backend_hint,
+            chat_label="QQ 群聊",
+            speaker_context=speaker_context,
+        )
+    except Exception as exc:
+        logger.warning(
+            "qq_social_agent fresh router failed: "
+            f"group={group_id} error={exc}"
+        )
+        _record_metric_event(
+            "fresh_router",
+            group_id=group_id,
+            user_id=user_id,
+            stage="routing",
+            action="failed",
+            need_search=False,
+            decision_should_reply=decision.should_reply,
+            decision_need_fresh=decision.need_fresh_context,
+            error=_short_notice_text(str(exc), 200),
+        )
+        return decision
+    _record_metric_event(
+        "fresh_router",
+        group_id=group_id,
+        user_id=user_id,
+        stage="routing",
+        action="search" if routed.need_search else "skip",
+        need_search=routed.need_search,
+        kind=routed.kind,
+        query_preview=_short_notice_text(routed.query, 80),
+        confidence=round(routed.confidence, 3),
+        reason=routed.reason,
+        backend_hint=backend_hint,
+    )
+    if routed.need_search and routed.query.strip():
+        return replace(
+            decision,
+            need_fresh_context=True,
+            fresh_query=routed.query.strip()[:120],
+            fresh_kind=routed.kind if routed.kind in {"news", "sports", "web"} else "web",
+        )
+    if decision.need_fresh_context and fresh_intent is not None and (
+        bool(getattr(fresh_intent, "explicit", False)) or bool(getattr(fresh_intent, "required", False))
+    ):
+        query = str(getattr(fresh_intent, "query", "") or "").strip()
+        kind = str(getattr(fresh_intent, "kind", decision.fresh_kind) or decision.fresh_kind)
+        if query:
+            return replace(decision, fresh_query=query[:120], fresh_kind=kind)
+    if decision.need_fresh_context and not decision.fresh_query.strip():
+        return replace(decision, need_fresh_context=False, fresh_kind="web")
+    return decision
+
+
 def _format_fresh_context_hint(intent: object | None) -> str:
     if intent is None:
         return ""
@@ -6847,13 +7432,9 @@ def _should_compact_group_context_message(
     plain_clean = plain_text.strip()
     if len(raw_clean) <= LONG_MESSAGE_SUMMARY_THRESHOLD:
         return False
-    if (
-        _event_has_reply_context(event)
-        and len(plain_clean) <= LONG_MESSAGE_SUMMARY_THRESHOLD
-        and len(raw_clean) <= REPLY_CONTEXT_SUMMARY_THRESHOLD
-    ):
+    if len(plain_clean) <= LONG_MESSAGE_SUMMARY_THRESHOLD:
         return False
-    return True
+    return len(plain_clean) > LONG_MESSAGE_SUMMARY_THRESHOLD
 
 
 async def _forward_context_text(
@@ -9332,6 +9913,11 @@ async def _send_approved_group_reply_scoped(
         last_group_mention_targets[approval.group_id] = (sent_mention_user_id, time.time())
     else:
         last_group_mention_targets.pop(approval.group_id, None)
+    _record_post_reply_followup_window(
+        approval.group_id,
+        trigger_user_id=approval.trigger_user_id,
+        mention_user_id=sent_mention_user_id,
+    )
     await _execute_approved_side_reaction(bot, approval)
     send_elapsed_ms = int((time.monotonic() - send_started_at) * 1000)
     if pipeline_state is not None:
@@ -9355,6 +9941,31 @@ async def _send_approved_group_reply_scoped(
         await _send_private_message(bot, user_id=approver_id, message=Message("已发。"))
     except ActionFailed:
         pass
+
+
+def _record_post_reply_followup_window(
+    group_id: int,
+    *,
+    trigger_user_id: int,
+    mention_user_id: int | None = None,
+) -> None:
+    now = time.time()
+    target_user_ids = {int(trigger_user_id or 0)}
+    if mention_user_id is not None:
+        target_user_ids.add(int(mention_user_id or 0))
+    target_user_ids.discard(0)
+    for target_user_id in sorted(target_user_ids):
+        _record_addressed_event(group_id, target_user_id, True, now=now)
+    if target_user_ids:
+        _record_metric_event(
+            "followup_window_opened",
+            group_id=group_id,
+            user_id=trigger_user_id,
+            stage="send",
+            action="post_reply",
+            target_user_ids=sorted(target_user_ids),
+            window_seconds=ADDRESS_FOLLOWUP_WINDOW_SECONDS,
+        )
 
 
 async def _execute_approved_side_reaction(bot: Bot, approval: PendingGroupApproval) -> None:

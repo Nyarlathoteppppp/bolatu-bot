@@ -17,6 +17,8 @@ class ToolSpec:
     description: str
     handler: ToolHandler
     enabled: bool = True
+    plugin_id: str = ""
+    permission: str = ""
 
 
 class ToolRegistry:
@@ -28,6 +30,9 @@ class ToolRegistry:
     def register(self, spec: ToolSpec) -> None:
         self._specs[spec.kind] = spec
 
+    def clear(self) -> None:
+        self._specs.clear()
+
     def available(self, allowed: Iterable[ToolKind] | None = None) -> tuple[ToolSpec, ...]:
         allowed_set = set(allowed) if allowed is not None else None
         return tuple(
@@ -35,6 +40,18 @@ class ToolRegistry:
             for kind, spec in self._specs.items()
             if spec.enabled and (allowed_set is None or kind in allowed_set)
         )
+
+    def summaries(self) -> list[dict[str, object]]:
+        return [
+            {
+                "kind": spec.kind.value,
+                "description": spec.description,
+                "enabled": spec.enabled,
+                "plugin_id": spec.plugin_id,
+                "permission": spec.permission,
+            }
+            for spec in self._specs.values()
+        ]
 
     async def execute(self, request: ToolRequest) -> ToolResult:
         started = time.monotonic()

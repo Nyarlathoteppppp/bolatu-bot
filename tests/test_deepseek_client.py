@@ -15,6 +15,7 @@ from qq_social_agent.deepseek_client import (
     _parse_mid_memory,
     _parse_reply_candidates,
     _parse_reply_decision,
+    _parse_fresh_search_decision,
     _parse_style_rules,
     ReplyCandidateDraft,
     _sanitize_reply,
@@ -839,3 +840,22 @@ def test_search_answer_uses_fast_route_and_small_prompt_budget() -> None:
     assert captured_calls[0][0:2] == ("search_answer", "search")
     assert captured_calls[0][2]["max_tokens"] == 180
     assert "旧说法" in captured_calls[0][2]["messages"][0]["content"]
+
+
+def test_parse_fresh_search_decision_json() -> None:
+    decision = _parse_fresh_search_decision(
+        '{"need_search": true, "kind": "web", "query": "滚石 新专辑", "confidence": 0.88, "reason": "明确搜索"}'
+    )
+
+    assert decision.need_search
+    assert decision.kind == "web"
+    assert decision.query == "滚石 新专辑"
+    assert decision.confidence == 0.88
+
+
+def test_parse_fresh_search_decision_requires_query() -> None:
+    decision = _parse_fresh_search_decision(
+        '{"need_search": true, "kind": "news", "query": "", "confidence": 0.5, "reason": "没对象"}'
+    )
+
+    assert not decision.need_search

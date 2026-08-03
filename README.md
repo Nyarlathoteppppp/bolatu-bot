@@ -82,6 +82,36 @@ scripts/stop_bot.sh
 scripts/start_bot_daemon.sh
 ```
 
+### 3.1 服务器热更新注意
+
+当前服务器 `docker-compose.server.yml` 对 bot 使用 bind mount：
+
+```text
+./qq_social_agent -> /app/qq_social_agent
+./prompts -> /app/prompts
+./plugins -> /app/plugins
+./config.yaml -> /app/config.yaml
+./data -> /app/data
+```
+
+所以普通 Python 代码、Prompt、插件、配置文件改动不需要重建镜像，直接重启 bot 容器即可生效：
+
+```bash
+cd /opt/qq-social-agent
+docker restart qq-social-agent-bot
+# 或
+docker compose -p qq-social-agent -f docker-compose.server.yml restart bot
+```
+
+只有改了 `pyproject.toml`、`Dockerfile.server`、系统依赖、镜像基础环境时，才使用重建：
+
+```bash
+cd /opt/qq-social-agent
+scripts/restart_bot.sh
+```
+
+注意：服务器 Docker 可能配置了 `HTTP_PROXY=http://127.0.0.1:7897`。如果本地反向代理没开，`scripts/restart_bot.sh` 会在拉 Docker Hub metadata 时失败，但旧容器通常仍在运行。遇到这种情况优先用 `docker restart qq-social-agent-bot`，不要重启 NapCat。
+
 除非 QQ 登录或连接确实损坏，不要随便重启 NapCat；重启可能需要重新扫码并触发 QQ 风控。
 
 查看日志：
@@ -119,7 +149,13 @@ python -m pytest -q
 /opt/qq-social-agent/prompts/zhangfengxue.yaml
 ```
 
-Prompt 在后端启动时加载。修改 Python 代码后使用 `scripts/restart_bot.sh` 重新构建 bot；只修改 Prompt 时运行 `docker compose -p qq-social-agent -f docker-compose.server.yml restart bot` 即可，不需要重新构建镜像。
+Prompt 在后端启动时加载。当前生产容器挂载了宿主机源码和 Prompt，所以修改 Python 代码、Prompt 或 `config.yaml` 后，默认只运行：
+
+```bash
+docker restart qq-social-agent-bot
+```
+
+不要为普通代码修改调用 `scripts/restart_bot.sh`，它会触发镜像重建；代理没开时容易失败。只有依赖和镜像环境变更才重建。
 
 `scripts/restart_bot.sh` 会在重建 bot 后自动清理 24 小时以前的 Docker 构建缓存，避免长期开发时 build cache 把 40G 系统盘吃满。
 

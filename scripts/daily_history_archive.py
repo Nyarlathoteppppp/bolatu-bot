@@ -470,12 +470,14 @@ def cos_sync(local_dir: Path, cos_dest: str, timeout_seconds: int) -> bool:
         return False
     cmd = [
         "timeout", str(timeout_seconds), "coscli", "sync", str(local_dir), cos_dest,
-        "--init-skip", "--disable-log", "--err-retry-num", "2",
+        "-r", "--init-skip", "--disable-log", "--err-retry-num", "2",
         "--routines", "2", "--fail-output=false", "--process-log=false",
     ]
     print("cos_sync:", " ".join(cmd))
     completed = subprocess.run(cmd, cwd=str(PROJECT_DIR), text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-    print(completed.stdout[-4000:])
+    output_tail = completed.stdout[-4000:]
+    print(output_tail)
+    print(f"cos_sync_returncode: {completed.returncode}")
     return completed.returncode == 0
 
 

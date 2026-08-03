@@ -77,6 +77,30 @@ class LocalPluginManifest:
 
 
 @dataclass(frozen=True)
+class LocalPluginRuntimeCapability:
+    plugin_id: str
+    plugin_name: str
+    kind: str
+    name: str
+    description: str = ""
+    permission: str = ""
+    target: str = ""
+    metadata: dict[str, object] | None = None
+
+    def to_summary(self) -> dict[str, object]:
+        return {
+            "plugin_id": self.plugin_id,
+            "plugin_name": self.plugin_name,
+            "kind": self.kind,
+            "name": self.name,
+            "description": self.description,
+            "permission": self.permission,
+            "target": self.target,
+            "metadata": dict(self.metadata or {}),
+        }
+
+
+@dataclass(frozen=True)
 class PluginLoadError:
     path: str
     error: str
@@ -86,11 +110,12 @@ class PluginLoadError:
 
 
 class LocalPluginRegistry:
-    """Loads local plugin manifests without executing plugin code.
+    """Loads local plugin manifests and builds an explicit execution plan.
 
-    This is deliberately a metadata registry first. It gives the project a stable
-    boundary for commands/tools/tasks before we migrate implementations out of
-    qq_social_agent.plugin.
+    Runtime execution stays allowlisted by the host application: manifests declare
+    commands/tools/tasks/routes/events, and qq_social_agent.plugin binds known
+    targets to local implementations. This avoids arbitrary dynamic imports while
+    letting plugins own capability switches, permissions, and UI metadata.
     """
 
     def __init__(self, root: Path | str) -> None:
@@ -147,7 +172,63 @@ class LocalPluginRegistry:
             "disabled": len(self._plugins) - len(enabled),
             "errors": [error.to_summary() for error in self._errors],
             "capability_counts": _merge_capability_counts(enabled),
+            "execution_plan": self.execution_plan(),
             "plugins": [plugin.to_summary() for plugin in enabled],
+        }
+
+    def capabilities(
+        self,
+        kind: str | None = None,
+        *,
+        enabled_only: bool = True,
+    ) -> tuple[LocalPluginRuntimeCapability, ...]:
+        normalized_kind = str(kind or "").strip()
+        records: list[LocalPluginRuntimeCapability] = []
+        for plugin in self.plugins(include_disabled=not enabled_only):
+            if enabled_only and not plugin.enabled:
+                continue
+            for capability_kind in CAPABILITY_KEYS:
+                if normalized_kind and capability_kind != normalized_kind:
+                    continue
+                for capability in plugin.capabilities.get(capability_kind, ()):
+                    records.append(
+                        LocalPluginRuntimeCapability(
+                            plugin_id=plugin.plugin_id,
+                            plugin_name=plugin.name,
+                            kind=capability_kind,
+                            name=capability.name,
+                            description=capability.description,
+                            permission=capability.permission,
+                            target=capability.target,
+                            metadata=capability.metadata,
+                        )
+                    )
+        return tuple(records)
+
+    def capability_enabled(
+        self,
+        kind: str,
+        *,
+        plugin_id: str = "",
+        name: str = "",
+        target: str = "",
+        permission: str = "",
+    ) -> bool:
+        return any(
+            _capability_matches(
+                capability,
+                plugin_id=plugin_id,
+                name=name,
+                target=target,
+                permission=permission,
+            )
+            for capability in self.capabilities(kind, enabled_only=True)
+        )
+
+    def execution_plan(self) -> dict[str, list[dict[str, object]]]:
+        return {
+            kind: [capability.to_summary() for capability in self.capabilities(kind, enabled_only=True)]
+            for kind in CAPABILITY_KEYS
         }
 
     def _manifest_paths(self) -> tuple[Path, ...]:
@@ -269,6 +350,29 @@ def _string_tuple(value: object) -> tuple[str, ...]:
     if isinstance(value, list):
         return tuple(str(item).strip() for item in value if str(item).strip())
     return ()
+
+
+def _capability_matches(
+    capability: LocalPluginRuntimeCapability,
+    *,
+    plugin_id: str = "",
+    name: str = "",
+    target: str = "",
+    permission: str = "",
+) -> bool:
+    if plugin_id and capability.plugin_id != plugin_id:
+        return False
+    if name and _normalized_key(capability.name) != _normalized_key(name):
+        return False
+    if target and _normalized_key(capability.target) != _normalized_key(target):
+        return False
+    if permission and _normalized_key(capability.permission) != _normalized_key(permission):
+        return False
+    return True
+
+
+def _normalized_key(value: object) -> str:
+    return str(value or "").strip().casefold()
 
 
 def _merge_capability_counts(plugins: tuple[LocalPluginManifest, ...]) -> dict[str, int]:

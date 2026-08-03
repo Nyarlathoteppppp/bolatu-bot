@@ -841,19 +841,28 @@ def fresh_kind_from_text(text: str) -> str | None:
 
 
 def detect_fresh_intent(text: str) -> FreshIntent | None:
-    full_text = re.sub(r"\s+", " ", str(text or "")).strip()
+    raw_text = str(text or "")
+    full_text = re.sub(r"\s+", " ", raw_text).strip()
     normalized = _normalize_query(full_text)
     compact = re.sub(r"\s+", "", full_text.casefold())
     if not compact or _is_low_value_fresh_query(compact):
         return None
 
-    explicit_query = _explicit_search_query(full_text)
+    explicit_query = None
+    explicit_source = full_text
+    for candidate in _explicit_search_candidate_texts(raw_text):
+        explicit_query = _explicit_search_query(candidate)
+        if explicit_query is None:
+            explicit_query = _embedded_explicit_search_query(candidate)
+        if explicit_query is not None:
+            explicit_source = candidate
+            break
     explicit = explicit_query is not None
-    kind = _classify_fresh_kind(full_text, explicit=explicit)
+    kind = _classify_fresh_kind(explicit_source if explicit else full_text, explicit=explicit)
     if kind is None:
         return None
     query = (
-        _normalize_query(explicit_query)
+        _clean_explicit_search_query(explicit_query or "")
         if explicit_query is not None
         else _fresh_query_from_text(_current_reply_text(full_text) or normalized)
     )
@@ -877,6 +886,49 @@ def should_use_fresh_context(query: str, fallback_text: str = "") -> bool:
 def _normalize_query(query: str) -> str:
     query = re.sub(r"\s+", " ", query).strip()
     return query[:120]
+
+
+def _explicit_search_candidate_texts(text: str) -> tuple[str, ...]:
+    candidates: list[str] = []
+    current = _current_reply_text(re.sub(r"\s+", " ", str(text or "")).strip())
+    if current:
+        candidates.append(current)
+    for raw_line in str(text or "").splitlines():
+        line = re.sub(r"\s+", " ", raw_line).strip()
+        if not line:
+            continue
+        line = re.sub(r"^\s*\d+[.、)）]\s*", "", line)
+        for separator in ("说：", "说:", "：", ":"):
+            if separator in line:
+                tail = line.split(separator, 1)[-1].strip()
+                if tail:
+                    candidates.append(tail)
+                    break
+        candidates.append(line)
+    candidates.append(str(text or ""))
+    output: list[str] = []
+    seen: set[str] = set()
+    for item in candidates:
+        clean = re.sub(r"\s+", " ", item).strip()
+        if not clean:
+            continue
+        key = clean.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        output.append(clean)
+    return tuple(output)
+
+
+def _clean_explicit_search_query(query: str) -> str:
+    clean = _normalize_query(query)
+    clean = re.sub(
+        r"^(?:讲讲|讲一下|说说|说一下|聊聊|介绍一下|看看|看一下|分析一下|讲一讲|说一说|关于)\s*",
+        "",
+        clean,
+    ).strip(" ，,：:")
+    clean = re.sub(r"^(?:一下|下|这个|这件事|这东西)\s*", "", clean).strip(" ，,：:")
+    return _normalize_query(clean or query)
 
 
 def _fresh_query_from_text(text: str) -> str:
@@ -918,6 +970,8 @@ def _is_low_value_fresh_query(text: str) -> bool:
         "乱码",
         "随便搜搜",
         "你能搜什么",
+        "搜索功能",
+        "联网功能",
     )
     if any(token in compact for token in low_value_tokens):
         return True
@@ -931,9 +985,9 @@ _EXPLICIT_SEARCH_RE = re.compile(
     r"(?:"
     r"帮我\s*找(?:一下)?|"
     r"(?:帮我|你)?\s*(?:去|来)?\s*(?:"
-    r"联网(?:搜|查|看)(?:一下)?|"
-    r"网上(?:搜|查|找|看)(?:一下)?|"
-    r"上网(?:搜|查|找|看)(?:一下)?|"
+    r"联网(?:搜索|搜|查|看)(?:一下)?|"
+    r"网上(?:搜索|搜|查|找|看)(?:一下)?|"
+    r"上网(?:搜索|搜|查|找|看)(?:一下)?|"
     r"搜索(?:一下)?|搜一下|搜搜|搜|查一下|查查|查"
     r")"
     r")"
@@ -944,6 +998,23 @@ _EXPLICIT_SEARCH_RE = re.compile(
 
 def _explicit_search_query(text: str) -> str | None:
     match = _EXPLICIT_SEARCH_RE.match(text)
+    if match is None:
+        return None
+    query = _normalize_query(match.group("query"))
+    return query or None
+
+
+def _embedded_explicit_search_query(text: str) -> str | None:
+    value = re.sub(r"\s+", " ", str(text or "")).strip()
+    if not value or any(token in value for token in ("搜索功能", "联网功能", "搜搜功能")):
+        return None
+    pattern = (
+        r"(?:称|说|让|叫|要|想|在)?\s*(?:你)?\s*"
+        r"(?:联网(?:搜索|搜|查|看)(?:一下)?|网上(?:搜索|搜|查|找|看)(?:一下)?|"
+        r"上网(?:搜索|搜|查|找|看)(?:一下)?|搜索(?:一下)?(?!功能)|搜一下|搜搜|查一下|查查)"
+        r"[，,：:\s]*(?P<query>[^。！？!；;\n]{2,80})"
+    )
+    match = re.search(pattern, value, flags=re.IGNORECASE)
     if match is None:
         return None
     query = _normalize_query(match.group("query"))

@@ -1455,7 +1455,7 @@ def test_followup_addressed_allows_plain_followup_question() -> None:
     assert reason == "followup_text"
 
 
-def test_followup_addressed_rejects_plain_group_chatter() -> None:
+def test_followup_addressed_allows_substantive_plain_followup() -> None:
     bot = SimpleNamespace(self_id=1801507496)
     event = SimpleNamespace(
         self_id=1801507496,
@@ -1467,8 +1467,8 @@ def test_followup_addressed_rejects_plain_group_chatter() -> None:
 
     allowed, reason = plugin._followup_addressed_allowed(event, bot)
 
-    assert not allowed
-    assert reason == "not_directed"
+    assert allowed
+    assert reason == "followup_text"
 
 
 def test_followup_addressed_rejects_at_other_user() -> None:
@@ -2744,3 +2744,20 @@ def test_format_token_usage_report(monkeypatch, tmp_path) -> None:
     assert "decision / deepseek-v4-flash" in report
     assert "reply_candidates / deepseek-v4-flash" in report
     assert "估算成本" in report
+
+
+def test_post_reply_followup_window_records_trigger_and_mention_targets() -> None:
+    plugin.addressed_event_times.clear()
+
+    plugin._record_post_reply_followup_window(1, trigger_user_id=100, mention_user_id=200)
+
+    assert plugin._addressed_followup_active(1, 100)
+    assert plugin._addressed_followup_active(1, 200)
+    assert not plugin._addressed_followup_active(1, 300)
+
+
+def test_proactive_chat_tick_uses_interval_not_next_hour(monkeypatch) -> None:
+    monkeypatch.setattr(plugin, "PROACTIVE_CHAT_INTERVAL_SECONDS", 45 * 60.0)
+    monkeypatch.setattr(plugin, "PROACTIVE_CHAT_POLL_JITTER_SECONDS", 0.0)
+
+    assert plugin._seconds_until_next_proactive_chat_tick(now=123456.0) == 45 * 60.0

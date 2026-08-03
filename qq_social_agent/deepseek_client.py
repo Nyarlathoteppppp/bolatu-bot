@@ -45,6 +45,15 @@ class ReplyDecision:
 
 
 @dataclass(frozen=True)
+class FreshSearchDecision:
+    need_search: bool
+    query: str = ""
+    kind: str = "web"
+    confidence: float = 0.0
+    reason: str = ""
+
+
+@dataclass(frozen=True)
 class MemoryFactDraft:
     kind: str
     content: str
@@ -326,6 +335,59 @@ class DeepSeekClient:
         )
         content = response.choices[0].message.content or ""
         return _parse_reply_decision(content)
+
+    async def route_fresh_search(
+        self,
+        *,
+        persona: Persona,
+        recent_messages: list[ChatMessage],
+        current_text: str,
+        current_nickname: str,
+        addressed: bool,
+        decision_action: str,
+        decision_reason: str,
+        backend_hint: str = "",
+        chat_label: str = "QQ 群聊",
+        speaker_context: str = "",
+    ) -> FreshSearchDecision:
+        context = _format_context_with_local_focus(
+            recent_messages[-10:],
+            formatter=_format_decision_message,
+            local_limit=5,
+        ) or "（暂无更多上下文）"
+        system = self.prompts.render(
+            "fresh_router",
+            "system",
+            persona_name=persona.name,
+            persona_decision_prompt=persona.decision_prompt,
+        )
+        user = self.prompts.render(
+            "fresh_router",
+            "user",
+            chat_label=chat_label,
+            addressed="true" if addressed else "false",
+            decision_action=decision_action,
+            decision_reason=decision_reason,
+            backend_hint=backend_hint or "无",
+            speaker_context_section=_optional_section("本轮说话关系", speaker_context),
+            context=context,
+            current_nickname=current_nickname,
+            current_text=current_text,
+        )
+        response = await self._chat_completion(
+            task="fresh_router",
+            route_name="search",
+            request={
+                "temperature": 0.1,
+                "max_tokens": 160,
+                "response_format": {"type": "json_object"},
+                "messages": [
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user},
+                ],
+            },
+        )
+        return _parse_fresh_search_decision(response.choices[0].message.content or "")
 
     async def timing_gate(
         self,
@@ -975,6 +1037,32 @@ def _optional_section(title: str, content: str) -> str:
 def _speaker_label(user_id: int, nickname: str) -> str:
     name = nickname.strip() or str(user_id)
     return f"{name}[#{str(user_id)[-5:]}]"
+
+
+def _parse_fresh_search_decision(content: str) -> FreshSearchDecision:
+    try:
+        raw = _loads_json_object(content)
+    except json.JSONDecodeError:
+        return FreshSearchDecision(False, reason="invalid_json")
+    need_search = bool(raw.get("need_search", raw.get("need_fresh_context", False)))
+    query = re.sub(r"\s+", " ", str(raw.get("query", raw.get("fresh_query", "")) or "")).strip()
+    kind = str(raw.get("kind", raw.get("fresh_kind", "web")) or "web").strip().lower()
+    if kind not in {"news", "sports", "web"}:
+        kind = "web"
+    try:
+        confidence = float(raw.get("confidence", 0.0))
+    except (TypeError, ValueError):
+        confidence = 0.0
+    reason = str(raw.get("reason", "") or "").strip()
+    if not query:
+        need_search = False
+    return FreshSearchDecision(
+        need_search=need_search,
+        query=query[:120],
+        kind=kind,
+        confidence=max(0.0, min(1.0, confidence)),
+        reason=reason[:60],
+    )
 
 
 def _parse_reply_decision(content: str) -> ReplyDecision:

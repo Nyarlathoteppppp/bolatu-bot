@@ -30,16 +30,18 @@ deepseek:
       base_url: https://api.siliconflow.cn/v1
       api_key_env: SILICONFLOW_API_KEY
       thinking: disabled
-  model: siliconflow/MiniMaxAI/MiniMax-M2.5
-  decision_model: siliconflow/Qwen/Qwen3.5-35B-A3B
-  reply_model: siliconflow/MiniMaxAI/MiniMax-M2.5
-  search_model: siliconflow/Qwen/Qwen3.5-35B-A3B
-  utility_model: siliconflow/MiniMaxAI/MiniMax-M2.5
-  jargon_model: siliconflow/Qwen/Qwen3.5-35B-A3B
-  memory_model: siliconflow/Qwen/Qwen3.5-35B-A3B
-  style_model: siliconflow/MiniMaxAI/MiniMax-M2.5
-  member_profile_model: siliconflow/MiniMaxAI/MiniMax-M2.5
+  model: siliconflow/deepseek-ai/DeepSeek-V4-Flash
+  decision_model: siliconflow/deepseek-ai/DeepSeek-V4-Flash
+  reply_model: siliconflow/deepseek-ai/DeepSeek-V4-Flash
+  search_model: siliconflow/deepseek-ai/DeepSeek-V4-Flash
+  utility_model: siliconflow/deepseek-ai/DeepSeek-V4-Flash
+  jargon_model: siliconflow/deepseek-ai/DeepSeek-V4-Flash
+  memory_model: siliconflow/deepseek-ai/DeepSeek-V4-Flash
+  style_model: siliconflow/deepseek-ai/DeepSeek-V4-Flash
+  member_profile_model: siliconflow/deepseek-ai/DeepSeek-V4-Flash
   model_catalog:
+    - siliconflow/deepseek-ai/DeepSeek-V4-Flash
+    - siliconflow/deepseek-ai/DeepSeek-V4-Pro
     - deepseek/deepseek-v4-flash
     - deepseek/deepseek-v4-pro
     - siliconflow/Qwen/Qwen3.5-35B-A3B
@@ -82,6 +84,19 @@ rate_control:
     enabled: false
     start: "01:00"
     end: "08:00"
+
+
+proactive_chat:
+  enabled: true
+  timezone: Asia/Shanghai
+  daytime_probability_percent: 20
+  quiet_probability_percent: 8
+  quiet_start_hour: 1
+  quiet_end_hour: 8
+  interval_minutes: 45
+  poll_jitter_seconds: 45
+  context_limit: 30
+  max_messages: 2
 
 social_actions:
   enabled: true
