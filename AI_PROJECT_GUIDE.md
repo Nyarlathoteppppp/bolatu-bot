@@ -2,7 +2,127 @@
 
 本文档给未来接手本项目的 AI / 开发者使用。目标是快速理解：这个 QQ 机器人怎么跑、消息怎么流动、Prompt 在哪里、哪些模块能改、哪些地方不要乱动。
 
-最后更新：2026-07-14
+最后更新：2026-08-03
+
+
+## 0. 2026-08 当前状态速览
+
+这部分给新接手的 Codex / AI 先读。项目当前主部署在服务器：
+
+```text
+/opt/qq-social-agent
+GitHub: Nyarlathoteppppp/bolatu-bot
+后端容器: qq-social-agent-bot
+NapCat/QQ 容器或进程不要随便重启，除非 QQ 掉线或登录态损坏。
+```
+
+Docker 部署注意：当前 `docker-compose.server.yml` 是宿主机代码目录 bind mount 到容器。多数 Python 代码和 prompt 修改后，直接：
+
+```bash
+docker restart qq-social-agent-bot
+```
+
+即可生效，不需要重建镜像。NapCat 不要跟着重启。
+
+### 0.1 当前群聊主流程
+
+```text
+NapCat/OneBot -> NoneBot plugin.py
+-> message chain/raw message 保存到 SQLite
+-> 后端硬筛选/工作强度/频控/buffer
+-> relation/reference resolver 判断谁回复谁、是否在说风雪
+-> decision/timing gate 判断是否插嘴和 social action
+-> tool_router 判断是否需要 fresh_search / market / deep_url / none
+-> RAG/记忆/画像/黑话/风格/原文语料装配上下文
+-> reply_candidates/reply_direct/search_answer 生成
+-> 审批或直发
+-> 发送后打开 90 秒同一人的 followup 窗口
+```
+
+核心原则：`decision` 只判断“该不该说、采取什么社交动作”；工具调用交给 `tool_router`。不要再把搜索词、行情符号塞回 decision prompt 里。
+
+### 0.2 主要 Prompt 文件
+
+统一入口：
+
+```text
+prompts/zhangfengxue.yaml
+```
+
+常改 flows：
+
+```text
+decision        是否插嘴 + action
+tool_router     search/market/deep_url/none 工具路由
+reply_candidates 审批三候选
+reply_direct     免审直发单候选
+search_answer    工具/搜索/行情后的单条事实回答
+style_learning   风格学习
+mid_memory       中期记忆总结
+member_profile   群友画像
+daily_review     每日 24 点复盘
+```
+
+### 0.3 搜索和工具
+
+搜索实现：`qq_social_agent/tools/fresh_context.py`。
+
+当前能力：
+
+```text
+Tavily 优先；失败后按 kind fallback 到 Google News / Bing Web
+每分钟外部查询限流
+精确内存缓存
+相关 query 内存缓存复用
+低质搜索词过滤，例如群内抽象玩梗/被踢幻想句不会外查
+工具失败时不再直接生成硬编码候选，而是把失败事实注入最新背景，让回复模型自然说明没拿到可靠新消息
+```
+
+工具失败不要重新加后端 fallback 回复池。本项目策略是：失败信息进入 prompt，LLM 正常生成；大不了不说话或说没拿到可靠新消息，不能编事实。
+
+### 0.4 续聊/主动监听
+
+机器人发出消息后，后端会给触发人和被艾特目标打开 90 秒 followup 窗口。窗口内同一人的后续消息会被当作弱点名进入 LLM 判断，但不会直接硬回复。
+
+相关位置：
+
+```text
+ADDRESS_FOLLOWUP_WINDOW_SECONDS = 90
+_record_post_reply_followup_window()
+_addressed_followup_active()
+_followup_addressed_allowed()
+_format_speaker_reference_context()
+```
+
+排查时看 `bot_metric_events`：
+
+```sql
+select * from bot_metric_events
+where event_type in ('followup_window_opened','followup_addressed_accepted','followup_addressed_rejected','decision_result')
+order by id desc limit 50;
+```
+
+### 0.5 观测和排查
+
+常用健康检查：
+
+```bash
+curl -fsS http://127.0.0.1:8080/readyz
+docker logs --tail 120 qq-social-agent-bot
+git status --short
+```
+
+关键指标表：
+
+```text
+bot_metric_events  后端流程、工具、审批、发送事件
+llm_usage_events    LLM 调用用量
+rag_retrieval_events RAG 检索命中
+messages / bot_sent_messages 原始消息和机器人发言
+memory_atoms / member_impressions / style_rules 长期记忆、画像、风格
+```
+
+如果“她为什么没说话/为什么搜了/为什么发错”：按 `pipeline_receive -> message_buffered -> decision_result -> tool_router -> tool_call -> rag_retrieval -> generated/approval/message_sent` 这条链查。
 
 ## 1. 项目定位
 

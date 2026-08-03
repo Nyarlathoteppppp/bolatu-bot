@@ -1,4 +1,5 @@
 import asyncio
+import time
 
 import pytest
 
@@ -414,3 +415,22 @@ def test_from_config_applies_runtime_limits(monkeypatch) -> None:
     assert tool.query_max_chars == 80
     assert tool.cache_ttl_by_kind == {"news": 300, "sports": 45, "web": 1800}
     assert tool.tavily_api_key == "configured"
+
+def test_safe_external_query_drops_abstract_group_banter() -> None:
+    assert _safe_external_query("你被平行宇宙的美少女权踢了") == ""
+    assert _safe_external_query("他被踢了") == ""
+    assert _safe_external_query("美国伊朗冲突 最新") == "美国伊朗冲突 最新"
+    assert _safe_external_query("比特币现在价格") == "比特币现在价格"
+
+
+@pytest.mark.anyio
+async def test_lookup_reuses_related_successful_cache_without_external_call() -> None:
+    tool = FreshContextTool(max_external_queries_per_minute=0, cache_ttl_seconds=60)
+    lookup = FreshLookup("美国伊朗冲突 最新", "news", (FreshItem("美国伊朗冲突最新进展", "示例媒体", "2026-08-03"),), "ok", provider="test", answer="双方局势仍在变化。")
+    tool._cache[("news", "美国伊朗冲突 最新")] = (time.monotonic(), lookup)
+    reused = await tool.lookup("美国伊朗现在冲突", kind="news")
+    assert reused.status == "ok"
+    assert reused.cached
+    assert reused.provider == "test:related_cache"
+    assert reused.answer == "双方局势仍在变化。"
+    assert tool.status_snapshot()["counters"]["external_requests"] == 0

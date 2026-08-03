@@ -196,6 +196,12 @@ class FreshContextTool:
                 return cached_lookup
             self._cache.pop(key, None)
 
+        related_cached = self._related_cached_lookup(normalized_kind, normalized_query, now=now)
+        if related_cached is not None:
+            self._stats["cache_hits"] += 1
+            self._record_lookup(related_cached, started=started)
+            return related_cached
+
         if not self._allow_external_query(now):
             lookup = FreshLookup(
                 normalized_query,
@@ -277,6 +283,45 @@ class FreshContextTool:
             self._cache.popitem(last=False)
         self._record_lookup(lookup, started=started)
         return lookup
+
+    def _related_cached_lookup(self, kind: str, query: str, *, now: float) -> FreshLookup | None:
+        query_key = _cache_query_key(query)
+        query_terms = _query_similarity_terms(query_key)
+        if len(query_terms) < 3:
+            return None
+        best: tuple[float, tuple[str, str], FreshLookup] | None = None
+        for key, cached in reversed(self._cache.items()):
+            cached_kind, cached_query_key = key
+            if cached_kind != kind or cached_query_key == query_key:
+                continue
+            cached_at, lookup = cached
+            if lookup.status != "ok":
+                continue
+            if now - cached_at > self.cache_ttl_by_kind[kind]:
+                continue
+            cached_terms = _query_similarity_terms(cached_query_key)
+            overlap = len(query_terms & cached_terms)
+            score = _query_similarity_score(query_terms, cached_terms)
+            if score < 0.55 or overlap < 4:
+                continue
+            if best is None or score > best[0]:
+                best = (score, key, lookup)
+        if best is None:
+            return None
+        score, key, lookup = best
+        self._cache.move_to_end(key)
+        return FreshLookup(
+            query,
+            kind,
+            lookup.items,
+            lookup.status,
+            provider=f"{lookup.provider}:related_cache",
+            answer=lookup.answer,
+            cached=True,
+            attempted_providers=lookup.attempted_providers,
+            latency_ms=0,
+            error=f"reused_related_query score={score:.2f} source={lookup.query[:60]}",
+        )
 
     async def _lookup_provider(
         self,
@@ -1156,7 +1201,42 @@ def _safe_external_query(query: str, *, max_chars: int = 120) -> str:
     clean = re.sub(r"(?<!\d)\d{7,12}(?!\d)", "[QQ号]", clean)
     clean = re.sub(r"[\x00-\x1f\x7f]+", " ", clean)
     clean = re.sub(r"\s+", " ", clean).strip()
+    if _looks_like_bad_external_query(clean):
+        return ""
     return clean[: max(1, int(max_chars))].rstrip()
+
+
+def _looks_like_bad_external_query(query: str) -> bool:
+    compact = re.sub(r"[\s，。！？,.!?~～]+", "", query.casefold())
+    if not compact:
+        return True
+    if _has_external_lookup_signal(compact):
+        return False
+    abstract_tokens = ("平行宇宙", "美少女权", "被踢", "踢了", "踢出去", "给踢", "被骂", "骂了")
+    if any(token in compact for token in abstract_tokens):
+        return True
+    if len(compact) <= 28 and re.search(r"^[你我他她它].{0,16}(?:被|给|把).{0,16}(?:踢|骂|打|杀|大肆|达斯|火宅)", compact):
+        return True
+    return False
+
+
+def _has_external_lookup_signal(compact: str) -> bool:
+    signal_terms = ("搜", "查", "最新", "现在", "今天", "今年", "新闻", "发生什么", "怎么了", "官网", "文档", "发布", "官宣", "赛程", "比分", "价格", "行情", "股票", "美股", "币价", "比特币", "以太坊")
+    return any(term in compact for term in signal_terms)
+
+
+def _query_similarity_terms(query_key: str) -> set[str]:
+    compact = re.sub(r"\s+", "", query_key.casefold())
+    terms = set(re.findall(r"[a-z0-9]{2,}", query_key.casefold()))
+    for index in range(max(0, len(compact) - 1)):
+        terms.add(compact[index : index + 2])
+    return {term for term in terms if len(term) >= 2}
+
+
+def _query_similarity_score(left: set[str], right: set[str]) -> float:
+    if not left or not right:
+        return 0.0
+    return len(left & right) / max(1, min(len(left), len(right)))
 
 
 def _cache_query_key(query: str) -> str:
