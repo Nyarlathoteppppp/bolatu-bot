@@ -23,3 +23,26 @@ def test_limits_to_two_intents() -> None:
 
 def test_market_topic_without_specific_symbol() -> None:
     assert is_market_topic("那是不是美股也可以看盘")
+
+
+def test_does_not_detect_unknown_ticker_from_member_name_with_amount_hint() -> None:
+    text = (
+        "土木-血火同源-偶像痴-NjTech本-HHU硕[#60236]说：我存在 "
+        "邪恶代代[#56514]说：最后你考了多少分 "
+        "邪恶代代[#56514]说：数学一"
+    )
+
+    assert detect_market_intents(text) == []
+
+
+def test_unknown_ticker_requires_explicit_stock_code_signal() -> None:
+    cashtag = detect_market_intents("$HHU 多少了")
+    prefixed = detect_market_intents("查股票 HHU 现在多少")
+
+    assert [(intent.kind, intent.symbol) for intent in cashtag] == [("stock", "HHU")]
+    assert [(intent.kind, intent.symbol) for intent in prefixed] == [("stock", "HHU")]
+
+
+def test_plain_english_name_with_market_hint_is_not_unknown_ticker() -> None:
+    assert detect_market_intents("Jane Street 给多少") == []
+

@@ -88,6 +88,21 @@ MARKET_HINTS = (
     "爆仓",
 )
 
+EXPLICIT_STOCK_CODE_PREFIXES = (
+    "股票",
+    "美股",
+    "股价",
+    "行情",
+    "看盘",
+    "ticker",
+    "代码",
+    "查",
+    "查下",
+    "查一下",
+    "看看",
+    "看一下",
+)
+
 
 def detect_market_intents(text: str, *, limit: int = 2) -> list[MarketIntent]:
     lowered = text.lower()
@@ -102,12 +117,7 @@ def detect_market_intents(text: str, *, limit: int = 2) -> list[MarketIntent]:
         if alias in lowered:
             _append_unique(intents, seen, MarketIntent("stock", symbol, display_name), limit)
 
-    tokens = {
-        match.group(1).upper()
-        for match in re.finditer(r"(?<![A-Za-z])([A-Za-z]{2,5})(?![A-Za-z])", text)
-    }
-    has_market_hint = any(hint in lowered for hint in MARKET_HINTS)
-    for token in tokens:
+    for token in _candidate_alpha_tokens(text):
         crypto_alias = CRYPTO_ALIASES.get(token.lower())
         if crypto_alias:
             _append_unique(
@@ -117,10 +127,38 @@ def detect_market_intents(text: str, *, limit: int = 2) -> list[MarketIntent]:
                 limit,
             )
             continue
-        if token in KNOWN_STOCK_TICKERS or has_market_hint:
+        if token in KNOWN_STOCK_TICKERS:
             _append_unique(intents, seen, MarketIntent("stock", token, token), limit)
 
+    existing_stock_symbols = {symbol for kind, symbol in seen if kind == "stock"}
+    for token in _explicit_stock_code_tokens(text):
+        if token not in existing_stock_symbols:
+            _append_unique(intents, seen, MarketIntent("stock", token, token), limit)
+            existing_stock_symbols.add(token)
+
     return intents[:limit]
+
+
+def _candidate_alpha_tokens(text: str) -> list[str]:
+    return [
+        match.group(1).upper()
+        for match in re.finditer(r"(?<![A-Za-z])([A-Za-z]{2,5})(?![A-Za-z])", text)
+    ]
+
+
+def _explicit_stock_code_tokens(text: str) -> list[str]:
+    tokens: list[str] = []
+    for match in re.finditer(r"[$＄]([A-Za-z]{1,5})(?![A-Za-z])", text):
+        tokens.append(match.group(1).upper())
+
+    prefix_pattern = "|".join(re.escape(prefix) for prefix in EXPLICIT_STOCK_CODE_PREFIXES)
+    for match in re.finditer(
+        rf"(?:{prefix_pattern})\s*[:：]?\s*([A-Za-z]{{2,5}})(?![A-Za-z])",
+        text,
+        flags=re.IGNORECASE,
+    ):
+        tokens.append(match.group(1).upper())
+    return tokens
 
 
 def is_market_topic(text: str) -> bool:
