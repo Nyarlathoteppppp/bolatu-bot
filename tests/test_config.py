@@ -192,6 +192,11 @@ def test_prompt_registry_loads_central_prompt_file() -> None:
     assert "务实的社会民主主义左派" in persona_prompt
     assert "身份政治" in persona_prompt
     assert "token 像空气一样" in persona_prompt
+    reply_direct_system = prompts.raw["flows"]["reply_direct"]["system"]
+    assert "问“你是 X 吗/你是不是 X”" in reply_direct_system
+    assert "群友互怼、反串、引用里的称呼不能覆盖手动事实" in reply_direct_system
+    member_profile_system = prompts.raw["flows"]["member_profile"]["system"]
+    assert "学历、学校、单位、现实身份属于高风险身份字段" in member_profile_system
 
 
 def test_central_prompt_file_contains_all_runtime_flows() -> None:

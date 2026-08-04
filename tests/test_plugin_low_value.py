@@ -1549,11 +1549,20 @@ def test_builtin_memory_atoms_include_owner_alias(monkeypatch, tmp_path) -> None
 
     atoms = store.relevant_memory_atoms(
         1026813421,
-        "xbw 奈亚子 张风雪制造者",
+        "xbw 奈亚子 张风雪制造者 澳门科技大学 墨尔本大学",
         subject_user_ids=[1535071184],
-        limit=5,
+        limit=8,
     )
     assert any("xbw、歌迷老蛆、奈亚子都是同一个人" in atom.content for atom in atoms)
+    assert any("澳门科技大学本科" in atom.content and "墨尔本大学 IT 硕士" in atom.content for atom in atoms)
+
+    daida_atoms = store.relevant_memory_atoms(
+        1026813421,
+        "邪恶代代 南开 北大软微",
+        subject_user_ids=[3066256514],
+        limit=5,
+    )
+    assert any("南开本科" in atom.content and "北大软微硕士" in atom.content for atom in daida_atoms)
 
 
 def test_builtin_memory_atoms_are_idempotent(monkeypatch, tmp_path) -> None:
@@ -1571,6 +1580,8 @@ def test_builtin_memory_atoms_are_idempotent(monkeypatch, tmp_path) -> None:
           and source in (
               'builtin_owner_relation',
               'builtin_owner_alias_relation',
+              'builtin_owner_education_identity',
+              'builtin_xiee_daida_education_identity',
               'builtin_focused_style_user'
           )
         group by source
@@ -1580,6 +1591,8 @@ def test_builtin_memory_atoms_are_idempotent(monkeypatch, tmp_path) -> None:
 
     assert counts.get("builtin_owner_relation", 0) == 0
     assert counts.get("builtin_owner_alias_relation") == 1
+    assert counts.get("builtin_owner_education_identity") == 1
+    assert counts.get("builtin_xiee_daida_education_identity") == 1
     assert counts.get("builtin_focused_style_user") == 1
 
 

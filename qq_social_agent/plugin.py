@@ -1177,6 +1177,26 @@ def _ensure_builtin_memory_atoms() -> None:
             importance=1.0,
         )
         memory.upsert_memory_atom(
+            atom_type="identity",
+            group_id=group_id,
+            subject_user_id=1535071184,
+            object_user_id=None,
+            content="歌迷老蛆/xbw/奈亚子/1535071184 的学历身份：澳门科技大学本科，墨尔本大学 IT 硕士；不是北大本科、不是北大软微、不是信科北本。群友关于北本/软微的调侃不能覆盖这条手动事实。",
+            source="builtin_owner_education_identity",
+            confidence=1.0,
+            importance=1.0,
+        )
+        memory.upsert_memory_atom(
+            atom_type="identity",
+            group_id=group_id,
+            subject_user_id=3066256514,
+            object_user_id=None,
+            content="邪恶代代/邪恶科代/3066256514 的学历身份：南开本科，北大软微硕士；这条事实不要串到歌迷老蛆或张风雪身上。",
+            source="builtin_xiee_daida_education_identity",
+            confidence=1.0,
+            importance=0.95,
+        )
+        memory.upsert_memory_atom(
             atom_type="preference",
             group_id=group_id,
             subject_user_id=FOCUSED_STYLE_USER_ID,
