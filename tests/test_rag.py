@@ -21,6 +21,7 @@ def test_rag_router_only_enables_explicit_retrieval_scenarios() -> None:
     casual = plan_rag_query("今天吃鹅腿吗", addressed=True)
     memory = plan_rag_query("你还记得以前谁说过菲尔兹奖吗", addressed=True)
     recent = plan_rag_query("刚才谁说了这个", addressed=True)
+    quant_career = plan_rag_query("歌迷老蛆怎么进量化选什么公司", addressed=True)
 
     assert casual.enabled is False
     assert casual.route == "casual"
@@ -28,6 +29,8 @@ def test_rag_router_only_enables_explicit_retrieval_scenarios() -> None:
     assert memory.route == "explicit_memory"
     assert recent.enabled is False
     assert recent.route == "recent_context"
+    assert quant_career.enabled is True
+    assert quant_career.route == "knowledge"
 
 
 def test_reply_envelope_uses_only_current_reply_for_rag_query() -> None:

@@ -70,6 +70,24 @@ KNOWLEDGE_SIGNALS = (
     "页面",
 )
 
+CAREER_KNOWLEDGE_TOPICS = ("量化", "quant", "Quant", "quantitative", "Quantitative")
+CAREER_KNOWLEDGE_SIGNALS = (
+    "公司",
+    "行业",
+    "岗位",
+    "实习",
+    "校招",
+    "求职",
+    "简历",
+    "面试",
+    "进入",
+    "怎么进",
+    "路线",
+    "职业",
+    "选什么",
+    "投什么",
+)
+
 
 @dataclass(frozen=True)
 class RAGQueryPlan:
@@ -96,9 +114,12 @@ def plan_rag_query(
     pronoun_person_reference = bool(related_user_ids and PERSON_PRONOUN_RE.search(clean))
     person_past = past_signal and (has_person_reference or contains_identifier or pronoun_person_reference)
     knowledge_signal = any(signal in clean for signal in KNOWLEDGE_SIGNALS)
+    career_knowledge_signal = any(topic in clean for topic in CAREER_KNOWLEDGE_TOPICS) and any(
+        signal in clean for signal in CAREER_KNOWLEDGE_SIGNALS
+    )
     if person_past:
         route = "person_past"
-    elif knowledge_signal:
+    elif knowledge_signal or career_knowledge_signal:
         route = "knowledge"
     elif recent_context_signal:
         # The normal recent-message window is more accurate and cheaper for
