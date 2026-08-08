@@ -73,6 +73,9 @@ class StyleRule:
     confidence: float = 0.6
     status: str = "active"
     valid_to: float | None = None
+    rule_fingerprint: str = ""
+    last_seen_at: float = 0.0
+    merged_count: int = 0
 
 
 @dataclass(frozen=True)
@@ -738,12 +741,40 @@ class MemoryStore:
             ("confidence", "real not null default 0.6"),
             ("status", "text not null default 'active'"),
             ("valid_to", "real"),
+            ("rule_fingerprint", "text not null default ''"),
+            ("last_seen_at", "real not null default 0"),
+            ("merged_count", "integer not null default 0"),
         )
         for name, declaration in additions:
             if name not in columns:
                 self.conn.execute(f"alter table style_rules add column {name} {declaration}")
+        rows = self.conn.execute(
+            """
+            select id, situation, style, created_at, rule_fingerprint, last_seen_at
+            from style_rules
+            where coalesce(rule_fingerprint, '') = ''
+               or coalesce(last_seen_at, 0) = 0
+            """
+        ).fetchall()
+        for row in rows:
+            fingerprint = str(row["rule_fingerprint"] or "") or _style_rule_fingerprint(
+                str(row["situation"] or ""),
+                str(row["style"] or ""),
+            )
+            last_seen_at = float(row["last_seen_at"] or row["created_at"] or time.time())
+            self.conn.execute(
+                """
+                update style_rules
+                set rule_fingerprint = ?, last_seen_at = ?
+                where id = ?
+                """,
+                (fingerprint, last_seen_at, int(row["id"])),
+            )
         self.conn.execute(
             "create index if not exists idx_style_rules_scope_status on style_rules(group_id, scope, status, created_at)"
+        )
+        self.conn.execute(
+            "create index if not exists idx_style_rules_fingerprint on style_rules(group_id, status, scope, rule_fingerprint)"
         )
 
     def _ensure_memory_atom_v2(self) -> None:
@@ -1938,62 +1969,212 @@ class MemoryStore:
         group_id: int,
         rules: list[tuple],
         *,
-        keep: int = 80,
-    ) -> None:
+        keep: int = 45,
+    ) -> dict[str, int]:
         now = time.time()
-        clean_rules: list[tuple[str, str, str, tuple[int, ...], tuple[int, ...]]] = []
+        clean_rules: list[tuple[str, str, str, tuple[int, ...], tuple[int, ...], str, str]] = []
         for raw_rule in rules:
             if len(raw_rule) < 3:
                 continue
             situation, style, source_text = (str(raw_rule[0]), str(raw_rule[1]), str(raw_rule[2]))
             source_user_ids = tuple(int(value) for value in (raw_rule[3] if len(raw_rule) > 3 else ()) if int(value) > 0)
             source_message_ids = tuple(int(value) for value in (raw_rule[4] if len(raw_rule) > 4 else ()) if int(value) > 0)
-            if situation.strip() and style.strip():
-                clean_rules.append((situation.strip(), style.strip(), source_text.strip(), source_user_ids, source_message_ids))
+            situation = situation.strip()
+            style = style.strip()
+            if situation and style:
+                fingerprint = _style_rule_fingerprint(situation, style)
+                if not fingerprint:
+                    continue
+                scope = "group" if not source_user_ids or len(set(source_user_ids)) >= 2 else "personal"
+                clean_rules.append((situation, style, source_text.strip(), source_user_ids, source_message_ids, scope, fingerprint))
         if not clean_rules:
-            return
-        self.conn.executemany(
-            """
-            insert into style_rules(
-              group_id, situation, style, source_text, created_at, scope,
-              source_user_ids_json, source_message_ids_json, support_user_count,
-              evidence_count, confidence, status, valid_to
-            ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?)
-            """,
-            [
-                (
-                    group_id, situation[:60], style[:80], source_text[:200], now,
-                    "group" if not user_ids or len(set(user_ids)) >= 2 else "personal",
-                    json.dumps(list(dict.fromkeys(user_ids)), ensure_ascii=False),
-                    json.dumps(list(dict.fromkeys(message_ids)), ensure_ascii=False),
-                    max(1, len(set(user_ids))), max(1, len(set(message_ids))),
-                    0.82 if len(set(user_ids)) >= 2 else (0.65 if not user_ids else 0.58),
-                    now + (90 if len(set(user_ids)) >= 2 or not user_ids else 30) * 24 * 60 * 60,
+            return {"new": 0, "merged": 0, "expired": 0, "skipped": 0}
+        stats = {"new": 0, "merged": 0, "expired": 0, "skipped": 0}
+        for situation, style, source_text, user_ids, message_ids, scope, fingerprint in clean_rules:
+            existing = self._find_mergeable_style_rule(
+                group_id,
+                fingerprint,
+                scope=scope,
+                source_user_ids=user_ids,
+                now=now,
+            )
+            if existing is not None:
+                self._merge_style_rule(
+                    existing,
+                    situation=situation,
+                    style=style,
+                    source_text=source_text,
+                    source_user_ids=user_ids,
+                    source_message_ids=message_ids,
+                    now=now,
                 )
-                for situation, style, source_text, user_ids, message_ids in clean_rules
-            ],
+                stats["merged"] += 1
+                continue
+            support_user_count = max(1, len(set(user_ids)))
+            evidence_count = max(1, len(set(message_ids)))
+            confidence = _style_rule_confidence(
+                support_user_count=support_user_count,
+                evidence_count=evidence_count,
+                merged_count=0,
+                has_user_ids=bool(user_ids),
+            )
+            self.conn.execute(
+                """
+                insert into style_rules(
+                  group_id, situation, style, source_text, created_at, scope,
+                  source_user_ids_json, source_message_ids_json, support_user_count,
+                  evidence_count, confidence, status, valid_to,
+                  rule_fingerprint, last_seen_at, merged_count
+                ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, 0)
+                """,
+                (
+                    group_id, situation[:60], style[:80], source_text[:200], now, scope,
+                    json.dumps(_unique_recent_ints(user_ids), ensure_ascii=False),
+                    json.dumps(_unique_recent_ints(message_ids, limit=20), ensure_ascii=False),
+                    support_user_count, evidence_count, confidence,
+                    now + (90 if scope == "group" else 30) * 24 * 60 * 60,
+                    fingerprint, now,
+                ),
+            )
+            stats["new"] += 1
+        stats["expired"] = self._expire_low_value_style_rules(group_id, keep=keep, now=now)
+        self.conn.commit()
+        return stats
+
+    def _find_mergeable_style_rule(
+        self,
+        group_id: int,
+        fingerprint: str,
+        *,
+        scope: str,
+        source_user_ids: tuple[int, ...],
+        now: float,
+    ) -> sqlite3.Row | None:
+        rows = self.conn.execute(
+            """
+            select id, group_id, situation, style, source_text, created_at, scope,
+                   source_user_ids_json, source_message_ids_json, support_user_count,
+                   evidence_count, confidence, status, valid_to,
+                   rule_fingerprint, last_seen_at, merged_count
+            from style_rules
+            where group_id = ?
+              and status = 'active'
+              and scope = ?
+              and rule_fingerprint = ?
+              and (valid_to is null or valid_to > ?)
+            order by support_user_count desc, evidence_count desc, confidence desc, last_seen_at desc, id desc
+            limit 12
+            """,
+            (group_id, scope, fingerprint, now),
+        ).fetchall()
+        if scope != "personal":
+            return rows[0] if rows else None
+        incoming_users = set(source_user_ids)
+        for row in rows:
+            existing_users = set(_loads_int_list(row["source_user_ids_json"]))
+            if not incoming_users or not existing_users or incoming_users & existing_users:
+                return row
+        return None
+
+    def _merge_style_rule(
+        self,
+        row: sqlite3.Row,
+        *,
+        situation: str,
+        style: str,
+        source_text: str,
+        source_user_ids: tuple[int, ...],
+        source_message_ids: tuple[int, ...],
+        now: float,
+    ) -> None:
+        old_user_ids = _loads_int_list(row["source_user_ids_json"])
+        old_message_ids = _loads_int_list(row["source_message_ids_json"])
+        merged_user_ids = _unique_recent_ints([*old_user_ids, *source_user_ids])
+        merged_message_ids = _unique_recent_ints([*old_message_ids, *source_message_ids], limit=20)
+        old_evidence_count = max(1, int(row["evidence_count"] or 1))
+        incoming_evidence = max(1, len(set(source_message_ids)))
+        evidence_count = old_evidence_count + incoming_evidence
+        support_user_count = max(1, len(set(merged_user_ids)))
+        merged_count = max(0, int(row["merged_count"] or 0)) + 1
+        confidence = _style_rule_confidence(
+            support_user_count=support_user_count,
+            evidence_count=evidence_count,
+            merged_count=merged_count,
+            has_user_ids=bool(merged_user_ids),
         )
+        scope = str(row["scope"] or "group")
         self.conn.execute(
             """
-            delete from style_rules
-            where group_id = ?
-              and id not in (
-                select id from style_rules
-                where group_id = ?
-                order by created_at desc, id desc
-                limit ?
-              )
+            update style_rules
+            set situation = ?, style = ?, source_text = ?,
+                source_user_ids_json = ?, source_message_ids_json = ?,
+                support_user_count = ?, evidence_count = ?, confidence = ?,
+                valid_to = ?, last_seen_at = ?, merged_count = ?
+            where id = ?
             """,
-            (group_id, group_id, keep),
+            (
+                _prefer_specific_style_text(str(row["situation"] or ""), situation, limit=60),
+                _prefer_specific_style_text(str(row["style"] or ""), style, limit=80),
+                (source_text or str(row["source_text"] or ""))[:200],
+                json.dumps(merged_user_ids, ensure_ascii=False),
+                json.dumps(merged_message_ids, ensure_ascii=False),
+                support_user_count,
+                evidence_count,
+                confidence,
+                now + (90 if scope == "group" else 30) * 24 * 60 * 60,
+                now,
+                merged_count,
+                int(row["id"]),
+            ),
         )
-        self.conn.commit()
+
+    def _expire_low_value_style_rules(self, group_id: int, *, keep: int, now: float) -> int:
+        if keep <= 0:
+            return 0
+        rows = self.conn.execute(
+            """
+            select id, situation, style, source_text, created_at, scope,
+                   source_user_ids_json, source_message_ids_json, support_user_count,
+                   evidence_count, confidence, status, valid_to,
+                   rule_fingerprint, last_seen_at, merged_count
+            from style_rules
+            where group_id = ?
+              and status = 'active'
+              and (valid_to is null or valid_to > ?)
+            """,
+            (group_id, now),
+        ).fetchall()
+        if len(rows) <= keep:
+            return 0
+        ranked = sorted(
+            rows,
+            key=lambda row: (
+                _style_rule_value(row, now=now),
+                float(row["last_seen_at"] or row["created_at"] or 0.0),
+                int(row["id"]),
+            ),
+            reverse=True,
+        )
+        expire_ids = [int(row["id"]) for row in ranked[keep:]]
+        if not expire_ids:
+            return 0
+        self.conn.execute(
+            f"""
+            update style_rules
+            set status = 'expired', valid_to = ?
+            where id in ({','.join('?' for _ in expire_ids)})
+            """,
+            [now, *expire_ids],
+        )
+        return len(expire_ids)
 
     def recent_style_rules(self, group_id: int, limit: int) -> list[StyleRule]:
         rows = self.conn.execute(
             """
             select group_id, situation, style, source_text, created_at, scope,
                    source_user_ids_json, source_message_ids_json, support_user_count,
-                   evidence_count, confidence, status, valid_to
+                   evidence_count, confidence, status, valid_to,
+                   rule_fingerprint, last_seen_at, merged_count
             from style_rules
             where group_id = ? and status = 'active' and (valid_to is null or valid_to > ?)
             order by created_at desc, id desc
@@ -2016,6 +2197,9 @@ class MemoryStore:
                 confidence=float(row["confidence"]),
                 status=str(row["status"]),
                 valid_to=float(row["valid_to"]) if row["valid_to"] is not None else None,
+                rule_fingerprint=str(row["rule_fingerprint"] or ""),
+                last_seen_at=float(row["last_seen_at"] or row["created_at"] or 0.0),
+                merged_count=int(row["merged_count"] or 0),
             )
             for row in reversed(rows)
         ]
@@ -2033,7 +2217,8 @@ class MemoryStore:
             """
             select group_id, situation, style, source_text, created_at, scope,
                    source_user_ids_json, source_message_ids_json, support_user_count,
-                   evidence_count, confidence, status, valid_to
+                   evidence_count, confidence, status, valid_to,
+                   rule_fingerprint, last_seen_at, merged_count
             from style_rules
             where group_id = ? and status = 'active' and (valid_to is null or valid_to > ?)
             order by created_at desc, id desc
@@ -2068,6 +2253,9 @@ class MemoryStore:
                 confidence=float(row["confidence"]),
                 status=str(row["status"]),
                 valid_to=float(row["valid_to"]) if row["valid_to"] is not None else None,
+                rule_fingerprint=str(row["rule_fingerprint"] or ""),
+                last_seen_at=float(row["last_seen_at"] or row["created_at"] or 0.0),
+                merged_count=int(row["merged_count"] or 0),
             )
             for _, _, row in scored[:limit]
         ]
@@ -3899,6 +4087,164 @@ def _clamp_float(value: float, low: float, high: float) -> float:
     except (TypeError, ValueError):
         number = low
     return max(low, min(high, number))
+
+
+_STYLE_RULE_CANONICAL_REPLACEMENTS = (
+    ("面对", "群友"),
+    ("遇到", "群友"),
+    ("当群友", "群友"),
+    ("可以", ""),
+    ("适合", ""),
+    ("建议", ""),
+    ("表达方式", ""),
+    ("表达", ""),
+    ("回应", "回复"),
+    ("接话", "回复"),
+    ("夸张比喻", "夸张"),
+    ("夸张词", "夸张"),
+    ("夸张方式", "夸张"),
+    ("离谱内容", "荒诞"),
+    ("荒谬观点", "荒诞"),
+    ("荒诞疑问", "荒诞"),
+    ("荒诞话题", "荒诞"),
+    ("明显玩梗内容", "玩梗"),
+    ("网络梗", "玩梗"),
+    ("接梗", "玩梗"),
+    ("用简短", "用短"),
+    ("一句", "短句"),
+    ("短促", "短"),
+    ("调侃", "吐槽"),
+    ("吐槽强化", "吐槽"),
+    ("放大槽点", "放大荒诞"),
+    ("突出反差", "放大荒诞"),
+    ("强化喜剧效果", "放大荒诞"),
+    ("放大荒诞感", "放大荒诞"),
+    ("反讽短句", "反讽"),
+    ("简短反讽句", "反讽"),
+    ("黑色幽默", "反讽"),
+    ("谐音梗", "谐音"),
+    ("双关语", "双关"),
+    ("制造幽默", "制造笑点"),
+    ("制造双关效果", "制造笑点"),
+    ("可爱语气词", "可爱语气"),
+    ("拟声词", "可爱语气"),
+    ("简短感叹句", "简短感叹"),
+    ("简短感叹", "短句感叹"),
+)
+
+
+def _style_rule_fingerprint(situation: str, style: str) -> str:
+    left = _normalize_style_rule_text(situation)
+    right = _normalize_style_rule_text(style)
+    if not left or not right:
+        return ""
+    return f"{left}=>{right}"[:160]
+
+
+def _normalize_style_rule_text(text: str) -> str:
+    normalized = _compact_text(text).casefold()
+    for old, new in _STYLE_RULE_CANONICAL_REPLACEMENTS:
+        normalized = normalized.replace(old.casefold(), new.casefold())
+    normalized = re.sub(r"(的时候|时可以|时用|时要)", "时", normalized)
+    normalized = re.sub(r"[，。、；：:,.!?！？\s]+", "", normalized)
+    low_info = ("方式", "语气", "内容", "观点", "话题")
+    for token in low_info:
+        if len(normalized) > 12:
+            normalized = normalized.replace(token, "")
+    return normalized[:80]
+
+
+def _unique_recent_ints(values: tuple[int, ...] | list[int], *, limit: int | None = None) -> list[int]:
+    result: list[int] = []
+    for value in values:
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError):
+            continue
+        if parsed <= 0:
+            continue
+        if parsed in result:
+            result.remove(parsed)
+        result.append(parsed)
+    if limit is not None and limit > 0:
+        result = result[-limit:]
+    return result
+
+
+def _style_rule_confidence(
+    *,
+    support_user_count: int,
+    evidence_count: int,
+    merged_count: int,
+    has_user_ids: bool,
+) -> float:
+    if not has_user_ids:
+        base = 0.65
+    elif support_user_count >= 2:
+        base = 0.78
+    else:
+        base = 0.56
+    base += min(0.14, max(0, evidence_count - 1) * 0.015)
+    base += min(0.08, max(0, merged_count) * 0.01)
+    base += min(0.08, max(0, support_user_count - 1) * 0.02)
+    return round(max(0.1, min(0.94, base)), 3)
+
+
+def _prefer_specific_style_text(old: str, new: str, *, limit: int) -> str:
+    old = str(old or "").strip()
+    new = str(new or "").strip()
+    if not old:
+        return new[:limit]
+    if not new:
+        return old[:limit]
+    return (new if _style_text_specificity(new) > _style_text_specificity(old) else old)[:limit]
+
+
+def _style_text_specificity(text: str) -> float:
+    compact = _compact_text(text)
+    score = min(4.0, len(compact) / 12)
+    specific_markers = ("技术", "代码", "难受", "情绪", "创造者", "小鸟", "学术", "搜索", "认真", "安慰", "自嘲", "互损")
+    score += sum(0.35 for marker in specific_markers if marker in compact)
+    generic_markers = ("群友", "内容", "话题", "事情", "表达", "回应", "接话")
+    score -= sum(0.18 for marker in generic_markers if marker in compact)
+    return score
+
+
+def _style_rule_value(row: sqlite3.Row, *, now: float) -> float:
+    situation = str(row["situation"] or "")
+    style = str(row["style"] or "")
+    evidence = max(1, int(row["evidence_count"] or 1))
+    support = max(1, int(row["support_user_count"] or 1))
+    confidence = max(0.1, min(1.0, float(row["confidence"] or 0.6)))
+    merged = max(0, int(row["merged_count"] or 0))
+    last_seen = float(row["last_seen_at"] or row["created_at"] or 0.0)
+    age_days = max(0.0, (now - last_seen) / (24 * 60 * 60))
+    recency = 1.5 / (1.0 + age_days / 14.0)
+    value = confidence * 3.0
+    value += min(evidence, 20) * 0.18
+    value += min(support, 8) * 0.42
+    value += min(merged, 20) * 0.08
+    value += recency
+    value += _style_text_specificity(f"{situation}{style}") * 0.35
+    if str(row["scope"] or "") == "personal":
+        value -= 0.35
+    generic_patterns = (
+        "群友回复",
+        "群友表达",
+        "群友讨论",
+        "群友提到",
+        "用短句",
+        "简短评价",
+        "用调侃",
+        "用玩梗",
+    )
+    compact = _compact_text(f"{situation}{style}")
+    value -= sum(0.22 for marker in generic_patterns if marker in compact)
+    if support <= 1:
+        value -= 0.35
+    if evidence <= 1:
+        value -= 0.25
+    return value
 
 
 def _normalize_memory_evidence_type(value: str) -> str:

@@ -127,6 +127,52 @@ def test_style_rules_are_kept_recent(tmp_path) -> None:
     assert [rule.situation for rule in rules] == ["场景2", "场景3", "场景4"]
 
 
+def test_style_rules_merge_equivalent_group_rules(tmp_path) -> None:
+    memory = MemoryStore(tmp_path / "bot.sqlite3")
+
+    first = memory.add_style_rules(
+        1,
+        [
+            ("群友用夸张方式吐槽时", "用短句放大荒诞感", "我兄弟明年准备down了", (100, 101), (11, 12)),
+        ],
+        keep=10,
+    )
+    second = memory.add_style_rules(
+        1,
+        [
+            ("面对夸张比喻时", "用简短反讽句放大荒诞感", "穷的不算人", (101, 102), (13, 14)),
+        ],
+        keep=10,
+    )
+
+    rules = memory.recent_style_rules(1, 10)
+
+    assert first["new"] == 1
+    assert second["merged"] == 1
+    assert len(rules) == 1
+    assert rules[0].support_user_count == 3
+    assert rules[0].evidence_count == 4
+    assert rules[0].merged_count == 1
+
+
+def test_personal_style_rules_merge_only_same_speaker(tmp_path) -> None:
+    memory = MemoryStore(tmp_path / "bot.sqlite3")
+
+    memory.add_style_rules(
+        1,
+        [
+            ("被说中时", "用目移装傻", "（目移）", (184589072,), (11,)),
+            ("被说中了的时候", "用目移装傻", "（目移）", (3370998238,), (12,)),
+        ],
+        keep=10,
+    )
+
+    rules = memory.recent_style_rules(1, 10)
+
+    assert len(rules) == 2
+    assert {rule.source_user_ids for rule in rules} == {(184589072,), (3370998238,)}
+
+
 def test_relevant_style_rules_match_current_text(tmp_path) -> None:
     memory = MemoryStore(tmp_path / "bot.sqlite3")
     memory.add_style_rules(

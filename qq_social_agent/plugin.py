@@ -8297,7 +8297,7 @@ async def _maintain_group_learning(group_id: int) -> None:
                     for rule in rules
                     if _is_useful_style_rule(rule.situation, rule.style, rule.source_text)
                 ]
-                memory.add_style_rules(
+                style_stats = memory.add_style_rules(
                     group_id,
                     [
                         (
@@ -8313,7 +8313,11 @@ async def _maintain_group_learning(group_id: int) -> None:
                 if useful_rules:
                     logger.info(
                         "qq_social_agent style rules learned: "
-                        f"group={group_id} rules={len(useful_rules)}"
+                        f"group={group_id} rules={len(useful_rules)} "
+                        f"new={style_stats.get('new', 0)} "
+                        f"merged={style_stats.get('merged', 0)} "
+                        f"expired={style_stats.get('expired', 0)} "
+                        f"skipped={style_stats.get('skipped', 0)}"
                     )
             except Exception as exc:
                 logger.warning(
