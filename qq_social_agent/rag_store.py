@@ -14,6 +14,11 @@ from zoneinfo import ZoneInfo
 
 from .temporal_evidence import default_evidence_kind
 
+try:  # NumPy is optional in development, but available in the production container.
+    import numpy as np
+except ImportError:  # pragma: no cover - exercised only in intentionally minimal installs.
+    np = None
+
 
 RAG_TIMEZONE = ZoneInfo("Asia/Shanghai")
 
@@ -652,14 +657,40 @@ class RAGStore:
             params,
         ).fetchall()
         scored: list[RankedDocument] = []
-        for row in rows:
-            vector = struct.unpack(f"<{len(query_vector)}f", row["vector_blob"])
-            denominator = query_norm * float(row["norm"] or 0.0)
-            if denominator <= 0:
-                continue
-            cosine = sum(a * b for a, b in zip(query_vector, vector)) / denominator
-            if cosine > 0:
-                scored.append(RankedDocument(_document_from_row(row), float(cosine)))
+        if np is not None and rows:
+            # RAG has about ten thousand active bge-m3 vectors. Doing their
+            # dot products in Python made semantic retrieval take around a
+            # second; let NumPy evaluate the complete candidate matrix.
+            query_array = np.asarray(query_vector, dtype=np.float32)
+            valid_rows: list[sqlite3.Row] = []
+            vectors: list[object] = []
+            norms: list[float] = []
+            for row in rows:
+                vector = np.frombuffer(row["vector_blob"], dtype="<f4")
+                norm = float(row["norm"] or 0.0)
+                if vector.size != query_array.size or norm <= 0:
+                    continue
+                valid_rows.append(row)
+                vectors.append(vector)
+                norms.append(norm)
+            if valid_rows:
+                matrix = np.vstack(vectors)
+                denominators = query_norm * np.asarray(norms, dtype=np.float32)
+                cosines = matrix @ query_array / denominators
+                scored = [
+                    RankedDocument(_document_from_row(row), float(score))
+                    for row, score in zip(valid_rows, cosines)
+                    if float(score) > 0
+                ]
+        else:
+            for row in rows:
+                vector = struct.unpack(f"<{len(query_vector)}f", row["vector_blob"])
+                denominator = query_norm * float(row["norm"] or 0.0)
+                if denominator <= 0:
+                    continue
+                cosine = sum(a * b for a, b in zip(query_vector, vector)) / denominator
+                if cosine > 0:
+                    scored.append(RankedDocument(_document_from_row(row), float(cosine)))
         scored.sort(key=lambda item: (item.score, item.document.importance, item.document.created_at), reverse=True)
         return scored[:limit]
 
