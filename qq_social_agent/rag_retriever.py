@@ -278,6 +278,7 @@ class RAGService:
         addressed: bool,
         related_user_ids: list[int] | None = None,
         excluded_user_ids: list[int] | None = None,
+        include_conversation: bool = True,
     ) -> RAGRetrievalResult:
         started = time.monotonic()
         normalized_query = normalize_rag_query(query)
@@ -343,6 +344,8 @@ class RAGService:
                 else set(related_ids)
             )
             document_types = self._document_types_for_plan(plan, bool(resolved_members))
+            if not include_conversation:
+                document_types = tuple(doc_type for doc_type in document_types if doc_type != "conversation")
             if plan.lexical:
                 lexical = self.store.lexical_search(
                     group_id,
@@ -383,7 +386,8 @@ class RAGService:
                 route=plan.route,
                 required_topic=normalized_query.focused_topic,
             )
-            hits = self._expand_conversation_hits(hits)
+            if include_conversation:
+                hits = self._expand_conversation_hits(hits)
             context = _format_rag_context(hits, max_chars=self.config.max_context_chars)
         except Exception as exc:
             error = str(exc)[:240]
@@ -409,6 +413,7 @@ class RAGService:
                 "raw_query_normalized": search_query != re.sub(r"\s+", " ", str(query)).strip(),
                 "reply_envelope_removed": normalized_query.reply_envelope_removed,
                 "focused_topic": normalized_query.focused_topic,
+                "include_conversation": include_conversation,
                 "hits": [
                     {
                         "document_id": hit.document.id,

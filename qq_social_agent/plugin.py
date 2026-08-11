@@ -233,6 +233,7 @@ last_group_mention_targets: dict[int, tuple[int, float]] = {}
 last_user_reply_times: dict[tuple[int, int], float] = {}
 group_processing_locks: dict[int, asyncio.Lock] = {}
 group_learning_tasks: dict[int, asyncio.Task[None]] = {}
+private_memory_tasks: dict[int, asyncio.Task[None]] = {}
 learning_coordinator: BackgroundLearningCoordinator | None = None
 group_message_buffers: dict[int, list["BufferedGroupMessage"]] = {}
 group_buffer_tasks: dict[int, asyncio.Task[None]] = {}
@@ -784,6 +785,7 @@ GROUP_BUFFER_SECONDS = 6.0
 GROUP_INFLIGHT_BUFFER_RETRY_SECONDS = 1.0
 PRIVATE_BUFFER_SECONDS = 2.5
 PRIVATE_INFLIGHT_BUFFER_RETRY_SECONDS = 0.75
+PRIVATE_CONTEXT_LIMIT = 25
 PRIVATE_FOLLOWUP_DELAY_SECONDS = 10.0
 PRIVATE_FOLLOWUP_PROBABILITY = 0.20
 # Keep this as an explicit override hook, but use the same 20% default for
@@ -1401,6 +1403,7 @@ async def _shutdown_background_tasks() -> None:
         group_buffer_tasks,
         group_passive_retry_tasks,
         group_learning_tasks,
+        private_memory_tasks,
         maintenance_tasks,
     )
     closers: list[object] = []
@@ -6015,7 +6018,7 @@ async def _run_private_followup_after_delay(user_id: int, *, expected_message_co
         persona = personas.get(str(state["persona"] or app_config.default_persona))
         if persona is None:
             return
-        recent = memory.recent_messages(chat_id, app_config.context_limit)
+        recent = memory.recent_messages(chat_id, PRIVATE_CONTEXT_LIMIT)
         if len(recent) < 2:
             return
         private_generation_inflight.add(user_id)
@@ -6278,7 +6281,7 @@ async def _handle_private_message_scoped(
     # Private chats share the same retrieval and learning pipeline as groups,
     # but their synthetic chat_id keeps every stored fact and source isolated.
     rag_service.request_source_sync()
-    _schedule_group_learning(chat_id)
+    _schedule_private_memory_maintenance(chat_id)
 
     state = memory.group_state(chat_id)
     if not bool(state["enabled"]):
@@ -6287,7 +6290,7 @@ async def _handle_private_message_scoped(
 
     persona_id = str(state["persona"] or app_config.default_persona)
     persona = personas.get(persona_id)
-    recent = memory.recent_messages(chat_id, app_config.context_limit)
+    recent = memory.recent_messages(chat_id, PRIVATE_CONTEXT_LIMIT)
     context_recent = _without_current_message(recent, user_id=user_id, text=text)
     market_intents = detect_market_intents(text, limit=2)
     rate = rate_limiter.allow(chat_id, mentioned=True)
@@ -6381,6 +6384,7 @@ async def _handle_private_message_scoped(
             addressed=True,
             related_user_ids=[user_id],
             excluded_user_ids=[int(event.self_id)],
+            include_conversation=False,
         )
     )
     market_context = ""
@@ -8298,8 +8302,26 @@ def _extract_forward_record_lines(payload: object, *, limit: int) -> list[str]:
         text = _forward_content_plain_text(content)
         if not text:
             continue
-        lines.append(f"{sender_name}: {_short_notice_text(text, 180)}")
+        timestamp = _forward_record_time_label(normalized)
+        prefix = f"[{timestamp}] " if timestamp else ""
+        lines.append(f"{prefix}{sender_name}: {_short_notice_text(text, 180)}")
     return lines
+
+
+def _forward_record_time_label(item: dict[str, object]) -> str:
+    raw_time = item.get("time", item.get("timestamp", item.get("msg_time", 0)))
+    try:
+        timestamp = float(raw_time or 0)
+    except (TypeError, ValueError):
+        return ""
+    if timestamp <= 0:
+        return ""
+    if timestamp > 10_000_000_000:
+        timestamp /= 1000.0
+    try:
+        return datetime.fromtimestamp(timestamp, DAILY_REVIEW_TIMEZONE).strftime("%m-%d %H:%M")
+    except (OSError, OverflowError, ValueError):
+        return ""
 
 
 def _forward_messages_from_payload(payload: object) -> list[object]:
@@ -8791,6 +8813,27 @@ def _schedule_group_learning(group_id: int) -> None:
         group_learning_tasks[group_id] = asyncio.create_task(_run_group_learning(group_id))
 
 
+def _schedule_private_memory_maintenance(chat_id: int) -> None:
+    """Preserve long-term private recall without learning a direct-chat style."""
+
+    if deepseek_client is None:
+        return
+    task = private_memory_tasks.get(chat_id)
+    if task is None or task.done():
+        private_memory_tasks[chat_id] = asyncio.create_task(_run_private_memory_maintenance(chat_id))
+
+
+async def _run_private_memory_maintenance(chat_id: int) -> None:
+    task = asyncio.current_task()
+    try:
+        await _maintain_group_learning(chat_id)
+    except Exception as exc:
+        logger.warning(f"qq_social_agent private memory maintenance failed: chat={chat_id} error={exc}")
+    finally:
+        if private_memory_tasks.get(chat_id) is task:
+            private_memory_tasks.pop(chat_id, None)
+
+
 async def _run_group_learning(group_id: int) -> None:
     task = asyncio.current_task()
     try:
@@ -8808,7 +8851,7 @@ async def _maintain_group_learning(group_id: int) -> None:
 
     mid_messages = memory.messages_for_mid_summary(
         group_id,
-        keep_recent=app_config.context_limit,
+        keep_recent=PRIVATE_CONTEXT_LIMIT if group_id >= PRIVATE_CHAT_OFFSET else app_config.context_limit,
         batch_size=MID_MEMORY_BATCH_SIZE,
         include_bot=False,
     )
@@ -8824,7 +8867,7 @@ async def _maintain_group_learning(group_id: int) -> None:
             if len(summary_messages) >= MID_MEMORY_MIN_BATCH:
                 draft = await deepseek_client.summarize_mid_memory(
                     messages=summary_messages,
-                    chat_label="QQ 群聊",
+                    chat_label="QQ 私聊" if group_id >= PRIVATE_CHAT_OFFSET else "QQ 群聊",
                 )
             if draft and draft.summary:
                 memory.add_memory_summary(
@@ -8869,6 +8912,11 @@ async def _maintain_group_learning(group_id: int) -> None:
                 )
         except Exception as exc:
             logger.warning(f"qq_social_agent mid memory skipped: group={group_id} error={exc}")
+
+    if group_id >= PRIVATE_CHAT_OFFSET:
+        # Direct-chat messages retain rolling summaries and explicit memory,
+        # but never teach the shared group style or auto-create a user profile.
+        return
 
     last_attempt = max(
         memory.last_style_rule_at(group_id),
