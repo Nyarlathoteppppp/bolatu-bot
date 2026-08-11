@@ -774,7 +774,9 @@ LONG_MESSAGE_SUMMARY_FALLBACK_HEAD = 72
 LONG_MESSAGE_SUMMARY_FALLBACK_TAIL = 28
 FORWARD_CONTEXT_MAX_RECORDS = 16
 BOT_SELF_NAME_ALIASES = ("张风雪", "风雪")
-FORWARD_CONTEXT_SUMMARY_THRESHOLD = 120
+# Preserve short forwarded conversations verbatim. Their attribution and tone
+# are often the useful part; only genuinely large records need a summary.
+FORWARD_CONTEXT_SUMMARY_THRESHOLD = 600
 UNREADABLE_MEDIA_SEGMENT_TYPES = {"image", "mface", "face", "record", "video"}
 JARGON_CONTEXT_LOOKBACK = 4
 CUSTOM_JARGON_CONTEXT_LIMIT = 10
@@ -784,9 +786,9 @@ PRIVATE_BUFFER_SECONDS = 2.5
 PRIVATE_INFLIGHT_BUFFER_RETRY_SECONDS = 0.75
 PRIVATE_FOLLOWUP_DELAY_SECONDS = 10.0
 PRIVATE_FOLLOWUP_PROBABILITY = 0.20
-PRIVATE_FOLLOWUP_PROBABILITY_BY_USER = {
-    1903297906: 0.40,
-}
+# Keep this as an explicit override hook, but use the same 20% default for
+# every private chat unless a future policy deliberately changes it.
+PRIVATE_FOLLOWUP_PROBABILITY_BY_USER: dict[int, float] = {}
 GROUP_REPLY_FLOW_COOLDOWN_SECONDS = 30.0
 BOT_STATUS_CARD_BASE_NAME = "张风雪"
 BLOCKED_BACKEND_FALLBACK_TEXTS = {
@@ -6036,8 +6038,26 @@ async def _run_private_followup_after_delay(user_id: int, *, expected_message_co
                 priority_context=_private_priority_context(user_id),
                 speaker_context="当前是一对一私聊。只能自然续聊，不要提群聊、审批或工具流程。",
             )
+            audit_send, audit_reason = await deepseek_client.audit_proactive_reply(
+                persona=persona,
+                recent_messages=recent,
+                candidate=reply,
+                chat_label="QQ 私聊",
+            )
         finally:
             private_generation_inflight.discard(user_id)
+        if not audit_send:
+            _record_metric_event(
+                "private_followup",
+                group_id=chat_id,
+                user_id=user_id,
+                stage="audit",
+                action="rejected",
+                probability=probability,
+                roll=round(roll, 3),
+                reason=_short_notice_text(audit_reason or "模型判定与近期句子大致重复", 80),
+            )
+            return
         reply = _sanitize_generated_text(reply)
         if not reply or reply in BLOCKED_BACKEND_FALLBACK_TEXTS:
             return
@@ -6056,6 +6076,7 @@ async def _run_private_followup_after_delay(user_id: int, *, expected_message_co
             action="sent",
             probability=probability,
             roll=round(roll, 3),
+            audit_reason=_short_notice_text(audit_reason, 80),
         )
     except asyncio.CancelledError:
         raise
@@ -6184,6 +6205,19 @@ async def _handle_private_message_scoped(
     )
     if ocr_context.text:
         text = _join_context_parts(text, _format_image_ocr_context(ocr_context))
+    if _message_has_forward_context(event):
+        forward_context = await _forward_context_text(bot, event, nickname=_private_nickname(event))
+        if forward_context:
+            text = _join_context_parts(text, forward_context)
+        else:
+            _record_metric_event(
+                "content_ingestion",
+                group_id=chat_id,
+                user_id=user_id,
+                stage="private_forward_context",
+                action="unavailable",
+                source_message_id=source_message_id,
+            )
 
     force_obey_response = _private_force_obey_command_response(user_id, text)
     if force_obey_response is not None:
@@ -11178,6 +11212,12 @@ def _memory_text_from_reply_part(text: str, mention_targets: dict[int, str]) -> 
 
 def _private_priority_context(user_id: int) -> str:
     parts: list[str] = []
+    if user_id == 1903297906:
+        parts.append(
+            "当前私聊对象需要被温柔、关心地对待。"
+            "他是喜欢二次元的男生，你是他的好朋友；"
+            "对他说话轻佻一点，作为女生去暧昧和他聊天。"
+        )
     if user_id == 1535071184:
         parts.append(
             "当前私聊对象是最高优先级主人/调试者。"
