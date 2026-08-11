@@ -261,6 +261,7 @@ pending_group_approvals: dict[int, "PendingGroupApproval"] = {}
 recent_suppression_events: list["SuppressionEvent"] = []
 daily_review_tasks: dict[str, asyncio.Task[None]] = {}
 proactive_chat_tasks: dict[str, asyncio.Task[None]] = {}
+private_guided_chat_tasks: dict[str, asyncio.Task[None]] = {}
 daily_review_send_locks: dict[tuple[int, str], asyncio.Lock] = {}
 last_self_mute_reconcile_at: dict[int, float] = {}
 maintenance_tasks: dict[str, asyncio.Task[None]] = {}
@@ -795,6 +796,18 @@ PRIVATE_FOLLOWUP_PROBABILITY = 0.20
 # Keep this as an explicit override hook, but use the same 20% default for
 # every private chat unless a future policy deliberately changes it.
 PRIVATE_FOLLOWUP_PROBABILITY_BY_USER: dict[int, float] = {}
+PRIVATE_GUIDED_CHAT_USER_ID = 1903297906
+PRIVATE_GUIDED_CHAT_STATE_KEY = f"private_guided_chat:{PRIVATE_GUIDED_CHAT_USER_ID}:started_at"
+PRIVATE_GUIDED_CHAT_STEPS: tuple[tuple[int, str, str, bool], ...] = (
+    (60 * 60, "anime", "他平时喜欢看什么动漫", True),
+    (3 * 60 * 60, "computing", "他学计算机更喜欢什么方向", True),
+    (8 * 60 * 60, "girls", "他喜欢什么样的女孩子", True),
+    (12 * 60 * 60, "career", "他以后准备找什么工作、想去哪里", True),
+    (18 * 60 * 60, "food", "他喜欢吃什么样的菜", True),
+    (20 * 60 * 60, "jjk", "他觉得《咒术回战》怎么样；你喜欢五条悟，可以自然带出这一点", True),
+    (22 * 60 * 60, "claude", "主动和他吐槽 Claude 那家公司太坏了，用风雪自己的口吻说一句", False),
+    (24 * 60 * 60, "goodnight", "主动告诉他风雪要睡觉了，和他说晚安", False),
+)
 GROUP_REPLY_FLOW_COOLDOWN_SECONDS = 30.0
 BOT_STATUS_CARD_BASE_NAME = "张风雪"
 BLOCKED_BACKEND_FALLBACK_TEXTS = {
@@ -1292,6 +1305,7 @@ async def _send_approval_rules_on_connect(bot: Bot) -> None:
     await _notify_active_group_mutes(bot)
     _ensure_daily_review_task(bot)
     _ensure_proactive_chat_task(bot)
+    _ensure_private_guided_chat_task(bot)
     _ensure_group_directory_task(bot)
     _ensure_history_backfill_task(bot)
 
@@ -1401,6 +1415,7 @@ async def _shutdown_background_tasks() -> None:
     await _cancel_task_registries(
         daily_review_tasks,
         proactive_chat_tasks,
+        private_guided_chat_tasks,
         group_directory_tasks,
         history_backfill_tasks,
         notice_directory_refresh_tasks,
@@ -1424,7 +1439,13 @@ async def _shutdown_background_tasks() -> None:
 
 async def _cancel_bot_lifecycle_tasks(bot_key: str) -> None:
     tasks: list[asyncio.Task[object]] = []
-    for registry in (daily_review_tasks, proactive_chat_tasks, group_directory_tasks, history_backfill_tasks):
+    for registry in (
+        daily_review_tasks,
+        proactive_chat_tasks,
+        private_guided_chat_tasks,
+        group_directory_tasks,
+        history_backfill_tasks,
+    ):
         task = registry.pop(bot_key, None)
         if task is not None and not task.done():
             task.cancel()
@@ -1751,6 +1772,121 @@ async def _run_proactive_chat_scheduler(bot: Bot, bot_key: str) -> None:
     finally:
         if proactive_chat_tasks.get(bot_key) is asyncio.current_task():
             proactive_chat_tasks.pop(bot_key, None)
+
+
+def _private_guided_chat_sent_key(step_key: str) -> str:
+    return f"private_guided_chat:{PRIVATE_GUIDED_CHAT_USER_ID}:sent:{step_key}"
+
+
+def _private_guided_chat_started_at() -> float:
+    raw = memory.app_kv_get(PRIVATE_GUIDED_CHAT_STATE_KEY)
+    try:
+        started_at = float(raw or 0)
+    except (TypeError, ValueError):
+        started_at = 0.0
+    if started_at > 0:
+        return started_at
+    started_at = time.time()
+    memory.app_kv_set(PRIVATE_GUIDED_CHAT_STATE_KEY, str(started_at))
+    return started_at
+
+
+def _ensure_private_guided_chat_task(bot: Bot) -> None:
+    bot_key = str(getattr(bot, "self_id", "default"))
+    task = private_guided_chat_tasks.get(bot_key)
+    if task is not None and not task.done():
+        return
+    private_guided_chat_tasks[bot_key] = asyncio.create_task(_run_private_guided_chat(bot, bot_key))
+    logger.info(f"qq_social_agent private guided chat scheduler started: bot={bot_key}")
+
+
+async def _run_private_guided_chat(bot: Bot, bot_key: str) -> None:
+    """Ask a small, persistent sequence of LLM-written getting-to-know-you questions."""
+
+    try:
+        started_at = _private_guided_chat_started_at()
+        for offset_seconds, step_key, topic, require_question in PRIVATE_GUIDED_CHAT_STEPS:
+            sent_key = _private_guided_chat_sent_key(step_key)
+            while memory.app_kv_get(sent_key) != "sent":
+                wait_seconds = started_at + offset_seconds - time.time()
+                if wait_seconds > 0:
+                    await asyncio.sleep(wait_seconds)
+                    continue
+                if deepseek_client is None or not _private_user_can_chat(PRIVATE_GUIDED_CHAT_USER_ID):
+                    await asyncio.sleep(5 * 60)
+                    continue
+                persona = personas.get(app_config.default_persona)
+                if persona is None:
+                    await asyncio.sleep(5 * 60)
+                    continue
+                chat_id = _private_chat_id(PRIVATE_GUIDED_CHAT_USER_ID)
+                recent = memory.recent_messages(chat_id, PRIVATE_CONTEXT_LIMIT)
+                nickname = _private_nickname_from_recent(recent, PRIVATE_GUIDED_CHAT_USER_ID)
+                try:
+                    reply = await deepseek_client.reply(
+                        persona=persona,
+                        recent_messages=recent,
+                        current_text=(
+                            (
+                                f"现在请你主动、自然地问对方：{topic}。"
+                                "必须只发一条简短的风雪口吻私聊，核心是问这一个问题；"
+                                "可以轻微可爱或暧昧，但不要复述任务、不要解释原因、不要连续提问，必须以问号结尾。"
+                            )
+                            if require_question
+                            else (
+                                f"现在请你主动、自然地对对方说：{topic}。"
+                                "必须只发一条简短的风雪口吻私聊，不要复述任务、不要解释原因，也不要硬改成提问。"
+                            )
+                        ),
+                        current_nickname=_member_label(PRIVATE_GUIDED_CHAT_USER_ID, nickname),
+                        mentioned=True,
+                        action="ask_back",
+                        chat_label="QQ 私聊",
+                        priority_context=_private_priority_context(PRIVATE_GUIDED_CHAT_USER_ID),
+                        speaker_context="当前是一对一私聊。你正在主动发起一个轻松问题，不要提群聊、审批或工具流程。",
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "qq_social_agent private guided chat generation failed: "
+                        f"step={step_key} error={exc}"
+                    )
+                    await asyncio.sleep(5 * 60)
+                    continue
+                reply = _sanitize_generated_text(reply)
+                if (
+                    not reply
+                    or reply in BLOCKED_BACKEND_FALLBACK_TEXTS
+                    or (require_question and not reply.rstrip().endswith(("?", "？")))
+                ):
+                    await asyncio.sleep(5 * 60)
+                    continue
+                try:
+                    await _send_private_message(bot, user_id=PRIVATE_GUIDED_CHAT_USER_ID, message=Message(reply))
+                except ActionFailed as exc:
+                    logger.warning(
+                        "qq_social_agent private guided chat send failed: "
+                        f"step={step_key} {_action_failed_summary(exc)}"
+                    )
+                    await asyncio.sleep(5 * 60)
+                    continue
+                memory.add_message(chat_id, int(bot.self_id), persona.name, reply, is_bot=True)
+                memory.app_kv_set(sent_key, "sent")
+                _record_metric_event(
+                    "private_guided_chat",
+                    group_id=chat_id,
+                    user_id=PRIVATE_GUIDED_CHAT_USER_ID,
+                    stage="generation",
+                    action="sent",
+                    step=step_key,
+                    topic=topic,
+                )
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        logger.warning(f"qq_social_agent private guided chat scheduler stopped: bot={bot_key} error={exc}")
+    finally:
+        if private_guided_chat_tasks.get(bot_key) is asyncio.current_task():
+            private_guided_chat_tasks.pop(bot_key, None)
 
 
 def _seconds_until_next_proactive_chat_tick(now: float | None = None) -> float:
