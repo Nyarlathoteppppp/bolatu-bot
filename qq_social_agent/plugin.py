@@ -784,6 +784,9 @@ PRIVATE_BUFFER_SECONDS = 2.5
 PRIVATE_INFLIGHT_BUFFER_RETRY_SECONDS = 0.75
 PRIVATE_FOLLOWUP_DELAY_SECONDS = 10.0
 PRIVATE_FOLLOWUP_PROBABILITY = 0.20
+PRIVATE_FOLLOWUP_PROBABILITY_BY_USER = {
+    1903297906: 0.40,
+}
 GROUP_REPLY_FLOW_COOLDOWN_SECONDS = 30.0
 BOT_STATUS_CARD_BASE_NAME = "张风雪"
 BLOCKED_BACKEND_FALLBACK_TEXTS = {
@@ -5974,6 +5977,10 @@ def _schedule_private_followup_if_due(user_id: int, *, added_messages: int) -> N
     )
 
 
+def _private_followup_probability(user_id: int) -> float:
+    return max(0.0, min(1.0, PRIVATE_FOLLOWUP_PROBABILITY_BY_USER.get(user_id, PRIVATE_FOLLOWUP_PROBABILITY)))
+
+
 async def _run_private_followup_after_delay(user_id: int, *, expected_message_count: int) -> None:
     try:
         await asyncio.sleep(PRIVATE_FOLLOWUP_DELAY_SECONDS)
@@ -5982,14 +5989,15 @@ async def _run_private_followup_after_delay(user_id: int, *, expected_message_co
         if private_message_buffers.get(user_id) or user_id in private_generation_inflight:
             return
         roll = random.random()
-        if roll >= PRIVATE_FOLLOWUP_PROBABILITY:
+        probability = _private_followup_probability(user_id)
+        if roll >= probability:
             _record_metric_event(
                 "private_followup",
                 group_id=_private_chat_id(user_id),
                 user_id=user_id,
                 stage="probability",
                 action="skipped",
-                probability=PRIVATE_FOLLOWUP_PROBABILITY,
+                probability=probability,
                 roll=round(roll, 3),
             )
             return
@@ -6046,7 +6054,7 @@ async def _run_private_followup_after_delay(user_id: int, *, expected_message_co
             user_id=user_id,
             stage="generation",
             action="sent",
-            probability=PRIVATE_FOLLOWUP_PROBABILITY,
+            probability=probability,
             roll=round(roll, 3),
         )
     except asyncio.CancelledError:
