@@ -7438,6 +7438,17 @@ async def _execute_fresh_tool_request(
     user_id: int | None = None,
 ) -> ToolResult:
     tool_result = await tool_registry.execute(request)
+    retry_attempted = False
+    # A user explicitly asking for fresh news should not receive a permanent
+    # "nothing found" answer because one provider had a transient timeout.
+    if request.required and str(tool_result.status) == "failed":
+        retry_attempted = True
+        await asyncio.sleep(0.35)
+        retry_result = await tool_registry.execute(
+            replace(request, arguments={**dict(request.arguments), "force_refresh": True})
+        )
+        if retry_result.ok or str(retry_result.status) != "failed":
+            tool_result = retry_result
     search_status = dict(tool_result.metadata)
     logger.info(
         "qq_social_agent fresh context: "
@@ -7460,6 +7471,7 @@ async def _execute_fresh_tool_request(
         attempted_providers=search_status.get("attempted_providers", []),
         result_count=search_status.get("result_count", 0),
         cached=search_status.get("cached", False),
+        retry_attempted=retry_attempted,
         latency_ms=tool_result.elapsed_ms,
         error=tool_result.error,
         query_preview=search_status.get("query_preview", ""),
@@ -7469,7 +7481,11 @@ async def _execute_fresh_tool_request(
 
 async def _execute_registered_fresh_search(request: ToolRequest) -> ToolResult:
     kind = str(request.arguments.get("kind", "web"))
-    context = await fresh_context_tool.context_for(request.query, kind=kind)
+    context = await fresh_context_tool.context_for(
+        request.query,
+        kind=kind,
+        force_refresh=bool(request.arguments.get("force_refresh", False)),
+    )
     status = fresh_context_tool.status_snapshot().get("last_request", {})
     status = status if isinstance(status, dict) else {}
     raw_status = str(status.get("status", "") or "unknown")

@@ -152,11 +152,11 @@ class FreshContextTool:
             web_cache_ttl_seconds=_config_int(cfg, "web_cache_ttl_seconds", default=30 * 60),
         )
 
-    async def context_for(self, query: str, *, kind: str = "news") -> str:
-        lookup = await self.lookup(query, kind=kind)
+    async def context_for(self, query: str, *, kind: str = "news", force_refresh: bool = False) -> str:
+        lookup = await self.lookup(query, kind=kind, force_refresh=force_refresh)
         return _prompt_context_from_fact_pack(fact_pack_from_lookup(lookup))
 
-    async def lookup(self, query: str, *, kind: str = "news") -> FreshLookup:
+    async def lookup(self, query: str, *, kind: str = "news", force_refresh: bool = False) -> FreshLookup:
         started = time.monotonic()
         self._stats["requests"] += 1
         normalized_kind = kind if kind in {"news", "sports", "web"} else "news"
@@ -174,7 +174,7 @@ class FreshContextTool:
         key = (normalized_kind, _cache_query_key(normalized_query))
         now = time.monotonic()
         cached = self._cache.get(key)
-        if cached:
+        if cached and not force_refresh:
             cached_at, lookup = cached
             ttl = self.cache_ttl_by_kind[normalized_kind] if lookup.status == "ok" else self.failure_ttl_seconds
             if now - cached_at <= ttl:
@@ -196,7 +196,11 @@ class FreshContextTool:
                 return cached_lookup
             self._cache.pop(key, None)
 
-        related_cached = self._related_cached_lookup(normalized_kind, normalized_query, now=now)
+        related_cached = (
+            None
+            if force_refresh
+            else self._related_cached_lookup(normalized_kind, normalized_query, now=now)
+        )
         if related_cached is not None:
             self._stats["cache_hits"] += 1
             self._record_lookup(related_cached, started=started)
