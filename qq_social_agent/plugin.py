@@ -237,6 +237,12 @@ learning_coordinator: BackgroundLearningCoordinator | None = None
 group_message_buffers: dict[int, list["BufferedGroupMessage"]] = {}
 group_buffer_tasks: dict[int, asyncio.Task[None]] = {}
 group_generation_inflight: set[int] = set()
+private_processing_locks: dict[int, asyncio.Lock] = {}
+private_message_buffers: dict[int, list["BufferedPrivateMessage"]] = {}
+private_buffer_tasks: dict[int, asyncio.Task[None]] = {}
+private_generation_inflight: set[int] = set()
+private_inbound_message_counts: dict[int, int] = {}
+private_followup_tasks: dict[int, asyncio.Task[None]] = {}
 group_addressed_waiters: dict[int, int] = {}
 group_reply_flow_timestamps: dict[int, float] = {}
 group_inbound_sequences: dict[int, int] = {}
@@ -357,6 +363,37 @@ if hasattr(_driver, "server_app"):
             action="manual_proactive",
         )
         return JSONResponse({"ok": True, "group_id": group_id, "message_id": message_id})
+
+    @_driver.server_app.post("/admin/send-private")
+    async def _http_admin_send_private_endpoint(request: Request) -> JSONResponse:
+        if not _is_local_admin_request(request):
+            return JSONResponse({"ok": False, "reason": "local_admin_only"}, status_code=403)
+        try:
+            payload = await request.json()
+        except Exception:
+            payload = {}
+        try:
+            user_id = int(str(payload.get("user_id") or "").strip())
+        except (TypeError, ValueError):
+            user_id = None
+        message_text = str(payload.get("message") or "").strip()
+        if user_id is None or not message_text:
+            return JSONResponse({"ok": False, "reason": "missing_user_id_or_message"}, status_code=400)
+        bot = _first_connected_onebot_bot()
+        if bot is None:
+            return JSONResponse({"ok": False, "reason": "onebot_disconnected"}, status_code=503)
+        try:
+            result = await _send_private_message(bot, user_id=user_id, message=Message(message_text))
+        except ActionFailed as exc:
+            return JSONResponse({"ok": False, "reason": _action_failed_summary(exc)}, status_code=502)
+        memory.add_message(
+            _private_chat_id(user_id),
+            int(bot.self_id),
+            BOT_STATUS_CARD_BASE_NAME,
+            message_text,
+            is_bot=True,
+        )
+        return JSONResponse({"ok": True, "user_id": user_id, "result": str(result)[:160]})
 
     @_driver.server_app.get("/admin")
     async def _http_admin_endpoint(request: Request, group_id: int | None = None) -> HTMLResponse:
@@ -743,6 +780,10 @@ JARGON_CONTEXT_LOOKBACK = 4
 CUSTOM_JARGON_CONTEXT_LIMIT = 10
 GROUP_BUFFER_SECONDS = 6.0
 GROUP_INFLIGHT_BUFFER_RETRY_SECONDS = 1.0
+PRIVATE_BUFFER_SECONDS = 2.5
+PRIVATE_INFLIGHT_BUFFER_RETRY_SECONDS = 0.75
+PRIVATE_FOLLOWUP_DELAY_SECONDS = 10.0
+PRIVATE_FOLLOWUP_PROBABILITY = 0.20
 GROUP_REPLY_FLOW_COOLDOWN_SECONDS = 30.0
 BOT_STATUS_CARD_BASE_NAME = "张风雪"
 BLOCKED_BACKEND_FALLBACK_TEXTS = {
@@ -991,6 +1032,18 @@ class BufferedGroupMessage:
     message_segments_json: str = ""
     raw_message_json: str = ""
     sender_json: str = ""
+
+
+@dataclass(frozen=True)
+class BufferedPrivateMessage:
+    bot: Bot
+    event: PrivateMessageEvent
+    text: str
+    user_id: int
+    nickname: str
+    created_at: float
+    source_message_id: str = ""
+    correlation_id: str = ""
 
 
 @dataclass(frozen=True)
@@ -5798,7 +5851,219 @@ async def handle_private_message(bot: Bot, event: PrivateMessageEvent) -> None:
     correlation_id = event_correlation_id(event, scope="private")
     mark_bot_seen(int(bot.self_id))
     with correlation_scope(correlation_id):
-        await _handle_private_message_scoped(bot, event, correlation_id=correlation_id)
+        text = _message_context_text(event, bot_id=int(bot.self_id))
+        if not text:
+            logger.info("qq_social_agent ignored private: empty_text")
+            return
+        user_id = int(event.user_id)
+        if _private_message_requires_immediate_handling(user_id, text):
+            await _handle_private_message_scoped(bot, event, correlation_id=correlation_id)
+            return
+        _buffer_private_message(bot, event, text=text, correlation_id=correlation_id)
+
+
+def _private_message_requires_immediate_handling(user_id: int, text: str) -> bool:
+    """Keep approvals and operator commands out of the conversational queue."""
+
+    compact = text.strip()
+    return (
+        user_id in COMMAND_ONLY_PRIVATE_USER_IDS
+        or _is_private_tool_text(compact)
+        or (_is_approval_user(user_id) and _is_approval_control_text(compact))
+        or compact in PRIVATE_CONTEXT_RESET_COMMANDS
+        or compact in (
+            PRIVATE_FORCE_OBEY_ON_COMMANDS
+            | PRIVATE_FORCE_OBEY_OFF_COMMANDS
+            | PRIVATE_FORCE_OBEY_STATUS_COMMANDS
+        )
+        or _extract_private_force_obey_once_text(user_id, compact) is not None
+    )
+
+
+def _buffer_private_message(
+    bot: Bot,
+    event: PrivateMessageEvent,
+    *,
+    text: str,
+    correlation_id: str,
+) -> None:
+    user_id = int(event.user_id)
+    item = BufferedPrivateMessage(
+        bot=bot,
+        event=event,
+        text=text,
+        user_id=user_id,
+        nickname=_private_nickname(event),
+        created_at=float(getattr(event, "time", 0) or time.time()),
+        source_message_id=event_message_source_id(event),
+        correlation_id=correlation_id,
+    )
+    private_message_buffers.setdefault(user_id, []).append(item)
+    _schedule_private_buffer_flush(user_id)
+    logger.info(
+        "qq_social_agent buffered private message: "
+        f"user={user_id} size={len(private_message_buffers.get(user_id, []))}"
+    )
+
+
+def _schedule_private_buffer_flush(user_id: int, *, delay: float = PRIVATE_BUFFER_SECONDS) -> None:
+    task = private_buffer_tasks.get(user_id)
+    if task is None or task.done():
+        private_buffer_tasks[user_id] = asyncio.create_task(
+            _flush_private_buffer_after_delay(user_id, delay=delay)
+        )
+
+
+def _private_processing_lock(user_id: int) -> asyncio.Lock:
+    lock = private_processing_locks.get(user_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        private_processing_locks[user_id] = lock
+    return lock
+
+
+async def _flush_private_buffer_after_delay(user_id: int, *, delay: float = PRIVATE_BUFFER_SECONDS) -> None:
+    should_reschedule = False
+    reschedule_delay = PRIVATE_INFLIGHT_BUFFER_RETRY_SECONDS
+    try:
+        await asyncio.sleep(delay)
+        async with _private_processing_lock(user_id):
+            if user_id in private_generation_inflight:
+                should_reschedule = True
+                logger.info(
+                    "qq_social_agent private generation inflight: "
+                    f"user={user_id} buffer_deferred size={len(private_message_buffers.get(user_id, []))}"
+                )
+                return
+            items = private_message_buffers.pop(user_id, [])
+            if not items:
+                return
+            private_generation_inflight.add(user_id)
+            try:
+                latest = items[-1]
+                with correlation_scope(latest.correlation_id):
+                    await _handle_private_message_scoped(
+                        latest.bot,
+                        latest.event,
+                        correlation_id=latest.correlation_id,
+                        buffered_messages=items,
+                    )
+            finally:
+                private_generation_inflight.discard(user_id)
+            _schedule_private_followup_if_due(user_id, added_messages=len(items))
+            if private_message_buffers.get(user_id):
+                should_reschedule = True
+    finally:
+        task = asyncio.current_task()
+        if private_buffer_tasks.get(user_id) is task:
+            private_buffer_tasks.pop(user_id, None)
+        if should_reschedule and private_message_buffers.get(user_id):
+            _schedule_private_buffer_flush(user_id, delay=reschedule_delay)
+
+
+def _schedule_private_followup_if_due(user_id: int, *, added_messages: int) -> None:
+    total = private_inbound_message_counts.get(user_id, 0) + max(0, added_messages)
+    private_inbound_message_counts[user_id] = total
+    if total < 2 or total % 2:
+        return
+    previous = private_followup_tasks.get(user_id)
+    if previous is not None and not previous.done():
+        previous.cancel()
+    private_followup_tasks[user_id] = asyncio.create_task(
+        _run_private_followup_after_delay(user_id, expected_message_count=total)
+    )
+
+
+async def _run_private_followup_after_delay(user_id: int, *, expected_message_count: int) -> None:
+    try:
+        await asyncio.sleep(PRIVATE_FOLLOWUP_DELAY_SECONDS)
+        if private_inbound_message_counts.get(user_id, 0) != expected_message_count:
+            return
+        if private_message_buffers.get(user_id) or user_id in private_generation_inflight:
+            return
+        roll = random.random()
+        if roll >= PRIVATE_FOLLOWUP_PROBABILITY:
+            _record_metric_event(
+                "private_followup",
+                group_id=_private_chat_id(user_id),
+                user_id=user_id,
+                stage="probability",
+                action="skipped",
+                probability=PRIVATE_FOLLOWUP_PROBABILITY,
+                roll=round(roll, 3),
+            )
+            return
+        if deepseek_client is None or not _private_user_can_chat(user_id):
+            return
+        chat_id = _private_chat_id(user_id)
+        state = memory.group_state(chat_id)
+        if not bool(state["enabled"]):
+            return
+        rate = rate_limiter.allow(chat_id, mentioned=True)
+        if not rate.allowed:
+            return
+        persona = personas.get(str(state["persona"] or app_config.default_persona))
+        if persona is None:
+            return
+        recent = memory.recent_messages(chat_id, app_config.context_limit)
+        if len(recent) < 2:
+            return
+        private_generation_inflight.add(user_id)
+        try:
+            reply = await deepseek_client.reply(
+                persona=persona,
+                recent_messages=recent,
+                current_text=(
+                    "对方刚连续和你聊了几句，现在停了十秒。"
+                    "如果能自然延续刚才的话题、补一个有用观点或轻轻开个新话题，就主动发一句；"
+                    "如果没有自然的话，不要回复。"
+                ),
+                current_nickname=_member_label(user_id, _private_nickname_from_recent(recent, user_id)),
+                mentioned=False,
+                action="reply",
+                chat_label="QQ 私聊",
+                memory_context=_format_memory_context(
+                    memory.relevant_memory_summaries(chat_id, " ".join(msg.text for msg in recent[-4:]), limit=MID_MEMORY_KEEP_SUMMARIES)
+                ),
+                priority_context=_private_priority_context(user_id),
+                speaker_context="当前是一对一私聊。只能自然续聊，不要提群聊、审批或工具流程。",
+            )
+        finally:
+            private_generation_inflight.discard(user_id)
+        reply = _sanitize_generated_text(reply)
+        if not reply or reply in BLOCKED_BACKEND_FALLBACK_TEXTS:
+            return
+        reply, _ = sanitize_political_output(reply)
+        bot = _first_connected_onebot_bot()
+        if bot is None:
+            return
+        for part in split_reply_messages(reply, max_messages=2):
+            await _send_private_message(bot, user_id=user_id, message=Message(part))
+            memory.add_message(chat_id, int(bot.self_id), persona.name, part, is_bot=True)
+        _record_metric_event(
+            "private_followup",
+            group_id=chat_id,
+            user_id=user_id,
+            stage="generation",
+            action="sent",
+            probability=PRIVATE_FOLLOWUP_PROBABILITY,
+            roll=round(roll, 3),
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        logger.warning(f"qq_social_agent private follow-up failed: user={user_id} error={exc}")
+    finally:
+        task = asyncio.current_task()
+        if private_followup_tasks.get(user_id) is task:
+            private_followup_tasks.pop(user_id, None)
+
+
+def _private_nickname_from_recent(recent: list[ChatMessage], user_id: int) -> str:
+    for item in reversed(recent):
+        if not item.is_bot and item.user_id == user_id:
+            return item.nickname
+    return "对方"
 
 
 async def _handle_private_message_scoped(
@@ -5806,8 +6071,17 @@ async def _handle_private_message_scoped(
     event: PrivateMessageEvent,
     *,
     correlation_id: str,
+    buffered_messages: list[BufferedPrivateMessage] | None = None,
 ) -> None:
-    text = _message_context_text(event, bot_id=int(bot.self_id))
+    buffered_items = list(buffered_messages or ())
+    if buffered_items:
+        latest = buffered_items[-1]
+        bot = latest.bot
+        event = latest.event
+        correlation_id = latest.correlation_id
+        text = latest.text
+    else:
+        text = _message_context_text(event, bot_id=int(bot.self_id))
     if not text:
         logger.info("qq_social_agent ignored private: empty_text")
         return
@@ -5815,12 +6089,28 @@ async def _handle_private_message_scoped(
     user_id = int(event.user_id)
     chat_id = _private_chat_id(user_id)
     source_message_id = event_message_source_id(event)
-    if not memory.claim_inbound_message(
-        chat_id,
-        source_message_id,
-        correlation_id=correlation_id,
-        created_at=float(getattr(event, "time", 0) or time.time()),
-    ):
+    claim_items = buffered_items or [
+        BufferedPrivateMessage(
+            bot=bot,
+            event=event,
+            text=text,
+            user_id=user_id,
+            nickname=_private_nickname(event),
+            created_at=float(getattr(event, "time", 0) or time.time()),
+            source_message_id=source_message_id,
+            correlation_id=correlation_id,
+        )
+    ]
+    accepted_items: list[BufferedPrivateMessage] = []
+    for item in claim_items:
+        if memory.claim_inbound_message(
+            chat_id,
+            item.source_message_id,
+            correlation_id=item.correlation_id,
+            created_at=item.created_at,
+        ):
+            accepted_items.append(item)
+    if not accepted_items:
         logger.info(
             "qq_social_agent ignored duplicate private message: "
             f"user={user_id} source_message_id={source_message_id}"
@@ -5835,6 +6125,13 @@ async def _handle_private_message_scoped(
             correlation_id=correlation_id,
         )
         return
+    if buffered_items:
+        latest = accepted_items[-1]
+        bot = latest.bot
+        event = latest.event
+        correlation_id = latest.correlation_id
+        source_message_id = latest.source_message_id
+        text = latest.text
     if await _handle_group_approval_private(bot, user_id, text):
         return
 
@@ -5903,8 +6200,28 @@ async def _handle_private_message_scoped(
         nickname=_private_nickname(event),
         chat_label="QQ 私聊",
     )
+    prompt_text = text
+    if len(accepted_items) > 1:
+        earlier = [
+            _short_notice_text(item.text, 240)
+            for item in accepted_items[:-1]
+            if item.text.strip()
+        ]
+        if earlier:
+            prompt_text = "[对方连续发了多条私聊]\n" + "\n".join(earlier + [text])
     logger.info(f"qq_social_agent private start: user={user_id} text={text!r}")
     nickname = _private_nickname(event)
+    for item in accepted_items[:-1]:
+        memory.add_message(
+            chat_id,
+            user_id,
+            item.nickname,
+            item.text,
+            is_bot=False,
+            source_message_id=item.source_message_id,
+            correlation_id=item.correlation_id,
+            **_event_message_storage_kwargs(item.event, bot=item.bot),
+        )
     memory.add_message(
         chat_id,
         user_id,
@@ -5915,6 +6232,7 @@ async def _handle_private_message_scoped(
         correlation_id=correlation_id,
         **_event_message_storage_kwargs(event, bot=bot),
     )
+    text = prompt_text
     # Private chats share the same retrieval and learning pipeline as groups,
     # but their synthetic chat_id keeps every stored fact and source isolated.
     rag_service.request_source_sync()
