@@ -5913,7 +5913,12 @@ async def _handle_private_message_scoped(
         is_bot=False,
         source_message_id=source_message_id,
         correlation_id=correlation_id,
+        **_event_message_storage_kwargs(event, bot=bot),
     )
+    # Private chats share the same retrieval and learning pipeline as groups,
+    # but their synthetic chat_id keeps every stored fact and source isolated.
+    rag_service.request_source_sync()
+    _schedule_group_learning(chat_id)
 
     state = memory.group_state(chat_id)
     if not bool(state["enabled"]):
@@ -5948,11 +5953,216 @@ async def _handle_private_message_scoped(
         logger.warning("qq_social_agent skipped private: deepseek_client_not_ready")
         return
 
-    memory_context = _format_memory_context(
-        memory.recent_memory_summaries(chat_id, MID_MEMORY_KEEP_SUMMARIES)
+    normalized_rag_query = normalize_rag_query(text)
+    context_query = normalized_rag_query.current_utterance or text
+    market_intents = detect_market_intents(context_query, limit=2)
+    fresh_intent = detect_fresh_intent(context_query)
+    tool_plan = _tool_plan_with_runtime_context(
+        _route_tools(
+            context_query,
+            market_intents=market_intents,
+            fresh_intent=fresh_intent,
+            addressed=True,
+            market_required=bool(market_intents) and _is_explicit_market_lookup(context_query),
+        ),
+        addressed=True,
+        group_id=chat_id,
+        user_id=user_id,
+        source_message_id=source_message_id,
     )
-    market_context = await _market_context_for(market_intents, market_topic=bool(market_intents))
-    fresh_context = await _private_fresh_context_for(text)
+    decision = _apply_backend_tool_decision(
+        ReplyDecision(
+            should_reply=True,
+            confidence=1.0,
+            reason="private_direct_conversation",
+            mode="reply",
+            action="answer",
+        ),
+        text=context_query,
+        market_intents=market_intents,
+        fresh_intent=fresh_intent,
+    )
+    decision = _apply_tool_plan(decision, tool_plan)
+    private_speaker_context = (
+        f"当前是和{_member_label(user_id, nickname)}的一对一私聊。"
+        "不要把普通代词误当成群友或机器人；不要艾特第三人、点群表情或假装在群里说话。"
+    )
+    decision, tool_plan = await _apply_tool_use_router(
+        decision,
+        tool_plan=tool_plan,
+        persona=persona,
+        context_recent=context_recent,
+        text=context_query,
+        nickname=nickname,
+        addressed_bot=True,
+        fresh_intent=fresh_intent,
+        market_intents=market_intents,
+        speaker_context=private_speaker_context,
+        group_id=chat_id,
+        user_id=user_id,
+        source_message_id=source_message_id,
+        chat_label="QQ 私聊",
+    )
+    _record_metric_event(
+        "private_tool_route_plan",
+        group_id=chat_id,
+        user_id=user_id,
+        stage="routing",
+        action=decision.action,
+        need_fresh=decision.need_fresh_context,
+        need_tool=decision.need_tool,
+        requests=[request.kind.value for request in tool_plan.requests],
+    )
+
+    rag_task: asyncio.Task[RAGRetrievalResult] = asyncio.create_task(
+        rag_service.retrieve(
+            group_id=chat_id,
+            query=context_query,
+            addressed=True,
+            related_user_ids=[user_id],
+            excluded_user_ids=[int(event.self_id)],
+        )
+    )
+    market_context = ""
+    if decision.need_tool and decision.tool == "market":
+        requested_intents = _market_intents_from_decision(
+            decision,
+            fallback_text=context_query,
+            fallback_intents=market_intents,
+        )
+        market_request = tool_plan.first(ToolKind.MARKET) or ToolRequest(
+            ToolKind.MARKET,
+            query=context_query,
+            reason="private_reply_requires_market",
+            required=True,
+            arguments={
+                "symbols": tuple(
+                    {
+                        "kind": item.kind,
+                        "symbol": item.symbol,
+                        "display": item.display_name,
+                    }
+                    for item in requested_intents[:2]
+                )
+            },
+        )
+        market_result = await tool_registry.execute(market_request)
+        market_context = market_result.context
+        _record_metric_event(
+            "tool_call",
+            group_id=chat_id,
+            user_id=user_id,
+            stage="private_market",
+            action="registry_execute",
+            tool_kind=ToolKind.MARKET.value,
+            success=market_result.ok,
+            status=market_result.status,
+            latency_ms=market_result.elapsed_ms,
+            error=market_result.error,
+            **dict(market_result.metadata),
+        )
+
+    fresh_context = ""
+    if decision.need_fresh_context:
+        query = decision.fresh_query.strip() or context_query
+        fresh_result = await _execute_fresh_tool_request(
+            ToolRequest(
+                ToolKind.FRESH_SEARCH,
+                query=query,
+                reason="private_reply_requires_fresh_context",
+                required=True,
+                arguments={"kind": decision.fresh_kind},
+            ),
+            metric_stage="private_fresh_context",
+            group_id=chat_id,
+            user_id=user_id,
+        )
+        fresh_context = fresh_result.context
+        if str(fresh_result.status) != "ok" and not fresh_context.strip():
+            fresh_context = _fresh_tool_failure_context(
+                query,
+                status=str(fresh_result.status),
+                reason=str(fresh_result.error or fresh_result.status or "搜索工具没有返回可用结果"),
+            )
+    deep_request = tool_plan.first(ToolKind.DEEP_URL)
+    if deep_request is not None:
+        deep_result = await tool_registry.execute(deep_request)
+        if deep_result.context:
+            fresh_context = _combine_text_sections(fresh_context, deep_result.context)
+        _record_metric_event(
+            "tool_call",
+            group_id=chat_id,
+            user_id=user_id,
+            stage="private_deep_url_reader",
+            action="registry_execute",
+            tool_kind=ToolKind.DEEP_URL.value,
+            success=deep_result.ok,
+            status=deep_result.status,
+            latency_ms=deep_result.elapsed_ms,
+            error=deep_result.error,
+            **dict(deep_result.metadata),
+        )
+
+    rag_result = await rag_task
+    memory_context = rag_result.context or _format_memory_context(
+        memory.relevant_memory_summaries(chat_id, context_query, limit=MID_MEMORY_KEEP_SUMMARIES)
+    )
+    related_user_ids = _related_member_user_ids(context_recent, current_user_id=user_id)
+    member_context = _format_member_context(
+        memory.member_impressions_for_context(chat_id, related_user_ids, limit=MEMBER_IMPRESSION_CONTEXT_LIMIT)
+    )
+    memory_atoms_context = _format_memory_atom_context(
+        memory.relevant_memory_atoms(
+            chat_id,
+            context_query,
+            subject_user_ids=related_user_ids,
+            speaker_user_id=user_id,
+            relationship_user_ids=related_user_ids,
+            limit=MEMORY_ATOM_CONTEXT_LIMIT,
+        )
+    )
+    style_context = _format_style_context(
+        memory.relevant_style_rules(chat_id, context_query, limit=STYLE_RULE_CONTEXT_LIMIT, speaker_user_id=user_id)
+    )
+    raw_corpus_context = _format_raw_corpus_context(
+        memory.relevant_raw_corpus_examples(
+            chat_id,
+            context_query,
+            limit=RAW_CORPUS_CONTEXT_LIMIT,
+            candidate_limit=RAW_CORPUS_CANDIDATE_LIMIT,
+            context_radius=RAW_CORPUS_CONTEXT_RADIUS,
+            exclude_user_id=user_id,
+            exclude_text=text,
+            preferred_user_id=user_id,
+            preferred_limit=2,
+            preferred_score_multiplier=1.1,
+            preferred_score_bonus=0.5,
+            per_user_limit=1,
+        )
+    )
+    jargon_context = await _selected_group_jargon_context(
+        chat_id,
+        context_recent,
+        current_text=context_query,
+        current_nickname=nickname,
+        chat_label="QQ 私聊",
+    )
+    recall_feedback_context = _format_recall_feedback_context(
+        memory.recent_recalled_reply_feedback(chat_id, RECALL_FEEDBACK_CONTEXT_LIMIT)
+    )
+    _record_metric_event(
+        "rag_retrieval",
+        group_id=chat_id,
+        user_id=user_id,
+        stage="private_generation_context",
+        action="injected" if rag_result.context else "empty",
+        route=rag_result.plan.route,
+        lexical_count=rag_result.lexical_count,
+        semantic_count=rag_result.semantic_count,
+        injected_count=len(rag_result.hits),
+        elapsed_ms=rag_result.elapsed_ms,
+        error=rag_result.error,
+    )
     try:
         reply = await deepseek_client.reply(
             persona=persona,
@@ -5961,9 +6171,17 @@ async def _handle_private_message_scoped(
             current_nickname=nickname,
             mentioned=True,
             chat_label="QQ 私聊",
+            action=decision.action,
             market_context=market_context,
             fresh_context=fresh_context,
             memory_context=memory_context,
+            member_context=member_context,
+            memory_atoms_context=memory_atoms_context,
+            style_context=style_context,
+            raw_corpus_context=raw_corpus_context,
+            jargon_context=jargon_context,
+            recall_feedback_context=recall_feedback_context,
+            speaker_context=private_speaker_context,
             priority_context=_combine_text_sections(_private_priority_context(user_id), forced_once_context),
         )
     except Exception as exc:
@@ -7438,6 +7656,7 @@ async def _apply_tool_use_router(
     group_id: int,
     user_id: int,
     source_message_id: str,
+    chat_label: str = "QQ 群聊",
 ) -> tuple[ReplyDecision, ToolRoutePlan]:
     router_should_run = _tool_router_should_run(
         decision,
@@ -7473,7 +7692,7 @@ async def _apply_tool_use_router(
             decision_action=decision.action,
             decision_reason=decision.reason,
             backend_hint=backend_hint,
-            chat_label="QQ 群聊",
+            chat_label=chat_label,
             speaker_context=speaker_context,
         )
     except Exception as exc:
@@ -8960,6 +9179,7 @@ async def _selected_group_jargon_context(
     *,
     current_text: str,
     current_nickname: str,
+    chat_label: str = "QQ 群聊",
 ) -> str:
     custom_entries = _matched_custom_group_jargon_entries(group_id, [current_text])
     heuristic_terms = detect_group_jargon_terms([current_text], extra_entries=custom_entries)
@@ -8983,7 +9203,7 @@ async def _selected_group_jargon_context(
             current_nickname=current_nickname,
             jargon_catalog=group_jargon_catalog(extra_entries=custom_entries),
             heuristic_terms=heuristic_terms,
-            chat_label="QQ 群聊",
+            chat_label=chat_label,
         )
     except Exception as exc:
         logger.warning(f"qq_social_agent jargon selector skipped: error={exc}")
