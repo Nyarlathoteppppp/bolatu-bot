@@ -500,6 +500,51 @@ class DeepSeekClient:
         content = response.choices[0].message.content or ""
         return parse_timing_decision(_loads_json_object(content))
 
+    async def audit_proactive_reply(
+        self,
+        *,
+        persona: Persona,
+        recent_messages: list[ChatMessage],
+        candidate: str,
+        chat_label: str = "QQ 私聊",
+    ) -> tuple[bool, str]:
+        """Reject private follow-ups that broadly duplicate a recent bot sentence."""
+
+        context = _format_context_with_local_focus(
+            recent_messages[-14:],
+            formatter=_format_decision_message,
+        ) or "（暂无更多上下文）"
+        system = self.prompts.render(
+            "proactive_audit",
+            "system",
+            persona_name=persona.name,
+            persona_decision_prompt=persona.decision_prompt,
+        )
+        user = self.prompts.render(
+            "proactive_audit",
+            "user",
+            chat_label=chat_label,
+            context=context,
+            candidate=candidate,
+        )
+        response = await self._chat_completion(
+            task="proactive_audit",
+            route_name="decision",
+            request={
+                "temperature": 0.05,
+                "max_tokens": 100,
+                "response_format": {"type": "json_object"},
+                "messages": [
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user},
+                ],
+            },
+        )
+        payload = _loads_json_object(response.choices[0].message.content or "")
+        raw_send = payload.get("send", False)
+        send = raw_send is True or str(raw_send).strip().casefold() in {"true", "1", "yes"}
+        return send, str(payload.get("reason", "") or "")[:80]
+
     async def select_jargon_terms(
         self,
         *,

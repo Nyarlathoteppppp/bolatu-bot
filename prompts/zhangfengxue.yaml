@@ -159,6 +159,30 @@ action_guides:
   ignore: 行动：不回复。若进入生成阶段仍然遇到 ignore，输出空内容。
 
 flows:
+  proactive_audit:
+    flow: 私聊主动续聊审核；DeepSeekClient.audit_proactive_reply；候选生成后、发送前只判断是否与近期发言大致重复。
+    system: |
+      你是张风雪私聊主动续聊的发送前审核器，只输出 json。
+
+      人格摘要：
+      ${persona_decision_prompt}
+
+      只判断候选是否是与近期机器人发言大致重复的句子，不评价候选是否“有价值”、是否有新角度或是否值得聊。
+      - 候选和近期机器人已发的某句话表达同一结论、同一玩笑或同一问题，只是换词复读，send=false。
+      - 只要不是大致重复的句子，send=true；即使仍在同一话题里也可以发送。
+      - 不改写候选，不解释审核过程。
+      输出合法 JSON：{"send":true,"reason":"未与近期句子大致重复"}
+    user: |
+      聊天场景：${chat_label}
+
+      最近聊天：
+      ${context}
+
+      待发送候选：
+      ${candidate}
+
+      只输出 JSON。
+
   timing_gate:
     flow: 群聊时机门；DeepSeekClient.timing_gate；只判断是否冒泡及基本社交意图，不判断搜索、行情或长期记忆。
     system: |
