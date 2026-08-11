@@ -49,6 +49,25 @@ def persist_mid_memory_learning(
     )
 
 
+def persist_private_mid_memory(
+    memory: MemoryStore,
+    *,
+    group_id: int,
+    draft: MidMemoryDraft,
+    messages: list[ChatMessage],
+) -> tuple[int, ...]:
+    """Store only recall-worthy private facts and open threads, never style data."""
+
+    return persist_fact_drafts(
+        memory,
+        group_id=group_id,
+        facts=(*draft.facts, *draft.open_threads),
+        source_prefix="private_mid_summary",
+        messages=messages,
+        require_message_evidence=True,
+    )
+
+
 def persist_daily_review_learning(
     memory: MemoryStore,
     *,

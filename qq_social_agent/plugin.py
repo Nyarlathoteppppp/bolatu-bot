@@ -107,7 +107,11 @@ from .memory import (
     RecalledReplyFeedback,
     StyleRule,
 )
-from .memory_learning import persist_daily_review_learning, persist_mid_memory_learning
+from .memory_learning import (
+    persist_daily_review_learning,
+    persist_mid_memory_learning,
+    persist_private_mid_memory,
+)
 from .observability import (
     build_trace_snapshot,
     correlation_scope,
@@ -8876,7 +8880,12 @@ async def _maintain_group_learning(group_id: int) -> None:
                     summary=draft.summary,
                     recall_cues=list(draft.recall_cues),
                 )
-                learned_atom_ids = persist_mid_memory_learning(
+                persist_memory = (
+                    persist_private_mid_memory
+                    if group_id >= PRIVATE_CHAT_OFFSET
+                    else persist_mid_memory_learning
+                )
+                learned_atom_ids = persist_memory(
                     memory,
                     group_id=group_id,
                     draft=draft,
