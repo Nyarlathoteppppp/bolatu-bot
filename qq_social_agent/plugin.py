@@ -7,7 +7,7 @@ import random
 import re
 import time
 from dataclasses import dataclass, replace
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 from urllib.parse import parse_qs, urlencode
@@ -262,6 +262,7 @@ recent_suppression_events: list["SuppressionEvent"] = []
 daily_review_tasks: dict[str, asyncio.Task[None]] = {}
 proactive_chat_tasks: dict[str, asyncio.Task[None]] = {}
 private_guided_chat_tasks: dict[str, asyncio.Task[None]] = {}
+private_hourly_chat_tasks: dict[str, asyncio.Task[None]] = {}
 daily_review_send_locks: dict[tuple[int, str], asyncio.Lock] = {}
 last_self_mute_reconcile_at: dict[int, float] = {}
 maintenance_tasks: dict[str, asyncio.Task[None]] = {}
@@ -808,6 +809,22 @@ PRIVATE_GUIDED_CHAT_STEPS: tuple[tuple[int, str, str, bool], ...] = (
     (22 * 60 * 60, "claude", "主动和他吐槽 Claude 那家公司太坏了，用风雪自己的口吻说一句", False),
     (24 * 60 * 60, "goodnight", "主动告诉他风雪要睡觉了，和他说晚安", False),
 )
+PRIVATE_HOURLY_CHAT_USER_ID = 1903297906
+PRIVATE_HOURLY_CHAT_DAYTIME_PERCENT = 15
+PRIVATE_HOURLY_CHAT_QUIET_PERCENT = 5
+PRIVATE_HOURLY_CHAT_QUIET_START_HOUR = 2
+PRIVATE_HOURLY_CHAT_QUIET_END_HOUR = 9
+PRIVATE_HOURLY_CHAT_LAST_SLOT_KEY = f"private_hourly_chat:{PRIVATE_HOURLY_CHAT_USER_ID}:last_slot"
+PRIVATE_HOURLY_CHAT_TOPICS: tuple[str, ...] = (
+    "游戏：最近玩过的游戏、单机和联机的乐趣、氪金和时间成本",
+    "动漫：新番、老番、角色塑造、轻松的二次元日常",
+    "财经：花钱、储蓄、市场情绪、工作和现实成本",
+    "AI：模型能力、AI 产品、编程工具、普通人会被怎样影响",
+    "学习：计算机学习、语言学习、留学适应、学习方法",
+    "生活：吃饭、睡眠、天气、出行、今天的小事",
+    "技术：写代码、软件工程、做项目、好用的小工具",
+    "日本：早稻田、留学生活、日语、城市和校园体验",
+)
 GROUP_REPLY_FLOW_COOLDOWN_SECONDS = 30.0
 BOT_STATUS_CARD_BASE_NAME = "张风雪"
 BLOCKED_BACKEND_FALLBACK_TEXTS = {
@@ -1306,6 +1323,7 @@ async def _send_approval_rules_on_connect(bot: Bot) -> None:
     _ensure_daily_review_task(bot)
     _ensure_proactive_chat_task(bot)
     _ensure_private_guided_chat_task(bot)
+    _ensure_private_hourly_chat_task(bot)
     _ensure_group_directory_task(bot)
     _ensure_history_backfill_task(bot)
 
@@ -1416,6 +1434,7 @@ async def _shutdown_background_tasks() -> None:
         daily_review_tasks,
         proactive_chat_tasks,
         private_guided_chat_tasks,
+        private_hourly_chat_tasks,
         group_directory_tasks,
         history_backfill_tasks,
         notice_directory_refresh_tasks,
@@ -1443,6 +1462,7 @@ async def _cancel_bot_lifecycle_tasks(bot_key: str) -> None:
         daily_review_tasks,
         proactive_chat_tasks,
         private_guided_chat_tasks,
+        private_hourly_chat_tasks,
         group_directory_tasks,
         history_backfill_tasks,
     ):
@@ -1887,6 +1907,146 @@ async def _run_private_guided_chat(bot: Bot, bot_key: str) -> None:
     finally:
         if private_guided_chat_tasks.get(bot_key) is asyncio.current_task():
             private_guided_chat_tasks.pop(bot_key, None)
+
+
+def _ensure_private_hourly_chat_task(bot: Bot) -> None:
+    bot_key = str(getattr(bot, "self_id", "default"))
+    task = private_hourly_chat_tasks.get(bot_key)
+    if task is not None and not task.done():
+        return
+    private_hourly_chat_tasks[bot_key] = asyncio.create_task(_run_private_hourly_chat(bot, bot_key))
+    logger.info(
+        "qq_social_agent private hourly chat scheduler started: "
+        f"bot={bot_key} daytime={PRIVATE_HOURLY_CHAT_DAYTIME_PERCENT}% "
+        f"quiet={PRIVATE_HOURLY_CHAT_QUIET_PERCENT}%"
+    )
+
+
+def _seconds_until_next_private_hourly_chat_tick(now: float | None = None) -> float:
+    current = time.time() if now is None else now
+    local_now = datetime.fromtimestamp(current, DAILY_REVIEW_TIMEZONE)
+    next_hour = local_now.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
+    return max(1.0, next_hour.timestamp() - current)
+
+
+def _private_hourly_chat_probability(now: float) -> int:
+    hour = datetime.fromtimestamp(now, DAILY_REVIEW_TIMEZONE).hour
+    if _hour_in_range(hour, PRIVATE_HOURLY_CHAT_QUIET_START_HOUR, PRIVATE_HOURLY_CHAT_QUIET_END_HOUR):
+        return PRIVATE_HOURLY_CHAT_QUIET_PERCENT
+    return PRIVATE_HOURLY_CHAT_DAYTIME_PERCENT
+
+
+async def _run_private_hourly_chat(bot: Bot, bot_key: str) -> None:
+    """At each Shanghai-hour boundary, occasionally let Fengxue open a topic herself."""
+
+    try:
+        while True:
+            await asyncio.sleep(_seconds_until_next_private_hourly_chat_tick())
+            now = time.time()
+            local_now = datetime.fromtimestamp(now, DAILY_REVIEW_TIMEZONE)
+            slot = local_now.strftime("%Y%m%d%H")
+            if memory.app_kv_get(PRIVATE_HOURLY_CHAT_LAST_SLOT_KEY) == slot:
+                continue
+            memory.app_kv_set(PRIVATE_HOURLY_CHAT_LAST_SLOT_KEY, slot)
+            probability = _private_hourly_chat_probability(now)
+            roll = random.uniform(0.0, 100.0)
+            chat_id = _private_chat_id(PRIVATE_HOURLY_CHAT_USER_ID)
+            if roll >= probability:
+                _record_metric_event(
+                    "private_hourly_chat",
+                    group_id=chat_id,
+                    user_id=PRIVATE_HOURLY_CHAT_USER_ID,
+                    stage="probability",
+                    action="skipped",
+                    probability=probability,
+                    roll=round(roll, 2),
+                    slot=slot,
+                )
+                continue
+            if (
+                deepseek_client is None
+                or not _private_user_can_chat(PRIVATE_HOURLY_CHAT_USER_ID)
+                or private_message_buffers.get(PRIVATE_HOURLY_CHAT_USER_ID)
+                or PRIVATE_HOURLY_CHAT_USER_ID in private_generation_inflight
+            ):
+                _record_metric_event(
+                    "private_hourly_chat",
+                    group_id=chat_id,
+                    user_id=PRIVATE_HOURLY_CHAT_USER_ID,
+                    stage="availability",
+                    action="skipped",
+                    probability=probability,
+                    roll=round(roll, 2),
+                    slot=slot,
+                )
+                continue
+            persona = personas.get(app_config.default_persona)
+            if persona is None:
+                continue
+            topic = random.choice(PRIVATE_HOURLY_CHAT_TOPICS)
+            recent = memory.recent_messages(chat_id, PRIVATE_CONTEXT_LIMIT)
+            nickname = _private_nickname_from_recent(recent, PRIVATE_HOURLY_CHAT_USER_ID)
+            private_generation_inflight.add(PRIVATE_HOURLY_CHAT_USER_ID)
+            try:
+                reply = await deepseek_client.reply(
+                    persona=persona,
+                    recent_messages=recent,
+                    current_text=(
+                        f"现在是北京时间 {local_now.strftime('%H:%M')}，你想主动和对方聊一点：{topic}。"
+                        "只发一条简短自然的私聊，可分享一个自己的判断、吐槽或轻轻问一句；"
+                        "不要复述任务、不要提概率或定时器、不要硬塞事实数据，也不要连续发问。"
+                    ),
+                    current_nickname=_member_label(PRIVATE_HOURLY_CHAT_USER_ID, nickname),
+                    mentioned=True,
+                    action="reply",
+                    chat_label="QQ 私聊",
+                    priority_context=_private_priority_context(PRIVATE_HOURLY_CHAT_USER_ID),
+                    speaker_context="当前是一对一私聊。你在自然主动开话题，不要提群聊、审批或工具流程。",
+                )
+            except Exception as exc:
+                logger.warning(f"qq_social_agent private hourly chat generation failed: slot={slot} error={exc}")
+                _record_metric_event(
+                    "private_hourly_chat",
+                    group_id=chat_id,
+                    user_id=PRIVATE_HOURLY_CHAT_USER_ID,
+                    stage="generation",
+                    action="failed",
+                    probability=probability,
+                    roll=round(roll, 2),
+                    slot=slot,
+                    topic=topic,
+                    reason=_short_notice_text(str(exc), 160),
+                )
+                continue
+            finally:
+                private_generation_inflight.discard(PRIVATE_HOURLY_CHAT_USER_ID)
+            reply = _sanitize_generated_text(reply)
+            if not reply or reply in BLOCKED_BACKEND_FALLBACK_TEXTS:
+                continue
+            try:
+                await _send_private_message(bot, user_id=PRIVATE_HOURLY_CHAT_USER_ID, message=Message(reply))
+            except ActionFailed as exc:
+                logger.warning(f"qq_social_agent private hourly chat send failed: slot={slot} {_action_failed_summary(exc)}")
+                continue
+            memory.add_message(chat_id, int(bot.self_id), persona.name, reply, is_bot=True)
+            _record_metric_event(
+                "private_hourly_chat",
+                group_id=chat_id,
+                user_id=PRIVATE_HOURLY_CHAT_USER_ID,
+                stage="generation",
+                action="sent",
+                probability=probability,
+                roll=round(roll, 2),
+                slot=slot,
+                topic=topic,
+            )
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        logger.warning(f"qq_social_agent private hourly chat scheduler stopped: bot={bot_key} error={exc}")
+    finally:
+        if private_hourly_chat_tasks.get(bot_key) is asyncio.current_task():
+            private_hourly_chat_tasks.pop(bot_key, None)
 
 
 def _seconds_until_next_proactive_chat_tick(now: float | None = None) -> float:
