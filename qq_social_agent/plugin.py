@@ -814,6 +814,8 @@ PRIVATE_HOURLY_CHAT_DAYTIME_PERCENT = 15
 PRIVATE_HOURLY_CHAT_QUIET_PERCENT = 5
 PRIVATE_HOURLY_CHAT_QUIET_START_HOUR = 2
 PRIVATE_HOURLY_CHAT_QUIET_END_HOUR = 9
+PRIVATE_HOURLY_CHAT_MIN_JITTER_SECONDS = 3 * 60
+PRIVATE_HOURLY_CHAT_MAX_JITTER_SECONDS = 53 * 60
 PRIVATE_HOURLY_CHAT_LAST_SLOT_KEY = f"private_hourly_chat:{PRIVATE_HOURLY_CHAT_USER_ID}:last_slot"
 PRIVATE_HOURLY_CHAT_START_AT_KEY = f"private_hourly_chat:{PRIVATE_HOURLY_CHAT_USER_ID}:start_at"
 SOCIAL_TOPIC_KEYWORDS: tuple[str, ...] = (
@@ -1953,7 +1955,8 @@ def _seconds_until_next_private_hourly_chat_tick(now: float | None = None) -> fl
     current = time.time() if now is None else now
     local_now = datetime.fromtimestamp(current, DAILY_REVIEW_TIMEZONE)
     next_hour = local_now.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
-    return max(1.0, next_hour.timestamp() - current)
+    jitter = random.uniform(PRIVATE_HOURLY_CHAT_MIN_JITTER_SECONDS, PRIVATE_HOURLY_CHAT_MAX_JITTER_SECONDS)
+    return max(1.0, next_hour.timestamp() - current + jitter)
 
 
 def _private_hourly_chat_probability(now: float) -> int:
@@ -1979,7 +1982,7 @@ def _private_hourly_chat_start_at() -> float:
 
 
 async def _run_private_hourly_chat(bot: Bot, bot_key: str) -> None:
-    """At each Shanghai-hour boundary, occasionally let Fengxue open a topic herself."""
+    """Once per Shanghai hour at a randomized offset, occasionally open a topic."""
 
     try:
         start_at = _private_hourly_chat_start_at()
