@@ -815,15 +815,36 @@ PRIVATE_HOURLY_CHAT_QUIET_PERCENT = 5
 PRIVATE_HOURLY_CHAT_QUIET_START_HOUR = 2
 PRIVATE_HOURLY_CHAT_QUIET_END_HOUR = 9
 PRIVATE_HOURLY_CHAT_LAST_SLOT_KEY = f"private_hourly_chat:{PRIVATE_HOURLY_CHAT_USER_ID}:last_slot"
+PRIVATE_HOURLY_CHAT_START_AT_KEY = f"private_hourly_chat:{PRIVATE_HOURLY_CHAT_USER_ID}:start_at"
 PRIVATE_HOURLY_CHAT_TOPICS: tuple[str, ...] = (
-    "游戏：最近玩过的游戏、单机和联机的乐趣、氪金和时间成本",
-    "动漫：新番、老番、角色塑造、轻松的二次元日常",
-    "财经：花钱、储蓄、市场情绪、工作和现实成本",
-    "AI：模型能力、AI 产品、编程工具、普通人会被怎样影响",
-    "学习：计算机学习、语言学习、留学适应、学习方法",
-    "生活：吃饭、睡眠、天气、出行、今天的小事",
-    "技术：写代码、软件工程、做项目、好用的小工具",
-    "日本：早稻田、留学生活、日语、城市和校园体验",
+    "游戏：最近玩过的游戏、单机和联机的乐趣",
+    "游戏：氪金、抽卡、账号价格和时间成本",
+    "游戏：剧情、角色、操作手感和最烦的机制",
+    "动漫：新番、老番和最近想补的作品",
+    "动漫：角色塑造、反派、主角和最喜欢的角色",
+    "动漫：制作、配乐、作画和让人记很久的片段",
+    "财经：花钱、储蓄和年轻人的现实成本",
+    "财经：市场情绪、投资焦虑和亏钱后的心态",
+    "财经：工资、消费、买东西值不值和性价比",
+    "AI：模型能力、AI 产品和编程工具",
+    "AI：AI 会怎样影响普通人的工作和学习",
+    "AI：自己想拿 AI 做什么有意思的小项目",
+    "学习：计算机学习、语言学习和学习方法",
+    "学习：拖延、考试、课程和怎么不把自己学烦",
+    "留学：适应新环境、租房、通勤和校园生活",
+    "技术：写代码、软件工程和做项目",
+    "技术：喜欢的编程语言、框架和好用的小工具",
+    "技术：bug、代码洁癖和最想吐槽的开发体验",
+    "日本：早稻田、留学生活、日语和城市体验",
+    "日本：便利店、吃饭、旅行和想逛的地方",
+    "生活：吃饭、睡眠、天气、出行和今天的小事",
+    "生活：最近有没有什么烦心事或高兴的小事",
+    "电影电视剧：想重看的作品、烂片和好看的角色",
+    "音乐：循环的歌、演唱会、BGM 和听歌的场景",
+    "互联网：最近见到的离谱热梗、产品和新闻",
+    "关系：朋友相处、聊天习惯和人与人之间的边界",
+    "未来：想过怎样的生活、城市选择和工作节奏",
+    "食物：夜宵、家乡菜、料理和最讨厌的食材",
 )
 GROUP_REPLY_FLOW_COOLDOWN_SECONDS = 30.0
 BOT_STATUS_CARD_BASE_NAME = "张风雪"
@@ -1936,13 +1957,35 @@ def _private_hourly_chat_probability(now: float) -> int:
     return PRIVATE_HOURLY_CHAT_DAYTIME_PERCENT
 
 
+def _private_hourly_chat_start_at() -> float:
+    raw = memory.app_kv_get(PRIVATE_HOURLY_CHAT_START_AT_KEY)
+    try:
+        start_at = float(raw or 0)
+    except (TypeError, ValueError):
+        start_at = 0.0
+    if start_at > 0:
+        return start_at
+    local_now = datetime.now(DAILY_REVIEW_TIMEZONE)
+    start_local = local_now.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)
+    start_at = start_local.timestamp()
+    memory.app_kv_set(PRIVATE_HOURLY_CHAT_START_AT_KEY, str(start_at))
+    return start_at
+
+
 async def _run_private_hourly_chat(bot: Bot, bot_key: str) -> None:
     """At each Shanghai-hour boundary, occasionally let Fengxue open a topic herself."""
 
     try:
+        start_at = _private_hourly_chat_start_at()
+        logger.info(
+            "qq_social_agent private hourly chat starts: "
+            f"at={datetime.fromtimestamp(start_at, DAILY_REVIEW_TIMEZONE).strftime('%Y-%m-%d %H:%M')}"
+        )
         while True:
             await asyncio.sleep(_seconds_until_next_private_hourly_chat_tick())
             now = time.time()
+            if now < start_at:
+                continue
             local_now = datetime.fromtimestamp(now, DAILY_REVIEW_TIMEZONE)
             slot = local_now.strftime("%Y%m%d%H")
             if memory.app_kv_get(PRIVATE_HOURLY_CHAT_LAST_SLOT_KEY) == slot:
