@@ -816,13 +816,18 @@ PRIVATE_HOURLY_CHAT_QUIET_START_HOUR = 2
 PRIVATE_HOURLY_CHAT_QUIET_END_HOUR = 9
 PRIVATE_HOURLY_CHAT_LAST_SLOT_KEY = f"private_hourly_chat:{PRIVATE_HOURLY_CHAT_USER_ID}:last_slot"
 PRIVATE_HOURLY_CHAT_START_AT_KEY = f"private_hourly_chat:{PRIVATE_HOURLY_CHAT_USER_ID}:start_at"
-PRIVATE_HOURLY_CHAT_TOPICS: tuple[str, ...] = (
+SOCIAL_TOPIC_KEYWORDS: tuple[str, ...] = (
     "游戏：最近玩过的游戏、单机和联机的乐趣",
     "游戏：氪金、抽卡、账号价格和时间成本",
     "游戏：剧情、角色、操作手感和最烦的机制",
+    "游戏：MOBA、FPS、开放世界和最适合下班玩的游戏",
     "动漫：新番、老番和最近想补的作品",
-    "动漫：角色塑造、反派、主角和最喜欢的角色",
-    "动漫：制作、配乐、作画和让人记很久的片段",
+    "动漫：热血漫、战斗设计、反派和主角塑造",
+    "动漫：百合动画、少女关系、暧昧感和角色互动",
+    "动漫：日常番、校园番、治愈番和轻松下饭作品",
+    "具体动画：《咒术回战》、五条悟、涩谷事变和角色人气",
+    "具体动画：《孤独摇滚》、轻音、乐队番和青春感",
+    "具体动画：高达、EVA、机战作品和世界观设定",
     "财经：花钱、储蓄和年轻人的现实成本",
     "财经：市场情绪、投资焦虑和亏钱后的心态",
     "财经：工资、消费、买东西值不值和性价比",
@@ -837,14 +842,15 @@ PRIVATE_HOURLY_CHAT_TOPICS: tuple[str, ...] = (
     "技术：bug、代码洁癖和最想吐槽的开发体验",
     "日本：早稻田、留学生活、日语和城市体验",
     "日本：便利店、吃饭、旅行和想逛的地方",
-    "生活：吃饭、睡眠、天气、出行和今天的小事",
-    "生活：最近有没有什么烦心事或高兴的小事",
+    "国际政治新闻：国际关系、选举、政策和媒体叙事，不碰具体敏感国内事件",
+    "历史：帝国兴衰、近代史、人物评价和历史假设",
     "电影电视剧：想重看的作品、烂片和好看的角色",
     "音乐：循环的歌、演唱会、BGM 和听歌的场景",
     "互联网：最近见到的离谱热梗、产品和新闻",
     "关系：朋友相处、聊天习惯和人与人之间的边界",
     "未来：想过怎样的生活、城市选择和工作节奏",
     "食物：夜宵、家乡菜、料理和最讨厌的食材",
+    "生活：吃饭、睡眠、天气、出行和今天的小事",
 )
 GROUP_REPLY_FLOW_COOLDOWN_SECONDS = 30.0
 BOT_STATUS_CARD_BASE_NAME = "张风雪"
@@ -2026,7 +2032,7 @@ async def _run_private_hourly_chat(bot: Bot, bot_key: str) -> None:
             persona = personas.get(app_config.default_persona)
             if persona is None:
                 continue
-            topic = random.choice(PRIVATE_HOURLY_CHAT_TOPICS)
+            topic = random.choice(SOCIAL_TOPIC_KEYWORDS)
             recent = memory.recent_messages(chat_id, PRIVATE_CONTEXT_LIMIT)
             nickname = _private_nickname_from_recent(recent, PRIVATE_HOURLY_CHAT_USER_ID)
             private_generation_inflight.add(PRIVATE_HOURLY_CHAT_USER_ID)
@@ -2147,6 +2153,7 @@ async def _send_proactive_chat_for_group(
         return False
     group_generation_inflight.add(group_id)
     try:
+        topic = random.choice(SOCIAL_TOPIC_KEYWORDS)
         recent_messages = memory.recent_messages(group_id, PROACTIVE_CHAT_CONTEXT_LIMIT)
         context_query = _proactive_chat_context_query(recent_messages)
         related_user_ids = _related_member_user_ids(recent_messages, current_user_id=0)
@@ -2196,7 +2203,9 @@ async def _send_proactive_chat_for_group(
             social_action_context=social_action_context,
         )
         prompt_text = (
-            "这是风雪按固定间隔随机主动发起聊天。根据最近群聊氛围，直接自然插一句或开个轻话题；"
+            "这是风雪按固定间隔随机主动发起聊天。这次抽到的话题方向是："
+            f"{topic}。必须围绕这个方向自然开口；"
+            "如果最近群聊能接上，就把话题方向贴进当前聊天；接不上就轻松开一个新话题。"
             "不要解释自己为什么突然说话，不要像公告，不要总结全场。"
         )
         drafts = await deepseek_client.reply_candidates(
@@ -2238,7 +2247,7 @@ async def _send_proactive_chat_for_group(
                 bot_reply=part,
                 trigger_user_id=0,
                 trigger_nickname="风雪主动发起",
-                trigger_text=f"interval_random probability={probability} roll={roll:.2f}",
+                trigger_text=f"interval_random probability={probability} roll={roll:.2f} topic={topic}",
                 action="proactive_chat",
             )
             memory.add_message(
@@ -2256,7 +2265,7 @@ async def _send_proactive_chat_for_group(
             await asyncio.sleep(random.uniform(0.8, 1.8))
         logger.info(
             "qq_social_agent proactive chat sent: "
-            f"group={group_id} parts={len(parts)} message_ids={sent_ids} probability={probability} roll={roll:.2f}"
+            f"group={group_id} parts={len(parts)} message_ids={sent_ids} probability={probability} roll={roll:.2f} topic={topic!r}"
         )
         _record_metric_event(
             "proactive_chat",
