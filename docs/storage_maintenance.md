@@ -5,7 +5,7 @@ This server is intended to run the QQ bot for a year or longer. Runtime data sta
 ## Current Layout
 
 - `/opt/qq-social-agent/data/bot.sqlite3`: live SQLite database. Do not put this directly on COS.
-- `/opt/qq-social-agent/data/backups`: local compressed DB backups and COS upload snapshots.
+- `/opt/qq-social-agent/data/backups`: local compressed DB backups, COS upload snapshots and `manual/` pre-change snapshots.
 - `/opt/qq-social-agent/server-data`: NapCat and QQ runtime data.
 - `/swapfile`: 2G disk-backed swap for memory spikes.
 
@@ -33,6 +33,7 @@ Installed jobs:
 Daily COS backup:
 
 - online SQLite snapshot: messages, memory, RAG, approval data, member profiles, feedback
+- manually created pre-change snapshots under `data/backups/manual`
 - project metadata archive: `config.yaml`, `prompts`, `scripts`, docs and project metadata
 - `server-data/napcat/config`
 
@@ -119,7 +120,8 @@ Latest report:
 - Keep local DB backups for about 90 days.
 - Upload DB snapshots, metadata, raw daily chat archives and historical memory JSON to COS daily.
 - Keep local COS upload snapshots for 14 days after upload.
+- Keep manual pre-change snapshots locally for 30 days after their successful COS upload.
 - Sync full NapCat `ntqq` gradually in bounded daily batches, not in one large monthly burst.
 - Keep COS objects for the year; bucket space is enough for this project.
-- Clean old VSCode server versions manually when `.vscode-server` exceeds a few GB.
+- Daily hygiene keeps only the two most recently used VSCode Remote Server builds; stale versions are removed automatically.
 - Do not delete `server-data/ntqq` blindly; it contains QQ runtime/login/cache data.

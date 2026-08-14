@@ -91,6 +91,59 @@ if [[ "${DOCKER_PRUNE:-1}" == "1" ]]; then
   echo
 fi
 
+echo "== VS Code Remote Server hygiene =="
+vscode_server_root="${VSCODE_SERVER_ROOT:-$HOME/.vscode-server}"
+vscode_server_keep="${VSCODE_SERVER_KEEP:-2}"
+vscode_servers_dir="$vscode_server_root/cli/servers"
+if [[ -d "$vscode_servers_dir" ]]; then
+  if [[ "$dry_run" == "1" ]]; then
+    python3 - "$vscode_servers_dir" "$vscode_server_keep" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+keep_count = max(1, int(sys.argv[2]))
+servers = [path for path in root.iterdir() if path.is_dir() and path.name.startswith("Stable-")]
+try:
+    order = json.loads((root / "lru.json").read_text(encoding="utf-8"))
+    ordered = [root / name for name in order if (root / name) in servers]
+    ordered += sorted((path for path in servers if path not in ordered), key=lambda path: path.stat().st_mtime, reverse=True)
+except Exception:
+    ordered = sorted(servers, key=lambda path: path.stat().st_mtime, reverse=True)
+keep = {path.name for path in ordered[:keep_count]}
+print(f"Keeping {len(keep)} newest/recent VS Code server builds: {', '.join(sorted(keep)) or 'none'}")
+for path in ordered[keep_count:]:
+    print(f"Would delete stale VS Code server build: {path}")
+PY
+  else
+    python3 - "$vscode_servers_dir" "$vscode_server_keep" <<'PY'
+import json
+import shutil
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+keep_count = max(1, int(sys.argv[2]))
+servers = [path for path in root.iterdir() if path.is_dir() and path.name.startswith("Stable-")]
+try:
+    order = json.loads((root / "lru.json").read_text(encoding="utf-8"))
+    ordered = [root / name for name in order if (root / name) in servers]
+    ordered += sorted((path for path in servers if path not in ordered), key=lambda path: path.stat().st_mtime, reverse=True)
+except Exception:
+    ordered = sorted(servers, key=lambda path: path.stat().st_mtime, reverse=True)
+keep = {path.name for path in ordered[:keep_count]}
+print(f"Keeping {len(keep)} newest/recent VS Code server builds: {', '.join(sorted(keep)) or 'none'}")
+for path in ordered[keep_count:]:
+    shutil.rmtree(path)
+    print(f"Deleted stale VS Code server build: {path}")
+PY
+  fi
+else
+  echo "VS Code Remote Server directory not present."
+fi
+echo
+
 echo "== NapCat temp/log hygiene =="
 napcat_temp_days="${NAPCAT_TEMP_DAYS:-14}"
 napcat_log_days="${NAPCAT_LOG_DAYS:-30}"

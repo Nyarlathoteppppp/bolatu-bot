@@ -41,6 +41,7 @@ fi
 timestamp="$(date +%Y%m%d_%H%M%S)"
 backup_dir="${BACKUP_DIR:-data/backups}"
 local_keep_days="${COS_LOCAL_SNAPSHOT_KEEP_DAYS:-14}"
+manual_keep_days="${COS_LOCAL_MANUAL_BACKUP_KEEP_DAYS:-30}"
 coscli_timeout_seconds="${COSCLI_TIMEOUT_SECONDS:-900}"
 coscli_ntqq_timeout_seconds="${COSCLI_NTQQ_TIMEOUT_SECONDS:-7200}"
 coscli_err_retry_num="${COSCLI_ERR_RETRY_NUM:-2}"
@@ -82,6 +83,7 @@ if [[ "$dry_run" == "1" ]]; then
     echo "NapCat ntqq full sync disabled. Set COS_INCLUDE_NAPCAT_NTQQ=1 only for a deliberate full cold backup."
   fi
   echo "Would delete local COS snapshots older than ${local_keep_days}d after a successful upload."
+  echo "Would delete uploaded manual backups older than ${manual_keep_days}d."
   exit 0
 fi
 
@@ -117,6 +119,9 @@ fi
 
 find "$backup_dir" -maxdepth 1 -type f -name "bot.sqlite3.cos_*.sqlite3.gz" -mtime +"$local_keep_days" -delete || true
 find "$backup_dir" -maxdepth 1 -type f -name "project_metadata_*.tar.gz" -mtime +"$local_keep_days" -delete || true
+# Manual snapshots are only cleaned after the successful backup-dir sync above.
+find "$backup_dir/manual" -type f -mtime +"$manual_keep_days" -delete 2>/dev/null || true
+find "$backup_dir/manual" -type d -empty -delete 2>/dev/null || true
 find coscli_output -type f -mtime +14 -delete 2>/dev/null || true
 find coscli_output -type d -empty -delete 2>/dev/null || true
 
