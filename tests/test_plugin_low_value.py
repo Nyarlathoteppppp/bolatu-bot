@@ -2774,3 +2774,26 @@ def test_proactive_chat_tick_uses_interval_not_next_hour(monkeypatch) -> None:
     monkeypatch.setattr(plugin, "PROACTIVE_CHAT_POLL_JITTER_SECONDS", 0.0)
 
     assert plugin._seconds_until_next_proactive_chat_tick(now=123456.0) == 45 * 60.0
+
+
+def test_group_proactive_topic_cooldown_excludes_sent_topic(monkeypatch, tmp_path) -> None:
+    _use_temp_plugin_memory(monkeypatch, tmp_path)
+    first_topic = plugin.SOCIAL_TOPIC_KEYWORDS[0]
+    plugin._record_group_proactive_topic(1026813421, first_topic, now=1000.0)
+
+    monkeypatch.setattr(plugin.random, "choice", lambda values: values[0])
+    selected, cooled_count = plugin._choose_group_proactive_topic(1026813421, now=1001.0)
+
+    assert cooled_count == 1
+    assert selected != first_topic
+
+
+def test_group_proactive_topic_cooldown_expires(monkeypatch, tmp_path) -> None:
+    _use_temp_plugin_memory(monkeypatch, tmp_path)
+    topic = plugin.SOCIAL_TOPIC_KEYWORDS[0]
+    plugin._record_group_proactive_topic(1026813421, topic, now=1000.0)
+
+    assert plugin._recent_group_proactive_topics(
+        1026813421,
+        now=1000.0 + plugin.GROUP_PROACTIVE_TOPIC_COOLDOWN_SECONDS + 1,
+    ) == []

@@ -827,7 +827,6 @@ SOCIAL_TOPIC_KEYWORDS: tuple[str, ...] = (
     "动漫：热血漫、战斗设计、反派和主角塑造",
     "动漫：百合动画、少女关系、暧昧感和角色互动",
     "动漫：日常番、校园番、治愈番和轻松下饭作品",
-    "具体动画：《咒术回战》、五条悟、涩谷事变和角色人气",
     "具体动画：《孤独摇滚》、轻音、乐队番和青春感",
     "具体动画：高达、EVA、机战作品和世界观设定",
     "财经：花钱、储蓄和年轻人的现实成本",
@@ -861,6 +860,9 @@ SOCIAL_TOPIC_KEYWORDS: tuple[str, ...] = (
     "食物：夜宵、家乡菜、料理和最讨厌的食材",
     "生活：吃饭、睡眠、天气、出行和今天的小事",
 )
+GROUP_PROACTIVE_TOPIC_COOLDOWN_SECONDS = 7 * 24 * 60 * 60
+GROUP_PROACTIVE_TOPIC_HISTORY_LIMIT = 80
+GROUP_PROACTIVE_TOPIC_HISTORY_KEY_PREFIX = "group_proactive_topic_history"
 GROUP_REPLY_FLOW_COOLDOWN_SECONDS = 30.0
 BOT_STATUS_CARD_BASE_NAME = "张风雪"
 BLOCKED_BACKEND_FALLBACK_TEXTS = {
@@ -2163,7 +2165,7 @@ async def _send_proactive_chat_for_group(
         return False
     group_generation_inflight.add(group_id)
     try:
-        topic = random.choice(SOCIAL_TOPIC_KEYWORDS)
+        topic, cooled_topic_count = _choose_group_proactive_topic(group_id, now=now)
         recent_messages = memory.recent_messages(group_id, PROACTIVE_CHAT_CONTEXT_LIMIT)
         context_query = _proactive_chat_context_query(recent_messages)
         related_user_ids = _related_member_user_ids(recent_messages, current_user_id=0)
@@ -2284,9 +2286,12 @@ async def _send_proactive_chat_for_group(
             action="sent",
             probability=probability,
             roll=round(roll, 2),
+            topic=topic,
+            cooled_topic_count=cooled_topic_count,
             message_count=len(parts),
             message_ids=sent_ids,
         )
+        _record_group_proactive_topic(group_id, topic, now=now)
         return True
     except ActionFailed as exc:
         logger.warning(f"qq_social_agent proactive chat send failed: group={group_id} {_action_failed_summary(exc)}")
@@ -2305,6 +2310,61 @@ def _proactive_chat_context_query(recent_messages: list[ChatMessage]) -> str:
     if not lines:
         return "风雪主动发起轻松群聊话题"
     return "\n".join(lines)[-800:]
+
+
+def _group_proactive_topic_history_key(group_id: int) -> str:
+    return f"{GROUP_PROACTIVE_TOPIC_HISTORY_KEY_PREFIX}:{int(group_id)}"
+
+
+def _recent_group_proactive_topics(group_id: int, *, now: float) -> list[tuple[str, float]]:
+    raw = memory.app_kv_get(_group_proactive_topic_history_key(group_id))
+    if raw is None:
+        return []
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError:
+        logger.warning("qq_social_agent invalid proactive topic history json, clearing it")
+        return []
+    if not isinstance(payload, list):
+        return []
+    cutoff = now - GROUP_PROACTIVE_TOPIC_COOLDOWN_SECONDS
+    selected: list[tuple[str, float]] = []
+    for item in payload[-GROUP_PROACTIVE_TOPIC_HISTORY_LIMIT:]:
+        if not isinstance(item, dict):
+            continue
+        topic = str(item.get("topic") or "").strip()
+        try:
+            sent_at = float(item.get("sent_at"))
+        except (TypeError, ValueError):
+            continue
+        if topic in SOCIAL_TOPIC_KEYWORDS and sent_at >= cutoff:
+            selected.append((topic, sent_at))
+    return selected
+
+
+def _choose_group_proactive_topic(group_id: int, *, now: float) -> tuple[str, int]:
+    recent = _recent_group_proactive_topics(group_id, now=now)
+    cooled_topics = {topic for topic, _ in recent}
+    candidates = [topic for topic in SOCIAL_TOPIC_KEYWORDS if topic not in cooled_topics]
+    # The pool can only exhaust after many successful sends in one week. In that case,
+    # continue rather than disabling proactive chat, but pick the least recently used topic.
+    if not candidates:
+        last_sent = {topic: sent_at for topic, sent_at in recent}
+        candidates = sorted(SOCIAL_TOPIC_KEYWORDS, key=lambda topic: last_sent.get(topic, 0.0))[:1]
+    return random.choice(candidates), len(cooled_topics)
+
+
+def _record_group_proactive_topic(group_id: int, topic: str, *, now: float) -> None:
+    if topic not in SOCIAL_TOPIC_KEYWORDS:
+        return
+    history = _recent_group_proactive_topics(group_id, now=now)
+    history = [(old_topic, sent_at) for old_topic, sent_at in history if old_topic != topic]
+    history.append((topic, now))
+    payload = [
+        {"topic": old_topic, "sent_at": round(sent_at, 3)}
+        for old_topic, sent_at in history[-GROUP_PROACTIVE_TOPIC_HISTORY_LIMIT:]
+    ]
+    memory.app_kv_set(_group_proactive_topic_history_key(group_id), json.dumps(payload, ensure_ascii=False))
 
 
 def _seconds_until_next_daily_review(now: float | None = None) -> float:
