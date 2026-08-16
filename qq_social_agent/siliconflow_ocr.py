@@ -54,7 +54,7 @@ class SiliconFlowOcrClient:
             )
         )
 
-    async def recognize(self, target: str) -> str:
+    async def recognize(self, target: str, *, prompt: str | None = None) -> str:
         if not self.config.enabled:
             return ""
         client = self._get_client()
@@ -78,7 +78,7 @@ class SiliconFlowOcrClient:
                         },
                         {
                             "type": "text",
-                            "text": self.config.prompt,
+                            "text": str(prompt or self.config.prompt),
                         },
                     ],
                 }

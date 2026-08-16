@@ -65,6 +65,13 @@ class ToolRoutingDecision:
 
 
 @dataclass(frozen=True)
+class MemeSelectionDecision:
+    send: bool = False
+    meme_id: int | None = None
+    reason: str = ""
+
+
+@dataclass(frozen=True)
 class MemoryFactDraft:
     kind: str
     content: str
@@ -683,6 +690,45 @@ class DeepSeekClient:
         response = await self._chat_completion(task="reply", route_name="reply", request=request)
         content = response.choices[0].message.content or ""
         return _sanitize_reply(content, persona.max_reply_chars)
+
+    async def select_private_meme(
+        self,
+        *,
+        current_text: str,
+        reply_text: str,
+        candidates: str,
+    ) -> MemeSelectionDecision:
+        system = self.prompts.render("private_meme_selector", "system")
+        user = self.prompts.render(
+            "private_meme_selector",
+            "user",
+            current_text=current_text,
+            reply_text=reply_text,
+            candidates=candidates,
+        )
+        response = await self._chat_completion(
+            task="private_meme_selector",
+            route_name="utility",
+            request={
+                "temperature": 0.15,
+                "max_tokens": 120,
+                "response_format": {"type": "json_object"},
+                "messages": [
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user},
+                ],
+            },
+        )
+        raw = _loads_json_object(response.choices[0].message.content or "")
+        try:
+            meme_id = int(raw.get("meme_id")) if raw.get("meme_id") is not None else None
+        except (TypeError, ValueError):
+            meme_id = None
+        return MemeSelectionDecision(
+            send=bool(raw.get("send", False)) and meme_id is not None,
+            meme_id=meme_id,
+            reason=str(raw.get("reason", "") or "").strip()[:40],
+        )
 
     async def summarize_long_message(
         self,

@@ -74,6 +74,7 @@ if [[ "$dry_run" == "1" ]]; then
   echo "Would create SQLite online backup: $snapshot_gz"
   echo "Would create metadata archive:      $metadata_tar"
   echo "Would sync $backup_dir to ${cos_dest%/}/data/backups"
+  echo "Would sync data/meme_library to ${cos_dest%/}/data/meme_library"
   if [[ "${COS_INCLUDE_NAPCAT_CONFIG:-1}" == "1" ]]; then
     echo "Would sync server-data/napcat/config to ${cos_dest%/}/server-data/napcat/config"
   fi
@@ -107,6 +108,10 @@ echo "created: $snapshot_gz"
 echo "created: $metadata_tar"
 
 coscli_sync "$coscli_timeout_seconds" "$backup_dir" "${cos_dest%/}/data/backups" -r
+
+if [[ -d data/meme_library ]]; then
+  coscli_sync "$coscli_timeout_seconds" data/meme_library "${cos_dest%/}/data/meme_library" -r || true
+fi
 
 if [[ "${COS_INCLUDE_NAPCAT_CONFIG:-1}" == "1" ]]; then
   coscli_sync "$coscli_timeout_seconds" server-data/napcat/config "${cos_dest%/}/server-data/napcat/config" -r || true

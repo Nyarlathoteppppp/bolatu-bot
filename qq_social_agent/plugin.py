@@ -83,6 +83,7 @@ from .history_sync import (
     resolve_reply_reference,
 )
 from .media_context import ImageOcrContext, ImageOcrService, file_metadata_context_for_event
+from .meme_library import PrivateMemeLibrary
 from .message_segments import (
     CONTEXT_MEDIA_SEGMENT_TYPES,
     segment_placeholder as normalized_segment_placeholder,
@@ -192,6 +193,11 @@ market_tool = MarketTool(max_external_queries_per_minute=2)
 fresh_context_tool = FreshContextTool.from_config(app_config.raw.get("fresh_search", {}))
 social_action_service = SocialActionService.from_config(app_config.raw.get("social_actions", {}))
 image_ocr_service = ImageOcrService.from_config(app_config.raw.get("image_ocr", {}))
+private_meme_library = PrivateMemeLibrary(
+    memory,
+    app_config.raw.get("meme_library", {}),
+    data_dir=app_config.data_path.parent,
+)
 content_ingestion_service = ContentIngestionService.from_config(app_config.raw.get("content_tools", {}))
 deep_content_tool = DeepContentTool.from_config(
     (app_config.raw.get("content_tools", {}) or {}).get("deep_url_reader", {})
@@ -6981,6 +6987,50 @@ async def _handle_private_message_scoped(
     if guarded:
         logger.info(f"qq_social_agent political guard private output: user={user_id}")
 
+    selected_meme_id: int | None = None
+    meme_gate = private_meme_library.turn_gate(user_id, received_messages=len(accepted_items))
+    if meme_gate.allowed and _private_meme_context_eligible(
+        decision=decision,
+        reply=reply,
+        market_context=market_context,
+        fresh_context=fresh_context,
+    ):
+        meme_candidates = private_meme_library.candidates(user_id, query=f"{context_query}\n{reply}")
+        if meme_candidates:
+            try:
+                meme_choice = await deepseek_client.select_private_meme(
+                    current_text=context_query,
+                    reply_text=reply,
+                    candidates=private_meme_library.candidate_text(meme_candidates),
+                )
+            except Exception as exc:
+                logger.warning(f"qq_social_agent private meme selector failed: user={user_id} error={exc}")
+                meme_choice = None
+            candidate_ids = {asset.id for asset in meme_candidates}
+            if meme_choice is not None and meme_choice.send and meme_choice.meme_id in candidate_ids:
+                selected_meme_id = meme_choice.meme_id
+            _record_metric_event(
+                "private_meme_selector",
+                group_id=chat_id,
+                user_id=user_id,
+                stage="selection",
+                action="selected" if selected_meme_id else "skipped",
+                gate_reason=meme_gate.reason,
+                turn_count=meme_gate.messages_since_last_meme,
+                selected_meme_id=selected_meme_id,
+                reason=meme_choice.reason if meme_choice is not None else "selector_error",
+            )
+    else:
+        _record_metric_event(
+            "private_meme_selector",
+            group_id=chat_id,
+            user_id=user_id,
+            stage="eligibility",
+            action="skipped",
+            gate_reason=meme_gate.reason,
+            turn_count=meme_gate.messages_since_last_meme,
+        )
+
     reply_parts = split_reply_messages(reply, max_messages=3)
     logger.info(
         "qq_social_agent sending private reply: "
@@ -6998,6 +7048,38 @@ async def _handle_private_message_scoped(
             return
         if index < len(reply_parts) - 1:
             await asyncio.sleep(0.9)
+    if selected_meme_id is not None:
+        image_ref = private_meme_library.image_base64_ref(selected_meme_id)
+        if image_ref:
+            try:
+                await _send_private_message(
+                    bot,
+                    user_id=user_id,
+                    message=Message(MessageSegment.image(file=image_ref)),
+                )
+            except ActionFailed as exc:
+                logger.warning(
+                    "qq_social_agent failed sending private meme: "
+                    f"user={user_id} meme={selected_meme_id} {_action_failed_summary(exc)}"
+                )
+            else:
+                private_meme_library.mark_sent(user_id, selected_meme_id)
+                asset = memory.meme_asset(selected_meme_id)
+                memory.add_message(
+                    chat_id,
+                    int(event.self_id),
+                    persona.name,
+                    f"[风雪附了一张私人表情包：{asset.description if asset else selected_meme_id}]",
+                    is_bot=True,
+                )
+                _record_metric_event(
+                    "private_meme_selector",
+                    group_id=chat_id,
+                    user_id=user_id,
+                    stage="delivery",
+                    action="sent",
+                    meme_id=selected_meme_id,
+                )
 
 
 bot_command = on_command("bot", priority=10, block=True)
@@ -11711,6 +11793,22 @@ def _private_priority_context(user_id: int) -> str:
     if _private_force_obey_enabled(user_id):
         parts.append(_private_force_obey_context(user_id))
     return _combine_text_sections(*parts)
+
+
+def _private_meme_context_eligible(
+    *,
+    decision: ReplyDecision,
+    reply: str,
+    market_context: str,
+    fresh_context: str,
+) -> bool:
+    """Keep curated images an accent for playful private chat, never an answer substitute."""
+
+    if decision.action in {"care", "market_check", "fresh_context"}:
+        return False
+    if decision.need_tool or decision.need_fresh_context or market_context.strip() or fresh_context.strip():
+        return False
+    return 0 < len(reply.strip()) <= 150
 
 
 def _command_chat_id(event: Event) -> int | None:

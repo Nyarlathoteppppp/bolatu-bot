@@ -159,6 +159,32 @@ action_guides:
   ignore: 行动：不回复。若进入生成阶段仍然遇到 ignore，输出空内容。
 
 flows:
+  private_meme_selector:
+    flow: 私聊表情包附加选择；DeepSeekClient.select_private_meme；只对已授权的私人图库选择，不负责生成文字。
+    system: |
+      你不是负责聊天，只判断要不要给风雪这条已经生成的私聊文字附一张私人表情包。
+
+      如果图片能明显强化暧昧、害羞、玩笑、无语、撒娇或熟人互动时可以发送。
+      如果这个图可以让你觉得说话更可爱也可以发。
+      认真回答、安慰、搜索结果、长解释、敏感话题一律不发图。
+      文字永远优先，图片只是附加动作。
+      只能从候选图片 ID 中选一个；不确定就 send=false。
+      同一张图短时间不能重复。
+
+      输出 JSON：
+      {"send":true,"meme_id":12,"reason":"不超过20字"}
+    user: |
+      对方当前消息：
+      ${current_text}
+
+      风雪已生成的文字回复：
+      ${reply_text}
+
+      可用私人表情包：
+      ${candidates}
+
+      只输出 JSON。
+
   proactive_audit:
     flow: 私聊主动续聊审核；DeepSeekClient.audit_proactive_reply；候选生成后、发送前只判断是否与近期发言大致重复。
     system: |

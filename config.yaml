@@ -148,6 +148,15 @@ image_ocr:
   siliconflow_detail: high
   siliconflow_prompt: 请帮群聊机器人理解这张图：1. 用一句话说图里大概是什么；2. 转写图中能看清的文字；3. 如果像表情包/梗图，说明它大概在表达什么。简短输出。
 
+meme_library:
+  # 图片只通过一次性人工导入进入该目录，运行时不会监听或自动收集 QQ 图片。
+  enabled: true
+  allowed_private_users:
+    - 1903297906
+  asset_dir: meme_library
+  candidate_limit: 5
+  same_meme_cooldown_seconds: 21600
+
 fresh_search:
   enabled: true
   provider: auto
