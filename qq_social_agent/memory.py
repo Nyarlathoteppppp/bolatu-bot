@@ -3999,16 +3999,27 @@ class MemoryStore:
         same_meme_cooldown_seconds: float = 6 * 60 * 60,
     ) -> list[MemeAsset]:
         now = time.time()
-        rows = self.conn.execute(
-            """
-            select * from meme_assets
-            where enabled = 1
-              and (last_used_at is null or last_used_at <= ?)
-            order by coalesce(last_used_at, 0) asc, use_count asc, id asc
-            limit 80
-            """,
-            (now - max(0.0, float(same_meme_cooldown_seconds)),),
-        ).fetchall()
+        cooldown = max(0.0, float(same_meme_cooldown_seconds))
+        if cooldown:
+            rows = self.conn.execute(
+                """
+                select * from meme_assets
+                where enabled = 1
+                  and (last_used_at is null or last_used_at <= ?)
+                order by coalesce(last_used_at, 0) asc, use_count asc, id asc
+                limit 80
+                """,
+                (now - cooldown,),
+            ).fetchall()
+        else:
+            rows = self.conn.execute(
+                """
+                select * from meme_assets
+                where enabled = 1
+                order by coalesce(last_used_at, 0) asc, use_count asc, id asc
+                limit 80
+                """
+            ).fetchall()
         assets = [_meme_asset_from_row(row) for row in rows]
         if not assets:
             return []

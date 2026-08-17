@@ -158,7 +158,7 @@ meme_library:
   asset_dir: meme_library
   candidate_limit: 5
   same_meme_cooldown_seconds: 21600
-  group_selection_probability: 0.18
+  # 群聊和私聊一样：先由模型根据文字判断是否附图，不再额外随机拦掉。
   group_cooldown_seconds: 900
 
 fresh_search:
