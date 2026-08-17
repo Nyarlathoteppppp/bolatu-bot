@@ -86,6 +86,7 @@ class FreshContextTool:
         failure_ttl_seconds: int = 2 * 60,
         provider: str | None = None,
         tavily_api_key: str | None = None,
+        searxng_base_url: str | None = None,
         timeout_seconds: float = 10.0,
         max_results: int = 5,
         cache_max_entries: int = 256,
@@ -99,6 +100,7 @@ class FreshContextTool:
         self.failure_ttl_seconds = max(0, int(failure_ttl_seconds))
         self.provider = (provider or os.getenv("FRESH_SEARCH_PROVIDER") or "auto").strip().lower()
         self.tavily_api_key = (tavily_api_key or os.getenv("TAVILY_API_KEY") or "").strip()
+        self.searxng_base_url = (searxng_base_url or os.getenv("SEARXNG_BASE_URL") or "").strip().rstrip("/")
         self.timeout_seconds = max(1.0, float(timeout_seconds))
         self.max_results = max(1, min(10, int(max_results)))
         self.cache_max_entries = max(1, int(cache_max_entries))
@@ -127,6 +129,9 @@ class FreshContextTool:
         tavily_cfg = cfg.get("tavily", {})
         if not isinstance(tavily_cfg, dict):
             tavily_cfg = {}
+        searxng_cfg = cfg.get("searxng", {})
+        if not isinstance(searxng_cfg, dict):
+            searxng_cfg = {}
         api_key_env = str(
             tavily_cfg.get("api_key_env")
             or cfg.get("tavily_api_key_env")
@@ -143,6 +148,11 @@ class FreshContextTool:
             failure_ttl_seconds=_config_int(cfg, "failure_ttl_seconds", default=2 * 60),
             provider="disabled" if cfg.get("enabled") is False else str(cfg.get("provider") or "auto"),
             tavily_api_key=os.getenv(api_key_env, "") if api_key_env else "",
+            searxng_base_url=str(
+                searxng_cfg.get("base_url")
+                or cfg.get("searxng_base_url")
+                or ""
+            ),
             timeout_seconds=_config_float(cfg, "timeout_seconds", default=10.0),
             max_results=_config_int(cfg, "max_results", default=5),
             cache_max_entries=_config_int(cfg, "cache_max_entries", default=256),
@@ -220,7 +230,13 @@ class FreshContextTool:
         self._stats["external_requests"] += 1
         initial_provider = self._resolved_provider(normalized_kind)
         providers = [initial_provider]
-        if initial_provider == "tavily":
+        if initial_provider == "searxng":
+            # SearXNG is the keyless primary source.  Keep the old providers as
+            # bounded fallbacks so a temporary engine outage never blocks chat.
+            if self.tavily_api_key:
+                providers.append("tavily")
+            providers.append(_fallback_provider(normalized_kind))
+        elif initial_provider == "tavily":
             providers.append(_fallback_provider(normalized_kind))
 
         attempted: list[str] = []
@@ -350,6 +366,17 @@ class FreshContextTool:
                 timeout_seconds=request_timeout,
                 max_results=self.max_results,
             )
+        if provider == "searxng":
+            if not self.searxng_base_url:
+                raise SearchProviderError("missing_base_url")
+            return "", await _invoke_provider(
+                _fetch_searxng_items,
+                query,
+                kind=kind,
+                base_url=self.searxng_base_url,
+                timeout_seconds=request_timeout,
+                max_results=self.max_results,
+            )
         if provider == "google_news":
             return "", await _invoke_provider(
                 _fetch_google_news_items,
@@ -368,6 +395,8 @@ class FreshContextTool:
         raise SearchProviderError("unsupported_provider")
 
     def _resolved_provider(self, kind: str = "news") -> str:
+        if self.provider == "searxng":
+            return "searxng"
         if self.provider == "tavily":
             return "tavily"
         if self.provider == "google_news":
@@ -393,6 +422,7 @@ class FreshContextTool:
         return {
             "enabled": self.provider != "disabled",
             "provider": self.provider,
+            "searxng_configured": bool(self.searxng_base_url),
             "tavily_configured": bool(self.tavily_api_key),
             "max_external_queries_per_minute": self.max_external_queries_per_minute,
             "rate_remaining": max(0, self.max_external_queries_per_minute - active_queries),
@@ -630,6 +660,45 @@ async def _fetch_tavily_lookup(
     return _parse_tavily_answer(data), _parse_tavily_results(data)
 
 
+async def _fetch_searxng_items(
+    query: str,
+    *,
+    kind: str,
+    base_url: str,
+    timeout_seconds: float = 10.0,
+    max_results: int = 5,
+) -> tuple[FreshItem, ...]:
+    """Use an operator-owned SearXNG JSON endpoint, never a public instance."""
+    root = str(base_url or "").strip().rstrip("/")
+    if not root.startswith(("http://", "https://")):
+        raise SearchProviderError("invalid_base_url")
+    params: dict[str, str] = {
+        "q": _tavily_query(query, kind=kind),
+        "format": "json",
+        "language": "zh-CN",
+        "safesearch": "0",
+    }
+    if kind in {"news", "sports"}:
+        params["categories"] = "news"
+        params["time_range"] = "month"
+    try:
+        async with httpx.AsyncClient(timeout=timeout_seconds, follow_redirects=True) as client:
+            response = await client.get(
+                f"{root}/search",
+                params=params,
+                headers={"Accept": "application/json", "User-Agent": "qq-social-agent/0.1"},
+            )
+            response.raise_for_status()
+            data = response.json()
+    except httpx.TimeoutException as exc:
+        raise SearchProviderError("timeout") from exc
+    except httpx.HTTPStatusError as exc:
+        raise SearchProviderError(f"http_{exc.response.status_code}") from exc
+    except (httpx.HTTPError, ValueError) as exc:
+        raise SearchProviderError(type(exc).__name__.lower()) from exc
+    return _parse_searxng_results(data)[:max_results]
+
+
 def _tavily_query(query: str, *, kind: str) -> str:
     if kind == "sports":
         return f"{query} 最新赛果 比分"
@@ -665,6 +734,40 @@ def _parse_tavily_results(data: object) -> tuple[FreshItem, ...]:
                 published_at=str(raw.get("published_date") or "")[:40],
                 summary=_clean_text(content)[:180],
                 url=url[:240],
+                score=_as_float(raw.get("score")),
+            )
+        )
+    return tuple(sorted(items, key=_fresh_item_sort_key)[:10])
+
+
+def _parse_searxng_results(data: object) -> tuple[FreshItem, ...]:
+    if not isinstance(data, dict):
+        return ()
+    raw_results = data.get("results")
+    if not isinstance(raw_results, list):
+        return ()
+    items: list[FreshItem] = []
+    seen: set[str] = set()
+    for raw in raw_results:
+        if not isinstance(raw, dict):
+            continue
+        title = _clean_text(str(raw.get("title") or ""))
+        url = str(raw.get("url") or "").strip()
+        if not title or not url or _looks_like_low_quality_result(title, url):
+            continue
+        key = _fresh_result_key(title, url)
+        if key in seen:
+            continue
+        seen.add(key)
+        source = _clean_text(str(raw.get("engine") or "")) or _source_from_url(url)
+        published_at = _clean_text(str(raw.get("publishedDate") or raw.get("published_at") or ""))[:40]
+        items.append(
+            FreshItem(
+                title=title[:120],
+                source=source[:40],
+                published_at=published_at,
+                summary=_clean_html(str(raw.get("content") or raw.get("snippet") or ""))[:180],
+                url=url[:500],
                 score=_as_float(raw.get("score")),
             )
         )

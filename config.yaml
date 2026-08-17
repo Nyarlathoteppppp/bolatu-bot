@@ -163,7 +163,8 @@ meme_library:
 
 fresh_search:
   enabled: true
-  provider: auto
+  # 自建 SearXNG 主搜索；失败时自动回退 Tavily / RSS 搜索。
+  provider: searxng
   max_external_queries_per_minute: 4
   timeout_seconds: 5
   max_results: 5
@@ -176,6 +177,9 @@ fresh_search:
   query_max_chars: 120
   tavily:
     api_key_env: TAVILY_API_KEY
+  searxng:
+    # Docker 内部地址，不暴露公网。
+    base_url: http://searxng:8080
 
 data_retention:
   metric_events_enabled: true

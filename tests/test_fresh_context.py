@@ -13,6 +13,7 @@ from qq_social_agent.tools.fresh_context import (
     fact_pack_from_lookup,
     detect_fresh_intent,
     _parse_google_news_rss,
+    _parse_searxng_results,
     _parse_tavily_answer,
     _parse_tavily_results,
     _prompt_context_from_lookup,
@@ -88,6 +89,48 @@ def test_parse_tavily_answer() -> None:
     answer = _parse_tavily_answer({"answer": "  美国和伊朗局势仍在变化。\n外交斡旋继续。  "})
 
     assert answer == "美国和伊朗局势仍在变化。 外交斡旋继续。"
+
+
+def test_parse_searxng_results_items() -> None:
+    items = _parse_searxng_results(
+        {
+            "results": [
+                {
+                    "title": " 美国和伊朗局势最新进展 ",
+                    "url": "https://news.example.com/iran",
+                    "content": "外交斡旋仍在继续。",
+                    "engine": "bing news",
+                    "publishedDate": "2026-08-17",
+                },
+                {
+                    "title": "美国和伊朗局势最新进展",
+                    "url": "https://news.example.com/iran?ref=duplicate",
+                    "content": "重复。",
+                },
+            ]
+        }
+    )
+
+    assert len(items) == 1
+    assert items[0].source == "bing news"
+    assert items[0].published_at == "2026-08-17"
+    assert "外交斡旋" in items[0].summary
+
+
+@pytest.mark.anyio
+async def test_searxng_provider_uses_local_json_endpoint(monkeypatch) -> None:
+    async def fake_searxng(query: str, *, kind: str, base_url: str):
+        assert base_url == "http://searxng:8080"
+        return (FreshItem("最新进展", "示例媒体", "2026-08-17", "摘要", "https://example.com"),)
+
+    monkeypatch.setattr(fresh_context, "_fetch_searxng_items", fake_searxng)
+    tool = FreshContextTool(provider="searxng", searxng_base_url="http://searxng:8080")
+
+    lookup = await tool.lookup("美国 伊朗 最新消息")
+
+    assert lookup.status == "ok"
+    assert lookup.provider == "searxng"
+    assert lookup.attempted_providers == ("searxng",)
 
 
 def test_fresh_context_includes_quick_answer() -> None:
@@ -405,6 +448,7 @@ def test_from_config_applies_runtime_limits(monkeypatch) -> None:
             "sports_cache_ttl_seconds": 45,
             "web_cache_ttl_seconds": 1800,
             "tavily": {"api_key_env": "CUSTOM_TAVILY_KEY"},
+            "searxng": {"base_url": "http://searxng:8080"},
         }
     )
 
@@ -415,6 +459,7 @@ def test_from_config_applies_runtime_limits(monkeypatch) -> None:
     assert tool.query_max_chars == 80
     assert tool.cache_ttl_by_kind == {"news": 300, "sports": 45, "web": 1800}
     assert tool.tavily_api_key == "configured"
+    assert tool.searxng_base_url == "http://searxng:8080"
 
 def test_safe_external_query_drops_abstract_group_banter() -> None:
     assert _safe_external_query("你被平行宇宙的美少女权踢了") == ""

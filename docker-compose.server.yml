@@ -1,4 +1,15 @@
 services:
+  searxng:
+    # Official registry; Docker bypasses the stale local proxy for this host.
+    image: ghcr.io/searxng/searxng:latest
+    container_name: qq-social-agent-searxng
+    restart: unless-stopped
+    volumes:
+      - ./server-data/searxng:/etc/searxng
+    environment:
+      SEARXNG_BASE_URL: http://searxng:8080/
+    # 不映射 ports：只能由同一 Docker 网络中的后端访问。
+
   bot:
     build:
       context: .
