@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import json
 import random
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -24,8 +25,11 @@ class PrivateMemeLibrary:
         self.memory = memory
         self.enabled = bool(cfg.get("enabled", True))
         self.allowed_private_users = _int_set(cfg.get("allowed_private_users", (1903297906,)))
+        self.allowed_group_ids = _int_set(cfg.get("allowed_group_ids", ()))
         self.candidate_limit = max(1, min(10, int(cfg.get("candidate_limit", 5))))
         self.same_meme_cooldown_seconds = max(60, int(cfg.get("same_meme_cooldown_seconds", 6 * 60 * 60)))
+        self.group_selection_probability = max(0.0, min(1.0, float(cfg.get("group_selection_probability", 0.18))))
+        self.group_cooldown_seconds = max(60, int(cfg.get("group_cooldown_seconds", 15 * 60)))
         self.asset_dir = (data_dir / str(cfg.get("asset_dir", "meme_library"))).resolve()
         self.asset_dir.mkdir(parents=True, exist_ok=True)
 
@@ -45,6 +49,26 @@ class PrivateMemeLibrary:
 
     def candidates(self, user_id: int, *, query: str) -> list[MemeAsset]:
         if not self.enabled or int(user_id) not in self.allowed_private_users:
+            return []
+        return self.memory.meme_assets_for_private(
+            query=query,
+            limit=self.candidate_limit,
+            same_meme_cooldown_seconds=self.same_meme_cooldown_seconds,
+        )
+
+    def group_gate(self, group_id: int) -> MemeGateResult:
+        if not self.enabled or int(group_id) not in self.allowed_group_ids:
+            return MemeGateResult(False, "group_not_enabled", 0)
+        state = self._state_for_key(self._group_state_key(group_id))
+        last_sent_at = float(state.get("last_sent_at", 0) or 0)
+        if last_sent_at and time.time() - last_sent_at < self.group_cooldown_seconds:
+            return MemeGateResult(False, "group_cooldown", 0)
+        if random.random() >= self.group_selection_probability:
+            return MemeGateResult(False, "group_probability_skip", 0)
+        return MemeGateResult(True, "eligible", 0)
+
+    def group_candidates(self, group_id: int, *, query: str) -> list[MemeAsset]:
+        if not self.enabled or int(group_id) not in self.allowed_group_ids:
             return []
         return self.memory.meme_assets_for_private(
             query=query,
@@ -78,11 +102,20 @@ class PrivateMemeLibrary:
         self._save_state(user_id, {"messages_since_last_meme": 0})
         return True
 
+    def mark_group_sent(self, group_id: int, meme_id: int) -> bool:
+        if not self.memory.mark_meme_asset_used(meme_id):
+            return False
+        self._save_state_for_key(self._group_state_key(group_id), {"last_sent_at": time.time()})
+        return True
+
     def _state_key(self, user_id: int) -> str:
         return f"private_meme_library:{int(user_id)}"
 
     def _state(self, user_id: int) -> dict[str, object]:
-        raw = self.memory.app_kv_get(self._state_key(user_id))
+        return self._state_for_key(self._state_key(user_id))
+
+    def _state_for_key(self, key: str) -> dict[str, object]:
+        raw = self.memory.app_kv_get(key)
         try:
             state = json.loads(raw or "{}")
         except (TypeError, ValueError, json.JSONDecodeError):
@@ -90,7 +123,13 @@ class PrivateMemeLibrary:
         return state if isinstance(state, dict) else {}
 
     def _save_state(self, user_id: int, state: dict[str, object]) -> None:
-        self.memory.app_kv_set(self._state_key(user_id), json.dumps(state, ensure_ascii=False))
+        self._save_state_for_key(self._state_key(user_id), state)
+
+    def _group_state_key(self, group_id: int) -> str:
+        return f"group_meme_library:{int(group_id)}"
+
+    def _save_state_for_key(self, key: str, state: dict[str, object]) -> None:
+        self.memory.app_kv_set(key, json.dumps(state, ensure_ascii=False))
 
 
 def _int_set(value: object) -> set[int]:

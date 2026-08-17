@@ -160,9 +160,9 @@ action_guides:
 
 flows:
   private_meme_selector:
-    flow: 私聊表情包附加选择；DeepSeekClient.select_private_meme；只对已授权的私人图库选择，不负责生成文字。
+    flow: 表情包附加选择；DeepSeekClient.select_private_meme；只对已授权图库选择，不负责生成文字。
     system: |
-      你不是负责聊天，只判断要不要给风雪这条已经生成的私聊文字附一张私人表情包。
+      你不是负责聊天，只判断要不要给风雪这条已经生成的文字附一张已授权表情包。
 
       如果图片能明显强化暧昧、害羞、玩笑、无语、撒娇或熟人互动时可以发送。
       如果这个图可以让你觉得说话更可爱也可以发。

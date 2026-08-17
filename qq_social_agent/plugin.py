@@ -11256,6 +11256,7 @@ async def _send_approved_group_reply_scoped(
         trigger_user_id=approval.trigger_user_id,
         mention_user_id=sent_mention_user_id,
     )
+    await _maybe_send_group_meme(bot, approval, candidate)
     await _execute_approved_side_reaction(bot, approval)
     send_elapsed_ms = int((time.monotonic() - send_started_at) * 1000)
     if pipeline_state is not None:
@@ -11279,6 +11280,109 @@ async def _send_approved_group_reply_scoped(
         await _send_private_message(bot, user_id=approver_id, message=Message("已发。"))
     except ActionFailed:
         pass
+
+
+def _group_meme_context_eligible(approval: PendingGroupApproval, candidate: PendingApprovalCandidate) -> bool:
+    if candidate.action in {"care", "market_check", "fresh_context"}:
+        return False
+    if approval.tool_evidence.strip():
+        return False
+    return 0 < len(candidate.text.strip()) <= 150
+
+
+async def _maybe_send_group_meme(
+    bot: Bot,
+    approval: PendingGroupApproval,
+    candidate: PendingApprovalCandidate,
+) -> None:
+    if deepseek_client is None or not _group_meme_context_eligible(approval, candidate):
+        return
+    gate = private_meme_library.group_gate(approval.group_id)
+    if not gate.allowed:
+        _record_metric_event(
+            "group_meme_selector",
+            group_id=approval.group_id,
+            user_id=approval.trigger_user_id,
+            stage="eligibility",
+            action="skipped",
+            gate_reason=gate.reason,
+        )
+        return
+    candidates = private_meme_library.group_candidates(
+        approval.group_id,
+        query=f"{approval.trigger_text}\n{candidate.text}",
+    )
+    if not candidates:
+        return
+    try:
+        choice = await deepseek_client.select_private_meme(
+            current_text=approval.trigger_text,
+            reply_text=_memory_text_from_reply_part(candidate.text, approval.mention_targets),
+            candidates=private_meme_library.candidate_text(candidates),
+        )
+    except Exception as exc:
+        logger.warning(
+            "qq_social_agent group meme selector failed: "
+            f"group={approval.group_id} error={exc}"
+        )
+        return
+    candidate_ids = {asset.id for asset in candidates}
+    if not choice.send or choice.meme_id not in candidate_ids:
+        _record_metric_event(
+            "group_meme_selector",
+            group_id=approval.group_id,
+            user_id=approval.trigger_user_id,
+            stage="selection",
+            action="skipped",
+            gate_reason=gate.reason,
+            reason=choice.reason,
+        )
+        return
+    image_ref = private_meme_library.image_base64_ref(choice.meme_id)
+    if not image_ref:
+        return
+    try:
+        message_id = await _send_group_message(
+            bot,
+            approval.group_id,
+            Message(MessageSegment.image(file=image_ref)),
+        )
+    except ActionFailed as exc:
+        logger.warning(
+            "qq_social_agent failed sending group meme: "
+            f"group={approval.group_id} meme={choice.meme_id} {_action_failed_summary(exc)}"
+        )
+        _record_metric_event(
+            "group_meme_selector",
+            group_id=approval.group_id,
+            user_id=approval.trigger_user_id,
+            stage="delivery",
+            action="failed",
+            meme_id=choice.meme_id,
+            error=_action_failed_summary(exc),
+        )
+        return
+    private_meme_library.mark_group_sent(approval.group_id, choice.meme_id)
+    asset = memory.meme_asset(choice.meme_id)
+    memory.add_message(
+        approval.group_id,
+        approval.self_id,
+        approval.persona_name,
+        f"[风雪附了一张已授权表情包：{asset.description if asset else choice.meme_id}]",
+        is_bot=True,
+        source_message_id=message_id,
+        source_kind="live",
+        correlation_id=approval.correlation_id,
+    )
+    _record_metric_event(
+        "group_meme_selector",
+        group_id=approval.group_id,
+        user_id=approval.trigger_user_id,
+        stage="delivery",
+        action="sent",
+        meme_id=choice.meme_id,
+        reason=choice.reason,
+    )
 
 
 def _record_post_reply_followup_window(

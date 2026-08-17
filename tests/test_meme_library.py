@@ -35,3 +35,35 @@ def test_private_meme_library_reads_curated_asset(tmp_path: Path) -> None:
     assert library.image_base64_ref(asset.id).startswith("base64://")
     assert library.mark_sent(1903297906, asset.id)
     assert library.candidates(1903297906, query="害羞") == []
+
+
+def test_group_meme_gate_respects_group_cooldown(tmp_path: Path) -> None:
+    memory = MemoryStore(tmp_path / "bot.sqlite3")
+    library = PrivateMemeLibrary(
+        memory,
+        {
+            "allowed_group_ids": [1026813421],
+            "group_selection_probability": 1,
+            "group_cooldown_seconds": 60,
+        },
+        data_dir=tmp_path,
+    )
+    image_path = tmp_path / "meme_library" / "a.png"
+    image_path.parent.mkdir(parents=True)
+    image_path.write_bytes(b"png-data")
+    asset = memory.upsert_meme_asset(
+        sha256="b" * 64,
+        source_group_id=1026813421,
+        source_user_id=1535071184,
+        source_message_id="manual:group",
+        file_path=str(image_path),
+        mime_type="image/png",
+        byte_size=image_path.stat().st_size,
+        description="开心",
+        tags=("开心",),
+        enabled=True,
+    )
+
+    assert library.group_gate(1026813421).allowed
+    assert library.mark_group_sent(1026813421, asset.id)
+    assert library.group_gate(1026813421).reason == "group_cooldown"
