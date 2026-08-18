@@ -2,7 +2,9 @@
 
 本文档给未来接手本项目的 AI / 开发者使用。目标是快速理解：这个 QQ 机器人怎么跑、消息怎么流动、Prompt 在哪里、哪些模块能改、哪些地方不要乱动。
 
-最后更新：2026-08-03
+最后更新：2026-08-18
+
+阅读顺序：先读本节状态速览，再读 [`docs/module_boundaries.md`](docs/module_boundaries.md) 了解模块边界；修改部署、数据或 Prompt 前分别查看第 4、5、7 节。
 
 
 ## 0. 2026-08 当前状态速览
@@ -15,6 +17,8 @@ GitHub: Nyarlathoteppppp/bolatu-bot
 后端容器: qq-social-agent-bot
 NapCat/QQ 容器或进程不要随便重启，除非 QQ 掉线或登录态损坏。
 ```
+
+当前搜索已接入 Tavily/RSS，并有自建 SearXNG MVP 配置。SearXNG 镜像/服务必须在 `docker compose ps` 中健康后，才应把它当作主搜索源；未就绪时保留现有 provider fallback，不要因为改 Prompt 或重启 bot 把搜索能力切断。
 
 Docker 部署注意：当前 `docker-compose.server.yml` 是宿主机代码目录 bind mount 到容器。多数 Python 代码和 prompt 修改后，直接：
 

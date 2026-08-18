@@ -21,6 +21,13 @@ def test_does_not_block_normal_topics() -> None:
     assert not has_political_redline("美国和伊朗冲突现在怎么样")
 
 
+def test_does_not_treat_709_inside_message_identifiers_as_sensitive() -> None:
+    assert not has_political_redline("张风雪原消息内容未知，消息ID：1392822709；可爱")
+    reply, guarded = sanitize_political_output("消息ID：1392822709")
+    assert not guarded
+    assert reply == "消息ID：1392822709"
+
+
 def test_sanitize_output_masks_redline_terms() -> None:
     reply, guarded = sanitize_political_output("中共暴政这个说法可以展开讲")
 
@@ -53,11 +60,11 @@ def test_sanitize_output_masks_expanded_sensitive_keywords() -> None:
 
 def test_sanitize_output_masks_recent_region_and_slang_keywords() -> None:
     reply, guarded = sanitize_political_output(
-        "八九、学潮、天安门、白纸、乌鲁木齐火灾、佳士、709、乌坎、赵紫阳、薄熙来、周永康、政治局、中南海、大纪元、新疆、维吾尔、西藏、修宪、连任、登基、墙国、赵家人"
+        "八九、学潮、天安门、白纸、乌鲁木齐火灾、佳士、乌坎、赵紫阳、薄熙来、周永康、政治局、中南海、大纪元、新疆、维吾尔、西藏、修宪、连任、登基、墙国、赵家人"
     )
 
     assert guarded
-    assert reply == "*j、*c、*a*、*z、*l*q*z、*s、***、*k、*z*、*x*、*y*、*z*、*n*、*j*、*j、*w*、*c、*x、*r、*j、*g、*j*"
+    assert reply == "*j、*c、*a*、*z、*l*q*z、*s、*k、*z*、*x*、*y*、*z*、*n*、*j*、*j、*w*、*c、*x、*r、*j、*g、*j*"
 
 
 def test_sanitize_output_masks_pinyin_abbreviations() -> None:

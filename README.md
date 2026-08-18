@@ -6,6 +6,13 @@ QQ 由 NapCat 接入，NoneBot2 接收 OneBot v11 事件；消息筛选、频率
 
 > 生产运行数据、QQ 登录态、密钥和群聊内容均不在仓库中。请先阅读“安全与数据”再部署。
 
+## 文档阅读顺序
+
+- [工程交接文档](AI_PROJECT_GUIDE.md)：运行、配置、Prompt、数据与常见排障。
+- [模块边界与维护手册](docs/module_boundaries.md)：当前模块职责、依赖方向、插件化现状与重构策略。
+- [服务器部署说明](SERVER_DEPLOY.md)：Docker、SSH tunnel 和发布边界。
+- [存储维护策略](docs/storage_maintenance.md)：SQLite、日志、COS 归档和容量巡检。
+
 ## 能做什么
 
 - **像群友一样聊天**：先判断“现在插嘴有没有意思”，再决定普通接话、回答、认可、关心、吐槽、反问、艾特他人、点表情或沉默。
