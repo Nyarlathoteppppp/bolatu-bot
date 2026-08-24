@@ -328,6 +328,18 @@ SUPERUSERS=["..."]
 
 `config.yaml` 只记录 provider、base URL、模型名、env var 名，不应该写真实 API key。
 
+### 5.1 服务器命令与引号规则
+
+远程排障有两层 shell：本机 shell 和 SSH 后的服务器 shell。包含正则、SQL、JSON、Python `-c`、管道或重定向的复杂命令，不能把单引号、双引号和 `|` 多层嵌套后直接拼进 `ssh`；这会让本机先错误解析远端内容，产生伪造的 `command not found`，诊断结果不可信。
+
+执行规范：
+
+1. 简单无参数命令才可用 `ssh qqbot-server 'cd /opt/qq-social-agent && docker ...'`。
+2. 复杂诊断先在本机临时目录生成独立 `.sh` 或 `.py` 脚本，上传到服务器 `/tmp/`，再执行 `ssh qqbot-server 'bash /tmp/<script>'`。SQL 用脚本内 Python `sqlite3`，JSON 请求用文件或脚本，不用多层引号拼接。
+3. 每条复杂命令先单独验证 exit code 和关键输出，再并行收集其他只读信息。
+4. 输出出现 `command not found`、`no matches found`、SQL 列不存在或 JSON 解析失败时，必须视为本次诊断失败并重新执行，不能根据其余残片下结论。
+5. 临时脚本只放 `/tmp/`，不得改动项目运行文件；完成后可以保留到系统临时清理。
+
 ## 6. 模型路由
 
 模型路由在 `config.yaml`：
