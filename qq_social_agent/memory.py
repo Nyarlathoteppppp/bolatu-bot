@@ -3737,6 +3737,7 @@ class MemoryStore:
         if speaker_user_id is not None:
             subject_set.add(int(speaker_user_id))
         has_query_terms = bool(_relevance_terms(query))
+        is_private_chat = group_id >= PRIVATE_CHAT_ID_OFFSET
         scored: list[tuple[float, float, sqlite3.Row]] = []
         for row in rows:
             content = str(row["content"])
@@ -3745,6 +3746,18 @@ class MemoryStore:
             subject = row["subject_user_id"]
             obj = row["object_user_id"]
             person_match = bool(subject_set and (subject in subject_set or obj in subject_set))
+            atom_type = str(row["atom_type"]).casefold()
+            # A private conversation has one speaker, so person-match alone is
+            # almost always true.  Do not let unrelated snack/anime preferences
+            # crowd out the active subject just because they belong to this user.
+            if (
+                is_private_chat
+                and lexical_score <= 0
+                and person_match
+                and atom_type not in {"identity", "relation", "fact"}
+                and float(row["importance"] or 0.0) < 0.85
+            ):
+                continue
             if has_query_terms and lexical_score <= 0 and not person_match:
                 continue
             if subject_set and subject in subject_set:
@@ -3755,7 +3768,7 @@ class MemoryStore:
                 score += 1.5
             elif speaker_user_id is not None and obj == int(speaker_user_id):
                 score += 0.75
-            if str(row["atom_type"]).casefold() == "relation" and subject_set:
+            if atom_type == "relation" and subject_set:
                 if subject in subject_set or obj in subject_set:
                     score += 0.75
             score += float(row["importance"] or 0.0) * 2.0
