@@ -7,7 +7,7 @@ from dataclasses import asdict, is_dataclass
 from typing import Any
 from urllib.parse import urlencode
 
-from .memory import MemoryAtom, MemoryStore, MemorySummary
+from .memory import MemoryAtom, MemoryStore, MemorySummary, PrivateConversationState
 
 
 def render_admin_dashboard(
@@ -138,6 +138,23 @@ def render_memory_audit_page(
     {_footer()}
     """
     return _page('张风雪记忆审计', body)
+
+
+def render_private_memory_page(*, memory: MemoryStore, notice: str = "") -> str:
+    """Small, direct-chat-focused editor for mutable relationship state."""
+
+    states = memory.recent_private_conversation_states(limit=120)
+    rows = ''.join(_private_state_card(state) for state in states)
+    body = f"""
+    {_header('私聊记忆')}
+    <main>
+      {_notice(notice)}
+      <section class="panel wide"><h2>三层说明</h2><p class="muted">最近 25 条原文用于当前聊天；这里编辑关系备注、当前话题和未完话题；长期事实仍在“记忆审计”，每条都有来源和纠错轨迹。锁定字段后，自动总结不会覆盖它。</p></section>
+      <section class="panel wide"><h2>已建立私聊状态 <span class="muted small">{len(states)} 个</span></h2>{rows or '<p class="muted">尚无私聊状态。收到下一条已白名单私聊后会自动建立。</p>'}</section>
+    </main>
+    {_footer()}
+    """
+    return _page('张风雪私聊记忆', body)
 
 
 
@@ -321,11 +338,47 @@ code,pre {{ font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; }}
 
 
 def _header(title: str) -> str:
-    return f'<header><h1>{_e(title)}</h1><nav><a href="/admin">概览</a><a href="/admin/tools">工具</a><a href="/admin/edit">编辑</a><a href="/admin/summaries">回想</a><a href="/admin/memory">记忆审计</a><a href="/admin/plugins">插件</a><a href="/trace">Trace</a><a href="/readyz">Ready JSON</a></nav></header>'
+    return f'<header><h1>{_e(title)}</h1><nav><a href="/admin">概览</a><a href="/admin/tools">工具</a><a href="/admin/edit">编辑</a><a href="/admin/private-memory">私聊记忆</a><a href="/admin/summaries">回想</a><a href="/admin/memory">记忆审计</a><a href="/admin/plugins">插件</a><a href="/trace">Trace</a><a href="/readyz">Ready JSON</a></nav></header>'
 
 
 def _footer() -> str:
     return '<footer class="muted small" style="padding:0 22px 24px;max-width:1480px;margin:0 auto;">只建议通过 SSH 隧道访问，不对公网开放。</footer>'
+
+
+def _private_state_card(state: PrivateConversationState) -> str:
+    threads = "\n".join(state.open_threads)
+    frozen = set(state.frozen_fields)
+    chat_id = state.chat_id
+    return f"""
+    <details class="panel" open>
+      <summary><strong>{_e(state.display_name or str(state.user_id))}</strong> [#{state.user_id % 100000:05d}] <span class="muted">更新于 {_fmt_time(state.updated_at)}</span></summary>
+      <p class="muted small">长期事实：<a href="/admin/memory?group_id={chat_id}&user_id={state.user_id}">记忆审计</a>；历史回想：<a href="/admin/summaries?group_id={chat_id}">聊天回想</a></p>
+      <form method="post" action="/admin/private-memory/save">
+        <input type="hidden" name="chat_id" value="{chat_id}">
+        <input type="hidden" name="user_id" value="{state.user_id}">
+        <div class="grid two">
+          <div class="field"><label>显示名</label><input name="display_name" value="{_e(state.display_name)}"></div>
+          <div class="field"><label>关系备注</label><input name="relationship_note" value="{_e(state.relationship_note)}" placeholder="例如：朋友；创作者；同学"></div>
+          <div class="field"><label>相处方式</label><input name="interaction_tone" value="{_e(state.interaction_tone)}" placeholder="例如：温柔、克制、技术优先"></div>
+          <div class="field"><label>当前话题</label><input name="current_topic" value="{_e(state.current_topic)}"></div>
+        </div>
+        <div class="field"><label>未完话题（一行一条，最多 5 条）</label><textarea name="open_threads">{_e(threads)}</textarea></div>
+        <p class="muted small">锁定后自动总结不会覆盖：
+          {_private_freeze_checkbox('display_name', frozen, '显示名')}
+          {_private_freeze_checkbox('relationship_note', frozen, '关系备注')}
+          {_private_freeze_checkbox('interaction_tone', frozen, '相处方式')}
+          {_private_freeze_checkbox('current_topic', frozen, '当前话题')}
+          {_private_freeze_checkbox('open_threads', frozen, '未完话题')}
+        </p>
+        <button type="submit">保存私聊状态</button>
+      </form>
+    </details>
+    """
+
+
+def _private_freeze_checkbox(field: str, frozen: set[str], label: str) -> str:
+    checked = " checked" if field in frozen else ""
+    return f'<label><input type="checkbox" name="frozen_fields" value="{field}"{checked}> 锁定{_e(label)}</label>'
 
 
 def _group_nav(groups: tuple[int, ...], selected: int | None, *, path: str = '/admin') -> str:

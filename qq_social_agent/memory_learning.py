@@ -56,16 +56,64 @@ def persist_private_mid_memory(
     draft: MidMemoryDraft,
     messages: list[ChatMessage],
 ) -> tuple[int, ...]:
-    """Store only recall-worthy private facts and open threads, never style data."""
+    """Persist direct-chat recall conservatively and keep mutable threads separate.
 
-    return persist_fact_drafts(
+    Private chat has much more banter, roleplay and one-off promises than a group.
+    Treating all of it as a durable fact makes later replies bizarre.  Only explicit
+    identity/preference/relationship facts enter the auditable atom store; open
+    threads update the short-term conversation state and naturally roll over.
+    """
+
+    durable_facts = tuple(fact for fact in draft.facts if _private_fact_is_durable(fact))
+    atom_ids = persist_fact_drafts(
         memory,
         group_id=group_id,
-        facts=(*draft.facts, *draft.open_threads),
+        facts=durable_facts,
         source_prefix="private_mid_summary",
         messages=messages,
         require_message_evidence=True,
     )
+    speaker = next((item for item in reversed(messages) if not item.is_bot), None)
+    if speaker is not None:
+        memory.refresh_private_conversation_learning(
+            chat_id=group_id,
+            user_id=speaker.user_id,
+            display_name=speaker.nickname,
+            open_threads=[
+                fact.content
+                for fact in draft.open_threads
+                if _private_open_thread_is_actionable(fact)
+            ],
+        )
+    return atom_ids
+
+
+def _private_fact_is_durable(fact: MemoryFactDraft) -> bool:
+    """Keep relationship play and unverified external claims out of private facts."""
+
+    if fact.kind not in {"identity", "preference", "relationship", "relation", "fact"}:
+        return False
+    if fact.confidence < 0.78:
+        return False
+    text = " ".join((fact.content,)).casefold()
+    if any(
+        marker in text
+        for marker in (
+            "亲亲", "爱爱", "奶头", "性幻想", "老婆", "宝宝", "老公",
+            "可乐", "奖励", "交换", "承诺", "黎曼猜想", "突破",
+        )
+    ):
+        return False
+    return bool(text.strip())
+
+
+def _private_open_thread_is_actionable(fact: MemoryFactDraft) -> bool:
+    if fact.confidence < 0.72 or fact.importance < 0.45:
+        return False
+    text = fact.content.strip()
+    if not text or len(text) > 280:
+        return False
+    return not any(marker in text for marker in ("亲亲", "爱爱", "奶头", "奖励", "交换"))
 
 
 def persist_daily_review_learning(

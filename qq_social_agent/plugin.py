@@ -53,6 +53,7 @@ from .admin_ui import (
     render_memory_summary_detail_page,
     render_message_detail_page,
     render_plugins_page,
+    render_private_memory_page,
 )
 from .approval_models import PendingApprovalCandidate, PendingGroupApproval
 from .background_learning import BackgroundLearningCoordinator
@@ -619,6 +620,33 @@ if hasattr(_driver, "server_app"):
                 notice=notice,
             )
         )
+
+    @_driver.server_app.get("/admin/private-memory")
+    async def _http_admin_private_memory_endpoint(request: Request, notice: str = "") -> HTMLResponse:
+        if not _is_local_admin_request(request):
+            return HTMLResponse("local admin only", status_code=403)
+        return HTMLResponse(render_private_memory_page(memory=memory, notice=notice))
+
+    @_driver.server_app.post("/admin/private-memory/save")
+    async def _http_admin_private_memory_save_endpoint(request: Request):
+        if not _is_local_admin_request(request):
+            return HTMLResponse("local admin only", status_code=403)
+        form = await _admin_form_data(request)
+        chat_id = _admin_form_int(form, "chat_id")
+        user_id = _admin_form_int(form, "user_id")
+        if chat_id is None or user_id is None:
+            return RedirectResponse(url="/admin/private-memory?notice=保存失败：缺少会话编号", status_code=303)
+        memory.update_private_conversation_state(
+            chat_id=chat_id,
+            user_id=user_id,
+            display_name=form.get("display_name", ""),
+            relationship_note=form.get("relationship_note", ""),
+            interaction_tone=form.get("interaction_tone", ""),
+            current_topic=form.get("current_topic", ""),
+            open_threads=[item.strip() for item in form.get("open_threads", "").splitlines() if item.strip()],
+            frozen_fields=[item.strip() for item in form.get("frozen_fields", "").split(",") if item.strip()],
+        )
+        return RedirectResponse(url="/admin/private-memory?notice=私聊状态已保存", status_code=303)
 
     @_driver.server_app.get("/admin/plugins")
     async def _http_admin_plugins_endpoint(request: Request) -> HTMLResponse:
@@ -3703,7 +3731,10 @@ def _http_trace_payload(*, trace_id: str = "", limit: int = 50) -> dict[str, obj
 async def _admin_form_data(request: Request) -> dict[str, str]:
     body = await request.body()
     parsed = parse_qs(body.decode("utf-8", errors="ignore"), keep_blank_values=True)
-    return {key: values[-1] if values else "" for key, values in parsed.items()}
+    return {
+        key: (",".join(values) if key == "frozen_fields" else (values[-1] if values else ""))
+        for key, values in parsed.items()
+    }
 
 
 def _admin_form_int(form: dict[str, str], key: str) -> int | None:
@@ -6705,6 +6736,13 @@ async def _handle_private_message_scoped(
         correlation_id=correlation_id,
         **_event_message_storage_kwargs(event, bot=bot),
     )
+    private_state = memory.private_conversation_state(chat_id)
+    if private_state is None or "display_name" not in private_state.frozen_fields:
+        memory.update_private_conversation_state(
+            chat_id=chat_id,
+            user_id=user_id,
+            display_name=nickname,
+        )
     text = prompt_text
     # Private chats share the same retrieval and learning pipeline as groups,
     # but their synthetic chat_id keeps every stored fact and source isolated.
@@ -6778,6 +6816,7 @@ async def _handle_private_message_scoped(
         f"当前是和{_member_label(user_id, nickname)}的一对一私聊。"
         "不要把普通代词误当成群友或机器人；不要艾特第三人、点群表情或假装在群里说话。"
     )
+    private_state_context = _private_conversation_state_context(chat_id)
     decision, tool_plan = await _apply_tool_use_router(
         decision,
         tool_plan=tool_plan,
@@ -6974,7 +7013,11 @@ async def _handle_private_message_scoped(
             jargon_context=jargon_context,
             recall_feedback_context=recall_feedback_context,
             speaker_context=private_speaker_context,
-            priority_context=_combine_text_sections(_private_priority_context(user_id), forced_once_context),
+            priority_context=_combine_text_sections(
+                _private_priority_context(user_id),
+                private_state_context,
+                forced_once_context,
+            ),
         )
     except Exception as exc:
         logger.warning(f"qq_social_agent private reply generation failed: user={user_id} error={exc}")
@@ -11897,6 +11940,27 @@ def _private_priority_context(user_id: int) -> str:
     if _private_force_obey_enabled(user_id):
         parts.append(_private_force_obey_context(user_id))
     return _combine_text_sections(*parts)
+
+
+def _private_conversation_state_context(chat_id: int) -> str:
+    """Inject only the compact, manually-correctable direct-chat state."""
+
+    state = memory.private_conversation_state(chat_id)
+    if state is None:
+        return ""
+    lines: list[str] = ["私聊状态（人工可编辑；不是群聊事实）："]
+    if state.relationship_note:
+        lines.append(f"- 关系备注：{state.relationship_note}")
+    if state.interaction_tone:
+        lines.append(f"- 相处方式：{state.interaction_tone}")
+    if state.current_topic:
+        lines.append(f"- 当前话题：{state.current_topic}")
+    if state.open_threads:
+        lines.append("- 未完话题：" + "；".join(state.open_threads[:3]))
+    if len(lines) == 1:
+        return ""
+    lines.append("只在当前消息相关时参考；话题结束后不要硬续，也不要把调情、玩笑或猜测说成现实事实。")
+    return "\n".join(lines)
 
 
 def _private_meme_context_eligible(
