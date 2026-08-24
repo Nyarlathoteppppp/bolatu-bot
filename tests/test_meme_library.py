@@ -68,6 +68,20 @@ def test_group_meme_gate_respects_group_cooldown(tmp_path: Path) -> None:
     assert library.group_gate(1026813421).reason == "group_cooldown"
 
 
+def test_private_meme_turn_gate_can_run_for_an_allowed_user(tmp_path: Path) -> None:
+    memory = MemoryStore(tmp_path / "bot.sqlite3")
+    library = PrivateMemeLibrary(
+        memory,
+        {"allowed_private_users": [1903297906]},
+        data_dir=tmp_path,
+    )
+
+    result = library.turn_gate(1903297906, received_messages=1)
+
+    assert result.messages_since_last_meme == 100
+    assert result.reason in {"eligible", "early_turn_70_percent_skip", "fourth_turn_20_percent_skip"}
+
+
 def test_meme_cooldown_is_scoped_to_each_conversation(tmp_path: Path) -> None:
     data_dir = tmp_path / "data"
     image_path = data_dir / "meme_library" / "a.png"
