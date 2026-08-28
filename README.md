@@ -9,6 +9,8 @@ QQ 由 NapCat 接入，NoneBot2 接收 OneBot v11 事件；消息筛选、频率
 ## 文档阅读顺序
 
 - [工程交接文档](AI_PROJECT_GUIDE.md)：运行、配置、Prompt、数据与常见排障。
+- [工程运行手册](docs/engineering_runbook.md)：生产变更、测试、发布、巡检、备份恢复和故障处理规范。
+- [最新项目审计](docs/audits/2026-08-28-project-audit.md)：当前运行基线、已知风险、复现方式与处理顺序。
 - [模块边界与维护手册](docs/module_boundaries.md)：当前模块职责、依赖方向、插件化现状与重构策略。
 - [群聊质量演进路线](docs/group_chat_evolution.md)：发送前校验、短期对话线、话题冷却和可观测性等后续框架。
 - [记忆生命周期与分层方案](docs/memory_lifecycle.md)：中期回想、memory atoms、RAG 召回与长期归档的当前机制和迁移计划。

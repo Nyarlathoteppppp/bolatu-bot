@@ -4,7 +4,7 @@
 
 最后更新：2026-08-28
 
-阅读顺序：先读本节状态速览，再读 [`docs/module_boundaries.md`](docs/module_boundaries.md) 了解模块边界；修改群聊长期记忆前读 [`docs/memory_lifecycle.md`](docs/memory_lifecycle.md)，调整群聊行为前读 [`docs/group_chat_evolution.md`](docs/group_chat_evolution.md)。修改部署、数据或 Prompt 前分别查看第 4、5、7 节。
+阅读顺序：先读本节状态速览，再读 [`docs/engineering_runbook.md`](docs/engineering_runbook.md) 了解生产变更和验证规范；再读 [`docs/module_boundaries.md`](docs/module_boundaries.md) 了解模块边界。修改群聊长期记忆前读 [`docs/memory_lifecycle.md`](docs/memory_lifecycle.md)，调整群聊行为前读 [`docs/group_chat_evolution.md`](docs/group_chat_evolution.md)。当前已知风险见 [`docs/audits/2026-08-28-project-audit.md`](docs/audits/2026-08-28-project-audit.md)。
 
 
 ## 0. 2026-08 当前状态速览
