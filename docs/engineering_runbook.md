@@ -127,7 +127,7 @@ git status --short
 
 日志目录：`/opt/qq-social-agent/logs/`。报告目录：`/opt/qq-social-agent/reports/`。
 
-**注意：** 2026-08-28 审计发现用户 crontab 还存在一条 04:20 的 `system_hygiene.sh --apply`，与 04:17 系统任务重复。修复前不要再新增第三条维护 cron；见审计报告的 P2-1。
+**注意：** 2026-08-28 已移除历史遗留的用户 crontab 清理任务。新增维护 cron 前先检查 `crontab -l` 与 `/etc/cron.d/qq-social-agent-*`，确保同类任务只有一份。
 
 ## 6. 故障处理
 

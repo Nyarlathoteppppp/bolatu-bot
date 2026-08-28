@@ -48,7 +48,7 @@ def test_group_meme_gate_respects_group_cooldown(tmp_path: Path) -> None:
         data_dir=tmp_path,
     )
     image_path = tmp_path / "meme_library" / "a.png"
-    image_path.parent.mkdir(parents=True)
+    image_path.parent.mkdir(parents=True, exist_ok=True)
     image_path.write_bytes(b"png-data")
     asset = memory.upsert_meme_asset(
         sha256="b" * 64,

@@ -155,6 +155,29 @@ def test_style_rules_merge_equivalent_group_rules(tmp_path) -> None:
     assert rules[0].merged_count == 1
 
 
+def test_style_rules_keep_distinct_expression_choices_separate(tmp_path) -> None:
+    memory = MemoryStore(tmp_path / "bot.sqlite3")
+
+    memory.add_style_rules(
+        1,
+        [
+            ("群友用夸张方式吐槽时", "用短句放大荒诞感", "第一条", (100, 101), (11, 12)),
+        ],
+        keep=10,
+    )
+    result = memory.add_style_rules(
+        1,
+        [
+            ("面对夸张比喻时", "认真拆逻辑说明", "第二条", (101, 102), (13, 14)),
+        ],
+        keep=10,
+    )
+
+    assert result["new"] == 1
+    assert result["merged"] == 0
+    assert len(memory.recent_style_rules(1, 10)) == 2
+
+
 def test_personal_style_rules_merge_only_same_speaker(tmp_path) -> None:
     memory = MemoryStore(tmp_path / "bot.sqlite3")
 

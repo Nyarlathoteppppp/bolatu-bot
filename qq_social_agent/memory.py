@@ -2137,6 +2137,8 @@ class MemoryStore:
             existing = self._find_mergeable_style_rule(
                 group_id,
                 fingerprint,
+                situation=situation,
+                style=style,
                 scope=scope,
                 source_user_ids=user_ids,
                 now=now,
@@ -2189,6 +2191,8 @@ class MemoryStore:
         group_id: int,
         fingerprint: str,
         *,
+        situation: str,
+        style: str,
         scope: str,
         source_user_ids: tuple[int, ...],
         now: float,
@@ -2203,19 +2207,30 @@ class MemoryStore:
             where group_id = ?
               and status = 'active'
               and scope = ?
-              and rule_fingerprint = ?
               and (valid_to is null or valid_to > ?)
             order by support_user_count desc, evidence_count desc, confidence desc, last_seen_at desc, id desc
-            limit 12
+            limit 80
             """,
-            (group_id, scope, fingerprint, now),
+            (group_id, scope, now),
         ).fetchall()
-        if scope != "personal":
-            return rows[0] if rows else None
-        incoming_users = set(source_user_ids)
         for row in rows:
-            existing_users = set(_loads_int_list(row["source_user_ids_json"]))
-            if not incoming_users or not existing_users or incoming_users & existing_users:
+            existing_fingerprint = str(row["rule_fingerprint"] or "")
+            if existing_fingerprint == fingerprint:
+                if scope != "personal":
+                    return row
+                incoming_users = set(source_user_ids)
+                existing_users = set(_loads_int_list(row["source_user_ids_json"]))
+                if not incoming_users or not existing_users or incoming_users & existing_users:
+                    return row
+        if scope != "group":
+            return None
+        for row in rows:
+            if _style_rules_are_semantically_mergeable(
+                str(row["situation"] or ""),
+                str(row["style"] or ""),
+                incoming_situation=situation,
+                incoming_style=style,
+            ):
                 return row
         return None
 
@@ -4552,6 +4567,58 @@ def _normalize_style_rule_text(text: str) -> str:
         if len(normalized) > 12:
             normalized = normalized.replace(token, "")
     return normalized[:80]
+
+
+_STYLE_RULE_SEMANTIC_MARKERS = (
+    "夸张",
+    "荒诞",
+    "玩梗",
+    "吐槽",
+    "反讽",
+    "短句",
+    "短",
+    "谐音",
+    "双关",
+    "互损",
+    "自嘲",
+    "安慰",
+    "难受",
+    "情绪",
+    "认真",
+    "技术",
+    "代码",
+    "搜索",
+    "政治",
+    "创造者",
+    "小鸟",
+    "可爱",
+)
+
+
+def _style_rule_semantic_markers(text: str) -> set[str]:
+    normalized = _normalize_style_rule_text(text)
+    return {marker for marker in _STYLE_RULE_SEMANTIC_MARKERS if marker in normalized}
+
+
+def _style_rules_are_semantically_mergeable(
+    existing_situation: str,
+    existing_style: str,
+    *,
+    incoming_situation: str,
+    incoming_style: str,
+) -> bool:
+    """Merge only clearly equivalent group-wide rules without an LLM call.
+
+    A shared generic setting alone is not enough: both the triggering scene and
+    the proposed expression must overlap on a known semantic marker. Personal
+    style keeps using exact fingerprints so one member's habits never bleed into
+    another member's profile.
+    """
+    existing_scene = _style_rule_semantic_markers(existing_situation)
+    incoming_scene = _style_rule_semantic_markers(incoming_situation)
+    existing_expression = _style_rule_semantic_markers(existing_style)
+    incoming_expression = _style_rule_semantic_markers(incoming_style)
+    return bool(existing_scene & incoming_scene) and bool(existing_expression & incoming_expression)
 
 
 def _unique_recent_ints(values: tuple[int, ...] | list[int], *, limit: int | None = None) -> list[int]:
