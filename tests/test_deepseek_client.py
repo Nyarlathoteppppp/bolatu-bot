@@ -33,6 +33,28 @@ def test_sanitize_empty_string_markers() -> None:
     assert _sanitize_reply('"（空字符串）"', 120) == ""
 
 
+def test_provider_circuit_uses_fallback_after_repeated_failures() -> None:
+    client = DeepSeekClient.__new__(DeepSeekClient)
+    primary = SimpleNamespace(provider="siliconflow", model="deepseek-ai/DeepSeek-V4-Flash")
+    fallback = SimpleNamespace(provider="deepseek", model="deepseek-v4-flash")
+    client.config = SimpleNamespace(
+        routes={"reply": primary},
+        fallback_routes={"reply": fallback},
+    )
+    client.route_overrides = {}
+    client._provider_failures = {}
+    client._provider_circuit_until = {}
+
+    for _ in range(3):
+        client._record_provider_failure("siliconflow")
+
+    assert client._candidate_routes("reply") == (fallback,)
+
+    client._record_provider_success("siliconflow")
+
+    assert client._candidate_routes("reply") == (primary, fallback)
+
+
 def test_sanitize_removes_json_artifact_fragments() -> None:
     text = '你问我才答的嘛~咋了，突然聊贝叶斯也觉得奇怪？"}]} 格式：{'
 

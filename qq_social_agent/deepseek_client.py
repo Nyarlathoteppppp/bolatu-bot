@@ -149,6 +149,9 @@ SOCIAL_ACTIONS = {
 
 LLMUsageRecorder = Callable[[str, str, Optional[int], Optional[int], Optional[int]], None]
 _usage_recorder: LLMUsageRecorder | None = None
+_PROVIDER_FAILURE_WINDOW_SECONDS = 120.0
+_PROVIDER_FAILURE_THRESHOLD = 3
+_PROVIDER_CIRCUIT_SECONDS = 300.0
 
 
 def set_usage_recorder(recorder: LLMUsageRecorder | None) -> None:
@@ -177,6 +180,8 @@ class DeepSeekClient:
         if not self.clients:
             raise RuntimeError("No LLM API key is configured. Put provider keys in .env.")
         self.route_overrides: dict[str, LLMModelRoute] = {}
+        self._provider_failures: dict[str, list[float]] = {}
+        self._provider_circuit_until: dict[str, float] = {}
         self.prompts = PromptRegistry()
 
     async def _chat_completion(
@@ -219,11 +224,13 @@ class DeepSeekClient:
                 response = await asyncio.wait_for(operation, timeout=current_timeout + 0.25)
             except Exception as exc:
                 last_error = exc
+                self._record_provider_failure(route.provider)
                 logger.warning(
                     "qq_social_agent llm provider failed, trying fallback: "
                     f"task={task} provider={route.provider} model={route.model} error={exc}"
                 )
                 continue
+            self._record_provider_success(route.provider)
             if self.config.usage_tracking_enabled:
                 _log_llm_usage(task, response, model=route.label)
             return response
@@ -267,7 +274,36 @@ class DeepSeekClient:
         fallback = self.config.fallback_routes.get(route_name)
         if fallback is None or fallback == primary:
             return (primary,)
+        circuit_until = self._provider_circuit_until.get(primary.provider, 0.0)
+        if circuit_until > time.monotonic():
+            # A provider-wide outage should not make every group message wait for
+            # the same timeout. The preferred route is retried after cooldown.
+            return (fallback,)
         return (primary, fallback)
+
+    def _record_provider_failure(self, provider: str) -> None:
+        now = time.monotonic()
+        failures = [
+            observed_at
+            for observed_at in self._provider_failures.get(provider, [])
+            if now - observed_at <= _PROVIDER_FAILURE_WINDOW_SECONDS
+        ]
+        failures.append(now)
+        self._provider_failures[provider] = failures
+        if len(failures) < _PROVIDER_FAILURE_THRESHOLD:
+            return
+        previous_until = self._provider_circuit_until.get(provider, 0.0)
+        until = now + _PROVIDER_CIRCUIT_SECONDS
+        self._provider_circuit_until[provider] = until
+        if previous_until <= now:
+            logger.warning(
+                "qq_social_agent llm provider circuit opened: "
+                f"provider={provider} failures={len(failures)} cooldown={int(_PROVIDER_CIRCUIT_SECONDS)}s"
+            )
+
+    def _record_provider_success(self, provider: str) -> None:
+        self._provider_failures.pop(provider, None)
+        self._provider_circuit_until.pop(provider, None)
 
     def parse_model_route(self, value: str, *, default_provider: str = "siliconflow") -> LLMModelRoute:
         if default_provider not in self.config.providers:
