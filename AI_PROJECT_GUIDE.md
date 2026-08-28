@@ -2,9 +2,9 @@
 
 本文档给未来接手本项目的 AI / 开发者使用。目标是快速理解：这个 QQ 机器人怎么跑、消息怎么流动、Prompt 在哪里、哪些模块能改、哪些地方不要乱动。
 
-最后更新：2026-08-18
+最后更新：2026-08-28
 
-阅读顺序：先读本节状态速览，再读 [`docs/module_boundaries.md`](docs/module_boundaries.md) 了解模块边界；修改部署、数据或 Prompt 前分别查看第 4、5、7 节。
+阅读顺序：先读本节状态速览，再读 [`docs/module_boundaries.md`](docs/module_boundaries.md) 了解模块边界；修改群聊长期记忆前读 [`docs/memory_lifecycle.md`](docs/memory_lifecycle.md)，调整群聊行为前读 [`docs/group_chat_evolution.md`](docs/group_chat_evolution.md)。修改部署、数据或 Prompt 前分别查看第 4、5、7 节。
 
 
 ## 0. 2026-08 当前状态速览
@@ -64,7 +64,7 @@ search_answer    工具/搜索/行情后的单条事实回答
 style_learning   风格学习
 mid_memory       中期记忆总结
 member_profile   群友画像
-daily_review     每日 24 点复盘
+daily_review     保留 Prompt 定义；群聊定时复盘当前关闭
 ```
 
 ### 0.3 搜索和工具

@@ -10,6 +10,8 @@ QQ 由 NapCat 接入，NoneBot2 接收 OneBot v11 事件；消息筛选、频率
 
 - [工程交接文档](AI_PROJECT_GUIDE.md)：运行、配置、Prompt、数据与常见排障。
 - [模块边界与维护手册](docs/module_boundaries.md)：当前模块职责、依赖方向、插件化现状与重构策略。
+- [群聊质量演进路线](docs/group_chat_evolution.md)：发送前校验、短期对话线、话题冷却和可观测性等后续框架。
+- [记忆生命周期与分层方案](docs/memory_lifecycle.md)：中期回想、memory atoms、RAG 召回与长期归档的当前机制和迁移计划。
 - [服务器部署说明](SERVER_DEPLOY.md)：Docker、SSH tunnel 和发布边界。
 - [存储维护策略](docs/storage_maintenance.md)：SQLite、日志、COS 归档和容量巡检。
 
@@ -22,7 +24,7 @@ QQ 由 NapCat 接入，NoneBot2 接收 OneBot v11 事件；消息筛选、频率
 - **会用工具，但不乱搜**：模型在需要新信息时选择搜索、深度网页读取、美股/ETF/加密货币行情查询；工具结果先压缩为背景，再交给回复模型自然接话。
 - **支持图片和富媒体上下文**：图片可走 OCR/视觉摘要；文件、语音、转发和表情保留结构化安全元数据，避免机器人“看不见还硬接”。
 - **可人工审批，也可自动发送**：候选回复可以私聊审批人选择；审查开启时可配置一部分消息直接发送，减少人工负担。
-- **会主动但不刷屏**：支持按时间段概率主动聊天、回复后的 90 秒续聊窗口、每日北京时间 24:00 复盘。
+- **会主动但不刷屏**：支持按时间段概率主动聊天和回复后的 90 秒续聊窗口；群聊每日复盘当前关闭。
 - **可维护地长期运行**：包含 Web 管理台、链路 Trace、Token/模型用量、RAG 评测、SQLite 体检、Docker 清理和腾讯云 COS 冷备份。
 
 ## 架构
@@ -102,7 +104,7 @@ action: reply / answer / agree / care / tease / ask_back / at_someone / react / 
 - 中期记忆总结和 memory atoms 提取。
 - 群友画像更新与身份/别名校准。
 - 原文语料、风格学习规则与优质/不准奏反馈合并。
-- RAG 索引、embedding 回填、每日复盘、概率主动聊天和 COS 归档。
+- RAG 索引、embedding 回填、概率主动聊天和 COS 归档。
 - Token、模型、工具、拦截和审批的 Trace/指标写入数据库。
 
 ### LLM 与后端的边界
