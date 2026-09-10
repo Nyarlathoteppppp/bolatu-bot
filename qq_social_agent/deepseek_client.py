@@ -885,8 +885,11 @@ class DeepSeekClient:
             include_bot_history=include_bot_history,
         )
         context = _format_context_with_local_focus(context_messages, formatter=_format_message)
-        recent_bot_replies = _recent_bot_reply_texts(recent_messages)
-        context = _append_recent_bot_duplicate_guard(context, recent_bot_replies)
+        search_reply = prompt_flow == "search_answer" and candidate_count == 1
+        direct_reply = prompt_flow == "reply_direct" and candidate_count == 1
+        recent_bot_replies = () if search_reply else _recent_bot_reply_texts(recent_messages)
+        if not search_reply:
+            context = _append_recent_bot_duplicate_guard(context, recent_bot_replies)
         if not context:
             context = "（暂无更多上下文）"
         mode = (
@@ -934,8 +937,6 @@ class DeepSeekClient:
             current_text=current_text,
             candidate_count=candidate_count,
         )
-        direct_reply = prompt_flow == "reply_direct" and candidate_count == 1
-        search_reply = prompt_flow == "search_answer" and candidate_count == 1
         request = {
             "max_tokens": (
                 180

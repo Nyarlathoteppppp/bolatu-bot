@@ -865,6 +865,75 @@ def test_search_answer_uses_fast_route_and_small_prompt_budget() -> None:
     assert "旧说法" in captured_calls[0][2]["messages"][0]["content"]
 
 
+def test_search_answer_keeps_reply_even_if_it_overlaps_recent_bot_text() -> None:
+    client = DeepSeekClient.__new__(DeepSeekClient)
+    client.config = SimpleNamespace(
+        max_tokens=260,
+        thinking="disabled",
+        reasoning_effort="low",
+        temperature=0.6,
+    )
+    client.prompts = PromptRegistry()
+    captured_calls: list[tuple[str, str, dict[str, object]]] = []
+
+    async def fake_chat_completion(*, task: str, route_name: str, request: dict[str, object]) -> object:
+        captured_calls.append((task, route_name, request))
+        return SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(
+                        content=(
+                            '{"candidates":[{"text":"没查到官方说 Astra 就是 GPT-6，知乎专栏里暂时只看到摘要。"'
+                            ',"style":"事实优先","action":"answer"}]}'
+                        )
+                    )
+                )
+            ]
+        )
+
+    client._chat_completion = fake_chat_completion
+    persona = Persona(
+        id="test",
+        name="张风雪",
+        description="",
+        prompt="人格",
+        decision_prompt="决策人格",
+        max_reply_chars=220,
+        passive_reply_probability=0.5,
+    )
+    recent = [
+        ChatMessage(
+            group_id=1026813421,
+            user_id=1801507496,
+            nickname="张风雪",
+            text="没查到“astra=GPT-6”的可靠来源，目前只有传闻。",
+            is_bot=True,
+            created_at=1.0,
+        )
+    ]
+
+    candidates = asyncio.run(
+        client.reply_candidates(
+            persona=persona,
+            recent_messages=recent,
+            current_text="搜一下知乎上面的 astra",
+            current_nickname="A[#11111]",
+            mentioned=True,
+            action="answer",
+            fresh_context="最新背景信息：知乎专栏在讨论 GPT-6 Astra。",
+            candidate_count=1,
+            prompt_flow="search_answer",
+            task_name="search_answer",
+        )
+    )
+
+    assert len(candidates) == 1
+    assert "Astra" in candidates[0].text
+    assert len(captured_calls) == 1
+    user_prompt = captured_calls[0][2]["messages"][1]["content"]
+    assert "机器人刚刚发过的话" not in user_prompt
+
+
 def test_parse_fresh_search_decision_json() -> None:
     decision = _parse_fresh_search_decision(
         '{"need_search": true, "kind": "web", "query": "滚石 新专辑", "confidence": 0.88, "reason": "明确搜索"}'
