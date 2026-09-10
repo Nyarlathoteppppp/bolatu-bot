@@ -361,6 +361,8 @@ class FreshContextTool:
             score = _query_similarity_score(query_terms, cached_terms)
             if score < 0.55 or overlap < 4:
                 continue
+            if _related_cache_scope_mismatch(query_key, cached_query_key):
+                continue
             if best is None or score > best[0]:
                 best = (score, key, lookup)
         if best is None:
@@ -378,11 +380,6 @@ class FreshContextTool:
             attempted_providers=lookup.attempted_providers,
             latency_ms=0,
             error=f"reused_related_query score={score:.2f} source={lookup.query[:60]}",
-            page_url=lookup.page_url,
-            page_title=lookup.page_title,
-            page_text=lookup.page_text,
-            page_status=lookup.page_status,
-            page_error=lookup.page_error,
         )
 
     async def _lookup_provider(
@@ -526,6 +523,18 @@ class FreshContextTool:
                 result = UrlReadResult("timeout", url, error="request_timeout")
             except Exception as exc:
                 result = UrlReadResult("fetch_error", url, error=type(exc).__name__[:80])
+            if result.ok and _looks_like_login_wall(result):
+                result = UrlReadResult(
+                    "fetch_error",
+                    result.requested_url,
+                    final_url=result.final_url,
+                    title=result.title,
+                    content_type=result.content_type,
+                    bytes_read=result.bytes_read,
+                    redirects=result.redirects,
+                    error="login_wall",
+                    latency_ms=result.latency_ms,
+                )
             last = result
             if result.ok and result.text.strip():
                 text = result.text.strip()
@@ -1504,8 +1513,7 @@ def _httpx_timeout(timeout_seconds: float) -> httpx.Timeout:
     return httpx.Timeout(timeout=total, connect=connect)
 
 
-_FOLLOWUP_SKIP_HOST_PARTS = (
-    "zhihu.com",
+_FOLLOWUP_SKIP_HOSTS = (
     "baike.baidu.com",
     "wikipedia.org",
     "tieba.baidu.com",
@@ -1519,6 +1527,45 @@ _FOLLOWUP_SKIP_HOST_PARTS = (
     "mp.weixin.qq.com",
     "searx.space",
 )
+_ZHIHU_HUB_PATHS = (
+    "/",
+    "/topics",
+    "/explore",
+    "/hot",
+    "/signin",
+    "/download",
+)
+_ZHIHU_ARTICLE_MARKERS = ("/p/", "/question/", "/answer/")
+_LOGIN_WALL_MARKERS = (
+    "打开知乎app",
+    "验证码登录",
+    "密码登录",
+    "获取短信验证码",
+    "其他扫码方式",
+    "请登录后查看",
+)
+_RELATED_SCOPE_MARKERS = (
+    "知乎",
+    "微博",
+    "热榜",
+    "热门",
+    "其他地方",
+    "别的网站",
+    "不要知乎",
+)
+
+
+def _normalized_host(host: str) -> str:
+    host = (host or "").lower().split(":", 1)[0]
+    if host.startswith("www."):
+        host = host[4:]
+    return host
+
+
+def _host_matches(host: str, pattern: str) -> bool:
+    host = _normalized_host(host)
+    pattern = pattern.lower()
+    return host == pattern or host.endswith("." + pattern)
 
 
 def _followup_skip_url(url: str) -> bool:
@@ -1526,7 +1573,35 @@ def _followup_skip_url(url: str) -> bool:
         parsed = urlparse(url)
     except ValueError:
         return True
-    host = (parsed.netloc or "").lower()
-    path = (parsed.path or "").lower()
-    blob = f"{host}{path}"
-    return any(part in blob for part in _FOLLOWUP_SKIP_HOST_PARTS)
+    host = _normalized_host(parsed.netloc)
+    path = (parsed.path or "").lower() or "/"
+    if "zhihu-trending" in host or "zhihu-trending" in path:
+        return True
+    if any(_host_matches(host, part) for part in _FOLLOWUP_SKIP_HOSTS):
+        return True
+    if _host_matches(host, "zhihu.com"):
+        blob = f"{host}{path}"
+        if any(marker in blob for marker in _ZHIHU_ARTICLE_MARKERS):
+            return False
+        if path == "/":
+            return True
+        return any(
+            path == skip or path.startswith(f"{skip.rstrip('/')}/")
+            for skip in _ZHIHU_HUB_PATHS
+            if skip != "/"
+        )
+    return False
+
+
+def _looks_like_login_wall(result: UrlReadResult) -> bool:
+    compact = re.sub(r"\s+", "", f"{result.title}\n{result.text}".casefold())
+    if not compact:
+        return False
+    hits = sum(1 for marker in _LOGIN_WALL_MARKERS if marker in compact)
+    return hits >= 2 and len(compact) < 800
+
+
+def _related_cache_scope_mismatch(left: str, right: str) -> bool:
+    return {item for item in _RELATED_SCOPE_MARKERS if item in left} != {
+        item for item in _RELATED_SCOPE_MARKERS if item in right
+    }

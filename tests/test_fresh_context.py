@@ -12,12 +12,14 @@ from qq_social_agent.tools.fresh_context import (
     _parse_bing_rss,
     fact_pack_from_lookup,
     detect_fresh_intent,
+    _followup_skip_url,
     _httpx_timeout,
     _parse_google_news_rss,
     _parse_searxng_results,
     _parse_tavily_answer,
     _parse_tavily_results,
     _prompt_context_from_lookup,
+    _related_cache_scope_mismatch,
     _safe_external_query,
 )
 from qq_social_agent.tools.safe_url_reader import UrlReadResult
@@ -580,7 +582,7 @@ async def test_followup_retries_next_url_at_most_twice(monkeypatch) -> None:
 
     async def fake_tavily(query: str, *, kind: str, api_key: str):
         return "", (
-            FreshItem("A", "example.com", "", url="https://zhihu.com/question/1"),
+            FreshItem("A", "example.com", "", url="https://www.zhihu.com/topics"),
             FreshItem("B", "example.com", "", url="https://example.com/a"),
             FreshItem("C", "example.com", "", url="https://example.com/b"),
             FreshItem("D", "example.com", "", url="https://example.com/c"),
@@ -723,3 +725,82 @@ async def test_searxng_empty_or_slow_first_hop_falls_back_to_tavily(monkeypatch)
     assert any(item.startswith("tavily:") for item in calls)
     searxng_budget = float(next(item.split(":", 1)[1] for item in calls if item.startswith("searxng:")))
     assert searxng_budget <= 1.5
+
+
+def test_followup_reads_zhihu_articles_but_skips_hubs_and_scrapers() -> None:
+    assert _followup_skip_url("https://www.zhihu.com/question/2070082903229347029") is False
+    assert _followup_skip_url("https://zhuanlan.zhihu.com/p/2080013448440816928") is False
+    assert _followup_skip_url("https://www.zhihu.com/topics") is True
+    assert _followup_skip_url("https://www.zhihu.com/explore") is True
+    assert _followup_skip_url("https://github.com/justjavac/zhihu-trending-hot-questions") is True
+    assert _followup_skip_url("https://prefixx.com/post") is False
+
+
+def test_related_cache_does_not_reuse_zhihu_scope_for_elsewhere() -> None:
+    assert _related_cache_scope_mismatch("知乎 astra", "astra ai 算力 创业公司 最新动态") is True
+    assert _related_cache_scope_mismatch("美国伊朗冲突 最新", "美国伊朗现在冲突") is False
+
+
+@pytest.mark.anyio
+async def test_followup_reads_zhihu_article_and_rejects_login_wall(monkeypatch) -> None:
+    reader = _FakeUrlReader(
+        [
+            UrlReadResult(
+                "ok",
+                "https://zhuanlan.zhihu.com/p/wall",
+                final_url="https://zhuanlan.zhihu.com/p/wall",
+                title="打开知乎App",
+                text="打开知乎App 验证码登录 密码登录 获取短信验证码",
+            ),
+            UrlReadResult(
+                "ok",
+                "https://zhuanlan.zhihu.com/p/astra",
+                final_url="https://zhuanlan.zhihu.com/p/astra",
+                title="GPT-6 Astra",
+                text="Astra 是跟算力迭代有关的模型，不是热榜条目。",
+            ),
+        ]
+    )
+
+    async def fake_tavily(query: str, *, kind: str, api_key: str):
+        return "GPT-6 Astra 讨论", (
+            FreshItem("hub", "zhihu.com", "", url="https://www.zhihu.com/topics"),
+            FreshItem("wall", "zhihu.com", "", url="https://zhuanlan.zhihu.com/p/wall"),
+            FreshItem("astra", "zhihu.com", "", url="https://zhuanlan.zhihu.com/p/astra"),
+        )
+
+    monkeypatch.setattr(fresh_context, "_fetch_tavily_lookup", fake_tavily)
+    tool = FreshContextTool(provider="tavily", tavily_api_key="test-key", url_reader=reader)
+    lookup = await tool.lookup("知乎 astra", kind="web")
+    context = _prompt_context_from_lookup(lookup)
+
+    assert reader.urls == [
+        "https://zhuanlan.zhihu.com/p/wall",
+        "https://zhuanlan.zhihu.com/p/astra",
+    ]
+    assert "Astra 是跟算力迭代有关的模型" in lookup.page_text
+    assert "网页正文" in context
+    assert "热门话题" not in context
+
+
+@pytest.mark.anyio
+async def test_related_cache_does_not_copy_page_text_across_queries() -> None:
+    tool = FreshContextTool(max_external_queries_per_minute=0, cache_ttl_seconds=60)
+    lookup = FreshLookup(
+        "美国伊朗冲突 最新",
+        "news",
+        (FreshItem("美国伊朗冲突最新进展", "示例媒体", "2026-08-03", url="https://news.example.com/a"),),
+        "ok",
+        provider="test",
+        answer="双方局势仍在变化。",
+        page_url="https://news.example.com/a",
+        page_text="这是上一轮正文，不该带到相似查询。",
+        page_status="ok",
+    )
+    tool._cache[("news", "美国伊朗冲突 最新")] = (time.monotonic(), lookup)
+    reused = await tool.lookup("美国伊朗现在冲突", kind="news")
+    assert reused.cached
+    assert reused.provider == "test:related_cache"
+    assert reused.answer == "双方局势仍在变化。"
+    assert reused.page_text == ""
+    assert reused.page_url == ""
