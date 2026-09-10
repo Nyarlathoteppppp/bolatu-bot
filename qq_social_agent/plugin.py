@@ -191,19 +191,20 @@ memory = MemoryStore(app_config.data_path)
 personas = PersonaRegistry(app_config.persona_dir)
 rate_limiter = RateLimiter(memory, app_config.rate)
 market_tool = MarketTool(max_external_queries_per_minute=2)
+content_ingestion_service = ContentIngestionService.from_config(app_config.raw.get("content_tools", {}))
+deep_content_tool = DeepContentTool.from_config(
+    (app_config.raw.get("content_tools", {}) or {}).get("deep_url_reader", {})
+    if isinstance(app_config.raw.get("content_tools", {}), dict)
+    else {}
+)
 fresh_context_tool = FreshContextTool.from_config(app_config.raw.get("fresh_search", {}))
+fresh_context_tool.url_reader = deep_content_tool.reader
 social_action_service = SocialActionService.from_config(app_config.raw.get("social_actions", {}))
 image_ocr_service = ImageOcrService.from_config(app_config.raw.get("image_ocr", {}))
 private_meme_library = PrivateMemeLibrary(
     memory,
     app_config.raw.get("meme_library", {}),
     data_dir=app_config.data_path.parent,
-)
-content_ingestion_service = ContentIngestionService.from_config(app_config.raw.get("content_tools", {}))
-deep_content_tool = DeepContentTool.from_config(
-    (app_config.raw.get("content_tools", {}) or {}).get("deep_url_reader", {})
-    if isinstance(app_config.raw.get("content_tools", {}), dict)
-    else {}
 )
 rag_service = RAGService(app_config.data_path, app_config.raw.get("rag", {}))
 rag_admin = RAGAdminController(rag_service)
@@ -2882,6 +2883,15 @@ def _private_force_obey_context(user_id: int | str, *, one_shot: bool = False) -
 
 def _combine_text_sections(*sections: str) -> str:
     return "\n".join(section.strip() for section in sections if section and section.strip())
+
+
+def _fresh_tool_failure_context(query: str, *, status: str, reason: str) -> str:
+    preview = _short_notice_text(query, 48)
+    detail = _short_notice_text(reason, 80)
+    return (
+        f"最新背景信息：查询“{preview}”没有拿到可靠结果（状态 {status}；{detail}）。"
+        "回复时不要编造最新事实，不要说“没联网”；可以承认没拿到可靠新消息。"
+    )
 
 
 def _private_force_obey_command_response(user_id: int | str, text: str) -> str | None:

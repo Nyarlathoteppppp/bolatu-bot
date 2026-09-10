@@ -14,6 +14,8 @@ from xml.etree import ElementTree
 
 import httpx
 
+from .safe_url_reader import SafeUrlReader, UrlReadResult
+
 
 @dataclass(frozen=True)
 class FreshItem:
@@ -47,6 +49,11 @@ class FreshLookup:
     attempted_providers: tuple[str, ...] = ()
     latency_ms: int = 0
     error: str = ""
+    page_url: str = ""
+    page_title: str = ""
+    page_text: str = ""
+    page_status: str = ""
+    page_error: str = ""
 
 
 @dataclass(frozen=True)
@@ -61,6 +68,8 @@ class FreshFactPack:
     sources: tuple[str, ...]
     cached: bool = False
     source_refs: tuple[str, ...] = ()
+    page_text: str = ""
+    page_url: str = ""
 
 
 @dataclass(frozen=True)
@@ -94,6 +103,10 @@ class FreshContextTool:
         news_cache_ttl_seconds: int | None = None,
         sports_cache_ttl_seconds: int | None = None,
         web_cache_ttl_seconds: int | None = None,
+        url_reader: SafeUrlReader | None = None,
+        followup_page_max_tries: int = 2,
+        followup_page_max_chars: int = 1800,
+        followup_page_timeout_seconds: float = 3.0,
     ):
         self.max_external_queries_per_minute = max(0, int(max_external_queries_per_minute))
         self.cache_ttl_seconds = max(0, int(cache_ttl_seconds))
@@ -120,8 +133,14 @@ class FreshContextTool:
             "no_results": 0,
             "failures": 0,
             "rate_limited": 0,
+            "page_reads": 0,
+            "page_read_successes": 0,
         }
         self._last_request: dict[str, object] = {}
+        self.url_reader = url_reader
+        self.followup_page_max_tries = max(0, min(2, int(followup_page_max_tries)))
+        self.followup_page_max_chars = max(400, min(4000, int(followup_page_max_chars)))
+        self.followup_page_timeout_seconds = max(1.0, min(8.0, float(followup_page_timeout_seconds)))
 
     @classmethod
     def from_config(cls, config: object | None) -> "FreshContextTool":
@@ -200,6 +219,11 @@ class FreshContextTool:
                     attempted_providers=lookup.attempted_providers,
                     latency_ms=0,
                     error=lookup.error,
+                    page_url=lookup.page_url,
+                    page_title=lookup.page_title,
+                    page_text=lookup.page_text,
+                    page_status=lookup.page_status,
+                    page_error=lookup.page_error,
                 )
                 self._stats["cache_hits"] += 1
                 self._record_lookup(cached_lookup, started=started)
@@ -251,10 +275,13 @@ class FreshContextTool:
             if remaining <= 0:
                 errors.append("total_timeout")
                 break
+            has_later_provider = index < len(candidate_providers) - 1
             provider_timeout = _provider_timeout_seconds(
                 remaining,
-                has_later_provider=index < len(candidate_providers) - 1,
+                has_later_provider=has_later_provider,
             )
+            if provider_name == "searxng" and has_later_provider:
+                provider_timeout = min(provider_timeout, 1.5)
             attempted.append(provider_name)
             used_provider = provider_name
             try:
@@ -285,6 +312,11 @@ class FreshContextTool:
             status = "failed"
         else:
             status = "no_result"
+        page = None
+        if status == "ok" and items:
+            page = await self._read_followup_page(items)
+            if page is not None and not page.ok:
+                errors.append(f"page:{page.error or page.status}")
         latency_ms = int((time.monotonic() - started) * 1000)
         lookup = FreshLookup(
             normalized_query,
@@ -296,6 +328,11 @@ class FreshContextTool:
             attempted_providers=tuple(attempted),
             latency_ms=latency_ms,
             error=";".join(errors)[:240],
+            page_url=(page.final_url or page.requested_url) if page is not None else "",
+            page_title=page.title if page is not None else "",
+            page_text=page.text if page is not None and page.ok else "",
+            page_status=page.status if page is not None else "",
+            page_error=page.error if page is not None else "",
         )
         self._cache[key] = (now, lookup)
         self._cache.move_to_end(key)
@@ -341,6 +378,11 @@ class FreshContextTool:
             attempted_providers=lookup.attempted_providers,
             latency_ms=0,
             error=f"reused_related_query score={score:.2f} source={lookup.query[:60]}",
+            page_url=lookup.page_url,
+            page_title=lookup.page_title,
+            page_text=lookup.page_text,
+            page_status=lookup.page_status,
+            page_error=lookup.page_error,
         )
 
     async def _lookup_provider(
@@ -458,7 +500,55 @@ class FreshContextTool:
             "cached": lookup.cached,
             "latency_ms": lookup.latency_ms or int((time.monotonic() - started) * 1000),
             "error": lookup.error[:120],
+            "page_status": lookup.page_status,
+            "page_url": lookup.page_url[:180],
         }
+
+    async def _read_followup_page(self, items: tuple[FreshItem, ...]) -> UrlReadResult | None:
+        if self.url_reader is None or self.followup_page_max_tries <= 0:
+            return None
+        last: UrlReadResult | None = None
+        tried = 0
+        for item in items:
+            url = str(item.url or "").strip()
+            if not url.startswith(("http://", "https://")):
+                continue
+            if _followup_skip_url(url):
+                continue
+            tried += 1
+            self._stats["page_reads"] += 1
+            try:
+                result = await asyncio.wait_for(
+                    self.url_reader.read(url),
+                    timeout=self.followup_page_timeout_seconds,
+                )
+            except asyncio.TimeoutError:
+                result = UrlReadResult("timeout", url, error="request_timeout")
+            except Exception as exc:
+                result = UrlReadResult("fetch_error", url, error=type(exc).__name__[:80])
+            last = result
+            if result.ok and result.text.strip():
+                text = result.text.strip()
+                truncated = result.truncated or len(text) > self.followup_page_max_chars
+                if len(text) > self.followup_page_max_chars:
+                    text = text[: self.followup_page_max_chars].rstrip()
+                self._stats["page_read_successes"] += 1
+                return UrlReadResult(
+                    result.status,
+                    result.requested_url,
+                    final_url=result.final_url,
+                    title=result.title,
+                    text=text,
+                    content_type=result.content_type,
+                    bytes_read=result.bytes_read,
+                    redirects=result.redirects,
+                    truncated=truncated,
+                    error=result.error,
+                    latency_ms=result.latency_ms,
+                )
+            if tried >= self.followup_page_max_tries:
+                break
+        return last
 
 
 def _prompt_context_from_lookup(lookup: FreshLookup) -> str:
@@ -533,6 +623,8 @@ def fact_pack_from_lookup(lookup: FreshLookup) -> FreshFactPack:
         uncertain.append("来源较少，不能把单条摘要当成绝对事实。")
     if lookup.error:
         uncertain.append(f"部分信息源失败：{lookup.error}。")
+    if lookup.status == "ok" and not lookup.page_text:
+        uncertain.append("本轮没有读到网页正文，只能看到标题和摘要；不要把摘要数字当成已核实事实，也不要编造正文里没有的细节。")
     return FreshFactPack(
         topic=lookup.query,
         kind=lookup.kind,
@@ -544,6 +636,8 @@ def fact_pack_from_lookup(lookup: FreshLookup) -> FreshFactPack:
         sources=tuple(_dedupe_strings(sources)[:5]),
         cached=lookup.cached,
         source_refs=tuple(source_refs[:5]),
+        page_text=lookup.page_text,
+        page_url=lookup.page_url,
     )
 
 
@@ -576,6 +670,12 @@ def _prompt_context_from_fact_pack(pack: FreshFactPack) -> str:
     if pack.source_refs:
         lines.append("可追溯来源：")
         lines.extend(f"- {item}" for item in pack.source_refs[:5])
+    if pack.page_text:
+        lines.append(
+            "网页正文（优先于下面的标题和摘要；数字、日期和结论以正文为准；"
+            f"来源 {pack.page_url or '本轮搜索结果'}）："
+        )
+        lines.append(pack.page_text)
     if pack.facts:
         lines.append("事实背景：")
         lines.extend(f"- {fact}" for fact in pack.facts[:4])
@@ -640,7 +740,7 @@ async def _fetch_tavily_lookup(
     if kind in {"news", "sports"}:
         payload["time_range"] = "week"
     try:
-        async with httpx.AsyncClient(timeout=timeout_seconds, follow_redirects=True) as client:
+        async with httpx.AsyncClient(timeout=_httpx_timeout(timeout_seconds), follow_redirects=True) as client:
             response = await client.post(
                 "https://api.tavily.com/search",
                 headers={
@@ -682,7 +782,7 @@ async def _fetch_searxng_items(
         params["categories"] = "news"
         params["time_range"] = "month"
     try:
-        async with httpx.AsyncClient(timeout=timeout_seconds, follow_redirects=True) as client:
+        async with httpx.AsyncClient(timeout=_httpx_timeout(timeout_seconds), follow_redirects=True) as client:
             response = await client.get(
                 f"{root}/search",
                 params=params,
@@ -801,7 +901,7 @@ async def _fetch_google_news_items(
         f"q={quote_plus(search_query)}&hl=zh-CN&gl=CN&ceid=CN:zh-Hans"
     )
     try:
-        async with httpx.AsyncClient(timeout=timeout_seconds, follow_redirects=True) as client:
+        async with httpx.AsyncClient(timeout=_httpx_timeout(timeout_seconds), follow_redirects=True) as client:
             response = await client.get(
                 url,
                 headers={"User-Agent": "Mozilla/5.0 qq-social-agent/0.1"},
@@ -824,7 +924,7 @@ async def _fetch_bing_web_items(
 ) -> tuple[FreshItem, ...]:
     url = f"https://www.bing.com/search?format=rss&q={quote_plus(query)}"
     try:
-        async with httpx.AsyncClient(timeout=timeout_seconds, follow_redirects=True) as client:
+        async with httpx.AsyncClient(timeout=_httpx_timeout(timeout_seconds), follow_redirects=True) as client:
             response = await client.get(
                 url,
                 headers={"User-Agent": "Mozilla/5.0 qq-social-agent/0.1"},
@@ -1396,3 +1496,37 @@ def _config_float(config: dict[str, object], *keys: str, default: float) -> floa
         except (TypeError, ValueError):
             break
     return default
+
+
+def _httpx_timeout(timeout_seconds: float) -> httpx.Timeout:
+    total = max(0.1, float(timeout_seconds))
+    connect = min(1.5, max(0.4, total * 0.3))
+    return httpx.Timeout(timeout=total, connect=connect)
+
+
+_FOLLOWUP_SKIP_HOST_PARTS = (
+    "zhihu.com",
+    "baike.baidu.com",
+    "wikipedia.org",
+    "tieba.baidu.com",
+    "weibo.com",
+    "facebook.com",
+    "twitter.com",
+    "x.com",
+    "instagram.com",
+    "tiktok.com",
+    "douyin.com",
+    "mp.weixin.qq.com",
+    "searx.space",
+)
+
+
+def _followup_skip_url(url: str) -> bool:
+    try:
+        parsed = urlparse(url)
+    except ValueError:
+        return True
+    host = (parsed.netloc or "").lower()
+    path = (parsed.path or "").lower()
+    blob = f"{host}{path}"
+    return any(part in blob for part in _FOLLOWUP_SKIP_HOST_PARTS)

@@ -12,6 +12,7 @@ from qq_social_agent.tools.fresh_context import (
     _parse_bing_rss,
     fact_pack_from_lookup,
     detect_fresh_intent,
+    _httpx_timeout,
     _parse_google_news_rss,
     _parse_searxng_results,
     _parse_tavily_answer,
@@ -19,6 +20,7 @@ from qq_social_agent.tools.fresh_context import (
     _prompt_context_from_lookup,
     _safe_external_query,
 )
+from qq_social_agent.tools.safe_url_reader import UrlReadResult
 
 
 def test_parse_google_news_rss_items() -> None:
@@ -479,3 +481,245 @@ async def test_lookup_reuses_related_successful_cache_without_external_call() ->
     assert reused.provider == "test:related_cache"
     assert reused.answer == "双方局势仍在变化。"
     assert tool.status_snapshot()["counters"]["external_requests"] == 0
+
+
+def test_httpx_timeout_caps_connect_so_dead_providers_leave_fallback_budget() -> None:
+    timeout = _httpx_timeout(5.0)
+    assert timeout.connect <= 1.5
+    assert timeout.read == 5.0
+    assert timeout.connect < timeout.read
+    reserved = fresh_context._provider_timeout_seconds(5.0, has_later_provider=True)
+    assert reserved < 5.0
+    assert reserved >= 0.5
+
+
+class _FakeUrlReader:
+    def __init__(self, results: list[UrlReadResult]) -> None:
+        self._results = list(results)
+        self.urls: list[str] = []
+
+    async def read(self, url: str) -> UrlReadResult:
+        self.urls.append(url)
+        if not self._results:
+            return UrlReadResult("fetch_error", url, error="exhausted")
+        return self._results.pop(0)
+
+
+@pytest.mark.anyio
+async def test_followup_reads_one_page_from_this_round_result_urls(monkeypatch) -> None:
+    reader = _FakeUrlReader(
+        [
+            UrlReadResult(
+                "ok",
+                "https://example.com/nvidia",
+                final_url="https://example.com/nvidia",
+                title="NVIDIA 10-K",
+                text="Fiscal year 2025 total revenue was $130.5 billion.",
+            )
+        ]
+    )
+
+    async def fake_tavily(query: str, *, kind: str, api_key: str):
+        return "data center 752", (
+            FreshItem(
+                "NVIDIA earnings",
+                "example.com",
+                "2026-02-01",
+                summary="data center 752 billion",
+                url="https://example.com/nvidia",
+            ),
+            FreshItem(
+                "Other",
+                "example.com",
+                "",
+                summary="ignore",
+                url="https://example.com/other",
+            ),
+        )
+
+    monkeypatch.setattr(fresh_context, "_fetch_tavily_lookup", fake_tavily)
+    tool = FreshContextTool(
+        provider="tavily",
+        tavily_api_key="test-key",
+        url_reader=reader,
+    )
+
+    lookup = await tool.lookup("NVIDIA 最新财报", kind="news")
+    context = _prompt_context_from_lookup(lookup)
+
+    assert lookup.status == "ok"
+    assert reader.urls == ["https://example.com/nvidia"]
+    assert "130.5 billion" in lookup.page_text
+    assert "网页正文" in context
+    assert "130.5 billion" in context
+    assert context.index("网页正文") < context.index("事实背景")
+    assert tool.status_snapshot()["last_request"]["page_status"] == "ok"
+
+
+@pytest.mark.anyio
+async def test_followup_retries_next_url_at_most_twice(monkeypatch) -> None:
+    reader = _FakeUrlReader(
+        [
+            UrlReadResult("fetch_error", "https://example.com/a", error="timeout"),
+            UrlReadResult(
+                "ok",
+                "https://example.com/b",
+                final_url="https://example.com/b",
+                title="B",
+                text="正文第二页有 816 亿美元。",
+            ),
+            UrlReadResult(
+                "ok",
+                "https://example.com/c",
+                final_url="https://example.com/c",
+                title="C",
+                text="不该读到第三页",
+            ),
+        ]
+    )
+
+    async def fake_tavily(query: str, *, kind: str, api_key: str):
+        return "", (
+            FreshItem("A", "example.com", "", url="https://zhihu.com/question/1"),
+            FreshItem("B", "example.com", "", url="https://example.com/a"),
+            FreshItem("C", "example.com", "", url="https://example.com/b"),
+            FreshItem("D", "example.com", "", url="https://example.com/c"),
+        )
+
+    monkeypatch.setattr(fresh_context, "_fetch_tavily_lookup", fake_tavily)
+    tool = FreshContextTool(
+        provider="tavily",
+        tavily_api_key="test-key",
+        url_reader=reader,
+    )
+
+    lookup = await tool.lookup("NVIDIA", kind="web")
+
+    assert reader.urls == ["https://example.com/a", "https://example.com/b"]
+    assert "816 亿美元" in lookup.page_text
+    assert lookup.page_url == "https://example.com/b"
+
+
+@pytest.mark.anyio
+async def test_followup_page_timeout_does_not_eat_full_reader_budget(monkeypatch) -> None:
+    class _SlowReader:
+        urls: list[str] = []
+
+        async def read(self, url: str) -> UrlReadResult:
+            self.urls.append(url)
+            await asyncio.sleep(8)
+            return UrlReadResult("ok", url, final_url=url, title="late", text="不该等到这里")
+
+    reader = _SlowReader()
+
+    async def fake_tavily(query: str, *, kind: str, api_key: str):
+        return "摘要", (
+            FreshItem("A", "example.com", "", url="https://example.com/slow"),
+            FreshItem("B", "example.com", "", url="https://example.com/also-slow"),
+        )
+
+    monkeypatch.setattr(fresh_context, "_fetch_tavily_lookup", fake_tavily)
+    tool = FreshContextTool(
+        provider="tavily",
+        tavily_api_key="test-key",
+        url_reader=reader,
+        followup_page_timeout_seconds=1.0,
+        timeout_seconds=5,
+    )
+    started = asyncio.get_running_loop().time()
+    lookup = await tool.lookup("NVIDIA", kind="web")
+    elapsed = asyncio.get_running_loop().time() - started
+
+    assert lookup.status == "ok"
+    assert lookup.page_text == ""
+    assert lookup.page_status == "timeout"
+    assert reader.urls == ["https://example.com/slow", "https://example.com/also-slow"]
+    assert elapsed < 3.0
+
+
+@pytest.mark.anyio
+async def test_news_dead_first_provider_still_reaches_fallback(monkeypatch) -> None:
+    calls: list[str] = []
+
+    async def hang_tavily(query: str, *, kind: str, api_key: str, timeout_seconds: float = 10.0):
+        calls.append(f"tavily:{timeout_seconds:.2f}")
+        await asyncio.sleep(10)
+        return "不该等到这里", ()
+
+    async def fast_google(query: str, *, kind: str, timeout_seconds: float = 10.0):
+        calls.append(f"google:{timeout_seconds:.2f}")
+        return (FreshItem("局势", "示例媒体", "2026-09-10", url="https://news.example.com/a"),)
+
+    monkeypatch.setattr(fresh_context, "_fetch_tavily_lookup", hang_tavily)
+    monkeypatch.setattr(fresh_context, "_fetch_google_news_items", fast_google)
+    tool = FreshContextTool(
+        provider="tavily",
+        tavily_api_key="test-key",
+        timeout_seconds=5,
+    )
+    started = asyncio.get_running_loop().time()
+
+    lookup = await tool.lookup("美国 伊朗 最新消息", kind="news")
+    elapsed = asyncio.get_running_loop().time() - started
+
+    assert lookup.status == "ok"
+    assert lookup.provider == "google_news"
+    assert elapsed < 5.0
+    assert any(item.startswith("google:") for item in calls)
+
+
+@pytest.mark.anyio
+async def test_searxng_empty_or_slow_first_hop_falls_back_to_tavily(monkeypatch) -> None:
+    calls: list[str] = []
+
+    async def slow_empty_searxng(
+        query: str,
+        *,
+        kind: str,
+        base_url: str,
+        timeout_seconds: float = 10.0,
+        max_results: int = 5,
+    ):
+        calls.append(f"searxng:{timeout_seconds:.2f}")
+        await asyncio.sleep(4)
+        return ()
+
+    async def fast_tavily(
+        query: str,
+        *,
+        kind: str,
+        api_key: str,
+        timeout_seconds: float = 10.0,
+        max_results: int = 4,
+    ):
+        calls.append(f"tavily:{timeout_seconds:.2f}")
+        return "双方局势仍在变化。", (
+            FreshItem(
+                "局势",
+                "示例媒体",
+                "2026-09-10",
+                summary="外交斡旋继续",
+                url="https://news.example.com/a",
+            ),
+        )
+
+    monkeypatch.setattr(fresh_context, "_fetch_searxng_items", slow_empty_searxng)
+    monkeypatch.setattr(fresh_context, "_fetch_tavily_lookup", fast_tavily)
+    tool = FreshContextTool(
+        provider="searxng",
+        searxng_base_url="http://searxng:8080",
+        tavily_api_key="test-key",
+        timeout_seconds=5,
+    )
+    started = asyncio.get_running_loop().time()
+
+    lookup = await tool.lookup("美国 伊朗 最新消息", kind="news")
+    elapsed = asyncio.get_running_loop().time() - started
+
+    assert lookup.status == "ok"
+    assert lookup.provider == "tavily"
+    assert elapsed < 4.0
+    assert any(item.startswith("searxng:") for item in calls)
+    assert any(item.startswith("tavily:") for item in calls)
+    searxng_budget = float(next(item.split(":", 1)[1] for item in calls if item.startswith("searxng:")))
+    assert searxng_budget <= 1.5

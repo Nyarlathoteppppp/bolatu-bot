@@ -2,6 +2,7 @@ services:
   searxng:
     # Official registry; Docker bypasses the stale local proxy for this host.
     image: ghcr.io/searxng/searxng:latest
+    platform: linux/amd64
     container_name: qq-social-agent-searxng
     restart: unless-stopped
     volumes:
