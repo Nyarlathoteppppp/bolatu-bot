@@ -241,6 +241,20 @@ class RAGIndexer:
                 "global",
                 max(float(row["updated_at"] or 0.0) for row in rows),
             )
+        self.store.conn.execute(
+            """
+            update rag_documents
+            set status = coalesce((
+              select case
+                when a.status = 'active' then 'active'
+                else coalesce(nullif(a.status, ''), 'inactive')
+              end
+              from memory_atoms a
+              where cast(a.id as text) = rag_documents.source_row_id
+            ), status)
+            where doc_type = 'memory_atom' and source_name = 'memory_atoms'
+            """
+        )
         return len(rows)
 
     def _sync_member_profiles(self) -> int:

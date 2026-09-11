@@ -1,4 +1,5 @@
 import sqlite3
+import time
 
 from qq_social_agent.memory import MemoryStore
 
@@ -112,6 +113,12 @@ def test_relevant_memory_summaries_match_query_cues(tmp_path) -> None:
     assert len(summaries) == 1
     assert "Claude" in summaries[0].summary
 
+    fallback = memory.relevant_memory_summaries(1, "完全无关的查询词xyzabc", limit=2)
+    assert [item.summary for item in fallback] == [
+        "群里聊过剩饭和外卖。",
+        "群里聊过 Claude 封中国号，态度很烦。",
+    ]
+
 
 def test_style_rules_are_kept_recent(tmp_path) -> None:
     memory = MemoryStore(tmp_path / "bot.sqlite3")
@@ -211,6 +218,31 @@ def test_relevant_style_rules_match_current_text(tmp_path) -> None:
 
     assert len(rules) == 1
     assert rules[0].situation == "聊亏钱"
+
+
+def test_relevant_style_rules_prefer_recently_seen_when_scores_tie(tmp_path) -> None:
+    memory = MemoryStore(tmp_path / "bot.sqlite3")
+    now = time.time()
+    memory.conn.executemany(
+        """
+        insert into style_rules(
+          group_id, situation, style, source_text, created_at, scope,
+          source_user_ids_json, source_message_ids_json, support_user_count,
+          evidence_count, confidence, status, valid_to,
+          rule_fingerprint, last_seen_at, merged_count
+        ) values (1, ?, '用一句现实成本短评', '股票又亏了', ?, 'group',
+                  '[]', '[]', 1, 1, 0.6, 'active', ?, ?, ?, 0)
+        """,
+        [
+            ("聊亏钱旧", now, now + 90 * 24 * 60 * 60, "old-stock", 100.0),
+            ("聊亏钱新", now, now + 90 * 24 * 60 * 60, "new-stock", 200.0),
+        ],
+    )
+    memory.conn.commit()
+
+    rules = memory.relevant_style_rules(1, "股票亏了", limit=2)
+
+    assert [rule.situation for rule in rules] == ["聊亏钱新", "聊亏钱旧"]
 
 
 def test_personal_style_only_applies_to_source_speaker(tmp_path) -> None:

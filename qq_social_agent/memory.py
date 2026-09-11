@@ -1933,7 +1933,10 @@ class MemoryStore:
             if score > 0:
                 scored.append((score, float(row["created_at"]), row))
         scored.sort(key=lambda item: (item[0], item[1]), reverse=True)
-        return [_summary_from_row(row) for _, _, row in scored[:limit]]
+        if scored:
+            return [_summary_from_row(row) for _, _, row in scored[:limit]]
+        fallback_limit = min(max(0, int(limit)), 2)
+        return [_summary_from_row(row) for row in rows[:fallback_limit]]
 
     def admin_recent_memory_summaries(
         self,
@@ -2413,7 +2416,8 @@ class MemoryStore:
             if score > 0:
                 confidence = max(0.1, min(1.0, float(row["confidence"])))
                 score = score * (0.5 + 0.5 * confidence) + min(2, max(0, int(row["support_user_count"]) - 1)) * 0.5
-                scored.append((score, float(row["created_at"]), row))
+                last_seen = float(row["last_seen_at"] or row["created_at"] or 0.0)
+                scored.append((score, last_seen, row))
         scored.sort(key=lambda item: (item[0], item[1]), reverse=True)
         return [
             StyleRule(
@@ -3784,23 +3788,38 @@ class MemoryStore:
         now: float | None = None,
     ) -> list[MemoryAtom]:
         current = time.time() if now is None else float(now)
+        subject_set = {
+            int(user_id)
+            for user_id in (*(subject_user_ids or ()), *(relationship_user_ids or ()))
+            if user_id is not None and int(user_id) > 0
+        }
+        if speaker_user_id is not None and int(speaker_user_id) > 0:
+            subject_set.add(int(speaker_user_id))
+        has_query_terms = bool(_relevance_terms(query))
+        clauses = [
+            "group_id = ?",
+            "status = 'active'",
+            "atom_type != 'jargon_candidate'",
+            "(valid_from is null or valid_from <= ?)",
+            "(valid_to is null or valid_to > ?)",
+            "(expires_at is null or expires_at > ?)",
+        ]
+        params: list[object] = [group_id, current, current, current]
+        if subject_set and not has_query_terms:
+            placeholders = ",".join("?" for _ in subject_set)
+            clauses.append(
+                f"(subject_user_id in ({placeholders}) or object_user_id in ({placeholders}) or subject_user_id is null)"
+            )
+            params.extend(subject_set)
+            params.extend(subject_set)
         rows = self.conn.execute(
             f"""
             select {_MEMORY_ATOM_SELECT_COLUMNS}
             from memory_atoms
-            where group_id = ?
-              and status = 'active'
-              and atom_type != 'jargon_candidate'
-              and (valid_from is null or valid_from <= ?)
-              and (valid_to is null or valid_to > ?)
-              and (expires_at is null or expires_at > ?)
+            where {" and ".join(clauses)}
             """,
-            (group_id, current, current, current),
+            tuple(params),
         ).fetchall()
-        subject_set = set(subject_user_ids or []) | set(relationship_user_ids or [])
-        if speaker_user_id is not None:
-            subject_set.add(int(speaker_user_id))
-        has_query_terms = bool(_relevance_terms(query))
         is_private_chat = group_id >= PRIVATE_CHAT_ID_OFFSET
         scored: list[tuple[float, float, sqlite3.Row]] = []
         for row in rows:

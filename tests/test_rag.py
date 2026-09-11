@@ -235,6 +235,33 @@ def test_rag_does_not_return_disputed_memory_atom(tmp_path) -> None:
     store.close()
 
 
+def test_rag_marks_expired_memory_atom_inactive_on_resync(tmp_path) -> None:
+    db_path = tmp_path / "bot.sqlite3"
+    memory = MemoryStore(db_path)
+    atom_id = memory.upsert_memory_atom(
+        atom_type="fact",
+        group_id=1,
+        content="临时活动今晚结束",
+        source="message:12",
+        source_message_id=12,
+        evidence_type="message",
+        confidence=0.8,
+        status="active",
+    )
+    memory.conn.close()
+
+    store = RAGStore(db_path)
+    RAGIndexer(store).sync_all()
+    assert store.lexical_search(1, "临时活动今晚结束", limit=5, doc_types=("memory_atom",))
+
+    memory = MemoryStore(db_path)
+    assert memory.expire_memory_atom(atom_id)
+    memory.conn.close()
+    RAGIndexer(store).sync_all()
+    assert store.lexical_search(1, "临时活动今晚结束", limit=5, doc_types=("memory_atom",)) == []
+    store.close()
+
+
 def test_rag_store_refreshes_embedding_when_content_changes(tmp_path) -> None:
     db_path = tmp_path / "bot.sqlite3"
     memory = MemoryStore(db_path)
