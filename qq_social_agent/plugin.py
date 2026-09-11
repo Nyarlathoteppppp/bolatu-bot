@@ -158,6 +158,7 @@ from .reply_splitter import split_reply_messages
 from .social_actions import PokeContext, ReactionResult, SocialActionService, reaction_from_action
 from .tools.fresh_context import (
     FreshContextTool,
+    _compact_search_query,
     detect_fresh_intent,
 )
 from .tools.deep_content import DeepContentTool
@@ -5398,7 +5399,12 @@ async def _handle_group_message_locked(
     persona = personas.get(persona_id)
 
     recent = memory.recent_messages(group_id, app_config.context_limit)
-    context_recent = _without_current_message(recent, user_id=user_id, text=text)
+    context_recent = _without_current_message(
+        recent,
+        user_id=user_id,
+        text=text,
+        buffered_messages=buffered_messages,
+    )
     rate = rate_limiter.allow(group_id, mentioned=addressed_bot, event_at=event_at)
     if not rate.allowed:
         logger.info(f"qq_social_agent suppressed by rate: group={group_id} reason={rate.reason}")
@@ -6114,7 +6120,9 @@ async def _handle_group_message_locked(
         else:
             if fresh_context_task is not None and not fresh_context_task.done():
                 fresh_context_task.cancel()
-            query = decision.fresh_query.strip() or text.strip()
+            query = _compact_search_query(decision.fresh_query.strip() or text.strip()) or (
+                decision.fresh_query.strip() or text.strip()
+            )
             fresh_result = await _execute_fresh_tool_request(
                 ToolRequest(
                     ToolKind.FRESH_SEARCH,
@@ -6905,7 +6913,9 @@ async def _handle_private_message_scoped(
 
     fresh_context = ""
     if decision.need_fresh_context:
-        query = decision.fresh_query.strip() or context_query
+        query = _compact_search_query(decision.fresh_query.strip() or context_query) or (
+            decision.fresh_query.strip() or context_query
+        )
         fresh_result = await _execute_fresh_tool_request(
             ToolRequest(
                 ToolKind.FRESH_SEARCH,
@@ -8512,9 +8522,10 @@ def _tool_request_from_llm_route(route: object, *, fallback_text: str) -> ToolRe
         kind = str(getattr(route, "kind", "web") or "web").strip().lower()
         if kind not in {"news", "sports", "web"}:
             kind = "web"
+        compacted = _compact_search_query(query) or query
         return ToolRequest(
             ToolKind.FRESH_SEARCH,
-            query=query[:160],
+            query=compacted[:160],
             reason=f"llm_tool_router:{reason}"[:120],
             confidence=confidence,
             required=True,
@@ -8578,6 +8589,131 @@ def _merge_tool_route_plans(base: ToolRoutePlan, extra: ToolRoutePlan) -> ToolRo
     return ToolRoutePlan(tuple(requests), source=source)
 
 
+_NEARBY_URL_RE = re.compile(r"https?://[^\s<>\"']+", re.IGNORECASE)
+_NEARBY_URL_HINT_RE = re.compile(
+    r"仓库|链接|github|不是这个|page not find|404|这是什么|这个链接|这个仓库",
+    re.IGNORECASE,
+)
+
+
+def _recent_http_urls(
+    text: str,
+    recent_messages: list[ChatMessage] | None = None,
+    *,
+    limit: int = 4,
+) -> tuple[str, ...]:
+    blobs: list[str] = [str(text or "")]
+    for message in reversed(list(recent_messages or ())[-limit:]):
+        blobs.append(str(getattr(message, "text", "") or ""))
+    found: list[str] = []
+    seen: set[str] = set()
+    for blob in blobs:
+        for match in _NEARBY_URL_RE.findall(blob):
+            url = match.rstrip(".,;，。！？)>\"']")
+            key = url.casefold()
+            if not url or key in seen:
+                continue
+            seen.add(key)
+            found.append(url)
+            if len(found) >= 3:
+                return tuple(found)
+    return tuple(found)
+
+
+def _nearby_url_tool_plan(
+    *,
+    text: str,
+    recent_messages: list[ChatMessage] | None,
+    addressed: bool,
+    existing: ToolRoutePlan,
+) -> ToolRoutePlan:
+    if not addressed or existing.first(ToolKind.DEEP_URL) is not None:
+        return ToolRoutePlan((), source="nearby_url")
+    urls = _recent_http_urls(text, recent_messages, limit=4)
+    if not urls:
+        return ToolRoutePlan((), source="nearby_url")
+    if _NEARBY_URL_HINT_RE.search(str(text or "")) is None:
+        return ToolRoutePlan((), source="nearby_url")
+    return ToolRoutePlan(
+        (
+            ToolRequest(
+                ToolKind.DEEP_URL,
+                query=urls[0][:500],
+                reason="nearby_url_in_recent_messages",
+                required=False,
+                arguments={},
+            ),
+        ),
+        source="nearby_url",
+    )
+
+
+def _finalize_routed_tool_plan(
+    decision: ReplyDecision,
+    tool_plan: ToolRoutePlan,
+    *,
+    text: str,
+    context_recent: list[ChatMessage],
+    addressed_bot: bool,
+    group_id: int,
+    user_id: int,
+    source_message_id: str,
+    routed: object | None = None,
+) -> tuple[ReplyDecision, ToolRoutePlan]:
+    final_plan = tool_plan
+    nearby_url_plan = _nearby_url_tool_plan(
+        text=text,
+        recent_messages=context_recent,
+        addressed=addressed_bot,
+        existing=final_plan,
+    )
+    if nearby_url_plan.requests:
+        routed_nearby = _tool_plan_with_runtime_context(
+            nearby_url_plan,
+            addressed=addressed_bot,
+            group_id=group_id,
+            user_id=user_id,
+            source_message_id=source_message_id,
+        )
+        final_plan = _merge_tool_route_plans(final_plan, routed_nearby)
+    fresh_request = final_plan.first(ToolKind.FRESH_SEARCH)
+    market_request = final_plan.first(ToolKind.MARKET)
+    if fresh_request is not None and fresh_request.required:
+        compacted_query = _compact_search_query(fresh_request.query) or fresh_request.query
+        decision = replace(
+            decision,
+            need_fresh_context=True,
+            fresh_query=compacted_query[:120],
+            fresh_kind=str(fresh_request.arguments.get("kind", "web") or "web"),
+        )
+    elif (
+        decision.need_fresh_context
+        and routed is not None
+        and str(getattr(routed, "tool", "none") or "none") == "none"
+    ):
+        decision = replace(decision, need_fresh_context=False, fresh_query="", fresh_kind="web")
+    if market_request is not None and market_request.required:
+        symbols = tuple(
+            ToolSymbol(
+                kind=str(item.get("kind", "")),
+                symbol=str(item.get("symbol", "")),
+                display=str(item.get("display", "")),
+            )
+            for item in tuple(market_request.arguments.get("symbols", ()))
+            if isinstance(item, dict) and item.get("symbol")
+        )
+        decision = replace(
+            decision,
+            should_reply=True,
+            action="market_check",
+            need_tool=True,
+            tool="market",
+            symbols=symbols,
+            comment_after_tool=bool(getattr(routed, "comment_after_tool", decision.comment_after_tool)),
+        )
+    return decision, final_plan
+
+
 async def _apply_tool_use_router(
     decision: ReplyDecision,
     *,
@@ -8617,7 +8753,16 @@ async def _apply_tool_use_router(
             existing_requests=list(tool_plan.kinds),
             reason="client_not_ready" if deepseek_client is None else "router_gate_false",
         )
-        return decision, tool_plan
+        return _finalize_routed_tool_plan(
+            decision,
+            tool_plan,
+            text=text,
+            context_recent=context_recent,
+            addressed_bot=addressed_bot,
+            group_id=group_id,
+            user_id=user_id,
+            source_message_id=source_message_id,
+        )
     backend_hint = _tool_router_backend_hint(fresh_intent, market_intents, tool_plan)
     try:
         routed = await deepseek_client.route_tool_use(
@@ -8648,7 +8793,16 @@ async def _apply_tool_use_router(
             error=_short_notice_text(str(exc), 200),
             backend_hint=backend_hint,
         )
-        return decision, tool_plan
+        return _finalize_routed_tool_plan(
+            decision,
+            tool_plan,
+            text=text,
+            context_recent=context_recent,
+            addressed_bot=addressed_bot,
+            group_id=group_id,
+            user_id=user_id,
+            source_message_id=source_message_id,
+        )
     request = _tool_request_from_llm_route(routed, fallback_text=text)
     final_plan = tool_plan
     if request is not None:
@@ -8675,37 +8829,17 @@ async def _apply_tool_use_router(
         accepted=request is not None,
         final_requests=list(final_plan.kinds),
     )
-    fresh_request = final_plan.first(ToolKind.FRESH_SEARCH)
-    market_request = final_plan.first(ToolKind.MARKET)
-    if fresh_request is not None and fresh_request.required:
-        decision = replace(
-            decision,
-            need_fresh_context=True,
-            fresh_query=fresh_request.query[:120],
-            fresh_kind=str(fresh_request.arguments.get("kind", "web") or "web"),
-        )
-    elif decision.need_fresh_context and str(getattr(routed, "tool", "none") or "none") == "none":
-        decision = replace(decision, need_fresh_context=False, fresh_query="", fresh_kind="web")
-    if market_request is not None and market_request.required:
-        symbols = tuple(
-            ToolSymbol(
-                kind=str(item.get("kind", "")),
-                symbol=str(item.get("symbol", "")),
-                display=str(item.get("display", "")),
-            )
-            for item in tuple(market_request.arguments.get("symbols", ()))
-            if isinstance(item, dict) and item.get("symbol")
-        )
-        decision = replace(
-            decision,
-            should_reply=True,
-            action="market_check",
-            need_tool=True,
-            tool="market",
-            symbols=symbols,
-            comment_after_tool=bool(getattr(routed, "comment_after_tool", decision.comment_after_tool)),
-        )
-    return decision, final_plan
+    return _finalize_routed_tool_plan(
+        decision,
+        final_plan,
+        text=text,
+        context_recent=context_recent,
+        addressed_bot=addressed_bot,
+        group_id=group_id,
+        user_id=user_id,
+        source_message_id=source_message_id,
+        routed=routed,
+    )
 
 
 def _format_fresh_context_hint(intent: object | None) -> str:
@@ -9254,19 +9388,31 @@ def _buffered_current_text(items: list[BufferedGroupMessage] | None) -> str:
         return items[0].text
     recent_items = items[-6:]
     last_item = items[-1]
+    last_label = _member_label(last_item.user_id, last_item.nickname)
+    speaker_count = len({item.user_id for item in recent_items})
     lines = [
-        f"【连续消息，按时间顺序；最后触发者：{_member_label(last_item.user_id, last_item.nickname)}】"
+        f"【连续消息，按时间顺序；最后触发者：{last_label}】",
+        f"当前发言人只有 {last_label}。",
     ]
+    if speaker_count > 1:
+        lines.append(
+            f"上面编号里还有其他人，他们不是 {last_label}；不要把旁人的话当成 {last_label} 说的，也不要把两个人认成同一个。"
+        )
     if len(items) > len(recent_items):
         lines.append(f"（前面还有 {len(items) - len(recent_items)} 条普通群消息）")
     for index, item in enumerate(recent_items, start=1):
-        line = _buffered_message_context_line(index, item)
+        line = _buffered_message_context_line(index, item, last_user_id=last_item.user_id)
         if line:
             lines.append(line)
     return "\n".join(lines).strip()
 
 
-def _buffered_message_context_line(index: int, item: BufferedGroupMessage) -> str:
+def _buffered_message_context_line(
+    index: int,
+    item: BufferedGroupMessage,
+    *,
+    last_user_id: int | None = None,
+) -> str:
     text = (item.text or "").strip()
     if not text:
         return ""
@@ -9275,7 +9421,8 @@ def _buffered_message_context_line(index: int, item: BufferedGroupMessage) -> st
         body = text
     else:
         body = f"{label}说：{text}"
-    return f"{index}. {body}"
+    role = "当前发言" if last_user_id is not None and item.user_id == last_user_id else "旁人"
+    return f"{index}. [{role}] {body}"
 
 
 def _buffered_current_user_id(items: list[BufferedGroupMessage] | None) -> int:
@@ -9806,6 +9953,7 @@ def _format_speaker_reference_context(
     lines = [
         f"- 当前触发人：{current_label}。",
         "- 当前消息优先级最高；最近聊天只用于理解氛围和指代，不代表当前发言人立场。",
+        "- 当前要对着说话的人只有上面这个当前触发人；最近真人发言里的其他人是旁人，不要把上下两个人认成同一个，也不要把旁人的话当成当前触发人说的。",
         _format_message_relation_summary(facts),
     ]
     if addressed_bot:
@@ -11796,13 +11944,44 @@ def _without_current_message(
     *,
     user_id: int,
     text: str,
+    buffered_messages: list[BufferedGroupMessage] | None = None,
 ) -> list[ChatMessage]:
     if not recent_messages:
         return recent_messages
-    last = recent_messages[-1]
-    if not last.is_bot and last.user_id == user_id and last.text == text:
-        return recent_messages[:-1]
-    return recent_messages
+    remaining = list(recent_messages)
+    if buffered_messages:
+        buffered_ids = {
+            str(item.source_message_id)
+            for item in buffered_messages
+            if getattr(item, "source_message_id", "")
+        }
+        if buffered_ids:
+            remaining = [
+                msg
+                for msg in remaining
+                if str(getattr(msg, "source_message_id", "") or "") not in buffered_ids
+            ]
+        else:
+            pending = list(buffered_messages)
+            trimmed: list[ChatMessage] = []
+            for msg in reversed(remaining):
+                matched = False
+                for index, item in enumerate(pending):
+                    if msg.is_bot or msg.user_id != item.user_id:
+                        continue
+                    if msg.text == item.text:
+                        pending.pop(index)
+                        matched = True
+                        break
+                if not matched:
+                    trimmed.append(msg)
+            remaining = list(reversed(trimmed))
+        if remaining:
+            return remaining
+    last = remaining[-1] if remaining else None
+    if last is not None and not last.is_bot and last.user_id == user_id and last.text == text:
+        return remaining[:-1]
+    return remaining
 
 
 MENTION_MARKER_RE = re.compile(r"\[\[at:(\d{5,12})\]\]")

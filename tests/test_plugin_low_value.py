@@ -633,8 +633,9 @@ def test_buffered_current_text_preserves_last_speaker_and_reply_relation() -> No
 
     assert plugin._buffered_current_nickname(items) == "歌迷老蛆"
     assert "最后触发者：歌迷老蛆[#71184]" in text
-    assert "1. 土木[#60236]说：我着急赶地铁" in text
-    assert "2. 歌迷老蛆[#71184]回复小鸟[#89072]消息" in text
+    assert "当前发言人只有 歌迷老蛆[#71184]" in text
+    assert "1. [旁人] 土木[#60236]说：我着急赶地铁" in text
+    assert "2. [当前发言] 歌迷老蛆[#71184]回复小鸟[#89072]消息" in text
     assert "歌迷老蛆[#71184]说：歌迷老蛆[#71184]回复" not in text
 
 
@@ -662,6 +663,7 @@ def test_speaker_reference_context_explains_reply_relation() -> None:
     )
 
     assert "当前触发人：歌迷老蛆[#71184]" in context
+    assert "当前要对着说话的人只有上面这个当前触发人" in context
     assert "target=reply_to_other" in context
     assert "歌迷老蛆[#71184] 是当前回复者/当前发言人" in context
     assert "小鸟[#89072] 是被回复对象" in context
@@ -2797,3 +2799,76 @@ def test_group_proactive_topic_cooldown_expires(monkeypatch, tmp_path) -> None:
         1026813421,
         now=1000.0 + plugin.GROUP_PROACTIVE_TOPIC_COOLDOWN_SECONDS + 1,
     ) == []
+
+
+def test_recent_http_urls_prefer_current_and_nearby_messages() -> None:
+    recent = [
+        ChatMessage(1, 101, "A", "旧链接 https://example.com/old", False, 1.0),
+        ChatMessage(1, 102, "B", "仓库在 https://github.com/Nyarlathoteppppp/bolatu-bot", False, 2.0),
+        ChatMessage(1, 103, "C", "不是这个", False, 3.0),
+    ]
+
+    urls = plugin._recent_http_urls("不是这个", recent, limit=4)
+
+    assert urls[0] == "https://github.com/Nyarlathoteppppp/bolatu-bot"
+    assert "https://example.com/old" in urls
+
+
+def test_nearby_url_tool_plan_reads_recent_github_when_addressed() -> None:
+    recent = [
+        ChatMessage(1, 102, "B", "https://github.com/Nyarlathoteppppp/bolatu-bot", False, 2.0),
+    ]
+    plan = plugin._nearby_url_tool_plan(
+        text="不是这个仓库",
+        recent_messages=recent,
+        addressed=True,
+        existing=plugin.ToolRoutePlan(),
+    )
+
+    assert plan.first(plugin.ToolKind.DEEP_URL) is not None
+    assert plan.first(plugin.ToolKind.DEEP_URL).query == "https://github.com/Nyarlathoteppppp/bolatu-bot"
+
+    skipped = plugin._nearby_url_tool_plan(
+        text="哈哈",
+        recent_messages=recent,
+        addressed=True,
+        existing=plugin.ToolRoutePlan(),
+    )
+    assert skipped.requests == ()
+
+
+def test_without_current_message_drops_buffered_speakers() -> None:
+    recent = [
+        ChatMessage(1, 11, "土木", "我着急赶地铁", False, 1.0, source_message_id="11"),
+        ChatMessage(1, 22, "歌迷老蛆", "南下了", False, 2.0, source_message_id="22"),
+        ChatMessage(1, 33, "旁听", "还在", False, 3.0, source_message_id="33"),
+    ]
+    buffered = [
+        plugin.BufferedGroupMessage(
+            bot=None,
+            event=None,
+            text="我着急赶地铁",
+            user_id=11,
+            nickname="土木",
+            created_at=1.0,
+            source_message_id="11",
+        ),
+        plugin.BufferedGroupMessage(
+            bot=None,
+            event=None,
+            text="南下了",
+            user_id=22,
+            nickname="歌迷老蛆",
+            created_at=2.0,
+            source_message_id="22",
+        ),
+    ]
+
+    remaining = plugin._without_current_message(
+        recent,
+        user_id=22,
+        text="南下了",
+        buffered_messages=buffered,
+    )
+
+    assert [msg.user_id for msg in remaining] == [33]

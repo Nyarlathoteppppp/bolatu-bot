@@ -887,8 +887,9 @@ class DeepSeekClient:
         context = _format_context_with_local_focus(context_messages, formatter=_format_message)
         search_reply = prompt_flow == "search_answer" and candidate_count == 1
         direct_reply = prompt_flow == "reply_direct" and candidate_count == 1
+        single_reply = candidate_count == 1
         recent_bot_replies = () if search_reply else _recent_bot_reply_texts(recent_messages)
-        if not search_reply:
+        if not search_reply and not single_reply:
             context = _append_recent_bot_duplicate_guard(context, recent_bot_replies)
         if not context:
             context = "（暂无更多上下文）"
@@ -963,13 +964,15 @@ class DeepSeekClient:
             request=request,
         )
         content = response.choices[0].message.content or ""
-        candidates = _parse_reply_candidates(
+        parsed_candidates = _parse_reply_candidates(
             content,
             max_chars=persona.max_reply_chars,
             fallback_action=normalized_action,
             limit=candidate_count,
         )
-        candidates = _filter_recent_bot_duplicate_candidates(candidates, recent_bot_replies)
+        candidates = _filter_recent_bot_duplicate_candidates(parsed_candidates, recent_bot_replies)
+        if single_reply and not candidates and parsed_candidates:
+            return parsed_candidates
         if len(candidates) >= candidate_count:
             return candidates
 
@@ -978,7 +981,7 @@ class DeepSeekClient:
             previous_content=content,
             parsed_count=len(candidates),
             candidate_count=candidate_count,
-            avoid_texts=recent_bot_replies,
+            avoid_texts=() if single_reply else recent_bot_replies,
         )
         try:
             retry_response = await self._chat_completion(
@@ -987,20 +990,25 @@ class DeepSeekClient:
                 request=retry_request,
             )
             retry_content = retry_response.choices[0].message.content or ""
-            retry_candidates = _parse_reply_candidates(
+            retry_parsed = _parse_reply_candidates(
                 retry_content,
                 max_chars=persona.max_reply_chars,
                 fallback_action=normalized_action,
                 limit=candidate_count,
             )
             retry_candidates = _filter_recent_bot_duplicate_candidates(
-                retry_candidates,
-                recent_bot_replies,
+                retry_parsed,
+                () if single_reply else recent_bot_replies,
             )
+            if single_reply and not retry_candidates and retry_parsed:
+                retry_candidates = retry_parsed
         except Exception as exc:
             logger.warning(f"qq_social_agent reply candidates retry failed: error={exc}")
             retry_candidates = ()
-        return _merge_reply_candidates(candidates, retry_candidates, limit=candidate_count)
+        merged = _merge_reply_candidates(candidates, retry_candidates, limit=candidate_count)
+        if single_reply and not merged and parsed_candidates:
+            return parsed_candidates
+        return merged
 
     async def daily_review(
         self,

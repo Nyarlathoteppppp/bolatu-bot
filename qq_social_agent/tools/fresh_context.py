@@ -369,6 +369,11 @@ class FreshContextTool:
             return None
         score, key, lookup = best
         self._cache.move_to_end(key)
+        reused_error = ""
+        if lookup.status == "ok":
+            reused_error = ""
+        else:
+            reused_error = lookup.error or f"reused_related_query score={score:.2f}"
         return FreshLookup(
             query,
             kind,
@@ -379,7 +384,8 @@ class FreshContextTool:
             cached=True,
             attempted_providers=lookup.attempted_providers,
             latency_ms=0,
-            error=f"reused_related_query score={score:.2f} source={lookup.query[:60]}",
+            error=reused_error,
+            page_error=f"reused_related_query score={score:.2f} source={lookup.query[:60]}",
         )
 
     async def _lookup_provider(
@@ -630,7 +636,7 @@ def fact_pack_from_lookup(lookup: FreshLookup) -> FreshFactPack:
         uncertain.append("快速摘要没有可核查的来源条目，只能当线索，不能当成已证实事实。")
     if len(set(sources)) <= 1 and facts:
         uncertain.append("来源较少，不能把单条摘要当成绝对事实。")
-    if lookup.error:
+    if lookup.error and lookup.status != "ok":
         uncertain.append(f"部分信息源失败：{lookup.error}。")
     if lookup.status == "ok" and not lookup.page_text:
         uncertain.append("本轮没有读到网页正文，只能看到标题和摘要；不要把摘要数字当成已核实事实，也不要编造正文里没有的细节。")
@@ -674,6 +680,8 @@ def _prompt_context_from_fact_pack(pack: FreshFactPack) -> str:
         ),
         f"状态：{pack.status}；时效：{pack.freshness}",
     ]
+    if str(pack.provider or "").endswith(":related_cache"):
+        lines.append("说明：复用上一跳条目，原查询不同，不要把条目讲成针对当前整句标题的新搜。")
     if pack.sources:
         lines.append(f"来源：{'、'.join(pack.sources)}")
     if pack.source_refs:
@@ -1127,6 +1135,7 @@ def detect_fresh_intent(text: str) -> FreshIntent | None:
         if explicit_query is not None
         else _fresh_query_from_text(_current_reply_text(full_text) or normalized)
     )
+    query = _compact_search_query(query)
     if _is_low_value_fresh_query(query):
         return None
     return FreshIntent(
@@ -1189,7 +1198,7 @@ def _clean_explicit_search_query(query: str) -> str:
         clean,
     ).strip(" ，,：:")
     clean = re.sub(r"^(?:一下|下|这个|这件事|这东西)\s*", "", clean).strip(" ，,：:")
-    return _normalize_query(clean or query)
+    return _compact_search_query(clean or query)
 
 
 def _fresh_query_from_text(text: str) -> str:
@@ -1199,7 +1208,83 @@ def _fresh_query_from_text(text: str) -> str:
         return _normalize_query(explicit_query)
     query = re.sub(r"(现在|今天)?(怎么样了|怎么了|是什么情况|咋了|如何了)$", "", query).strip()
     query = re.sub(r"(最新消息|最新新闻|新闻|赛果|比分|结果)$", "", query).strip()
-    return _normalize_query(query or text)
+    return _compact_search_query(query or text)
+
+
+_QUERY_STOPWORDS = {
+    "让",
+    "使",
+    "把",
+    "将",
+    "被",
+    "给",
+    "对",
+    "向",
+    "与",
+    "和",
+    "及",
+    "以及",
+    "的",
+    "了",
+    "着",
+    "过",
+    "是",
+    "在",
+    "有",
+    "如何",
+    "怎样",
+    "怎么",
+    "什么",
+    "哪些",
+    "哪个",
+    "这个",
+    "那个",
+    "成为",
+    "一下",
+    "讲讲",
+    "看看",
+    "说说",
+}
+_QUERY_TITLE_HINT_RE = re.compile(r"[：:]|如何成为|怎样成为|关键能力|一文看懂|深度解析")
+
+
+def _compact_search_query(query: str) -> str:
+    clean = _normalize_query(query)
+    if not clean:
+        return ""
+    compact = re.sub(r"[\s，。！？,.!?]+", "", clean)
+    looks_like_title = (
+        len(compact) > 40
+        or bool(_QUERY_TITLE_HINT_RE.search(clean))
+        or ("\"" in clean or "“" in clean or "”" in clean)
+    )
+    if not looks_like_title:
+        return clean
+    split_source = clean
+    for stopword in sorted(_QUERY_STOPWORDS, key=len, reverse=True):
+        split_source = split_source.replace(stopword, " ")
+    raw_tokens = re.findall(
+        r"[A-Za-z0-9][A-Za-z0-9._+-]*|[\u4e00-\u9fff]{2,}",
+        split_source,
+    )
+    tokens: list[str] = []
+    seen: set[str] = set()
+    for token in raw_tokens:
+        normalized = token.strip()
+        if not normalized or normalized in _QUERY_STOPWORDS:
+            continue
+        key = normalized.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        tokens.append(normalized)
+        if len(tokens) >= 6:
+            break
+    compacted = " ".join(tokens[:6]).strip()
+    compacted_len = len(re.sub(r"\s+", "", compacted))
+    if compacted_len <= 2:
+        return clean
+    return compacted[:120]
 
 
 def _current_reply_text(text: str) -> str:

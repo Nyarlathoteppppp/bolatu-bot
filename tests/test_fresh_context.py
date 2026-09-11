@@ -12,6 +12,7 @@ from qq_social_agent.tools.fresh_context import (
     _parse_bing_rss,
     fact_pack_from_lookup,
     detect_fresh_intent,
+    _compact_search_query,
     _followup_skip_url,
     _httpx_timeout,
     _parse_google_news_rss,
@@ -804,3 +805,21 @@ async def test_related_cache_does_not_copy_page_text_across_queries() -> None:
     assert reused.answer == "双方局势仍在变化。"
     assert reused.page_text == ""
     assert reused.page_url == ""
+    assert reused.error == ""
+    context = _prompt_context_from_lookup(reused)
+    assert "复用上一跳条目" in context
+    assert "部分信息源失败" not in context
+
+
+def test_compact_search_query_keeps_short_terms_and_drops_title_stopwords() -> None:
+    title = "让触觉成为具身智能的关键能力：如何成为下一代机器人的感知底座"
+    compacted = _compact_search_query(title)
+    compact_blob = compacted.replace(" ", "")
+    assert "触觉" in compacted
+    assert "具身智能" in compacted
+    assert compact_blob != "让"
+    assert compacted.count("让") == 0
+    assert _compact_search_query("astra GPT-6 知乎") == "astra GPT-6 知乎"
+    intent = detect_fresh_intent("搜一下知乎上面的 astra")
+    assert intent is not None
+    assert "astra" in intent.query.casefold()
