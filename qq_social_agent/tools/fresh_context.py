@@ -9,7 +9,7 @@ import time
 from collections import OrderedDict
 from dataclasses import dataclass
 from email.utils import parsedate_to_datetime
-from urllib.parse import quote_plus, urlparse
+from urllib.parse import quote_plus, unquote, urlparse
 from xml.etree import ElementTree
 
 import httpx
@@ -54,6 +54,8 @@ class FreshLookup:
     page_text: str = ""
     page_status: str = ""
     page_error: str = ""
+    page_urls: tuple[str, ...] = ()
+    page_texts: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -70,6 +72,8 @@ class FreshFactPack:
     source_refs: tuple[str, ...] = ()
     page_text: str = ""
     page_url: str = ""
+    page_texts: tuple[str, ...] = ()
+    page_urls: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -104,9 +108,11 @@ class FreshContextTool:
         sports_cache_ttl_seconds: int | None = None,
         web_cache_ttl_seconds: int | None = None,
         url_reader: SafeUrlReader | None = None,
-        followup_page_max_tries: int = 2,
+        followup_page_max_tries: int = 4,
         followup_page_max_chars: int = 1800,
         followup_page_timeout_seconds: float = 3.0,
+        followup_page_max_successes: int = 2,
+        followup_search_hops: int = 2,
     ):
         self.max_external_queries_per_minute = max(0, int(max_external_queries_per_minute))
         self.cache_ttl_seconds = max(0, int(cache_ttl_seconds))
@@ -138,9 +144,11 @@ class FreshContextTool:
         }
         self._last_request: dict[str, object] = {}
         self.url_reader = url_reader
-        self.followup_page_max_tries = max(0, min(2, int(followup_page_max_tries)))
+        self.followup_page_max_tries = max(0, min(4, int(followup_page_max_tries)))
         self.followup_page_max_chars = max(400, min(4000, int(followup_page_max_chars)))
         self.followup_page_timeout_seconds = max(1.0, min(8.0, float(followup_page_timeout_seconds)))
+        self.followup_page_max_successes = max(1, min(2, int(followup_page_max_successes)))
+        self.followup_search_hops = max(1, min(2, int(followup_search_hops)))
 
     @classmethod
     def from_config(cls, config: object | None) -> "FreshContextTool":
@@ -179,6 +187,11 @@ class FreshContextTool:
             news_cache_ttl_seconds=_config_int(cfg, "news_cache_ttl_seconds", default=5 * 60),
             sports_cache_ttl_seconds=_config_int(cfg, "sports_cache_ttl_seconds", default=60),
             web_cache_ttl_seconds=_config_int(cfg, "web_cache_ttl_seconds", default=30 * 60),
+            followup_page_max_tries=_config_int(cfg, "followup_page_max_tries", default=4),
+            followup_page_max_chars=_config_int(cfg, "followup_page_max_chars", default=1800),
+            followup_page_timeout_seconds=_config_float(cfg, "followup_page_timeout_seconds", default=3.0),
+            followup_page_max_successes=_config_int(cfg, "followup_page_max_successes", default=2),
+            followup_search_hops=_config_int(cfg, "followup_search_hops", default=2),
         )
 
     async def context_for(self, query: str, *, kind: str = "news", force_refresh: bool = False) -> str:
@@ -224,6 +237,8 @@ class FreshContextTool:
                     page_text=lookup.page_text,
                     page_status=lookup.page_status,
                     page_error=lookup.page_error,
+                    page_urls=lookup.page_urls,
+                    page_texts=lookup.page_texts,
                 )
                 self._stats["cache_hits"] += 1
                 self._record_lookup(cached_lookup, started=started)
@@ -312,11 +327,37 @@ class FreshContextTool:
             status = "failed"
         else:
             status = "no_result"
+        ok_pages: tuple[UrlReadResult, ...] = ()
         page = None
         if status == "ok" and items:
-            page = await self._read_followup_page(items)
-            if page is not None and not page.ok:
+            ok_pages, page = await self._read_followup_pages(items, query=normalized_query)
+            if not ok_pages and self.followup_search_hops >= 2 and normalized_kind == "web":
+                hop_query = _second_hop_query(normalized_query)
+                if hop_query and hop_query != normalized_query:
+                    hop_timeout = min(2.0, max(0.8, self.timeout_seconds * 0.4))
+                    hop_provider = used_provider or self._resolved_provider(normalized_kind)
+                    try:
+                        hop_answer, hop_items = await asyncio.wait_for(
+                            self._lookup_provider(
+                                hop_provider,
+                                hop_query,
+                                kind=normalized_kind,
+                                timeout_seconds=hop_timeout,
+                            ),
+                            timeout=max(0.1, hop_timeout),
+                        )
+                    except (asyncio.TimeoutError, SearchProviderError, Exception):
+                        hop_answer, hop_items = "", ()
+                    if hop_items:
+                        attempted.append(f"{hop_provider}:hop2")
+                        merged = _merge_fresh_items(items, hop_items)
+                        if hop_answer and not answer:
+                            answer = hop_answer
+                        items = merged
+                        ok_pages, page = await self._read_followup_pages(items, query=hop_query)
+            if page is not None and not page.ok and not ok_pages:
                 errors.append(f"page:{page.error or page.status}")
+        first_page = ok_pages[0] if ok_pages else page
         latency_ms = int((time.monotonic() - started) * 1000)
         lookup = FreshLookup(
             normalized_query,
@@ -328,11 +369,13 @@ class FreshContextTool:
             attempted_providers=tuple(attempted),
             latency_ms=latency_ms,
             error=";".join(errors)[:240],
-            page_url=(page.final_url or page.requested_url) if page is not None else "",
-            page_title=page.title if page is not None else "",
-            page_text=page.text if page is not None and page.ok else "",
-            page_status=page.status if page is not None else "",
-            page_error=page.error if page is not None else "",
+            page_url=(first_page.final_url or first_page.requested_url) if first_page is not None else "",
+            page_title=first_page.title if first_page is not None else "",
+            page_text=ok_pages[0].text if ok_pages else "",
+            page_status=first_page.status if first_page is not None else "",
+            page_error=first_page.error if first_page is not None and not ok_pages else "",
+            page_urls=tuple((item.final_url or item.requested_url) for item in ok_pages),
+            page_texts=tuple(item.text for item in ok_pages),
         )
         self._cache[key] = (now, lookup)
         self._cache.move_to_end(key)
@@ -507,63 +550,115 @@ class FreshContextTool:
             "page_url": lookup.page_url[:180],
         }
 
-    async def _read_followup_page(self, items: tuple[FreshItem, ...]) -> UrlReadResult | None:
-        if self.url_reader is None or self.followup_page_max_tries <= 0:
-            return None
+    async def _read_followup_pages(
+        self,
+        items: tuple[FreshItem, ...],
+        *,
+        query: str,
+    ) -> tuple[tuple[UrlReadResult, ...], UrlReadResult | None]:
+        if self.followup_page_max_tries <= 0:
+            return (), None
+        ranked = _rank_followup_items(items, query=query)
         last: UrlReadResult | None = None
+        successes: list[UrlReadResult] = []
         tried = 0
-        for item in items:
-            url = str(item.url or "").strip()
-            if not url.startswith(("http://", "https://")):
-                continue
-            if _followup_skip_url(url):
-                continue
-            tried += 1
-            self._stats["page_reads"] += 1
-            try:
-                result = await asyncio.wait_for(
-                    self.url_reader.read(url),
-                    timeout=self.followup_page_timeout_seconds,
-                )
-            except asyncio.TimeoutError:
-                result = UrlReadResult("timeout", url, error="request_timeout")
-            except Exception as exc:
-                result = UrlReadResult("fetch_error", url, error=type(exc).__name__[:80])
-            if result.ok and _looks_like_login_wall(result):
-                result = UrlReadResult(
-                    "fetch_error",
-                    result.requested_url,
-                    final_url=result.final_url,
-                    title=result.title,
-                    content_type=result.content_type,
-                    bytes_read=result.bytes_read,
-                    redirects=result.redirects,
-                    error="login_wall",
-                    latency_ms=result.latency_ms,
-                )
-            last = result
-            if result.ok and result.text.strip():
-                text = result.text.strip()
-                truncated = result.truncated or len(text) > self.followup_page_max_chars
-                if len(text) > self.followup_page_max_chars:
-                    text = text[: self.followup_page_max_chars].rstrip()
-                self._stats["page_read_successes"] += 1
-                return UrlReadResult(
-                    result.status,
-                    result.requested_url,
-                    final_url=result.final_url,
-                    title=result.title,
-                    text=text,
-                    content_type=result.content_type,
-                    bytes_read=result.bytes_read,
-                    redirects=result.redirects,
-                    truncated=truncated,
-                    error=result.error,
-                    latency_ms=result.latency_ms,
-                )
-            if tried >= self.followup_page_max_tries:
+        index = 0
+        batch_size = max(1, min(2, self.followup_page_max_successes))
+        while index < len(ranked) and tried < self.followup_page_max_tries:
+            remaining_tries = self.followup_page_max_tries - tried
+            remaining_successes = self.followup_page_max_successes - len(successes)
+            if remaining_successes <= 0:
                 break
-        return last
+            batch: list[FreshItem] = []
+            while index < len(ranked) and len(batch) < min(batch_size, remaining_tries, remaining_successes):
+                item = ranked[index]
+                index += 1
+                url = str(item.url or "").strip()
+                if not url.startswith(("http://", "https://")):
+                    continue
+                if _followup_skip_url(url):
+                    continue
+                batch.append(item)
+            if not batch:
+                continue
+            results = await asyncio.gather(*[self._read_one_followup_url(item.url) for item in batch])
+            tried += len(batch)
+            for result in results:
+                last = result
+                if result.ok and result.text.strip():
+                    successes.append(result)
+                    if len(successes) >= self.followup_page_max_successes:
+                        return tuple(successes), successes[0]
+        return tuple(successes), last if successes else last
+
+    async def _read_one_followup_url(self, url: str) -> UrlReadResult:
+        self._stats["page_reads"] += 1
+        wiki = await _read_wikipedia_extract(url, timeout_seconds=self.followup_page_timeout_seconds)
+        if wiki is not None:
+            return self._finalize_followup_result(wiki)
+        if self.url_reader is None:
+            extracted = await _extract_tavily_url(
+                url,
+                api_key=self.tavily_api_key,
+                timeout_seconds=self.followup_page_timeout_seconds,
+            )
+            if extracted is not None:
+                return self._finalize_followup_result(extracted)
+            return UrlReadResult("fetch_error", url, error="reader_unavailable")
+        try:
+            result = await asyncio.wait_for(
+                self.url_reader.read(url),
+                timeout=self.followup_page_timeout_seconds,
+            )
+        except asyncio.TimeoutError:
+            result = UrlReadResult("timeout", url, error="request_timeout")
+        except Exception as exc:
+            result = UrlReadResult("fetch_error", url, error=type(exc).__name__[:80])
+        result = self._finalize_followup_result(result)
+        if result.ok and result.text.strip():
+            return result
+        extracted = await _extract_tavily_url(
+            url,
+            api_key=self.tavily_api_key,
+            timeout_seconds=min(2.5, self.followup_page_timeout_seconds),
+        )
+        if extracted is not None:
+            return self._finalize_followup_result(extracted)
+        return result
+
+    def _finalize_followup_result(self, result: UrlReadResult) -> UrlReadResult:
+        if result.ok and _looks_like_login_wall(result):
+            return UrlReadResult(
+                "fetch_error",
+                result.requested_url,
+                final_url=result.final_url,
+                title=result.title,
+                content_type=result.content_type,
+                bytes_read=result.bytes_read,
+                redirects=result.redirects,
+                error="login_wall",
+                latency_ms=result.latency_ms,
+            )
+        if result.ok and result.text.strip():
+            text = result.text.strip()
+            truncated = result.truncated or len(text) > self.followup_page_max_chars
+            if len(text) > self.followup_page_max_chars:
+                text = text[: self.followup_page_max_chars].rstrip()
+            self._stats["page_read_successes"] += 1
+            return UrlReadResult(
+                result.status,
+                result.requested_url,
+                final_url=result.final_url,
+                title=result.title,
+                text=text,
+                content_type=result.content_type,
+                bytes_read=result.bytes_read,
+                redirects=result.redirects,
+                truncated=truncated,
+                error=result.error,
+                latency_ms=result.latency_ms,
+            )
+        return result
 
 
 def _prompt_context_from_lookup(lookup: FreshLookup) -> str:
@@ -638,7 +733,9 @@ def fact_pack_from_lookup(lookup: FreshLookup) -> FreshFactPack:
         uncertain.append("来源较少，不能把单条摘要当成绝对事实。")
     if lookup.error and lookup.status != "ok":
         uncertain.append(f"部分信息源失败：{lookup.error}。")
-    if lookup.status == "ok" and not lookup.page_text:
+    page_texts = lookup.page_texts or ((lookup.page_text,) if lookup.page_text else ())
+    page_urls = lookup.page_urls or ((lookup.page_url,) if lookup.page_url else ())
+    if lookup.status == "ok" and not page_texts:
         uncertain.append("本轮没有读到网页正文，只能看到标题和摘要；不要把摘要数字当成已核实事实，也不要编造正文里没有的细节。")
     return FreshFactPack(
         topic=lookup.query,
@@ -651,8 +748,10 @@ def fact_pack_from_lookup(lookup: FreshLookup) -> FreshFactPack:
         sources=tuple(_dedupe_strings(sources)[:5]),
         cached=lookup.cached,
         source_refs=tuple(source_refs[:5]),
-        page_text=lookup.page_text,
-        page_url=lookup.page_url,
+        page_text=page_texts[0] if page_texts else "",
+        page_url=page_urls[0] if page_urls else "",
+        page_texts=tuple(page_texts[:2]),
+        page_urls=tuple(page_urls[:2]),
     )
 
 
@@ -687,12 +786,17 @@ def _prompt_context_from_fact_pack(pack: FreshFactPack) -> str:
     if pack.source_refs:
         lines.append("可追溯来源：")
         lines.extend(f"- {item}" for item in pack.source_refs[:5])
-    if pack.page_text:
+    page_texts = pack.page_texts or ((pack.page_text,) if pack.page_text else ())
+    page_urls = pack.page_urls or ((pack.page_url,) if pack.page_url else ())
+    if page_texts:
         lines.append(
             "网页正文（优先于下面的标题和摘要；数字、日期和结论以正文为准；"
-            f"来源 {pack.page_url or '本轮搜索结果'}）："
+            "多段正文冲突时优先更完整、更具体的一段，不要把两段拼成一件没写过的事）："
         )
-        lines.append(pack.page_text)
+        for index, text in enumerate(page_texts[:2], start=1):
+            url = page_urls[index - 1] if index - 1 < len(page_urls) else pack.page_url
+            lines.append(f"[S{index} 正文] {url or '本轮搜索结果'}：")
+            lines.append(text)
     if pack.facts:
         lines.append("事实背景：")
         lines.extend(f"- {fact}" for fact in pack.facts[:4])
@@ -1075,33 +1179,130 @@ def _fresh_result_key(title: str, url: str) -> str:
     return f"{host}:{title_key}"
 
 
-def _fresh_item_sort_key(item: FreshItem) -> tuple[int, int, float]:
+def _fresh_item_sort_key(item: FreshItem) -> tuple[int, int, int, int, float]:
+    host_score = _host_priority(item.url)
     has_date = 1 if item.published_at else 0
     has_summary = 1 if item.summary else 0
     score = item.score if item.score is not None else 0.0
-    return (-has_date, -has_summary, -score)
+    return (-host_score, 0, -has_date, -has_summary, -score)
+
+
+def _host_priority(url: str) -> int:
+    host = _normalized_host(_source_from_url(url))
+    if not host:
+        return 0
+    if _wikipedia_host(host):
+        return 6
+    if host == "github.com" or host.endswith(".github.io"):
+        return 5
+    if host.endswith(".gov.cn") or host.endswith(".edu.cn"):
+        return 4
+    if any(host == item or host.endswith("." + item) for item in _PREFERRED_NEWS_HOSTS):
+        return 3
+    if any(marker in host for marker in ("notes.", "zhihu.com", "bilibili.com", "hupu.com")):
+        return 2
+    return 0
+
+
+def _query_overlap_score(item: FreshItem, query: str) -> int:
+    terms = _query_overlap_terms(query)
+    if not terms:
+        return 0
+    haystack = f"{item.title} {item.summary} {item.url}".casefold()
+    return sum(1 for term in terms if term in haystack)
+
+
+def _query_overlap_terms(query: str) -> set[str]:
+    terms: set[str] = set()
+    for raw in re.findall(r"[A-Za-z0-9._-]{2,}|[\u4e00-\u9fff]{2,}", str(query or "")):
+        term = raw.casefold()
+        if term in {"https", "http", "www", "com", "最新", "消息", "新闻"}:
+            continue
+        terms.add(term)
+    return terms
+
+
+def _rank_followup_items(items: tuple[FreshItem, ...], *, query: str) -> tuple[FreshItem, ...]:
+    preferred_host = _preferred_host_from_query(query)
+    return tuple(
+        sorted(
+            items,
+            key=lambda item: (
+                0 if preferred_host and _host_matches(_source_from_url(item.url), preferred_host) else 1,
+                -_query_overlap_score(item, query),
+                -_host_priority(item.url),
+                0 if item.published_at else 1,
+                0 if item.summary else 1,
+                -(item.score or 0.0),
+            ),
+        )
+    )
+
+
+def _preferred_host_from_query(query: str) -> str:
+    compact = str(query or "").casefold()
+    mapping = (
+        ("知乎", "zhihu.com"),
+        ("github", "github.com"),
+        ("维基", "wikipedia.org"),
+        ("wiki", "wikipedia.org"),
+        ("wikipedia", "wikipedia.org"),
+        ("b站", "bilibili.com"),
+        ("bilibili", "bilibili.com"),
+    )
+    for marker, host in mapping:
+        if marker in compact:
+            return host
+    return ""
+
+
+def _merge_fresh_items(*groups: tuple[FreshItem, ...]) -> tuple[FreshItem, ...]:
+    merged: list[FreshItem] = []
+    seen: set[str] = set()
+    for group in groups:
+        for item in group:
+            key = _fresh_result_key(item.title, item.url)
+            if key in seen:
+                continue
+            seen.add(key)
+            merged.append(item)
+    return tuple(merged[:10])
+
+
+def _second_hop_query(query: str) -> str:
+    clean = _normalize_query(query)
+    if not clean:
+        return ""
+    compact = re.sub(r"\s+", "", clean.casefold())
+    if any(marker in compact for marker in ("维基", "wiki", "wikipedia")):
+        return clean
+    if any(marker in compact for marker in ("是什么", "是谁", "什么是", "简介", "定义")):
+        return f"{clean} 维基百科"
+    return ""
 
 
 def _looks_like_low_quality_result(title: str, source: str) -> bool:
-    haystack = f"{title} {source}".lower()
-    blocked = [
-        "x.com",
+    host = _normalized_host(_source_from_url(source) or source)
+    title_blob = f"{title} {source}".casefold()
+    if host in {"x.com", "twitter.com", "t.co"} or host.endswith(".x.com") or host.endswith(".twitter.com"):
+        return True
+    if "x.com/" in title_blob or "twitter.com/" in title_blob:
+        return True
+    blocked_title = (
         "网址",
         "直播地址",
         "results on x",
         "live posts & updates",
-        "hg",
-        "𝐡",
-        "𝐠",
         "博彩",
         "下注",
         "赔率",
         "胜平负",
-        "预测",
         "prediction",
         "odds",
-    ]
-    return any(token in haystack for token in blocked)
+    )
+    if any(token in title_blob for token in blocked_title):
+        return True
+    return False
 
 
 def fresh_kind_from_text(text: str) -> str | None:
@@ -1598,9 +1799,128 @@ def _httpx_timeout(timeout_seconds: float) -> httpx.Timeout:
     return httpx.Timeout(timeout=total, connect=connect)
 
 
+def _wikipedia_host(host: str) -> bool:
+    host = _normalized_host(host)
+    return any(host == suffix or host.endswith("." + suffix) for suffix in _WIKIPEDIA_HOST_SUFFIXES)
+
+
+def _wikipedia_title_from_url(url: str) -> tuple[str, str] | None:
+    try:
+        parsed = urlparse(url)
+    except ValueError:
+        return None
+    host = _normalized_host(parsed.netloc)
+    if not _wikipedia_host(host):
+        return None
+    path = unquote(parsed.path or "")
+    match = re.search(r"/(?:wiki|zh-cn|zh-hans|zh-hant|zh)/([^?#]+)$", path)
+    if not match:
+        return None
+    title = match.group(1).replace("_", " ").strip()
+    if not title or title.casefold() in {"main page", "首页", "wiki"}:
+        return None
+    lang = "zh"
+    host_match = re.match(r"^([a-z]{2,3})\.(?:m\.)?wikipedia\.org$", host)
+    if host_match:
+        lang = host_match.group(1)
+    elif host.startswith("zh."):
+        lang = "zh"
+    elif host.startswith("en."):
+        lang = "en"
+    return lang, title
+
+
+async def _read_wikipedia_extract(url: str, *, timeout_seconds: float) -> UrlReadResult | None:
+    parsed = _wikipedia_title_from_url(url)
+    if parsed is None:
+        return None
+    lang, title = parsed
+    api_url = f"https://{lang}.wikipedia.org/w/api.php"
+    params = {
+        "action": "query",
+        "format": "json",
+        "prop": "extracts",
+        "exintro": 1,
+        "explaintext": 1,
+        "redirects": 1,
+        "titles": title,
+    }
+    try:
+        async with httpx.AsyncClient(timeout=_httpx_timeout(timeout_seconds), follow_redirects=True) as client:
+            response = await client.get(
+                api_url,
+                params=params,
+                headers={"User-Agent": "qq-social-agent/0.1 (wikipedia extract)"},
+            )
+            response.raise_for_status()
+            data = response.json()
+    except Exception:
+        return None
+    pages = ((data or {}).get("query") or {}).get("pages") if isinstance(data, dict) else None
+    if not isinstance(pages, dict):
+        return None
+    for page in pages.values():
+        if not isinstance(page, dict):
+            continue
+        extract = str(page.get("extract") or "").strip()
+        page_title = str(page.get("title") or title).strip()
+        if not extract:
+            continue
+        return UrlReadResult(
+            "ok",
+            url,
+            final_url=url,
+            title=page_title,
+            text=extract,
+            content_type="application/json",
+        )
+    return None
+
+
+async def _extract_tavily_url(
+    url: str,
+    *,
+    api_key: str,
+    timeout_seconds: float,
+) -> UrlReadResult | None:
+    if not api_key or len(api_key) < 16 or not url.startswith(("http://", "https://")):
+        return None
+    try:
+        async with httpx.AsyncClient(timeout=_httpx_timeout(timeout_seconds), follow_redirects=True) as client:
+            response = await client.post(
+                "https://api.tavily.com/extract",
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json",
+                },
+                json={"urls": [url], "extract_depth": "basic"},
+            )
+            response.raise_for_status()
+            data = response.json()
+    except Exception:
+        return None
+    results = data.get("results") if isinstance(data, dict) else None
+    if not isinstance(results, list):
+        return None
+    for raw in results:
+        if not isinstance(raw, dict):
+            continue
+        raw_text = str(raw.get("raw_content") or raw.get("content") or "").strip()
+        if not raw_text:
+            continue
+        return UrlReadResult(
+            "ok",
+            url,
+            final_url=str(raw.get("url") or url),
+            title=str(raw.get("title") or ""),
+            text=raw_text,
+            content_type="text/plain",
+        )
+    return None
+
+
 _FOLLOWUP_SKIP_HOSTS = (
     "baike.baidu.com",
-    "wikipedia.org",
     "tieba.baidu.com",
     "weibo.com",
     "facebook.com",
@@ -1611,6 +1931,23 @@ _FOLLOWUP_SKIP_HOSTS = (
     "douyin.com",
     "mp.weixin.qq.com",
     "searx.space",
+)
+_PREFERRED_NEWS_HOSTS = (
+    "thepaper.cn",
+    "cls.cn",
+    "stcn.com",
+    "eastmoney.com",
+    "sina.com.cn",
+    "163.com",
+    "qq.com",
+    "people.com.cn",
+    "xinhuanet.com",
+    "gov.cn",
+)
+_WIKIPEDIA_HOST_SUFFIXES = (
+    "wikipedia.org",
+    "wikimedia.org",
+    "m.wikipedia.org",
 )
 _ZHIHU_HUB_PATHS = (
     "/",

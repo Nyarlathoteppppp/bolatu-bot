@@ -15,6 +15,11 @@ from qq_social_agent.tools.fresh_context import (
     _compact_search_query,
     _followup_skip_url,
     _httpx_timeout,
+    _looks_like_low_quality_result,
+    _rank_followup_items,
+    _read_wikipedia_extract,
+    _second_hop_query,
+    _wikipedia_title_from_url,
     _parse_google_news_rss,
     _parse_searxng_results,
     _parse_tavily_answer,
@@ -545,6 +550,8 @@ async def test_followup_reads_one_page_from_this_round_result_urls(monkeypatch) 
         provider="tavily",
         tavily_api_key="test-key",
         url_reader=reader,
+        followup_page_max_successes=1,
+        followup_search_hops=1,
     )
 
     lookup = await tool.lookup("NVIDIA 最新财报", kind="news")
@@ -594,6 +601,9 @@ async def test_followup_retries_next_url_at_most_twice(monkeypatch) -> None:
         provider="tavily",
         tavily_api_key="test-key",
         url_reader=reader,
+        followup_page_max_tries=2,
+        followup_page_max_successes=1,
+        followup_search_hops=1,
     )
 
     lookup = await tool.lookup("NVIDIA", kind="web")
@@ -627,6 +637,7 @@ async def test_followup_page_timeout_does_not_eat_full_reader_budget(monkeypatch
         tavily_api_key="test-key",
         url_reader=reader,
         followup_page_timeout_seconds=1.0,
+        followup_search_hops=1,
         timeout_seconds=5,
     )
     started = asyncio.get_running_loop().time()
@@ -771,14 +782,19 @@ async def test_followup_reads_zhihu_article_and_rejects_login_wall(monkeypatch) 
         )
 
     monkeypatch.setattr(fresh_context, "_fetch_tavily_lookup", fake_tavily)
-    tool = FreshContextTool(provider="tavily", tavily_api_key="test-key", url_reader=reader)
+    tool = FreshContextTool(
+        provider="tavily",
+        tavily_api_key="test-key",
+        url_reader=reader,
+        followup_search_hops=1,
+    )
     lookup = await tool.lookup("知乎 astra", kind="web")
     context = _prompt_context_from_lookup(lookup)
 
-    assert reader.urls == [
+    assert set(reader.urls) == {
         "https://zhuanlan.zhihu.com/p/wall",
         "https://zhuanlan.zhihu.com/p/astra",
-    ]
+    }
     assert "Astra 是跟算力迭代有关的模型" in lookup.page_text
     assert "网页正文" in context
     assert "热门话题" not in context
@@ -823,3 +839,107 @@ def test_compact_search_query_keeps_short_terms_and_drops_title_stopwords() -> N
     intent = detect_fresh_intent("搜一下知乎上面的 astra")
     assert intent is not None
     assert "astra" in intent.query.casefold()
+
+
+def test_low_quality_filter_uses_host_not_title_substring() -> None:
+    assert _looks_like_low_quality_result("HG 高达模型评测", "https://zhuanlan.zhihu.com/p/1") is False
+    assert _looks_like_low_quality_result("最新预测", "https://news.example.com/a") is False
+    assert _looks_like_low_quality_result("Live posts & updates", "https://x.com/foo") is True
+    assert _looks_like_low_quality_result("赛果", "https://twitter.com/foo") is True
+
+
+def test_rank_followup_items_prefers_query_host_and_wikipedia() -> None:
+    items = (
+        FreshItem("杂讯", "example.com", "2026-09-01", url="https://example.com/noise"),
+        FreshItem("Astra", "zhihu.com", "", url="https://zhuanlan.zhihu.com/p/astra"),
+        FreshItem("Astra", "wikipedia.org", "", url="https://zh.wikipedia.org/wiki/OpenAI"),
+    )
+    ranked = _rank_followup_items(items, query="知乎 astra")
+    assert ranked[0].url == "https://zhuanlan.zhihu.com/p/astra"
+    wiki_first = _rank_followup_items(items, query="OpenAI 是什么")
+    assert wiki_first[0].url == "https://zh.wikipedia.org/wiki/OpenAI"
+    assert _followup_skip_url("https://zh.wikipedia.org/wiki/OpenAI") is False
+    assert _wikipedia_title_from_url("https://zh.wikipedia.org/wiki/OpenAI") == ("zh", "OpenAI")
+    assert "维基百科" in _second_hop_query("Astra 是什么")
+
+
+@pytest.mark.anyio
+async def test_followup_reads_two_pages_in_parallel(monkeypatch) -> None:
+    reader = _FakeUrlReader(
+        [
+            UrlReadResult(
+                "ok",
+                "https://example.com/a",
+                final_url="https://example.com/a",
+                title="A",
+                text="第一页写 130.5 billion。",
+            ),
+            UrlReadResult(
+                "ok",
+                "https://example.com/b",
+                final_url="https://example.com/b",
+                title="B",
+                text="第二页写 Agent 模型。",
+            ),
+        ]
+    )
+
+    async def fake_tavily(query: str, *, kind: str, api_key: str):
+        return "摘要", (
+            FreshItem("A", "example.com", "", url="https://example.com/a"),
+            FreshItem("B", "example.com", "", url="https://example.com/b"),
+        )
+
+    monkeypatch.setattr(fresh_context, "_fetch_tavily_lookup", fake_tavily)
+    tool = FreshContextTool(
+        provider="tavily",
+        tavily_api_key="test-key",
+        url_reader=reader,
+        followup_search_hops=1,
+    )
+    lookup = await tool.lookup("NVIDIA", kind="web")
+    context = _prompt_context_from_lookup(lookup)
+    assert reader.urls == ["https://example.com/a", "https://example.com/b"]
+    assert lookup.page_texts[0].startswith("第一页")
+    assert "第二页写 Agent 模型" in lookup.page_texts[1]
+    assert "[S1 正文]" in context
+    assert "[S2 正文]" in context
+
+
+@pytest.mark.anyio
+async def test_wikipedia_extract_uses_api_not_html(monkeypatch) -> None:
+    class _NoHtmlReader:
+        async def read(self, url: str) -> UrlReadResult:
+            if "wikipedia.org" in url:
+                raise AssertionError(f"should not scrape html {url}")
+            return UrlReadResult("fetch_error", url, error="unused")
+
+    async def fake_wiki(url: str, *, timeout_seconds: float):
+        if "wikipedia.org" not in url:
+            return None
+        return UrlReadResult(
+            "ok",
+            url,
+            final_url=url,
+            title="OpenAI",
+            text="OpenAI 是一家人工智能研究公司。",
+            content_type="application/json",
+        )
+
+    async def fake_tavily(query: str, *, kind: str, api_key: str):
+        return "", (
+            FreshItem("OpenAI", "wikipedia.org", "", url="https://zh.wikipedia.org/wiki/OpenAI"),
+            FreshItem("杂讯", "example.com", "", url="https://example.com/noise"),
+        )
+
+    monkeypatch.setattr(fresh_context, "_fetch_tavily_lookup", fake_tavily)
+    monkeypatch.setattr(fresh_context, "_read_wikipedia_extract", fake_wiki)
+    tool = FreshContextTool(
+        provider="tavily",
+        tavily_api_key="test-key",
+        url_reader=_NoHtmlReader(),
+        followup_search_hops=1,
+    )
+    lookup = await tool.lookup("OpenAI 是什么", kind="web")
+    assert "人工智能研究公司" in lookup.page_text
+    assert lookup.page_url == "https://zh.wikipedia.org/wiki/OpenAI"
