@@ -9,6 +9,7 @@ import nonebot
 nonebot.init()
 
 import qq_social_agent.plugin as plugin
+from qq_social_agent.context_assembler import merge_rag_and_summary_context
 from qq_social_agent.plugin import (
     APPROVAL_CHOICE_RE,
     APPROVAL_DETAIL_COMMANDS,
@@ -2872,3 +2873,30 @@ def test_without_current_message_drops_buffered_speakers() -> None:
     )
 
     assert [msg.user_id for msg in remaining] == [33]
+
+
+def test_merge_rag_keeps_summary_appendix() -> None:
+    merged = merge_rag_and_summary_context(
+        "【检索到的旧群聊证据】\n- 旧聊记录",
+        "阶段回想：今天聊了 Astra",
+        summary_char_limit=80,
+    )
+    assert "旧聊记录" in merged
+    assert "【阶段回想附录】" in merged
+    assert "Astra" in merged
+    assert merge_rag_and_summary_context("", "只有回想") == "只有回想"
+    assert merge_rag_and_summary_context("只有 RAG", "") == "只有 RAG"
+
+
+def test_empty_mid_memory_skips_window_after_streak(monkeypatch, tmp_path) -> None:
+    _use_temp_plugin_memory(monkeypatch, tmp_path)
+    plugin.mid_memory_empty_streak.clear()
+    messages = [
+        ChatMessage(1, 11, "甲", f"m{index}", False, 100.0 + index, id=index + 1)
+        for index in range(3)
+    ]
+
+    assert plugin._note_empty_mid_memory(1, messages) == "empty_summary"
+    assert plugin._note_empty_mid_memory(1, messages) == "empty_summary"
+    assert plugin._note_empty_mid_memory(1, messages) == "skipped_empty_window"
+    assert plugin.mid_memory_empty_streak[1] == 0

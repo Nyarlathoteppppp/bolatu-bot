@@ -1870,6 +1870,25 @@ class MemoryStore:
         )
         self.conn.commit()
 
+    def advance_memory_summary_cursor(self, group_id: int, last_message_id: int) -> None:
+        """Move the mid-memory window forward without writing a summary."""
+
+        cursor = max(0, int(last_message_id))
+        if cursor <= 0:
+            return
+        self.conn.execute(
+            """
+            insert into memory_summary_state(group_id, last_message_id)
+            values (?, ?)
+            on conflict(group_id) do update set last_message_id = max(
+              memory_summary_state.last_message_id,
+              excluded.last_message_id
+            )
+            """,
+            (int(group_id), cursor),
+        )
+        self.conn.commit()
+
     def recent_memory_summaries(self, group_id: int, limit: int) -> list[MemorySummary]:
         rows = self.conn.execute(
             """
@@ -3723,6 +3742,35 @@ class MemoryStore:
         ).fetchall()
         return [_memory_atom_from_row(row) for row in rows]
 
+    def active_memory_atoms_for_subject(
+        self,
+        group_id: int,
+        subject_user_id: int | None,
+        *,
+        atom_types: tuple[str, ...] | None = None,
+        limit: int = 20,
+    ) -> list[MemoryAtom]:
+        if subject_user_id is None:
+            return []
+        clauses = ["group_id = ?", "status = 'active'", "subject_user_id = ?"]
+        params: list[object] = [int(group_id), int(subject_user_id)]
+        if atom_types:
+            placeholders = ",".join("?" for _ in atom_types)
+            clauses.append(f"atom_type in ({placeholders})")
+            params.extend(atom_types)
+        params.append(max(1, min(100, int(limit))))
+        rows = self.conn.execute(
+            f"""
+            select {_MEMORY_ATOM_SELECT_COLUMNS}
+            from memory_atoms
+            where {" and ".join(clauses)}
+            order by importance desc, updated_at desc, id desc
+            limit ?
+            """,
+            tuple(params),
+        ).fetchall()
+        return [_memory_atom_from_row(row) for row in rows]
+
     def relevant_memory_atoms(
         self,
         group_id: int,
@@ -3742,6 +3790,7 @@ class MemoryStore:
             from memory_atoms
             where group_id = ?
               and status = 'active'
+              and atom_type != 'jargon_candidate'
               and (valid_from is null or valid_from <= ?)
               and (valid_to is null or valid_to > ?)
               and (expires_at is null or expires_at > ?)

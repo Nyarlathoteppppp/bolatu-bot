@@ -654,3 +654,39 @@ def test_message_chain_storage_round_trip(tmp_path) -> None:
     recent = memory.recent_messages(1, 1)[0]
     assert recent.session_id == "group:1"
     assert "\"type\":\"at\"" in recent.message_segments_json
+
+
+def test_advance_memory_summary_cursor_skips_empty_window(tmp_path) -> None:
+    memory = MemoryStore(tmp_path / "bot.sqlite3")
+    for index in range(8):
+        memory.add_message(1, index, f"u{index}", f"m{index}", created_at=100 + index)
+    batch = memory.messages_for_mid_summary(1, keep_recent=3, batch_size=10)
+    assert [message.text for message in batch] == ["m0", "m1", "m2", "m3", "m4"]
+
+    memory.advance_memory_summary_cursor(1, batch[-1].id)
+
+    assert memory.recent_memory_summaries(1, 3) == []
+    assert memory.messages_for_mid_summary(1, keep_recent=3, batch_size=10) == []
+
+
+def test_relevant_memory_atoms_exclude_jargon_candidates(tmp_path) -> None:
+    memory = MemoryStore(tmp_path / "bot.sqlite3")
+    memory.upsert_memory_atom(
+        atom_type="jargon_candidate",
+        group_id=1,
+        content="黑话候选：南下了",
+        source="mid_summary:41",
+        importance=0.9,
+        confidence=0.9,
+    )
+    memory.upsert_memory_atom(
+        atom_type="preference",
+        group_id=1,
+        content="甲最近喜欢南下",
+        source="mid_summary:42",
+        importance=0.8,
+        confidence=0.9,
+    )
+
+    atoms = memory.relevant_memory_atoms(1, "南下")
+    assert [atom.atom_type for atom in atoms] == ["preference"]

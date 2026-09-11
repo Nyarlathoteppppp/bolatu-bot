@@ -58,7 +58,7 @@ from .admin_ui import (
 from .approval_models import PendingApprovalCandidate, PendingGroupApproval
 from .background_learning import BackgroundLearningCoordinator
 from .config import PROJECT_ROOT, load_config
-from .context_assembler import assemble_generation_context
+from .context_assembler import assemble_generation_context, merge_rag_and_summary_context
 from .content_ingestion import ContentIngestionService, explicit_file_read_requested
 from .cue_patterns import CuePatternTracker, CueRepeatState
 from .decision_gate import (
@@ -240,6 +240,7 @@ JARGON_LLM_SELECTOR_ENABLED = bool(
 cue_pattern_tracker = CuePatternTracker(window_seconds=10 * 60)
 deepseek_client: DeepSeekClient | None = None
 last_mid_memory_attempt: dict[int, float] = {}
+mid_memory_empty_streak: dict[int, int] = {}
 last_style_learn_attempt: dict[int, float] = {}
 addressed_event_times: dict[tuple[int, int], list[float]] = {}
 last_group_mention_targets: dict[int, tuple[int, float]] = {}
@@ -788,6 +789,8 @@ MID_MEMORY_KEEP_SUMMARIES = 4
 MID_MEMORY_BATCH_SIZE = 60
 MID_MEMORY_MIN_BATCH = 24
 MID_MEMORY_RETRY_INTERVAL_SECONDS = 10 * 60
+MID_MEMORY_EMPTY_SKIP_STREAK = 3
+MID_MEMORY_SUMMARY_APPENDIX_CHARS = 900
 STYLE_LEARN_INTERVAL_SECONDS = 60 * 60
 STYLE_LEARN_MESSAGE_LIMIT = 40
 STYLE_LEARN_CANDIDATE_LIMIT = 160
@@ -5876,14 +5879,20 @@ async def _handle_group_message_locked(
     if not rag_context_applied:
         rag_result = await rag_task
         rag_context_applied = True
-        if rag_result.context:
-            memory_context = rag_result.context
+        summary_context = memory_context
+        memory_context = merge_rag_and_summary_context(
+            rag_result.context,
+            summary_context,
+            summary_char_limit=MID_MEMORY_SUMMARY_APPENDIX_CHARS,
+        )
         _record_metric_event(
             "rag_retrieval",
             group_id=group_id,
             user_id=user_id,
             stage="generation_context",
-            action="injected" if rag_result.context else "empty",
+            action="merged" if rag_result.context and summary_context else (
+                "injected" if rag_result.context else "empty"
+            ),
             route=rag_result.plan.route,
             lexical_count=rag_result.lexical_count,
             semantic_count=rag_result.semantic_count,
@@ -6919,8 +6928,13 @@ async def _handle_private_message_scoped(
         )
 
     rag_result = await rag_task
-    memory_context = rag_result.context or _format_memory_context(
+    summary_context = _format_memory_context(
         memory.relevant_memory_summaries(chat_id, context_query, limit=MID_MEMORY_KEEP_SUMMARIES)
+    )
+    memory_context = merge_rag_and_summary_context(
+        rag_result.context,
+        summary_context,
+        summary_char_limit=MID_MEMORY_SUMMARY_APPENDIX_CHARS,
     )
     related_user_ids = _related_member_user_ids(context_recent, current_user_id=user_id)
     member_context = _format_member_context(
@@ -9511,9 +9525,29 @@ async def _run_group_learning(group_id: int) -> None:
             group_learning_tasks.pop(group_id, None)
 
 
+def _note_empty_mid_memory(group_id: int, summary_messages: list[ChatMessage]) -> str:
+    streak = mid_memory_empty_streak.get(group_id, 0) + 1
+    mid_memory_empty_streak[group_id] = streak
+    if streak < MID_MEMORY_EMPTY_SKIP_STREAK or not summary_messages:
+        return "empty_summary"
+    memory.advance_memory_summary_cursor(group_id, summary_messages[-1].id)
+    mid_memory_empty_streak[group_id] = 0
+    logger.warning(
+        "qq_social_agent mid memory skipped empty window: "
+        f"group={group_id} messages={len(summary_messages)} end_id={summary_messages[-1].id}"
+    )
+    return "skipped_empty_window"
+
+
 async def _maintain_group_learning(group_id: int) -> None:
     if deepseek_client is None:
         return
+
+    expired_atoms = memory.expire_due_memory_atoms(group_id=group_id)
+    if expired_atoms:
+        logger.info(
+            f"qq_social_agent expired due memory atoms: group={group_id} count={expired_atoms}"
+        )
 
     mid_messages = memory.messages_for_mid_summary(
         group_id,
@@ -9521,10 +9555,12 @@ async def _maintain_group_learning(group_id: int) -> None:
         batch_size=MID_MEMORY_BATCH_SIZE,
         include_bot=False,
     )
+    empty_streak = mid_memory_empty_streak.get(group_id, 0)
+    retry_wait = MID_MEMORY_RETRY_INTERVAL_SECONDS * (2 ** min(empty_streak, 3))
     if (
         len(mid_messages) >= MID_MEMORY_MIN_BATCH
         and time.time() - last_mid_memory_attempt.get(group_id, 0.0)
-        >= MID_MEMORY_RETRY_INTERVAL_SECONDS
+        >= retry_wait
     ):
         last_mid_memory_attempt[group_id] = time.time()
         try:
@@ -9558,6 +9594,7 @@ async def _maintain_group_learning(group_id: int) -> None:
                     f"group={group_id} messages={len(mid_messages)} cues={len(draft.recall_cues)} "
                     f"atoms={len(learned_atom_ids)}"
                 )
+                mid_memory_empty_streak[group_id] = 0
                 _record_metric_event(
                     "mid_memory_learning",
                     group_id=group_id,
@@ -9570,15 +9607,16 @@ async def _maintain_group_learning(group_id: int) -> None:
                     open_thread_count=len(draft.open_threads),
                 )
             else:
+                skip_action = _note_empty_mid_memory(group_id, summary_messages)
                 logger.warning(
                     "qq_social_agent mid memory returned empty summary: "
-                    f"group={group_id} messages={len(summary_messages)}"
+                    f"group={group_id} messages={len(summary_messages)} action={skip_action}"
                 )
                 _record_metric_event(
                     "mid_memory_learning",
                     group_id=group_id,
                     stage="memory",
-                    action="empty_summary",
+                    action=skip_action,
                     message_count=len(summary_messages),
                 )
         except Exception as exc:

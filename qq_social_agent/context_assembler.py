@@ -35,6 +35,24 @@ _MODE_TOTAL_BUDGETS: dict[PipelineMode, int] = {
 }
 
 
+def merge_rag_and_summary_context(
+    rag_context: str = "",
+    summary_context: str = "",
+    *,
+    summary_char_limit: int = 900,
+) -> str:
+    """Keep ranked mid-chat summaries beside RAG hits instead of replacing them."""
+
+    rag = (rag_context or "").strip()
+    summary = (summary_context or "").strip()
+    if not rag:
+        return summary
+    if not summary:
+        return rag
+    appendix = _trim_context(summary, max(80, int(summary_char_limit)))
+    return f"{rag}\n\n【阶段回想附录】\n{appendix}"
+
+
 def assemble_generation_context(
     *,
     memory_context: str = "",

@@ -9,6 +9,8 @@ from .deepseek_client import DailyReviewDraft, MemoryFactDraft, MidMemoryDraft
 from .memory import ChatMessage, MemoryStore
 
 
+_PROTECTED_IDENTITY_KINDS = frozenset({"identity"})
+_DEFAULT_OPEN_THREAD_DAYS = 21
 _ATOM_TYPE_BY_KIND = {
     "event": "event",
     "fact": "fact",
@@ -188,8 +190,17 @@ def persist_fact_drafts(
         valid_to = None
         if fact.valid_for_days is not None:
             valid_to = observed_at + max(1, fact.valid_for_days) * 24 * 60 * 60
+        elif fact.kind == "open_thread":
+            valid_to = observed_at + _DEFAULT_OPEN_THREAD_DAYS * 24 * 60 * 60
         evidence_label = ",".join(str(item) for item in evidence_ids[:4])
         source = f"{source_prefix}:{evidence_label}" if evidence_label else source_prefix
+        if _should_skip_learned_identity(
+            memory,
+            group_id=group_id,
+            fact=fact,
+            source_prefix=source_prefix,
+        ):
+            continue
         atom_id = memory.upsert_memory_atom(
             atom_type=_ATOM_TYPE_BY_KIND.get(fact.kind, "note"),
             group_id=group_id,
@@ -208,3 +219,32 @@ def persist_fact_drafts(
         if atom_id and atom_id not in atom_ids:
             atom_ids.append(atom_id)
     return tuple(atom_ids)
+
+
+def _should_skip_learned_identity(
+    memory: MemoryStore,
+    *,
+    group_id: int,
+    fact: MemoryFactDraft,
+    source_prefix: str,
+) -> bool:
+    if fact.kind not in _PROTECTED_IDENTITY_KINDS:
+        return False
+    if fact.subject_user_id is None:
+        return False
+    if not str(source_prefix).startswith(("mid_summary", "private_mid_summary", "daily_review")):
+        return False
+    lookup = getattr(memory, "active_memory_atoms_for_subject", None)
+    if lookup is None:
+        return False
+    protected = lookup(
+        group_id,
+        fact.subject_user_id,
+        atom_types=("identity",),
+    )
+    return any(
+        str(getattr(atom, "source", "") or "").startswith(
+            ("builtin_", "builtin:", "manual", "operator:", "admin_")
+        )
+        for atom in protected
+    )
