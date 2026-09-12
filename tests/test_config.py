@@ -1,4 +1,4 @@
-from qq_social_agent.config import AppConfig, PROJECT_ROOT, parse_llm_model_route
+from qq_social_agent.config import AppConfig, PROJECT_ROOT, load_config, parse_llm_model_route
 from qq_social_agent.persona import PersonaRegistry
 from qq_social_agent.prompts import PromptRegistry
 
@@ -225,6 +225,18 @@ def test_central_prompt_file_contains_all_runtime_flows() -> None:
             persona_prompt="人格",
             max_reply_chars=520,
         )
+
+
+def test_production_config_uses_official_deepseek_flash_for_reply() -> None:
+    config = load_config(PROJECT_ROOT / "config.yaml")
+
+    assert config.deepseek.routes["reply"].label == "deepseek/deepseek-flash"
+    assert config.deepseek.fallback_routes["reply"].label == "siliconflow/deepseek-ai/DeepSeek-V4-Flash"
+    assert "deepseek/deepseek-flash" in {route.label for route in config.deepseek.model_catalog}
+    assert config.raw["image_ocr"]["deepseek_vision_enabled"] is True
+    assert config.raw["image_ocr"]["deepseek_vision_model"] == "deepseek-flash"
+    assert config.raw["image_ocr"]["cache_empty_results"] is False
+    assert config.raw["image_ocr"]["siliconflow_fallback_enabled"] is True
 
 
 def test_persona_registry_loads_persona_from_central_prompt_file() -> None:

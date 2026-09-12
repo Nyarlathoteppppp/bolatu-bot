@@ -32,7 +32,7 @@ deepseek:
       thinking: disabled
   model: siliconflow/deepseek-ai/DeepSeek-V4-Flash
   decision_model: siliconflow/deepseek-ai/DeepSeek-V4-Flash
-  reply_model: siliconflow/deepseek-ai/DeepSeek-V4-Flash
+  reply_model: deepseek/deepseek-flash
   search_model: siliconflow/deepseek-ai/DeepSeek-V4-Flash
   utility_model: siliconflow/deepseek-ai/DeepSeek-V4-Flash
   jargon_model: siliconflow/deepseek-ai/DeepSeek-V4-Flash
@@ -40,6 +40,7 @@ deepseek:
   style_model: siliconflow/deepseek-ai/DeepSeek-V4-Flash
   member_profile_model: siliconflow/deepseek-ai/DeepSeek-V4-Flash
   model_catalog:
+    - deepseek/deepseek-flash
     - siliconflow/deepseek-ai/DeepSeek-V4-Flash
     - siliconflow/deepseek-ai/DeepSeek-V4-Pro
     - deepseek/deepseek-v4-flash
@@ -49,7 +50,7 @@ deepseek:
     - siliconflow/Pro/moonshotai/Kimi-K2.6
   fallback_models:
     decision: deepseek/deepseek-v4-flash
-    reply: deepseek/deepseek-v4-flash
+    reply: siliconflow/deepseek-ai/DeepSeek-V4-Flash
     search: deepseek/deepseek-v4-flash
     utility: deepseek/deepseek-v4-flash
     jargon: deepseek/deepseek-v4-flash
@@ -138,7 +139,16 @@ image_ocr:
   max_text_chars_per_image: 220
   max_calls_per_minute: 18
   cache_ttl_seconds: 86400
+  cache_empty_results: false
   api_timeout_seconds: 8
+  deepseek_vision_enabled: true
+  deepseek_vision_base_url: https://api.deepseek.com
+  deepseek_vision_api_key_env: DEEPSEEK_API_KEY
+  deepseek_vision_model: deepseek-flash
+  deepseek_vision_timeout_seconds: 20
+  deepseek_vision_max_tokens: 512
+  deepseek_vision_detail: high
+  deepseek_vision_prompt: 请帮群聊机器人理解这张图：1. 用一句话说图里大概是什么；2. 转写图中能看清的文字；3. 如果像表情包/梗图，说明它大概在表达什么。简短输出。
   siliconflow_fallback_enabled: true
   siliconflow_api_key_env: SILICONFLOW_API_KEY
   siliconflow_base_url: https://api.siliconflow.cn/v1

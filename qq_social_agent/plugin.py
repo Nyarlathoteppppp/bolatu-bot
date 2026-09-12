@@ -81,12 +81,19 @@ from .history_sync import (
     ReplyReference,
     backfill_group_history,
     event_message_source_id,
+    reply_message_id,
     resolve_reply_reference,
 )
-from .media_context import ImageOcrContext, ImageOcrService, file_metadata_context_for_event
+from .media_context import (
+    ImageOcrContext,
+    ImageOcrService,
+    collect_ocr_image_segments,
+    file_metadata_context_for_event,
+)
 from .meme_library import PrivateMemeLibrary
 from .message_segments import (
     CONTEXT_MEDIA_SEGMENT_TYPES,
+    message_text_from_payload,
     segment_placeholder as normalized_segment_placeholder,
     segment_type_and_data,
 )
@@ -1143,15 +1150,13 @@ MODEL_ROUTE_INFOS = (
 MODEL_ROUTE_NAMES = tuple(route_name for route_name, _, _ in MODEL_ROUTE_INFOS)
 MODEL_ROUTE_STORAGE_NAMES = (*MODEL_ROUTE_NAMES, "utility")
 UTILITY_GROUP_ROUTE_NAMES = ("jargon", "memory", "style", "member_profile")
-CHANGELOG_NOTICE_KEY = "2026-07-10-model-routes-v5"
+CHANGELOG_NOTICE_KEY = "2026-09-12-official-reply-vision-v1"
 CHANGELOG_NOTICE_MESSAGE = """张风雪后端更新记录：
-1. 1535071184 恢复为主人私聊：可普通对话、审批/工具命令和强服从；不再是命令专用号。
-2. 工具命令兼容“bot 工具 审批”这种带空格写法。
-3. LLM 路由拆细：决策、回复、黑话、记忆、风格都可以单独切模型。
-4. 群聊风格学习默认改为 siliconflow/deepseek-ai/DeepSeek-V4-Flash。
-5. 可切换模型目录新增 siliconflow/Pro/moonshotai/Kimi-K2.6。
-6. 模型状态会显示可切换部分、当前模型、fallback、API key 来源和可切换模型清单。
-7. 切工具模型 <模型> 保留为兼容批量命令，会同时切黑话/记忆/风格/画像。
+1. 回复模型默认改为官方 deepseek/deepseek-flash（V4.1 Flash，可看图）。
+2. 识图主链路改为同一条官方视觉；SiliconFlow DeepSeek-OCR 仅作兜底。
+3. 空 OCR 结果不再缓存 24 小时，失败后下次还能重试。
+4. 引用图、转发图也会识图；历史纯图片会留下 [图片] 占位，不再直接丢掉。
+5. 回复模型 fallback 仍是 siliconflow/deepseek-ai/DeepSeek-V4-Flash。
 
 审批提醒：
 - 审批：A/B/C 或 1/2/3 发送；D/X/取消 不发。
@@ -3373,7 +3378,7 @@ def _format_model_route_status() -> str:
         provider = app_config.deepseek.providers[route.provider]
         lines.append(f"- {route.label}（{_provider_key_source(provider.name)} / {provider.api_key_env}）")
     lines.append("")
-    lines.append("命令示例：切回复模型 siliconflow/deepseek-ai/DeepSeek-V4-Flash；切搜索模型 siliconflow/deepseek-ai/DeepSeek-V4-Flash；切决策模型 siliconflow/deepseek-ai/DeepSeek-V4-Flash；清模型覆盖。")
+    lines.append("命令示例：切回复模型 deepseek/deepseek-flash；切搜索模型 siliconflow/deepseek-ai/DeepSeek-V4-Flash；切决策模型 siliconflow/deepseek-ai/DeepSeek-V4-Flash；清模型覆盖。")
     return "\n".join(lines)
 
 
@@ -4431,9 +4436,13 @@ def _status_image_ocr() -> dict[str, object]:
     return {
         "enabled": bool(cfg.get("enabled", True)),
         "napcat_ocr_enabled": bool(cfg.get("napcat_ocr_enabled", True)),
+        "deepseek_vision_enabled": bool(cfg.get("deepseek_vision_enabled", True)),
+        "deepseek_vision_model": str(cfg.get("deepseek_vision_model", "deepseek-flash")),
+        "deepseek_vision_api_key_env": str(cfg.get("deepseek_vision_api_key_env", "DEEPSEEK_API_KEY")),
         "siliconflow_fallback_enabled": bool(cfg.get("siliconflow_fallback_enabled", False)),
         "siliconflow_model": str(cfg.get("siliconflow_model", "deepseek-ai/DeepSeek-OCR")),
         "siliconflow_api_key_env": str(cfg.get("siliconflow_api_key_env", "SILICONFLOW_API_KEY")),
+        "cache_empty_results": bool(cfg.get("cache_empty_results", False)),
         "max_images_per_message": int(cfg.get("max_images_per_message", 2)),
         "max_calls_per_minute": int(cfg.get("max_calls_per_minute", 18)),
     }
@@ -7699,7 +7708,12 @@ async def _image_ocr_context_for_event(
     if not group_allowed:
         return ImageOcrContext("", 0, 0, "group_not_allowed")
     started_at = time.monotonic()
-    context = await image_ocr_service.context_for_event(bot, event)
+    extra_image_segments = await _ocr_related_image_segments(bot, event)
+    context = await image_ocr_service.context_for_event(
+        bot,
+        event,
+        extra_image_segments=extra_image_segments,
+    )
     if context.image_count:
         _record_metric_event(
             "image_ocr",
@@ -7724,6 +7738,73 @@ async def _image_ocr_context_for_event(
 def _format_image_ocr_context(context: ImageOcrContext) -> str:
     text = _short_notice_text(context.text, 360)
     return f"{IMAGE_OCR_CONTEXT_PREFIX} {text}]" if text else ""
+
+
+async def _ocr_related_image_segments(
+    bot: Bot,
+    event: GroupMessageEvent | PrivateMessageEvent,
+) -> list[dict[str, object]]:
+    extra: list[dict[str, object]] = []
+    reply_images = _reply_ocr_image_segments(event)
+    extra.extend(reply_images)
+    if not reply_images and _event_has_reply_context(event):
+        extra.extend(await _fetch_reply_ocr_image_segments(bot, event))
+    forward_images = _inline_forward_ocr_image_segments(event)
+    extra.extend(forward_images)
+    if not forward_images and _forward_message_ids(event):
+        extra.extend(await _fetch_forward_ocr_image_segments(bot, event))
+    return extra
+
+
+def _reply_ocr_image_segments(event: GroupMessageEvent | PrivateMessageEvent) -> list[dict[str, object]]:
+    reply = getattr(event, "reply", None)
+    if reply is None:
+        return []
+    return collect_ocr_image_segments(getattr(reply, "message", None))
+
+
+async def _fetch_reply_ocr_image_segments(
+    bot: Bot,
+    event: GroupMessageEvent | PrivateMessageEvent,
+) -> list[dict[str, object]]:
+    message_id = reply_message_id(event)
+    if not message_id:
+        return []
+    try:
+        payload = await onebot_gateway.get_msg(bot, message_id)
+    except Exception as exc:
+        logger.warning(f"qq_social_agent reply image fetch failed: error={exc}")
+        return []
+    return collect_ocr_image_segments(payload)
+
+
+def _inline_forward_ocr_image_segments(
+    event: GroupMessageEvent | PrivateMessageEvent,
+) -> list[dict[str, object]]:
+    images: list[dict[str, object]] = []
+    for payload in _inline_forward_payloads(event):
+        images.extend(collect_ocr_image_segments(payload))
+    return images
+
+
+async def _fetch_forward_ocr_image_segments(
+    bot: Bot,
+    event: GroupMessageEvent | PrivateMessageEvent,
+) -> list[dict[str, object]]:
+    images: list[dict[str, object]] = []
+    for forward_id in _forward_message_ids(event)[:2]:
+        try:
+            payload = await onebot_gateway.get_forward_msg(bot, forward_id)
+        except Exception as exc:
+            logger.warning(
+                "qq_social_agent forward image fetch failed: "
+                f"forward_id={forward_id} error={exc}"
+            )
+            continue
+        images.extend(collect_ocr_image_segments(payload))
+        if images:
+            break
+    return images
 
 
 def _event_has_reply_context(event: GroupMessageEvent | PrivateMessageEvent) -> bool:
@@ -7862,12 +7943,7 @@ def _event_reply_context(
     if reply is None and resolved_reply is None:
         return ""
     raw_message = getattr(reply, "message", None) if reply is not None else None
-    message_text = ""
-    if raw_message is not None:
-        try:
-            message_text = raw_message.extract_plain_text().strip()
-        except Exception:
-            message_text = str(raw_message).strip()
+    message_text = message_text_from_payload(raw_message, language="zh") if raw_message is not None else ""
     if not message_text and resolved_reply is not None:
         message_text = resolved_reply.text.strip()
     sender = getattr(reply, "sender", None) if reply is not None else None
@@ -9077,28 +9153,7 @@ def _forward_sender_label(sender: object, item: dict[str, object]) -> str:
 
 
 def _forward_content_plain_text(content: object) -> str:
-    if hasattr(content, "extract_plain_text"):
-        try:
-            return re.sub(r"\s+", " ", content.extract_plain_text().strip())
-        except Exception:
-            pass
-    if isinstance(content, str):
-        clean = re.sub(r"\[CQ:[^\]]+\]", " ", content)
-        return re.sub(r"\s+", " ", clean).strip()
-    if isinstance(content, dict):
-        segment_type = str(content.get("type", "") or "")
-        data = content.get("data") if isinstance(content.get("data"), dict) else {}
-        if segment_type == "text":
-            return re.sub(r"\s+", " ", str(data.get("text", "") or "").strip())
-        return _message_segment_placeholder(segment_type, data)
-    if isinstance(content, list):
-        parts: list[str] = []
-        for segment in content:
-            text = _forward_content_plain_text(segment)
-            if text:
-                parts.append(text)
-        return re.sub(r"\s+", " ", " ".join(parts)).strip()
-    return ""
+    return message_text_from_payload(content, language="zh")
 
 
 async def _summarize_forward_records(raw: str, *, nickname: str) -> str:

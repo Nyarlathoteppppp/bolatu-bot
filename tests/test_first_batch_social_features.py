@@ -299,6 +299,225 @@ def test_image_ocr_service_can_use_fallback_without_napcat_ocr() -> None:
     assert context.text == "第1张图：fallback 识别文字"
 
 
+def test_image_ocr_service_uses_primary_vision_before_fallback() -> None:
+    class RejectNapcatOcrBot:
+        async def call_api(self, api: str, **data):
+            raise AssertionError(f"NapCat OCR should not be called: {api}")
+
+    class FakePrimaryOcr:
+        def __init__(self) -> None:
+            self.targets = []
+
+        async def recognize(self, target: str) -> str:
+            self.targets.append(target)
+            return "官方视觉识别"
+
+    class FakeFallbackOcr:
+        async def recognize(self, target: str) -> str:
+            raise AssertionError(f"fallback should not run: {target}")
+
+    primary = FakePrimaryOcr()
+    event = SimpleNamespace(
+        message=[
+            SimpleNamespace(type="image", data={"url": "https://example.com/vision.png"}),
+        ],
+    )
+    service = ImageOcrService(
+        max_images_per_message=1,
+        max_calls_per_minute=10,
+        napcat_ocr_enabled=False,
+        primary_ocr=primary,
+        fallback_ocr=FakeFallbackOcr(),
+    )
+
+    context = asyncio.run(service.context_for_event(RejectNapcatOcrBot(), event))
+
+    assert primary.targets == ["https://example.com/vision.png"]
+    assert context.text == "第1张图：官方视觉识别"
+
+
+def test_image_ocr_service_falls_back_when_primary_vision_is_empty() -> None:
+    class RejectNapcatOcrBot:
+        async def call_api(self, api: str, **data):
+            raise AssertionError(f"NapCat OCR should not be called: {api}")
+
+    class EmptyPrimaryOcr:
+        async def recognize(self, target: str) -> str:
+            return ""
+
+    class FakeFallbackOcr:
+        async def recognize(self, target: str) -> str:
+            return "SiliconFlow 兜底识别"
+
+    event = SimpleNamespace(
+        message=[
+            SimpleNamespace(type="image", data={"url": "https://example.com/fallback-after-empty.png"}),
+        ],
+    )
+    service = ImageOcrService(
+        max_images_per_message=1,
+        max_calls_per_minute=10,
+        napcat_ocr_enabled=False,
+        primary_ocr=EmptyPrimaryOcr(),
+        fallback_ocr=FakeFallbackOcr(),
+    )
+
+    context = asyncio.run(service.context_for_event(RejectNapcatOcrBot(), event))
+
+    assert context.text == "第1张图：SiliconFlow 兜底识别"
+
+
+def test_image_ocr_service_does_not_cache_empty_results() -> None:
+    class EmptyThenTextBot:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def call_api(self, api: str, **data):
+            self.calls += 1
+            if self.calls <= 2:
+                return {"texts": []}
+            return {"texts": [{"text": "第二次才识别到"}]}
+
+    event = SimpleNamespace(
+        message=[
+            SimpleNamespace(type="image", data={"url": "https://example.com/retry.png"}),
+        ],
+    )
+    service = ImageOcrService(
+        max_images_per_message=1,
+        max_calls_per_minute=10,
+        cache_empty_results=False,
+    )
+    bot = EmptyThenTextBot()
+
+    first = asyncio.run(service.context_for_event(bot, event))
+    second = asyncio.run(service.context_for_event(bot, event))
+
+    assert first.ocr_count == 0
+    assert first.skipped_reason == "empty_ocr"
+    assert second.text == "第1张图：第二次才识别到"
+
+
+def test_image_ocr_service_reads_extra_reply_images() -> None:
+    class FakeOcrBot:
+        async def call_api(self, api: str, **data):
+            assert api == "ocr_image"
+            return {"texts": [{"text": "引用图文字"}]}
+
+    event = SimpleNamespace(
+        message=[SimpleNamespace(type="text", data={"text": "这是啥"})],
+    )
+    service = ImageOcrService(max_images_per_message=2, max_calls_per_minute=10)
+    context = asyncio.run(
+        service.context_for_event(
+            FakeOcrBot(),
+            event,
+            extra_image_segments=[{"url": "https://example.com/reply.png"}],
+        )
+    )
+
+    assert context.image_count == 1
+    assert context.text == "第1张图：引用图文字"
+
+
+def test_ocr_related_image_segments_include_reply_and_forward() -> None:
+    class FakeRelatedBot:
+        async def call_api(self, api: str, **data):
+            if api == "get_msg":
+                assert data == {"message_id": 42}
+                return {
+                    "message": [
+                        {"type": "image", "data": {"url": "https://example.com/reply.png"}},
+                    ]
+                }
+            if api == "get_forward_msg":
+                assert data == {"id": "fwd-1"}
+                return {
+                    "messages": [
+                        {
+                            "type": "node",
+                            "data": {
+                                "content": [
+                                    {"type": "image", "data": {"url": "https://example.com/fwd.png"}},
+                                ]
+                            },
+                        }
+                    ]
+                }
+            raise AssertionError(f"unexpected api {api}: {data}")
+
+    event = SimpleNamespace(
+        reply=SimpleNamespace(message=None, message_id=42),
+        message=[
+            SimpleNamespace(type="reply", data={"id": "42"}),
+            SimpleNamespace(type="forward", data={"id": "fwd-1"}),
+        ],
+    )
+
+    extra = asyncio.run(plugin._ocr_related_image_segments(FakeRelatedBot(), event))
+    urls = [item.get("url") for item in extra]
+    assert "https://example.com/reply.png" in urls
+    assert "https://example.com/fwd.png" in urls
+
+
+def test_history_backfill_keeps_image_placeholder(tmp_path) -> None:
+    class FakeHistoryBot:
+        self_id = 999
+
+        async def call_api(self, api: str, **data):
+            assert api == "get_group_msg_history"
+            return {
+                "messages": [
+                    {
+                        "message_id": 11,
+                        "group_id": 1,
+                        "user_id": 100,
+                        "time": 1000,
+                        "sender": {"user_id": 100, "nickname": "A"},
+                        "message": [{"type": "image", "data": {"summary": "截图"}}],
+                    }
+                ]
+            }
+
+    memory = MemoryStore(tmp_path / "bot.sqlite3")
+    inserted = asyncio.run(backfill_group_history(FakeHistoryBot(), memory, 1, count=20, self_id=999))
+
+    assert inserted == 1
+    assert [message.text for message in memory.recent_messages(1, 3)] == ["[图片:截图]"]
+
+
+def test_event_reply_context_keeps_image_placeholder() -> None:
+    event = SimpleNamespace(
+        user_id=1535071184,
+        sender=SimpleNamespace(card="歌迷老蛆", nickname=""),
+        reply=SimpleNamespace(
+            user_id=123456789,
+            sender=SimpleNamespace(card="安钰与雨与余", nickname=""),
+            message=[{"type": "image", "data": {"summary": "截图"}}],
+            message_id=42,
+        ),
+        message=[
+            SimpleNamespace(type="reply", data={"id": "42"}),
+            SimpleNamespace(type="text", data={"text": "这是啥"}),
+        ],
+        get_plaintext=lambda: "这是啥",
+    )
+
+    text = plugin._message_context_text(event)
+
+    assert "安钰与雨与余[#56789]说：[图片:截图]" in text
+    assert "原消息内容未知" not in text
+
+
+def test_status_image_ocr_reports_official_vision() -> None:
+    status = plugin._status_image_ocr()
+
+    assert status["deepseek_vision_enabled"] is True
+    assert status["deepseek_vision_model"] == "deepseek-flash"
+    assert status["cache_empty_results"] is False
+    assert status["siliconflow_fallback_enabled"] is True
+
+
 def test_unreadable_image_with_ocr_context_can_enter_buffer() -> None:
     event = SimpleNamespace(
         message=[SimpleNamespace(type="image", data={"summary": "截图"})],

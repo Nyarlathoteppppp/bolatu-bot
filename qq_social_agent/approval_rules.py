@@ -23,7 +23,7 @@ D/X/取消 不发；T 打开工具单；R 展开详细目录。
 
 BOT_TOOL_INDEX_MESSAGE = """张风雪 bot工具目录：
 用法：回 T/工具 打开本目录；回 A/B/C 展开栏目；回 A1/B3 直接执行。
-带参数的命令直接发完整句，例如：加私聊 123456789、拦截 20、切回复模型 siliconflow/deepseek-ai/DeepSeek-V4-Flash。
+带参数的命令直接发完整句，例如：加私聊 123456789、拦截 20、切回复模型 deepseek/deepseek-flash。
 
 A 查看/调试：A1拦截 A2模型 A3审批人 A4私聊白名单 A5 token A6统计。
 B 学习/画像：B1记忆 B2风格 B3群友画像 B4记忆单元。
@@ -135,7 +135,7 @@ BOT_TOOL_SECTION_MESSAGES = {
 6. 记忆模型：中期聊天回想压缩。
 7. 风格模型：群聊表达风格学习。
 8. 画像模型：群友长期画像摘要。
-9. 切回复模型 siliconflow/deepseek-ai/DeepSeek-V4-Flash。
+9. 切回复模型 deepseek/deepseek-flash。
 10. 切风格模型 siliconflow/deepseek-ai/DeepSeek-V4-Flash。
 11. 切画像模型 siliconflow/deepseek-ai/DeepSeek-V4-Flash。
 12. 切决策模型 siliconflow/deepseek-ai/DeepSeek-V4-Flash。

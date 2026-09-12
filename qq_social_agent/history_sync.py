@@ -78,7 +78,7 @@ def normalize_message_payload(payload: dict[str, Any], *, fallback_group_id: int
         return None
     group_id = coerce_int(payload.get("group_id"), fallback_group_id)
     nickname = sender_nickname(sender, fallback_user_id=user_id)
-    text = message_text_from_payload(payload)
+    text = message_text_from_payload(payload, language="zh")
     created_at = float(coerce_int(payload.get("time") or payload.get("timestamp"), 0) or time.time())
     return HistoricalMessage(
         group_id=group_id,
@@ -105,7 +105,7 @@ async def resolve_reply_reference(
     sender = payload.get("sender") if isinstance(payload.get("sender"), dict) else {}
     user_id = coerce_int(payload.get("user_id") or sender.get("user_id") or sender.get("uin"), 0) or None
     nickname = sender_nickname(sender, fallback_user_id=user_id)
-    text = message_text_from_payload(payload)
+    text = message_text_from_payload(payload, language="zh")
     return ReplyReference(message_id=str(message_id), user_id=user_id, nickname=nickname, text=text)
 
 
@@ -137,7 +137,7 @@ def _event_reply_has_text(event: Any) -> bool:
     if reply is None:
         return False
     raw_message = getattr(reply, "message", None)
-    return bool(message_text_from_payload(raw_message))
+    return bool(message_text_from_payload(raw_message, language="zh"))
 
 
 def _message_id_from_payload(payload: dict[str, Any]) -> str:

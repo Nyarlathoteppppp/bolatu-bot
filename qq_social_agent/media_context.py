@@ -16,7 +16,7 @@ from .message_segments import (
     segment_type_and_data,
     segments_to_text,
 )
-from .siliconflow_ocr import SiliconFlowOcrClient
+from .siliconflow_ocr import SiliconFlowOcrClient, VisionOcrClient
 
 
 @dataclass(frozen=True)
@@ -51,16 +51,20 @@ class ImageOcrService:
         cache_ttl_seconds: int = 24 * 60 * 60,
         api_timeout_seconds: float = 8.0,
         napcat_ocr_enabled: bool = True,
-        fallback_ocr: SiliconFlowOcrClient | None = None,
+        primary_ocr: VisionOcrClient | None = None,
+        fallback_ocr: SiliconFlowOcrClient | VisionOcrClient | None = None,
+        cache_empty_results: bool = False,
     ) -> None:
         self.enabled = enabled
         self.max_images_per_message = max(0, int(max_images_per_message))
         self.max_text_chars_per_image = max(40, int(max_text_chars_per_image))
         self.max_calls_per_minute = max(0, int(max_calls_per_minute))
-        self.cache_ttl_seconds = max(60, int(cache_ttl_seconds))
+        self.cache_ttl_seconds = max(0, int(cache_ttl_seconds))
         self.api_timeout_seconds = max(0.05, float(api_timeout_seconds))
         self.napcat_ocr_enabled = bool(napcat_ocr_enabled)
+        self.primary_ocr = primary_ocr
         self.fallback_ocr = fallback_ocr
+        self.cache_empty_results = bool(cache_empty_results)
         self._cache: dict[str, _OcrCacheEntry] = {}
         self._call_times: deque[float] = deque()
 
@@ -75,13 +79,22 @@ class ImageOcrService:
             cache_ttl_seconds=int(cfg.get("cache_ttl_seconds", 24 * 60 * 60)),
             api_timeout_seconds=float(cfg.get("api_timeout_seconds", 8.0)),
             napcat_ocr_enabled=bool(cfg.get("napcat_ocr_enabled", True)),
+            primary_ocr=VisionOcrClient.from_deepseek_config(cfg),
             fallback_ocr=SiliconFlowOcrClient.from_config(cfg),
+            cache_empty_results=bool(cfg.get("cache_empty_results", False)),
         )
 
-    async def context_for_event(self, bot: onebot_gateway.OneBotGateway, event: Any) -> ImageOcrContext:
+    async def context_for_event(
+        self,
+        bot: onebot_gateway.OneBotGateway,
+        event: Any,
+        extra_image_segments: list[dict[str, Any]] | tuple[dict[str, Any], ...] = (),
+    ) -> ImageOcrContext:
         if not self.enabled:
             return ImageOcrContext("", 0, 0, "disabled")
-        image_segments = ocr_image_segments_from_event(event)
+        image_segments = _unique_ocr_image_segments(
+            [*ocr_image_segments_from_event(event), *list(extra_image_segments)]
+        )
         if not image_segments:
             return ImageOcrContext("", 0, 0)
         if self.max_images_per_message <= 0:
@@ -135,10 +148,12 @@ class ImageOcrService:
             seen_targets.add(target)
             text = await self._ocr_target(bot, target)
             if text:
-                self._cache[image_key] = _OcrCacheEntry(text=text, created_at=time.time())
+                self._store_cache(image_key, text)
                 return ImageOcrResult(image_key=image_key, text=text, from_cache=False)
-        self._cache[image_key] = _OcrCacheEntry(text="", created_at=time.time())
+        if self.cache_empty_results:
+            self._store_cache(image_key, "")
         return None
+
     async def _ocr_target(self, bot: onebot_gateway.OneBotGateway, target: str) -> str:
         if self.napcat_ocr_enabled:
             for enhanced in (False, True):
@@ -157,23 +172,35 @@ class ImageOcrService:
                 text = parse_ocr_text(payload)
                 if text:
                     return text
-        if self.fallback_ocr is not None:
+        for client in (self.primary_ocr, self.fallback_ocr):
+            if client is None:
+                continue
             if not self._rate_limit_available(time.time()):
                 return ""
             self._remember_call(time.time())
             try:
-                text = await self.fallback_ocr.recognize(target)
+                text = await client.recognize(target)
             except Exception:
-                return ""
+                continue
             if text:
                 return _compact_ocr_text(text, 500)
         return ""
+
+    def _store_cache(self, image_key: str, text: str) -> None:
+        if self.cache_ttl_seconds <= 0:
+            return
+        if not text and not self.cache_empty_results:
+            return
+        self._cache[image_key] = _OcrCacheEntry(text=text, created_at=time.time())
 
     def _cached_text(self, image_key: str) -> str | None:
         entry = self._cache.get(image_key)
         if entry is None:
             return None
-        if time.time() - entry.created_at > self.cache_ttl_seconds:
+        if self.cache_ttl_seconds <= 0 or time.time() - entry.created_at > self.cache_ttl_seconds:
+            self._cache.pop(image_key, None)
+            return None
+        if not entry.text and not self.cache_empty_results:
             self._cache.pop(image_key, None)
             return None
         return entry.text
@@ -189,9 +216,10 @@ class ImageOcrService:
         self._call_times.append(now)
 
     async def aclose(self) -> None:
-        closer = getattr(self.fallback_ocr, "aclose", None)
-        if closer is not None:
-            await closer()
+        for client in (self.primary_ocr, self.fallback_ocr):
+            closer = getattr(client, "aclose", None)
+            if closer is not None:
+                await closer()
 
 
 async def file_metadata_context_for_event(
@@ -243,15 +271,90 @@ def image_segments_from_event(event: Any) -> list[dict[str, Any]]:
 
 
 def ocr_image_segments_from_event(event: Any) -> list[dict[str, Any]]:
+    return collect_ocr_image_segments(getattr(event, "message", []) or [])
+
+
+def collect_ocr_image_segments(payload: Any, *, limit: int = 8) -> list[dict[str, Any]]:
     images: list[dict[str, Any]] = []
-    for segment in getattr(event, "message", []) or []:
-        segment_type, data = segment_type_and_data(segment)
+    seen: set[str] = set()
+
+    def add(segment_type: str, data: dict[str, Any]) -> None:
+        if len(images) >= max(0, int(limit)):
+            return
         if segment_type not in {"image", "mface"}:
-            continue
+            return
         if is_marketface_segment(segment_type, data):
-            continue
+            return
+        key = image_cache_key(data)
+        if key and key in seen:
+            return
+        if key:
+            seen.add(key)
         images.append(data)
+
+    def walk(value: Any, depth: int = 0) -> None:
+        if len(images) >= max(0, int(limit)) or value is None or depth > 8:
+            return
+        if isinstance(value, (list, tuple)):
+            for item in value:
+                walk(item, depth + 1)
+            return
+        if isinstance(value, dict):
+            segment_type, data = segment_type_and_data(value)
+            if segment_type in {"image", "mface"}:
+                add(segment_type, data)
+                return
+            if segment_type == "node":
+                node = value.get("data") if isinstance(value.get("data"), dict) else value
+                walk(node.get("content", node.get("message")), depth + 1)
+                return
+            for key in ("messages", "message", "content", "data"):
+                if key in value:
+                    walk(value.get(key), depth + 1)
+            return
+        if hasattr(value, "type") or hasattr(value, "data"):
+            segment_type, data = segment_type_and_data(value)
+            if segment_type in {"image", "mface"}:
+                add(segment_type, data)
+                return
+            if segment_type == "node":
+                node = data if isinstance(data, dict) else {}
+                walk(node.get("content", node.get("message")), depth + 1)
+                return
+            if segment_type == "forward" and isinstance(data, dict):
+                for key in ("content", "messages", "message"):
+                    if data.get(key):
+                        walk(data.get(key), depth + 1)
+                        break
+                return
+            if segment_type:
+                return
+        if hasattr(value, "message"):
+            walk(getattr(value, "message", None), depth + 1)
+            return
+        if not isinstance(value, (str, bytes)) and hasattr(value, "__iter__"):
+            try:
+                iterator = iter(value)
+            except TypeError:
+                return
+            for item in iterator:
+                walk(item, depth + 1)
+
+    walk(payload)
     return images
+
+
+def _unique_ocr_image_segments(segments: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    unique: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for data in segments:
+        key = image_cache_key(data)
+        if key and key in seen:
+            continue
+        if key:
+            seen.add(key)
+        unique.append(data)
+    return unique
 
 
 def image_cache_key(data: dict[str, Any]) -> str:
