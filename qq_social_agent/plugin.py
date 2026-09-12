@@ -4206,6 +4206,48 @@ async def _admin_apply_tool_action(form: dict[str, str], *, group_id: int | None
             return "没有目标群。"
         payload, _ = await _http_proactive_chat_payload(group_id=group_id)
         return f"主动发言触发结果：{payload}"
+    if action == "send_group":
+        if group_id is None:
+            return "没有目标群。"
+        message_text = form.get("message", "").strip()
+        if not message_text:
+            return "群消息内容为空。"
+        bot = _first_connected_onebot_bot()
+        if bot is None:
+            return "OneBot 未连接，发不出去。"
+        message_id = await _send_group_message(bot, group_id, Message(message_text))
+        _record_bot_sent_message(
+            group_id=group_id,
+            message_id=message_id,
+            bot_reply=message_text,
+            trigger_user_id=0,
+            trigger_nickname="Admin手动发起",
+            trigger_text="admin tools send_group",
+            action="manual_proactive",
+        )
+        return f"已发送到群 {group_id}，message_id={message_id}。"
+    if action == "send_private":
+        user_id = _safe_admin_user_id(form.get("user_id"))
+        message_text = form.get("message", "").strip()
+        if user_id is None:
+            return "私聊 QQ 号无效。"
+        if not message_text:
+            return "私聊内容为空。"
+        bot = _first_connected_onebot_bot()
+        if bot is None:
+            return "OneBot 未连接，发不出去。"
+        try:
+            result = await _send_private_message(bot, user_id=user_id, message=Message(message_text))
+        except ActionFailed as exc:
+            return f"私聊发送失败：{_action_failed_summary(exc)}"
+        memory.add_message(
+            _private_chat_id(user_id),
+            int(bot.self_id),
+            BOT_STATUS_CARD_BASE_NAME,
+            message_text,
+            is_bot=True,
+        )
+        return f"已发送私聊给 {user_id}：{str(result)[:80]}"
     return "未知工具动作。"
 
 

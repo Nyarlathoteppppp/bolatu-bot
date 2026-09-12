@@ -43,6 +43,20 @@ def render_admin_dashboard(
         {_approval_card(pending_approvals)}
         {_plugin_card(plugins or [])}
       </section>
+      <section class="grid cards">
+        {_onebot_card(status.get('onebot') if isinstance(status.get('onebot'), dict) else {})}
+        {_search_card(status.get('search') if isinstance(status.get('search'), dict) else {})}
+        {_rag_card(status.get('rag') if isinstance(status.get('rag'), dict) else {})}
+        {_last_message_card(status.get('last_message') if isinstance(status.get('last_message'), dict) else None)}
+      </section>
+      <section class="grid two">
+        {_panel('运行缓冲', _buffers_block(status.get('buffers') if isinstance(status.get('buffers'), dict) else {}))}
+        {_panel('最近错误', _status_event_table(status.get('recent_errors') if isinstance(status.get('recent_errors'), list) else []))}
+      </section>
+      <section class="grid two">
+        {_panel('最近拦截/拒绝', _status_event_table(status.get('recent_rejections') if isinstance(status.get('recent_rejections'), list) else []))}
+        {_panel('群状态', _groups_status_block(status.get('groups') if isinstance(status.get('groups'), list) else []))}
+      </section>
       <section class="grid two">
         {_panel('最近关系判断', _metric_table(relation_events, show_meta=True))}
         {_panel('最近决策', _metric_table(decision_events, show_meta=True))}
@@ -87,6 +101,7 @@ def render_admin_tools_page(
         {_panel('运行开关', _tools_switch_forms(state))}
         {_panel('审批人 / 私聊 / 强服从', _tools_user_forms(state))}
       </section>
+      <section class="panel wide"><h2>手动发送</h2>{_tools_send_forms(state)}</section>
       <section class="grid two">
         {_panel('模型路由', _tools_model_forms(state))}
         {_panel('黑话词典', _tools_jargon_forms(state, selected_group_id))}
@@ -416,6 +431,138 @@ def _approval_card(pending: list[object]) -> str:
     return f'<section class="card"><h2>审批队列：{len(pending)}</h2><ul>{"".join(items)}</ul></section>'
 
 
+def _onebot_card(payload: object) -> str:
+    data = payload if isinstance(payload, dict) else {}
+    bots = data.get('connected_bots') if isinstance(data.get('connected_bots'), list) else []
+    details = data.get('bots') if isinstance(data.get('bots'), list) else []
+    ok = bool(bots)
+    cls = 'ok' if ok else 'bad'
+    rows = []
+    for item in details[:4]:
+        if not isinstance(item, dict):
+            continue
+        bot_id = item.get('bot_id') or ''
+        connected = bool(item.get('connected'))
+        last_api = item.get('last_api_name') or '无'
+        outcome = item.get('last_api_outcome') or ''
+        seen = _fmt_time(item.get('last_seen_at'))
+        rows.append(
+            f'<li><b>{_e(bot_id)}</b> {"在线" if connected else "离线"}'
+            f'<br><span class="muted small">最近 API={_e(last_api)} {_e(outcome)} 见到 {_e(seen)}</span></li>'
+        )
+    body = ''.join(rows) or '<p class="muted">暂无 OneBot 连接记录。</p>'
+    if rows:
+        body = f'<ul>{body}</ul>'
+    return (
+        f'<section class="card"><h2>OneBot <span class="{cls}">{"OK" if ok else "BAD"}</span></h2>'
+        f'<p><b>{len(bots)}</b> 在线：{_e(_join_display(bots))}</p>{body}</section>'
+    )
+
+
+def _search_card(payload: object) -> str:
+    data = payload if isinstance(payload, dict) else {}
+    enabled = bool(data.get('enabled'))
+    last = data.get('last_request') if isinstance(data.get('last_request'), dict) else {}
+    counters = data.get('counters') if isinstance(data.get('counters'), dict) else {}
+    cls = 'ok' if enabled else 'muted'
+    last_line = '暂无最近搜索。'
+    if last:
+        last_line = (
+            f'{_e(last.get("status") or "unknown")} {_e(last.get("provider") or "")} '
+            f'{_e(last.get("query_preview") or "")} '
+            f'<span class="muted small">{_fmt_time(last.get("at"))}</span>'
+        )
+    return (
+        f'<section class="card"><h2>搜索 <span class="{cls}">{"开启" if enabled else "关闭"}</span></h2>'
+        f'<p>provider={_e(data.get("provider"))} 剩余额度={_e(data.get("rate_remaining"))}</p>'
+        f'<p class="muted small">成功 {_e(counters.get("successes", 0))} / 无结果 {_e(counters.get("no_results", 0))} / 失败 {_e(counters.get("failures", 0))}</p>'
+        f'<p>{last_line}</p></section>'
+    )
+
+
+def _rag_card(payload: object) -> str:
+    data = payload if isinstance(payload, dict) else {}
+    enabled = bool(data.get('enabled', True))
+    store = data.get('store') if isinstance(data.get('store'), dict) else {}
+    last = store.get('last_retrieval') if isinstance(store.get('last_retrieval'), dict) else {}
+    cls = 'ok' if enabled and not data.get('last_error') else 'bad' if data.get('last_error') else 'muted'
+    last_line = '暂无最近召回。'
+    if last:
+        last_line = (
+            f'{_e(last.get("route") or "")} injected={_e(last.get("injected_count"))} '
+            f'{_e(last.get("query_preview") or "")}'
+        )
+    error = data.get('last_error')
+    error_html = f'<p class="bad small">{_e(error)}</p>' if error else ''
+    return (
+        f'<section class="card"><h2>RAG <span class="{cls}">{"开启" if enabled else "关闭"}</span></h2>'
+        f'<p>文档 {_e(store.get("documents", 0))} · 1h 召回 {_e(store.get("retrievals_1h", 0))} · 知识源 {_e(store.get("active_knowledge_sources", 0))}</p>'
+        f'<p class="muted small">上次同步 {_fmt_time(data.get("last_sync_at"))} mode={_e(data.get("mode"))}</p>'
+        f'<p>{last_line}</p>{error_html}</section>'
+    )
+
+
+def _last_message_card(payload: dict[str, object] | None) -> str:
+    if not payload:
+        return '<section class="card"><h2>最后消息</h2><p class="muted">暂无消息。</p></section>'
+    who = '风雪' if payload.get('is_bot') else payload.get('nickname') or payload.get('user_id')
+    href = f'/admin/messages/{_e(payload.get("id"))}' if payload.get('id') else '/admin'
+    return (
+        '<section class="card"><h2>最后消息</h2>'
+        f'<p><a href="{href}">{_e(who)}</a> 群 {_e(payload.get("group_id"))} '
+        f'<span class="muted small">{_fmt_time(payload.get("created_at"))} · {_e(payload.get("age_seconds"))}s 前</span></p>'
+        f'<p>{_e(payload.get("text"))}</p></section>'
+    )
+
+
+def _buffers_block(payload: object) -> str:
+    data = payload if isinstance(payload, dict) else {}
+    if not data:
+        return '<p class="muted">暂无缓冲。</p>'
+    rows = []
+    for key, value in data.items():
+        rows.append(f'<tr><th>{_e(key)}</th><td>{_e(_join_display(value) if not isinstance(value, dict) else _short_json(value, 180))}</td></tr>')
+    return '<table>' + ''.join(rows) + '</table>'
+
+
+def _groups_status_block(rows: object) -> str:
+    items = rows if isinstance(rows, list) else []
+    if not items:
+        return '<p class="muted">没有目标群。</p>'
+    out = ['<table><tr><th>群</th><th>状态</th><th>闭嘴</th><th>人数</th></tr>']
+    for row in items:
+        if not isinstance(row, dict):
+            continue
+        muted = int(row.get('muted_left_seconds') or 0)
+        name = row.get('group_name') or row.get('group_id')
+        out.append(
+            f'<tr><td>{_e(name)}<br><span class="muted small">{_e(row.get("group_id"))}</span></td>'
+            f'<td>{"开启" if row.get("enabled") else "关闭"}<br><span class="muted small">persona={_e(row.get("persona"))}</span></td>'
+            f'<td>{muted}s</td><td>{_e(row.get("member_count", 0))}</td></tr>'
+        )
+    out.append('</table>')
+    return ''.join(out)
+
+
+def _status_event_table(rows: object) -> str:
+    items = rows if isinstance(rows, list) else []
+    if not items:
+        return '<p class="muted">暂无记录。</p>'
+    out = ['<table><tr><th>时间</th><th>类型</th><th>阶段</th><th>动作</th><th>摘要</th></tr>']
+    for row in items[:8]:
+        if not isinstance(row, dict):
+            continue
+        meta = row.get('metadata') if isinstance(row.get('metadata'), dict) else {}
+        summary = _metric_summary(meta) if meta else ''
+        out.append(
+            f'<tr><td class="small">{_fmt_time(row.get("created_at"))}</td>'
+            f'<td>{_e(row.get("event_type"))}</td><td>{_e(row.get("stage"))}</td>'
+            f'<td>{_e(row.get("action"))}</td><td>{summary}</td></tr>'
+        )
+    out.append('</table>')
+    return ''.join(out)
+
+
 
 
 
@@ -442,8 +589,9 @@ def _tools_private_card(payload: object) -> str:
     rows = [
         ('固定白名单', _join_display(data.get('config_ids'))),
         ('运行时白名单', _join_display(data.get('runtime_ids'))),
+        ('可普通私聊的管理员', _join_display(data.get('implicit_chat_ids'))),
         ('命令专用', _join_display(data.get('command_only_ids'))),
-        ('强服从', '开启' if data.get('force_obey_enabled') else '关闭'),
+        ('主人/测试号强服从', '开启' if data.get('force_obey_enabled') else '关闭'),
     ]
     return '<section class="card"><h2>私聊</h2><table>' + ''.join(f'<tr><th>{_e(k)}</th><td>{_e(v)}</td></tr>' for k, v in rows) + '</table></section>'
 
@@ -526,10 +674,35 @@ def _tools_user_forms(state: dict[str, Any]) -> str:
     force_form = (
         '<form class="inline" method="post" action="/admin/tools/action">'
         '<input type="hidden" name="action" value="force_obey">'
-        '<div class="field"><label>测试号强服从</label><select name="enabled"><option value="1">开启</option><option value="0">关闭</option></select></div>'
+        '<div class="field"><label>主人/测试号强服从</label><select name="enabled"><option value="1">开启</option><option value="0">关闭</option></select></div>'
         '<button type="submit">应用</button></form>'
     )
     return approval_report + approver_form + private_report + private_form + force_form
+
+
+def _tools_send_forms(state: dict[str, Any]) -> str:
+    groups = state.get('groups') if isinstance(state.get('groups'), list) else []
+    selected = state.get('selected_group_id') or ''
+    group_options = ''.join(
+        f'<option value="{_e(row.get("group_id"))}"{" selected" if str(row.get("group_id")) == str(selected) else ""}>'
+        f'群 {_e(row.get("group_name") or row.get("group_id"))}</option>'
+        for row in groups if isinstance(row, dict)
+    )
+    group_form = (
+        '<form class="inline" method="post" action="/admin/tools/action">'
+        '<input type="hidden" name="action" value="send_group">'
+        f'<div class="field"><label>发群消息</label><select name="group_id">{group_options}</select></div>'
+        '<div class="field" style="min-width:280px"><label>内容</label><input name="message" placeholder="风雪要说的话"></div>'
+        '<button type="submit">发送到群</button></form>'
+    )
+    private_form = (
+        '<form class="inline" method="post" action="/admin/tools/action">'
+        '<input type="hidden" name="action" value="send_private">'
+        '<div class="field"><label>发私聊 QQ</label><input name="user_id" class="mini" placeholder="1535071184"></div>'
+        '<div class="field" style="min-width:280px"><label>内容</label><input name="message" placeholder="风雪要说的话"></div>'
+        '<button type="submit">发送私聊</button></form>'
+    )
+    return group_form + private_form
 
 
 def _tools_model_forms(state: dict[str, Any]) -> str:

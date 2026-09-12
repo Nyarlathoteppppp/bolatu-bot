@@ -1,4 +1,5 @@
 from qq_social_agent.admin_ui import (
+    render_admin_dashboard,
     render_admin_edit_page,
     render_admin_tools_page,
     render_memory_atom_detail_page,
@@ -171,7 +172,8 @@ def test_admin_tools_page_renders_controls_and_docs() -> None:
         "private_chat": {
             "config_ids": [2776760548],
             "runtime_ids": [3115344487],
-            "command_only_ids": [1535071184],
+            "implicit_chat_ids": [1535071184, 2776760548],
+            "command_only_ids": [],
             "force_obey_enabled": False,
         },
         "models": [
@@ -203,4 +205,124 @@ def test_admin_tools_page_renders_controls_and_docs() -> None:
     assert "RAG状态" in html
     assert "pending_count" in html and ">0<" in html
     assert "工具目录" in html
+    assert "可普通私聊的管理员" in html
+    assert "主人/测试号强服从" in html
+    assert ">测试号强服从<" not in html
+    assert "发送到群" in html
+    assert "发送私聊" in html
+    assert 'name="action" value="send_group"' in html
+    assert 'name="action" value="send_private"' in html
+
+
+def test_admin_dashboard_renders_runtime_status(tmp_path) -> None:
+    memory = MemoryStore(tmp_path / "bot.sqlite3")
+    html = render_admin_dashboard(
+        memory=memory,
+        groups=(1026813421,),
+        selected_group_id=1026813421,
+        ready={"ok": True, "onebot_ready": True},
+        health={"ok": True},
+        status={
+            "onebot": {
+                "connected_bots": ["1801507496"],
+                "bots": [
+                    {
+                        "bot_id": "1801507496",
+                        "connected": True,
+                        "last_api_name": "send_group_msg",
+                        "last_api_outcome": "success",
+                        "last_seen_at": 1783872000,
+                    }
+                ],
+            },
+            "search": {
+                "enabled": True,
+                "provider": "searxng",
+                "rate_remaining": 8,
+                "counters": {"successes": 3, "no_results": 1, "failures": 0},
+                "last_request": {
+                    "status": "ok",
+                    "provider": "searxng",
+                    "query_preview": "今天天气",
+                    "at": 1783872000,
+                },
+            },
+            "rag": {
+                "enabled": True,
+                "mode": "hybrid",
+                "last_sync_at": 1783872000,
+                "last_error": "",
+                "store": {
+                    "documents": 12,
+                    "retrievals_1h": 4,
+                    "active_knowledge_sources": 2,
+                    "last_retrieval": {
+                        "route": "hybrid",
+                        "injected_count": 3,
+                        "query_preview": "小鸟",
+                    },
+                },
+            },
+            "last_message": {
+                "id": 9,
+                "group_id": 1026813421,
+                "user_id": 1535071184,
+                "nickname": "主人",
+                "text": "风雪在吗",
+                "is_bot": False,
+                "created_at": 1783872000,
+                "age_seconds": 12,
+            },
+            "buffers": {
+                "group_buffers": {"1026813421": 2},
+                "generation_inflight_groups": [1026813421],
+            },
+            "recent_errors": [
+                {
+                    "created_at": 1783872000,
+                    "event_type": "llm_decision",
+                    "stage": "decision",
+                    "action": "timeout",
+                    "metadata": {"error": "deadline exceeded"},
+                }
+            ],
+            "recent_rejections": [
+                {
+                    "created_at": 1783872000,
+                    "event_type": "approval_canceled",
+                    "stage": "approval",
+                    "action": "reject",
+                    "metadata": {"reason": "owner rejected"},
+                }
+            ],
+            "groups": [
+                {
+                    "group_id": 1026813421,
+                    "group_name": "柏拉图学院",
+                    "enabled": True,
+                    "persona": "zhangfengxue",
+                    "muted_left_seconds": 0,
+                    "member_count": 91,
+                }
+            ],
+        },
+        model_routes={"reply": "deepseek/deepseek-v4-flash"},
+        pending_approvals=[],
+        plugins=[],
+    )
+
+    assert "OneBot" in html
+    assert "1801507496" in html
+    assert "搜索" in html
+    assert "今天天气" in html
+    assert "RAG" in html
+    assert "小鸟" in html
+    assert "最后消息" in html
+    assert "风雪在吗" in html
+    assert "运行缓冲" in html
+    assert "最近错误" in html
+    assert "deadline exceeded" in html
+    assert "最近拦截/拒绝" in html
+    assert "owner rejected" in html
+    assert "柏拉图学院" in html
 
