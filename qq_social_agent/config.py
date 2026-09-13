@@ -29,6 +29,14 @@ class LLMModelRoute:
 
 
 @dataclass(frozen=True)
+class ReplyPeakRouting:
+    enabled: bool
+    timezone: str
+    weekdays: frozenset[int]
+    windows: tuple[tuple[int, int], ...]
+
+
+@dataclass(frozen=True)
 class DeepSeekConfig:
     base_url: str
     model: str
@@ -59,6 +67,7 @@ class DeepSeekConfig:
     fallback_routes: dict[str, LLMModelRoute]
     model_catalog: tuple[LLMModelRoute, ...]
     usage_tracking_enabled: bool
+    reply_peak_routing: ReplyPeakRouting
 
 
 @dataclass(frozen=True)
@@ -170,6 +179,7 @@ class AppConfig:
                 default_provider="deepseek",
             ),
         }
+        reply_peak_routing = _reply_peak_routing(deepseek)
         self.deepseek = DeepSeekConfig(
             base_url=str(deepseek.get("base_url", "https://api.deepseek.com")),
             model=base_model,
@@ -200,6 +210,7 @@ class AppConfig:
             fallback_routes=fallback_routes,
             model_catalog=_model_catalog(deepseek, routes, fallback_routes, providers),
             usage_tracking_enabled=bool(deepseek.get("usage_tracking_enabled", True)),
+            reply_peak_routing=reply_peak_routing,
         )
         self.rate = RateConfig(
             min_interval_seconds=int(rate.get("min_interval_seconds", 60)),
@@ -300,6 +311,54 @@ def _llm_providers(deepseek: dict[str, Any]) -> dict[str, LLMProviderConfig]:
                 thinking=str(raw.get("thinking", "disabled")).lower(),
             )
     return providers
+
+
+def _reply_peak_routing(deepseek: dict[str, Any]) -> ReplyPeakRouting:
+    raw = deepseek.get("reply_peak_routing", {})
+    if raw is None:
+        raw = {}
+    if not isinstance(raw, dict):
+        raise ValueError("deepseek.reply_peak_routing must be a mapping")
+
+    raw_weekdays = raw.get("weekdays", [0, 1, 2, 3, 4])
+    if not isinstance(raw_weekdays, list):
+        raise ValueError("deepseek.reply_peak_routing.weekdays must be a list")
+    weekdays = frozenset(int(day) for day in raw_weekdays)
+    if any(day < 0 or day > 6 for day in weekdays):
+        raise ValueError("deepseek.reply_peak_routing.weekdays must use 0 through 6")
+
+    raw_windows = raw.get("windows", [])
+    if not isinstance(raw_windows, list):
+        raise ValueError("deepseek.reply_peak_routing.windows must be a list")
+    windows: list[tuple[int, int]] = []
+    for index, raw_window in enumerate(raw_windows):
+        if not isinstance(raw_window, dict):
+            raise ValueError(f"deepseek.reply_peak_routing.windows[{index}] must be a mapping")
+        start = _minutes_after_midnight(raw_window.get("start"), f"windows[{index}].start")
+        end = _minutes_after_midnight(raw_window.get("end"), f"windows[{index}].end")
+        if start >= end:
+            raise ValueError(f"deepseek.reply_peak_routing.windows[{index}] must end after it starts")
+        windows.append((start, end))
+
+    return ReplyPeakRouting(
+        enabled=bool(raw.get("enabled", False)),
+        timezone=str(raw.get("timezone", "Asia/Shanghai")),
+        weekdays=weekdays,
+        windows=tuple(windows),
+    )
+
+
+def _minutes_after_midnight(value: object, field: str) -> int:
+    text = str(value or "").strip()
+    try:
+        hour_text, minute_text = text.split(":", 1)
+        hour = int(hour_text)
+        minute = int(minute_text)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"deepseek.reply_peak_routing.{field} must use HH:MM") from exc
+    if not 0 <= hour <= 23 or not 0 <= minute <= 59:
+        raise ValueError(f"deepseek.reply_peak_routing.{field} must use a valid HH:MM time")
+    return hour * 60 + minute
 
 
 def parse_llm_model_route(

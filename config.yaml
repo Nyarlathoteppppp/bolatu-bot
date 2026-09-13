@@ -33,6 +33,15 @@ deepseek:
   model: siliconflow/deepseek-ai/DeepSeek-V4-Flash
   decision_model: siliconflow/deepseek-ai/DeepSeek-V4-Flash
   reply_model: deepseek/deepseek-flash
+  reply_peak_routing:
+    enabled: true
+    timezone: Asia/Shanghai
+    weekdays: [0, 1, 2, 3, 4]
+    windows:
+      - start: "09:00"
+        end: "12:00"
+      - start: "14:00"
+        end: "18:00"
   search_model: siliconflow/deepseek-ai/DeepSeek-V4-Flash
   utility_model: siliconflow/deepseek-ai/DeepSeek-V4-Flash
   jargon_model: siliconflow/deepseek-ai/DeepSeek-V4-Flash

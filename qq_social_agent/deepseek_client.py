@@ -6,7 +6,9 @@ import os
 import re
 import time
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Callable, Optional
+from zoneinfo import ZoneInfo
 
 from nonebot import logger
 from openai import AsyncOpenAI
@@ -274,12 +276,40 @@ class DeepSeekClient:
         fallback = self.config.fallback_routes.get(route_name)
         if fallback is None or fallback == primary:
             return (primary,)
+        if route_name == "reply" and route_name not in self.route_overrides and self._is_reply_peak_now():
+            # DeepSeek's weekday peak windows are billed at twice the off-peak
+            # rate. The configured reply fallback is SiliconFlow, so use it as
+            # the primary route only during those windows.
+            primary, fallback = fallback, primary
         circuit_until = self._provider_circuit_until.get(primary.provider, 0.0)
         if circuit_until > time.monotonic():
             # A provider-wide outage should not make every group message wait for
             # the same timeout. The preferred route is retried after cooldown.
             return (fallback,)
         return (primary, fallback)
+
+    def _is_reply_peak_now(self) -> bool:
+        routing = getattr(self.config, "reply_peak_routing", None)
+        if routing is None or not routing.enabled or not routing.windows:
+            return False
+        try:
+            now = datetime.now(ZoneInfo(routing.timezone))
+        except Exception as exc:
+            logger.warning(
+                "qq_social_agent invalid reply peak routing timezone, disabling schedule: "
+                f"timezone={getattr(routing, 'timezone', '')} error={exc}"
+            )
+            return False
+        return self._is_reply_peak_at(now)
+
+    def _is_reply_peak_at(self, now: datetime) -> bool:
+        routing = getattr(self.config, "reply_peak_routing", None)
+        if routing is None or not routing.enabled or not routing.windows:
+            return False
+        if now.weekday() not in routing.weekdays:
+            return False
+        current_minute = now.hour * 60 + now.minute
+        return any(start <= current_minute < end for start, end in routing.windows)
 
     def _record_provider_failure(self, provider: str) -> None:
         now = time.monotonic()

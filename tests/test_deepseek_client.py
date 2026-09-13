@@ -1,5 +1,7 @@
 import asyncio
+from datetime import datetime
 from types import SimpleNamespace
+from zoneinfo import ZoneInfo
 
 import qq_social_agent.deepseek_client as deepseek_module
 from qq_social_agent.deepseek_client import (
@@ -53,6 +55,39 @@ def test_provider_circuit_uses_fallback_after_repeated_failures() -> None:
     client._record_provider_success("siliconflow")
 
     assert client._candidate_routes("reply") == (primary, fallback)
+
+
+def test_reply_peak_prefers_siliconflow_but_manual_override_wins() -> None:
+    client = DeepSeekClient.__new__(DeepSeekClient)
+    official = SimpleNamespace(provider="deepseek", model="deepseek-flash")
+    siliconflow = SimpleNamespace(provider="siliconflow", model="deepseek-ai/DeepSeek-V4-Flash")
+    client.config = SimpleNamespace(
+        routes={"reply": official},
+        fallback_routes={"reply": siliconflow},
+        reply_peak_routing=SimpleNamespace(
+            enabled=True,
+            timezone="Asia/Shanghai",
+            weekdays=frozenset({0, 1, 2, 3, 4}),
+            windows=((540, 720), (840, 1080)),
+        ),
+    )
+    client.route_overrides = {}
+    client._provider_failures = {}
+    client._provider_circuit_until = {}
+
+    peak = datetime(2026, 9, 7, 10, 30, tzinfo=ZoneInfo("Asia/Shanghai"))
+    off_peak = datetime(2026, 9, 7, 12, 30, tzinfo=ZoneInfo("Asia/Shanghai"))
+    weekend = datetime(2026, 9, 13, 10, 30, tzinfo=ZoneInfo("Asia/Shanghai"))
+
+    assert client._is_reply_peak_at(peak) is True
+    assert client._is_reply_peak_at(off_peak) is False
+    assert client._is_reply_peak_at(weekend) is False
+
+    client._is_reply_peak_now = lambda: True
+    assert client._candidate_routes("reply") == (siliconflow, official)
+
+    client.route_overrides["reply"] = official
+    assert client._candidate_routes("reply") == (official, siliconflow)
 
 
 def test_sanitize_removes_json_artifact_fragments() -> None:

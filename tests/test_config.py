@@ -72,6 +72,29 @@ def test_llm_provider_routes_can_use_multislash_model_names() -> None:
     assert config.fallback_routes["reply"].label == "deepseek/deepseek-v4-flash"
 
 
+def test_reply_peak_routing_parses_shanghai_weekday_windows() -> None:
+    config = AppConfig(
+        {
+            "deepseek": {
+                "reply_peak_routing": {
+                    "enabled": True,
+                    "timezone": "Asia/Shanghai",
+                    "weekdays": [0, 1, 2, 3, 4],
+                    "windows": [
+                        {"start": "09:00", "end": "12:00"},
+                        {"start": "14:00", "end": "18:00"},
+                    ],
+                }
+            }
+        }
+    ).deepseek
+
+    assert config.reply_peak_routing.enabled is True
+    assert config.reply_peak_routing.timezone == "Asia/Shanghai"
+    assert config.reply_peak_routing.weekdays == frozenset({0, 1, 2, 3, 4})
+    assert config.reply_peak_routing.windows == ((540, 720), (840, 1080))
+
+
 def test_llm_route_catalog_and_split_utility_flows() -> None:
     config = AppConfig(
         {
