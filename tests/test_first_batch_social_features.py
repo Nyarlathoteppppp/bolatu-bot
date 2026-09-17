@@ -420,7 +420,7 @@ def test_image_ocr_service_reads_extra_reply_images() -> None:
     assert context.text == "第1张图：引用图文字"
 
 
-def test_ocr_related_image_segments_include_reply_and_forward() -> None:
+def test_ocr_related_image_segments_include_reply_not_forward() -> None:
     class FakeRelatedBot:
         async def call_api(self, api: str, **data):
             if api == "get_msg":
@@ -431,19 +431,7 @@ def test_ocr_related_image_segments_include_reply_and_forward() -> None:
                     ]
                 }
             if api == "get_forward_msg":
-                assert data == {"id": "fwd-1"}
-                return {
-                    "messages": [
-                        {
-                            "type": "node",
-                            "data": {
-                                "content": [
-                                    {"type": "image", "data": {"url": "https://example.com/fwd.png"}},
-                                ]
-                            },
-                        }
-                    ]
-                }
+                raise AssertionError("forward images must not be collected as top-level OCR extras")
             raise AssertionError(f"unexpected api {api}: {data}")
 
     event = SimpleNamespace(
@@ -457,7 +445,7 @@ def test_ocr_related_image_segments_include_reply_and_forward() -> None:
     extra = asyncio.run(plugin._ocr_related_image_segments(FakeRelatedBot(), event))
     urls = [item.get("url") for item in extra]
     assert "https://example.com/reply.png" in urls
-    assert "https://example.com/fwd.png" in urls
+    assert "https://example.com/fwd.png" not in urls
 
 
 def test_history_backfill_keeps_image_placeholder(tmp_path) -> None:
@@ -584,3 +572,41 @@ def test_inline_forward_nodes_are_read_without_onebot_fetch() -> None:
     assert "转发人传了聊天记录" in context
     assert "甲" in context and "第一句" in context
     assert "乙" in context and "第二句" in context
+
+
+
+def test_image_ocr_service_caps_fresh_calls_in_short_window() -> None:
+    class CountingOcrBot:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def call_api(self, api: str, **data):
+            self.calls += 1
+            if api == "ocr_image":
+                return {"texts": [{"text": f"图{self.calls}"}]}
+            return {"url": data.get("file") or "https://example.com/x.png"}
+
+    def event_for(index: int):
+        return SimpleNamespace(
+            message=[
+                SimpleNamespace(
+                    type="image",
+                    data={"url": f"https://example.com/{index}.png", "file": f"{index}.png"},
+                )
+            ]
+        )
+
+    bot = CountingOcrBot()
+    service = ImageOcrService(
+        max_images_per_message=1,
+        max_calls_per_minute=18,
+        max_fresh_calls_per_window=3,
+        fresh_call_window_seconds=30,
+    )
+    contexts = [
+        asyncio.run(service.context_for_event(bot, event_for(index)))
+        for index in range(5)
+    ]
+    assert [item.ocr_count for item in contexts] == [1, 1, 1, 0, 0]
+    assert sum(1 for _ in contexts if _.ocr_count) == 3
+    assert contexts[-1].skipped_reason in {"", "empty_ocr"}

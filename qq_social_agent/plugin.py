@@ -250,6 +250,7 @@ last_mid_memory_attempt: dict[int, float] = {}
 mid_memory_empty_streak: dict[int, int] = {}
 last_style_learn_attempt: dict[int, float] = {}
 addressed_event_times: dict[tuple[int, int], list[float]] = {}
+followup_window_opened_at: dict[tuple[int, int], float] = {}
 last_group_mention_targets: dict[int, tuple[int, float]] = {}
 last_user_reply_times: dict[tuple[int, int], float] = {}
 group_processing_locks: dict[int, asyncio.Lock] = {}
@@ -277,6 +278,7 @@ notice_directory_refresh_tasks: dict[int, asyncio.Task[None]] = {}
 pending_group_approvals: dict[int, "PendingGroupApproval"] = {}
 recent_suppression_events: list["SuppressionEvent"] = []
 daily_review_tasks: dict[str, asyncio.Task[None]] = {}
+weekly_usage_report_tasks: dict[str, asyncio.Task[None]] = {}
 proactive_chat_tasks: dict[str, asyncio.Task[None]] = {}
 private_guided_chat_tasks: dict[str, asyncio.Task[None]] = {}
 private_hourly_chat_tasks: dict[str, asyncio.Task[None]] = {}
@@ -803,14 +805,15 @@ STYLE_LEARN_MESSAGE_LIMIT = 40
 STYLE_LEARN_CANDIDATE_LIMIT = 160
 STYLE_LEARN_PER_USER_LIMIT = 5
 STYLE_LEARN_MIN_MESSAGES = 12
-STYLE_RULE_CONTEXT_LIMIT = 12
-MEMBER_PROFILE_SUMMARY_INTERVAL_SECONDS = 24 * 60 * 60
+STYLE_RULE_CONTEXT_LIMIT = 4
+MEMBER_PROFILE_SUMMARY_INTERVAL_SECONDS = 72 * 60 * 60
 MEMBER_PROFILE_SUMMARY_LOOKBACK_SECONDS = 7 * 24 * 60 * 60
-MEMBER_PROFILE_SUMMARY_ACTIVE_LIMIT = 20
+MEMBER_PROFILE_SUMMARY_ACTIVE_LIMIT = 8
 MEMBER_PROFILE_SUMMARY_MIN_MESSAGES = 5
-MEMBER_PROFILE_SUMMARY_MESSAGE_LIMIT = 240
+MEMBER_PROFILE_SUMMARY_MESSAGE_LIMIT = 24
+MEMBER_PROFILE_SUMMARY_MIN_CHARS = 40
 MEMBER_IMPRESSION_CONTEXT_LIMIT = 8
-RAW_CORPUS_CONTEXT_LIMIT = 6
+RAW_CORPUS_CONTEXT_LIMIT = 2
 RAW_CORPUS_CANDIDATE_LIMIT = 240
 RAW_CORPUS_CONTEXT_RADIUS = 2
 FOCUSED_STYLE_USER_ID = 184589072
@@ -825,11 +828,13 @@ REPLY_CONTEXT_SUMMARY_THRESHOLD = 180
 LONG_MESSAGE_SUMMARY_SOURCE_LIMIT = 1800
 LONG_MESSAGE_SUMMARY_FALLBACK_HEAD = 72
 LONG_MESSAGE_SUMMARY_FALLBACK_TAIL = 28
-FORWARD_CONTEXT_MAX_RECORDS = 16
+FORWARD_CONTEXT_MAX_RECORDS = 20
+FORWARD_OCR_MAX_IMAGES = 4
+FORWARD_RECORD_LINE_LIMIT = 320
 BOT_SELF_NAME_ALIASES = ("张风雪", "风雪")
 # Preserve short forwarded conversations verbatim. Their attribution and tone
 # are often the useful part; only genuinely large records need a summary.
-FORWARD_CONTEXT_SUMMARY_THRESHOLD = 600
+FORWARD_CONTEXT_SUMMARY_THRESHOLD = 1400
 UNREADABLE_MEDIA_SEGMENT_TYPES = {"image", "mface", "face", "record", "video"}
 JARGON_CONTEXT_LOOKBACK = 4
 CUSTOM_JARGON_CONTEXT_LIMIT = 10
@@ -842,7 +847,9 @@ PRIVATE_FOLLOWUP_DELAY_SECONDS = 10.0
 PRIVATE_FOLLOWUP_PROBABILITY = 0.20
 # Keep this as an explicit override hook, but use the same 20% default for
 # every private chat unless a future policy deliberately changes it.
-PRIVATE_FOLLOWUP_PROBABILITY_BY_USER: dict[int, float] = {}
+PRIVATE_FOLLOWUP_PROBABILITY_BY_USER: dict[int, float] = {
+    1903297906: 0.08,
+}
 PRIVATE_GUIDED_CHAT_USER_ID = 1903297906
 PRIVATE_GUIDED_CHAT_STATE_KEY = f"private_guided_chat:{PRIVATE_GUIDED_CHAT_USER_ID}:started_at"
 PRIVATE_GUIDED_CHAT_STEPS: tuple[tuple[int, str, str, bool], ...] = (
@@ -856,10 +863,11 @@ PRIVATE_GUIDED_CHAT_STEPS: tuple[tuple[int, str, str, bool], ...] = (
     (24 * 60 * 60, "goodnight", "主动告诉他风雪要睡觉了，和他说晚安", False),
 )
 PRIVATE_HOURLY_CHAT_USER_ID = 1903297906
-PRIVATE_HOURLY_CHAT_DAYTIME_PERCENT = 15
-PRIVATE_HOURLY_CHAT_QUIET_PERCENT = 5
+PRIVATE_HOURLY_CHAT_DAYTIME_PERCENT = 8
+PRIVATE_HOURLY_CHAT_QUIET_PERCENT = 2
 PRIVATE_HOURLY_CHAT_QUIET_START_HOUR = 2
 PRIVATE_HOURLY_CHAT_QUIET_END_HOUR = 9
+PRIVATE_HOURLY_CHAT_MIN_IDLE_SECONDS = 45 * 60
 PRIVATE_HOURLY_CHAT_MIN_JITTER_SECONDS = 3 * 60
 PRIVATE_HOURLY_CHAT_MAX_JITTER_SECONDS = 53 * 60
 PRIVATE_HOURLY_CHAT_LAST_SLOT_KEY = f"private_hourly_chat:{PRIVATE_HOURLY_CHAT_USER_ID}:last_slot"
@@ -986,7 +994,9 @@ PROACTIVE_CHAT_POLL_JITTER_SECONDS = max(0.0, min(300.0, float(_proactive_chat_c
 PROACTIVE_CHAT_CONTEXT_LIMIT = max(6, min(60, int(_proactive_chat_config.get("context_limit", app_config.context_limit))))
 PROACTIVE_CHAT_MAX_MESSAGES = max(1, min(3, int(_proactive_chat_config.get("max_messages", 2))))
 ADDRESS_REPEAT_WINDOW_SECONDS = 10 * 60
-ADDRESS_FOLLOWUP_WINDOW_SECONDS = 90
+ADDRESS_FOLLOWUP_HARD_SECONDS = 15
+ADDRESS_FOLLOWUP_SOFT_SECONDS = 40
+ADDRESS_FOLLOWUP_WINDOW_SECONDS = ADDRESS_FOLLOWUP_HARD_SECONDS
 MENTION_TARGET_LIMIT = 8
 REPEAT_MENTION_SUPPRESS_SECONDS = 10 * 60
 PRIVATE_DEBUG_OWNER_ID = 2776760548
@@ -1178,6 +1188,7 @@ class BufferedGroupMessage:
     pipeline_state: PipelineState | None = None
     addressed: bool = False
     direct_addressed: bool = False
+    followup_soft: bool = False
     session_id: str = ""
     message_segments_json: str = ""
     raw_message_json: str = ""
@@ -1256,6 +1267,12 @@ async def _init_client() -> None:
     _apply_model_route_overrides()
     _ensure_builtin_memory_atoms()
     _run_metric_retention_once("startup")
+    try:
+        pruned = memory.prune_member_profile_summaries(keep_per_member=3)
+        if pruned:
+            logger.info(f"qq_social_agent member profile history pruned: deleted={pruned} keep=3")
+    except Exception as exc:
+        logger.warning(f"qq_social_agent member profile history prune failed: error={exc}")
     if METRIC_RETENTION_ENABLED and "metric_retention" not in maintenance_tasks:
         maintenance_tasks["metric_retention"] = asyncio.create_task(_run_metric_retention_loop())
     await rag_service.start()
@@ -1430,6 +1447,7 @@ async def _send_approval_rules_on_connect(bot: Bot) -> None:
     await _send_changelog_notice_to_approvers(bot)
     await _notify_active_group_mutes(bot)
     _ensure_daily_review_task(bot)
+    _ensure_weekly_usage_report_task(bot)
     _ensure_proactive_chat_task(bot)
     _ensure_private_guided_chat_task(bot)
     _ensure_private_hourly_chat_task(bot)
@@ -1541,6 +1559,7 @@ async def _mark_onebot_disconnected(bot: Bot) -> None:
 async def _shutdown_background_tasks() -> None:
     await _cancel_task_registries(
         daily_review_tasks,
+        weekly_usage_report_tasks,
         proactive_chat_tasks,
         private_guided_chat_tasks,
         private_hourly_chat_tasks,
@@ -1805,6 +1824,166 @@ def _changelog_notice_marker(marker_key: str, approver_id: int) -> str:
     return f"{marker_key}:{approver_id}"
 
 
+
+WEEKLY_USAGE_REPORT_WEEKDAY = 6
+WEEKLY_USAGE_REPORT_HOUR = 21
+WEEKLY_USAGE_REPORT_MINUTE = 0
+WEEKLY_USAGE_REPORT_POLL_SECONDS = 5 * 60
+WEEKLY_USAGE_REPORT_KV_KEY = "weekly_usage_report_sent_week"
+
+
+def _weekly_usage_report_week_id(now: float | None = None) -> str:
+    current = datetime.fromtimestamp(time.time() if now is None else now, DAILY_REVIEW_TIMEZONE)
+    iso = current.isocalendar()
+    return f"{iso[0]}-W{int(iso[1]):02d}"
+
+
+def _weekly_usage_report_window(now: float | None = None) -> tuple[float, float]:
+    end_at = time.time() if now is None else now
+    return end_at - 7 * 24 * 60 * 60, end_at
+
+
+def _seconds_until_next_weekly_usage_report(now: float | None = None) -> float:
+    current = time.time() if now is None else now
+    local = datetime.fromtimestamp(current, DAILY_REVIEW_TIMEZONE)
+    days_ahead = (WEEKLY_USAGE_REPORT_WEEKDAY - local.weekday()) % 7
+    target_date = (local + timedelta(days=days_ahead)).replace(
+        hour=WEEKLY_USAGE_REPORT_HOUR,
+        minute=WEEKLY_USAGE_REPORT_MINUTE,
+        second=0,
+        microsecond=0,
+    )
+    if target_date.timestamp() <= current:
+        target_date = target_date + timedelta(days=7)
+    return max(1.0, target_date.timestamp() - current)
+
+
+def _weekly_usage_report_due(now: float | None = None) -> bool:
+    current = datetime.fromtimestamp(time.time() if now is None else now, DAILY_REVIEW_TIMEZONE)
+    if current.weekday() != WEEKLY_USAGE_REPORT_WEEKDAY:
+        return False
+    return current.hour > WEEKLY_USAGE_REPORT_HOUR or (
+        current.hour == WEEKLY_USAGE_REPORT_HOUR and current.minute >= WEEKLY_USAGE_REPORT_MINUTE
+    )
+
+
+def _format_token_count(value: int) -> str:
+    if value >= 10000:
+        return f"{value / 10000:.1f}万"
+    return str(value)
+
+
+def _format_weekly_usage_report(*, now: float | None = None) -> str:
+    end_at = time.time() if now is None else now
+    start_at, end_at = _weekly_usage_report_window(end_at)
+    rows = memory.llm_usage_summary(start_at=start_at, end_at=end_at)
+    by_task: dict[str, dict[str, int]] = {}
+    total_calls = 0
+    total_tokens = 0
+    for row in rows:
+        bucket = by_task.setdefault(row.task, {"n": 0, "tokens": 0})
+        bucket["n"] += int(row.call_count)
+        bucket["tokens"] += int(row.total_tokens)
+        total_calls += int(row.call_count)
+        total_tokens += int(row.total_tokens)
+    start_label = datetime.fromtimestamp(start_at, DAILY_REVIEW_TIMEZONE).strftime("%Y-%m-%d")
+    end_label = datetime.fromtimestamp(end_at, DAILY_REVIEW_TIMEZONE).strftime("%Y-%m-%d")
+    lines = [
+        f"风雪本周用量 {_weekly_usage_report_week_id(end_at)}",
+        f"窗口：{start_label} ~ {end_label}",
+        f"总调用 {total_calls}，约 {_format_token_count(total_tokens)} token",
+    ]
+    ranked = sorted(by_task.items(), key=lambda item: item[1]["tokens"], reverse=True)
+    if not ranked:
+        lines.append("这周还没有记到模型用量。")
+    else:
+        for task, stats in ranked[:10]:
+            share = (100.0 * stats["tokens"] / total_tokens) if total_tokens else 0.0
+            lines.append(
+                f"- {task}  {share:.0f}%  {_format_token_count(stats['tokens'])}  n={stats['n']}"
+            )
+    ocr_rows = [
+        item
+        for item in memory.metric_summary(start_at=start_at, end_at=end_at, limit=200)
+        if item.event_type == "image_ocr"
+    ]
+    if ocr_rows:
+        ocr_bits = "，".join(f"{item.action}={item.count}" for item in ocr_rows)
+        lines.append(f"识图 {ocr_bits}")
+    search_rows = [
+        item
+        for item in memory.metric_summary(start_at=start_at, end_at=end_at, limit=200)
+        if item.event_type == "tool_router" and item.action == "fresh_search"
+    ]
+    if search_rows:
+        lines.append(f"搜索 {sum(item.count for item in search_rows)} 次")
+    lines.append("画像/回复占大头；识图和搜索通常很小。")
+    return "\n".join(lines)
+
+
+def _weekly_usage_report_already_sent(week_id: str) -> bool:
+    return str(memory.app_kv_get(WEEKLY_USAGE_REPORT_KV_KEY) or "") == week_id
+
+
+def _mark_weekly_usage_report_sent(week_id: str) -> None:
+    memory.app_kv_set(WEEKLY_USAGE_REPORT_KV_KEY, week_id)
+
+
+async def _send_weekly_usage_report(bot: Bot, *, now: float | None = None, force: bool = False) -> bool:
+    current = time.time() if now is None else now
+    week_id = _weekly_usage_report_week_id(current)
+    if not force and _weekly_usage_report_already_sent(week_id):
+        return False
+    text = _format_weekly_usage_report(now=current)
+    sent = False
+    for user_id in OWNER_USER_IDS:
+        await _send_private_text(bot, user_id, text)
+        sent = True
+    if sent:
+        _mark_weekly_usage_report_sent(week_id)
+        logger.info(f"qq_social_agent weekly usage report sent: week={week_id}")
+    return sent
+
+
+def _ensure_weekly_usage_report_task(bot: Bot) -> None:
+    bot_key = str(getattr(bot, "self_id", "default"))
+    task = weekly_usage_report_tasks.get(bot_key)
+    if task is not None and not task.done():
+        return
+    weekly_usage_report_tasks[bot_key] = asyncio.create_task(
+        _run_weekly_usage_report_scheduler(bot, bot_key)
+    )
+    logger.info(f"qq_social_agent weekly usage report scheduler started: bot={bot_key}")
+
+
+async def _run_weekly_usage_report_scheduler(bot: Bot, bot_key: str) -> None:
+    try:
+        while True:
+            delay = WEEKLY_USAGE_REPORT_POLL_SECONDS
+            try:
+                now = time.time()
+                if _weekly_usage_report_due(now):
+                    await _send_weekly_usage_report(bot, now=now)
+                delay = min(
+                    _seconds_until_next_weekly_usage_report(time.time()),
+                    WEEKLY_USAGE_REPORT_POLL_SECONDS,
+                )
+            except Exception as exc:
+                logger.warning(
+                    f"qq_social_agent weekly usage report tick failed: bot={bot_key} error={exc}"
+                )
+            await asyncio.sleep(max(1.0, delay))
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        logger.warning(
+            f"qq_social_agent weekly usage report scheduler stopped: bot={bot_key} error={exc}"
+        )
+    finally:
+        if weekly_usage_report_tasks.get(bot_key) is asyncio.current_task():
+            weekly_usage_report_tasks.pop(bot_key, None)
+
+
 def _ensure_daily_review_task(bot: Bot) -> None:
     if not _plugin_task_enabled("daily_review", "daily_review_midnight"):
         logger.info("qq_social_agent daily review scheduler disabled by plugin manifest")
@@ -2046,6 +2225,12 @@ def _private_hourly_chat_probability(now: float) -> int:
     return PRIVATE_HOURLY_CHAT_DAYTIME_PERCENT
 
 
+def _private_hourly_chat_recently_active(recent: list[ChatMessage], *, now: float) -> bool:
+    if not recent:
+        return False
+    return now - float(recent[-1].created_at or 0) < PRIVATE_HOURLY_CHAT_MIN_IDLE_SECONDS
+
+
 def _private_hourly_chat_start_at() -> float:
     raw = memory.app_kv_get(PRIVATE_HOURLY_CHAT_START_AT_KEY)
     try:
@@ -2112,11 +2297,24 @@ async def _run_private_hourly_chat(bot: Bot, bot_key: str) -> None:
                     slot=slot,
                 )
                 continue
+            recent = memory.recent_messages(chat_id, PRIVATE_CONTEXT_LIMIT)
+            if _private_hourly_chat_recently_active(recent, now=now):
+                _record_metric_event(
+                    "private_hourly_chat",
+                    group_id=chat_id,
+                    user_id=PRIVATE_HOURLY_CHAT_USER_ID,
+                    stage="idle",
+                    action="skipped",
+                    probability=probability,
+                    roll=round(roll, 2),
+                    slot=slot,
+                    idle_seconds=int(now - recent[-1].created_at),
+                )
+                continue
             persona = personas.get(app_config.default_persona)
             if persona is None:
                 continue
             topic = random.choice(SOCIAL_TOPIC_KEYWORDS)
-            recent = memory.recent_messages(chat_id, PRIVATE_CONTEXT_LIMIT)
             nickname = _private_nickname_from_recent(recent, PRIVATE_HOURLY_CHAT_USER_ID)
             private_generation_inflight.add(PRIVATE_HOURLY_CHAT_USER_ID)
             try:
@@ -3076,10 +3274,7 @@ def _is_basic_approval_user(user_id: int) -> bool:
 
 
 def _approval_review_enabled() -> bool:
-    raw = memory.app_kv_get(APPROVAL_REVIEW_ENABLED_KEY)
-    if raw is None:
-        return True
-    return raw.strip().lower() not in {"0", "false", "off", "disabled", "no"}
+    return False
 
 
 def _set_approval_review_enabled_value(enabled: bool) -> None:
@@ -3106,7 +3301,7 @@ def _approval_auto_send_selected(percent: int) -> bool:
 
 
 def _approval_direct_single_reply_enabled() -> bool:
-    return not _approval_review_enabled() or _approval_auto_send_percent() >= 100
+    return True
 
 
 def _can_manage_approval_auto_send_percent(user_id: int) -> bool:
@@ -3346,12 +3541,11 @@ def _format_ai_work_intensity_status() -> str:
 
 
 def _format_approval_review_status() -> str:
-    mode = "开启审查：bot 发群前会先发审批单。" if _approval_review_enabled() else "关闭审查：bot 直接发送第 1 候选。"
     pending_count = len(pending_group_approvals)
     auto_send_percent = _approval_auto_send_percent()
     return (
-        f"审查状态：{mode}\n"
-        f"免审自动发送概率：{auto_send_percent}%（审查开启时生效，命中后直接发第 1 候选；100% 时只生成 1 条直发回复）。\n"
+        "审查状态：关闭审查：bot 直接发送第 1 候选。人工审查已永久关闭，不能再打开。\n"
+        f"免审自动发送概率：{auto_send_percent}%（已失效，群聊回复一律直发）。\n"
         f"当前待审候选：{pending_count} 条。"
     )
 
@@ -4445,6 +4639,8 @@ def _status_image_ocr() -> dict[str, object]:
         "cache_empty_results": bool(cfg.get("cache_empty_results", False)),
         "max_images_per_message": int(cfg.get("max_images_per_message", 2)),
         "max_calls_per_minute": int(cfg.get("max_calls_per_minute", 18)),
+        "max_fresh_ocr_calls": int(cfg.get("max_fresh_ocr_calls", 6)),
+        "fresh_ocr_window_seconds": float(cfg.get("fresh_ocr_window_seconds", 30)),
     }
 
 
@@ -4841,19 +5037,20 @@ async def _handle_group_message_scoped(
         addressed_bot,
         now=event_at,
     )
-    followup_active = (
-        group_allowed
-        and not addressed_bot
-        and _addressed_followup_active(group_id, int(event.user_id), now=event_at)
+    followup_kind = (
+        _followup_window_kind(group_id, int(event.user_id), now=event_at)
+        if group_allowed and not addressed_bot
+        else ""
     )
     followup_addressed = False
-    if followup_active:
-        followup_addressed, followup_reject_reason = _followup_addressed_allowed(
+    followup_soft = False
+    if followup_kind:
+        followup_allowed, followup_reject_reason = _followup_addressed_allowed(
             event,
             bot,
             reply_reference=reply_reference,
         )
-        if not followup_addressed:
+        if not followup_allowed:
             logger.info(
                 "qq_social_agent followup addressed rejected: "
                 f"group={group_id} user={int(event.user_id)} reason={followup_reject_reason}"
@@ -4867,8 +5064,10 @@ async def _handle_group_message_scoped(
                 reason=followup_reject_reason,
                 source_message_id=source_message_id,
                 correlation_id=correlation_id,
+                window_kind=followup_kind,
             )
-        else:
+        elif followup_kind == "hard":
+            followup_addressed = True
             _record_metric_event(
                 "followup_addressed_accepted",
                 group_id=group_id,
@@ -4878,7 +5077,22 @@ async def _handle_group_message_scoped(
                 reason=followup_reject_reason,
                 source_message_id=source_message_id,
                 correlation_id=correlation_id,
-                window_seconds=ADDRESS_FOLLOWUP_WINDOW_SECONDS,
+                window_kind="hard",
+                window_seconds=ADDRESS_FOLLOWUP_HARD_SECONDS,
+            )
+        else:
+            followup_soft = True
+            _record_metric_event(
+                "followup_soft_accepted",
+                group_id=group_id,
+                user_id=int(event.user_id),
+                stage="group",
+                action="decision",
+                reason=followup_reject_reason,
+                source_message_id=source_message_id,
+                correlation_id=correlation_id,
+                window_kind="soft",
+                window_seconds=ADDRESS_FOLLOWUP_SOFT_SECONDS,
             )
     raw_text = _message_context_text(event, bot_id=int(bot.self_id), resolved_reply=reply_reference)
     message_storage_kwargs = _event_message_storage_kwargs(event, bot=bot)
@@ -4950,7 +5164,7 @@ async def _handle_group_message_scoped(
     if group_allowed and _message_has_forward_context(event):
         forward_context = await _forward_context_text(bot, event, nickname=_nickname(event))
         if forward_context:
-            raw_text = _join_context_parts(raw_text or plain_text, forward_context)
+            raw_text = _join_context_blocks(raw_text or plain_text, forward_context)
     _record_metric_event(
         "message_received",
         group_id=group_id,
@@ -4960,6 +5174,7 @@ async def _handle_group_message_scoped(
         addressed=addressed_bot or followup_addressed,
         direct_addressed=addressed_bot,
         followup_addressed=followup_addressed,
+        followup_soft=followup_soft,
         has_media=_message_has_context_media(event),
         has_file_context=bool(file_context),
         has_ocr=bool(ocr_context.text),
@@ -5031,6 +5246,7 @@ async def _handle_group_message_scoped(
         and group_allowed
         and plain_text
         and not _is_low_value_group_text(plain_text)
+        and not forward_context
         and _should_compact_group_context_message(event, raw_text=raw_text, plain_text=plain_text)
     ):
         text = await _message_text_for_context(
@@ -5087,6 +5303,7 @@ async def _handle_group_message_scoped(
         and group_allowed
         and not addressed_bot
         and not followup_addressed
+        and not followup_soft
         and not contextual_search_request
     ):
         if not _ordinary_user_trigger_selected(user_policy.ordinary_trigger_percent):
@@ -5140,7 +5357,7 @@ async def _handle_group_message_scoped(
                 **message_storage_kwargs,
             )
         )
-    effective_addressed = addressed_bot or contextual_search_request or followup_addressed
+    effective_addressed = addressed_bot or contextual_search_request or followup_addressed or followup_soft
     if group_allowed and effective_addressed and _should_defer_group_reply_flow(group_id, now=time.monotonic()):
         _buffer_group_message(
             bot,
@@ -5152,6 +5369,7 @@ async def _handle_group_message_scoped(
             pipeline_state=pipeline_state,
             addressed=True,
             direct_addressed=addressed_bot,
+            followup_soft=followup_soft,
         )
         logger.info(
             "qq_social_agent deferred addressed group message by reply flow cooldown: "
@@ -5184,6 +5402,7 @@ async def _handle_group_message_scoped(
                 replied_to_bot_hint=replied_to_bot_direct,
                 contextual_addressed_hint=contextual_search_request,
                 followup_addressed_hint=followup_addressed,
+                followup_soft_hint=followup_soft,
                 addressed_repeat_count_hint=addressed_repeat_count_hint,
                 trigger_sequence=inbound_sequence,
                 pipeline_state=pipeline_state,
@@ -5211,6 +5430,7 @@ async def _handle_group_message_locked(
     replied_to_bot_hint: bool = False,
     contextual_addressed_hint: bool = False,
     followup_addressed_hint: bool = False,
+    followup_soft_hint: bool = False,
     addressed_repeat_count_hint: int = 0,
     trigger_sequence: int = 0,
     pipeline_state: PipelineState | None = None,
@@ -5227,6 +5447,13 @@ async def _handle_group_message_locked(
     user_id = _buffered_current_user_id(buffered_messages) if buffered_messages else int(event.user_id)
     if buffered_messages:
         trigger_sequence = buffered_messages[-1].inbound_sequence
+        source_message_id = (
+            source_message_id
+            or buffered_messages[-1].source_message_id
+            or event_message_source_id(event)
+        )
+    else:
+        source_message_id = source_message_id or event_message_source_id(event)
     nickname = _buffered_current_nickname(buffered_messages) if buffered_messages else _nickname(event)
     buffered_addressed = any(item.addressed for item in buffered_messages or ())
     buffered_direct_addressed = any(item.direct_addressed for item in buffered_messages or ())
@@ -5236,9 +5463,16 @@ async def _handle_group_message_locked(
     )
     direct_addressed_bot = buffered_direct_addressed or mentioned or replied_to_bot or bool(addressed_bot_hint)
     synthetic_addressed_bot = bool(contextual_addressed_hint)
+    buffered_followup_soft = any(item.followup_soft for item in buffered_messages or ())
+    followup_soft = (
+        not direct_addressed_bot
+        and not synthetic_addressed_bot
+        and (buffered_followup_soft or bool(followup_soft_hint))
+    )
     followup_addressed = (
         not direct_addressed_bot
         and not synthetic_addressed_bot
+        and not followup_soft
         and (buffered_addressed or bool(followup_addressed_hint))
     )
     addressed_bot = direct_addressed_bot or synthetic_addressed_bot or followup_addressed
@@ -5282,6 +5516,8 @@ async def _handle_group_message_locked(
         pipeline_state.mentioned = mentioned
         pipeline_state.replied_to_bot = replied_to_bot
         pipeline_state.trigger_sequence = trigger_sequence
+        if not pipeline_state.source_message_id:
+            pipeline_state.source_message_id = source_message_id
 
     if not buffered_messages and replied_to_bot and _is_low_value_reply_to_bot_event(event):
         plain_reply_text = _plain_text(event)
@@ -5580,6 +5816,7 @@ async def _handle_group_message_locked(
         replied_to_bot=replied_to_bot,
         addressed_bot=addressed_bot,
         followup_addressed=followup_addressed,
+        followup_soft=followup_soft,
         self_id=int(event.self_id),
         relation_facts=relation_facts,
     )
@@ -5626,15 +5863,9 @@ async def _handle_group_message_locked(
                 "qq_social_agent inferred follow-up search: "
                 f"group={group_id} query={fresh_intent.query!r} kind={fresh_intent.kind}"
             )
-    rag_task: asyncio.Task[RAGRetrievalResult] = asyncio.create_task(
-        rag_service.retrieve(
-            group_id=group_id,
-            query=reference_resolution.expanded_query or text,
-            addressed=addressed_bot,
-            related_user_ids=list(reference_resolution.user_ids),
-            excluded_user_ids=[int(event.self_id)],
-        )
-    )
+    # Retrieval is only useful after we know this message will generate a reply.
+    # Prefetching during decision/ignore burns CPU on the majority silent path.
+    rag_task: asyncio.Task[RAGRetrievalResult] | None = None
     rag_result: RAGRetrievalResult | None = None
     rag_context_applied = False
     fresh_context_task: asyncio.Task[ToolResult] | None = None
@@ -5661,7 +5892,7 @@ async def _handle_group_message_locked(
         fresh_intent=fresh_intent,
     )
     if pre_decision.skip_reason:
-        if not rag_task.done():
+        if rag_task is not None and not rag_task.done():
             rag_task.cancel()
         if fresh_context_task is not None and not fresh_context_task.done():
             fresh_context_task.cancel()
@@ -5874,7 +6105,7 @@ async def _handle_group_message_locked(
     )
     _schedule_group_learning(group_id)
     if pipeline_state.output_channel is OutputChannel.SILENT:
-        if not rag_task.done():
+        if rag_task is not None and not rag_task.done():
             rag_task.cancel()
         if fresh_context_task is not None and not fresh_context_task.done():
             fresh_context_task.cancel()
@@ -5896,7 +6127,7 @@ async def _handle_group_message_locked(
         return
 
     if pipeline_state.output_channel is OutputChannel.REACT:
-        if not rag_task.done():
+        if rag_task is not None and not rag_task.done():
             rag_task.cancel()
         await _execute_reaction_action(
             bot,
@@ -5913,7 +6144,7 @@ async def _handle_group_message_locked(
         return
 
     if pipeline_state.output_channel is OutputChannel.POKE:
-        if not rag_task.done():
+        if rag_task is not None and not rag_task.done():
             rag_task.cancel()
         await _execute_poke_action(
             bot,
@@ -5934,6 +6165,15 @@ async def _handle_group_message_locked(
             )
         )
     if not rag_context_applied:
+        rag_task = asyncio.create_task(
+            rag_service.retrieve(
+                group_id=group_id,
+                query=reference_resolution.expanded_query or text,
+                addressed=addressed_bot,
+                related_user_ids=list(reference_resolution.user_ids),
+                excluded_user_ids=[int(event.self_id)],
+            )
+        )
         rag_result = await rag_task
         rag_context_applied = True
         summary_context = memory_context
@@ -6150,6 +6390,7 @@ async def _handle_group_message_locked(
                         correlation_id=current_correlation_id(),
                         trigger_sequence=trigger_sequence,
                         pipeline_state=pipeline_state,
+                        source_message_id=source_message_id,
                     ),
                 )
                 return
@@ -6374,6 +6615,7 @@ async def _handle_group_message_locked(
             tool_evidence=_approval_evidence_from_context(fresh_context),
             trigger_sequence=trigger_sequence,
             pipeline_state=pipeline_state,
+            source_message_id=source_message_id,
         ),
     )
 
@@ -6732,11 +6974,10 @@ async def _handle_private_message_scoped(
     )
     if ocr_context.text:
         text = _join_context_parts(text, _format_image_ocr_context(ocr_context))
+    forward_context = ""
     if _message_has_forward_context(event):
         forward_context = await _forward_context_text(bot, event, nickname=_private_nickname(event))
-        if forward_context:
-            text = _join_context_parts(text, forward_context)
-        else:
+        if not forward_context:
             _record_metric_event(
                 "content_ingestion",
                 group_id=chat_id,
@@ -6764,11 +7005,20 @@ async def _handle_private_message_scoped(
         text = forced_once_text
         forced_once_context = _private_force_obey_context(user_id, one_shot=True)
 
-    text = await _message_text_for_context(
-        text,
-        nickname=_private_nickname(event),
-        chat_label="QQ 私聊",
-    )
+    if not forward_context:
+        text = await _message_text_for_context(
+            text,
+            nickname=_private_nickname(event),
+            chat_label="QQ 私聊",
+        )
+    elif len((text or "").strip()) > LONG_MESSAGE_SUMMARY_THRESHOLD:
+        text = await _message_text_for_context(
+            text,
+            nickname=_private_nickname(event),
+            chat_label="QQ 私聊",
+        )
+    if forward_context:
+        text = _join_context_blocks(text, forward_context)
     prompt_text = text
     if len(accepted_items) > 1:
         earlier = [
@@ -7137,7 +7387,11 @@ async def _handle_private_message_scoped(
     )
     for index, part in enumerate(reply_parts):
         try:
-            await _send_private_message(bot, user_id=user_id, message=Message(part))
+            await _send_private_message(
+                bot,
+                user_id=user_id,
+                message=_message_with_reply_quote(Message(part), source_message_id if index == 0 else ""),
+            )
             memory.add_message(chat_id, int(event.self_id), persona.name, part, is_bot=True)
         except ActionFailed as exc:
             logger.warning(
@@ -7736,7 +7990,7 @@ async def _image_ocr_context_for_event(
 
 
 def _format_image_ocr_context(context: ImageOcrContext) -> str:
-    text = _short_notice_text(context.text, 360)
+    text = _short_notice_text(context.text, 800)
     return f"{IMAGE_OCR_CONTEXT_PREFIX} {text}]" if text else ""
 
 
@@ -7749,10 +8003,6 @@ async def _ocr_related_image_segments(
     extra.extend(reply_images)
     if not reply_images and _event_has_reply_context(event):
         extra.extend(await _fetch_reply_ocr_image_segments(bot, event))
-    forward_images = _inline_forward_ocr_image_segments(event)
-    extra.extend(forward_images)
-    if not forward_images and _forward_message_ids(event):
-        extra.extend(await _fetch_forward_ocr_image_segments(bot, event))
     return extra
 
 
@@ -8189,10 +8439,13 @@ async def _execute_fresh_tool_request(
 
 async def _execute_registered_fresh_search(request: ToolRequest) -> ToolResult:
     kind = str(request.arguments.get("kind", "web"))
+    raw_queries = request.arguments.get("queries", ())
+    queries = tuple(str(item).strip() for item in (raw_queries or ()) if str(item or "").strip())
     context = await fresh_context_tool.context_for(
         request.query,
         kind=kind,
         force_refresh=bool(request.arguments.get("force_refresh", False)),
+        queries=queries,
     )
     status = fresh_context_tool.status_snapshot().get("last_request", {})
     status = status if isinstance(status, dict) else {}
@@ -8626,13 +8879,20 @@ def _tool_request_from_llm_route(route: object, *, fallback_text: str) -> ToolRe
         if kind not in {"news", "sports", "web"}:
             kind = "web"
         compacted = _compact_search_query(query) or query
+        queries = tuple(
+            (_compact_search_query(str(item)) or str(item).strip())[:160]
+            for item in getattr(route, "queries", ()) or ()
+            if str(item or "").strip()
+        )
+        if compacted and compacted not in queries:
+            queries = (compacted, *queries)[:4]
         return ToolRequest(
             ToolKind.FRESH_SEARCH,
             query=compacted[:160],
             reason=f"llm_tool_router:{reason}"[:120],
             confidence=confidence,
             required=True,
-            arguments={"kind": kind},
+            arguments={"kind": kind, "queries": queries},
         )
     if tool == "market":
         raw_symbols = tuple(getattr(route, "symbols", ()) or ())
@@ -9017,12 +9277,8 @@ async def _forward_context_text(
     *,
     nickname: str,
 ) -> str:
-    records: list[str] = []
-    for payload in _inline_forward_payloads(event):
-        records.extend(_extract_forward_record_lines(payload, limit=FORWARD_CONTEXT_MAX_RECORDS - len(records)))
-        if len(records) >= FORWARD_CONTEXT_MAX_RECORDS:
-            break
-    if not records:
+    payloads: list[object] = list(_inline_forward_payloads(event))
+    if not payloads:
         for forward_id in _forward_message_ids(event)[:2]:
             try:
                 payload = await onebot_gateway.get_forward_msg(bot, forward_id)
@@ -9038,16 +9294,18 @@ async def _forward_context_text(
                     f"forward_id={forward_id} error={exc}"
                 )
                 continue
-            records.extend(_extract_forward_record_lines(payload, limit=FORWARD_CONTEXT_MAX_RECORDS - len(records)))
-            if len(records) >= FORWARD_CONTEXT_MAX_RECORDS:
+            if payload:
+                payloads.append(payload)
+            if payloads:
                 break
+    records = await _forward_records_from_payloads(bot, payloads)
     if not records:
         return ""
     raw = "\n".join(records)
     summary = await _summarize_forward_records(raw, nickname=nickname)
     if not summary:
         return ""
-    return f"{nickname}传了聊天记录，大致内容如下：{summary}"
+    return f"{nickname}传了聊天记录，内容如下：\n{summary}"
 
 
 def _forward_message_ids(event: GroupMessageEvent | PrivateMessageEvent) -> list[str]:
@@ -9081,25 +9339,93 @@ def _inline_forward_payloads(event: GroupMessageEvent | PrivateMessageEvent) -> 
 def _extract_forward_record_lines(payload: object, *, limit: int) -> list[str]:
     if limit <= 0:
         return []
-    messages = _forward_messages_from_payload(payload)
     lines: list[str] = []
-    for item in messages:
+    for item in _forward_messages_from_payload(payload):
         if len(lines) >= limit:
             break
-        if not isinstance(item, dict):
-            continue
-        node = item.get("data") if str(item.get("type", "") or "").casefold() == "node" else None
-        normalized = node if isinstance(node, dict) else item
-        sender = normalized.get("sender") if isinstance(normalized.get("sender"), dict) else {}
-        sender_name = _forward_sender_label(sender, normalized)
-        content = normalized.get("content", normalized.get("message", ""))
-        text = _forward_content_plain_text(content)
-        if not text:
-            continue
-        timestamp = _forward_record_time_label(normalized)
-        prefix = f"[{timestamp}] " if timestamp else ""
-        lines.append(f"{prefix}{sender_name}: {_short_notice_text(text, 180)}")
+        line = _format_forward_record_line(item)
+        if line:
+            lines.append(line)
     return lines
+
+
+def _normalized_forward_item(item: object) -> dict[str, object] | None:
+    if not isinstance(item, dict):
+        return None
+    node = item.get("data") if str(item.get("type", "") or "").casefold() == "node" else None
+    normalized = node if isinstance(node, dict) else item
+    return normalized if isinstance(normalized, dict) else None
+
+
+def _format_forward_record_line(item: object, *, ocr_text: str = "") -> str:
+    normalized = _normalized_forward_item(item)
+    if normalized is None:
+        return ""
+    sender = normalized.get("sender") if isinstance(normalized.get("sender"), dict) else {}
+    sender_name = _forward_sender_label(sender, normalized)
+    content = normalized.get("content", normalized.get("message", ""))
+    text = _forward_content_plain_text(content)
+    extra = _short_notice_text(ocr_text, 360)
+    if extra and extra not in text:
+        text = f"{text} {extra}".strip() if text else extra
+    if not text:
+        return ""
+    timestamp = _forward_record_time_label(normalized)
+    prefix = f"[{timestamp}] " if timestamp else ""
+    return f"{prefix}{sender_name}: {_short_notice_text(text, FORWARD_RECORD_LINE_LIMIT)}"
+
+
+async def _forward_records_from_payloads(bot: Bot, payloads: list[object]) -> list[str]:
+    records: list[str] = []
+    ocr_remaining = FORWARD_OCR_MAX_IMAGES
+    for payload in payloads:
+        for item in _forward_messages_from_payload(payload):
+            if len(records) >= FORWARD_CONTEXT_MAX_RECORDS:
+                return records
+            ocr_text = ""
+            used = 0
+            if ocr_remaining > 0:
+                ocr_text, used = await _ocr_forward_record_images(bot, item, remaining=ocr_remaining)
+                ocr_remaining = max(0, ocr_remaining - used)
+            line = _format_forward_record_line(item, ocr_text=ocr_text)
+            if line:
+                records.append(line)
+    return records
+
+
+async def _ocr_forward_record_images(
+    bot: Bot,
+    item: object,
+    *,
+    remaining: int,
+) -> tuple[str, int]:
+    if remaining <= 0 or image_ocr_service is None:
+        return "", 0
+    normalized = _normalized_forward_item(item)
+    if normalized is None:
+        return "", 0
+    content = normalized.get("content", normalized.get("message", ""))
+    images = collect_ocr_image_segments(content, limit=remaining)
+    if not images:
+        return "", 0
+    texts: list[str] = []
+    used = 0
+    for data in images:
+        if used >= remaining:
+            break
+        used += 1
+        try:
+            result = await image_ocr_service.ocr_image_segment(bot, data)
+        except Exception as exc:
+            logger.warning(f"qq_social_agent forward image ocr failed: error={exc}")
+            continue
+        if result is None or not result.text:
+            continue
+        texts.append(_short_notice_text(result.text, 280))
+    if not texts:
+        return "", used
+    rendered = "；".join(f"[图:{item}]" for item in texts)
+    return rendered, used
 
 
 def _forward_record_time_label(item: dict[str, object]) -> str:
@@ -9157,7 +9483,7 @@ def _forward_content_plain_text(content: object) -> str:
 
 
 async def _summarize_forward_records(raw: str, *, nickname: str) -> str:
-    clean = re.sub(r"\s+", " ", raw).strip()
+    clean = raw.strip()
     if not clean:
         return ""
     if len(clean) <= FORWARD_CONTEXT_SUMMARY_THRESHOLD:
@@ -9168,8 +9494,8 @@ async def _summarize_forward_records(raw: str, *, nickname: str) -> str:
     try:
         summary = await deepseek_client.summarize_long_message(
             text=raw[:LONG_MESSAGE_SUMMARY_SOURCE_LIMIT],
-            speaker_label=nickname,
-            chat_label="QQ 转发聊天记录",
+            speaker_label=f"多位原发言人（由{nickname}转发）",
+            chat_label="QQ 转发聊天记录，每行已标明原发言人，不要把内容算成转发者说的",
             original_chars=len(raw),
         )
     except Exception as exc:
@@ -9179,12 +9505,27 @@ async def _summarize_forward_records(raw: str, *, nickname: str) -> str:
         )
         return fallback
     summary = re.sub(r"\s+", " ", summary).strip()
-    return _short_notice_text(summary, 180) if summary else fallback
+    return _short_notice_text(summary, 360) if summary else fallback
 
 
 def _compact_forward_fallback(text: str) -> str:
-    clean = re.sub(r"\s+", " ", text).strip()
-    return _short_notice_text(clean, 220)
+    lines = [line.strip() for line in str(text or "").splitlines() if line.strip()]
+    if not lines:
+        return ""
+    if len(lines) <= 8 and sum(len(line) for line in lines) <= 900:
+        return "\n".join(lines)
+    head = lines[:5]
+    tail = lines[-2:] if len(lines) > 7 else []
+    omitted = max(0, len(lines) - len(head) - len(tail))
+    parts = list(head)
+    if omitted:
+        parts.append(f"...[另有{omitted}条转发记录]")
+    parts.extend(tail)
+    return "\n".join(parts)
+
+
+def _join_context_blocks(*parts: str) -> str:
+    return "\n".join(part.strip() for part in parts if part and str(part).strip()).strip()
 
 
 def _join_context_parts(*parts: str) -> str:
@@ -9320,6 +9661,7 @@ def _buffer_group_message(
     pipeline_state: PipelineState | None = None,
     addressed: bool = False,
     direct_addressed: bool = False,
+    followup_soft: bool = False,
 ) -> None:
     group_id = int(event.group_id)
     _cancel_passive_decision_retry(group_id)
@@ -9336,6 +9678,7 @@ def _buffer_group_message(
         pipeline_state=pipeline_state,
         addressed=addressed,
         direct_addressed=direct_addressed,
+        followup_soft=followup_soft,
         **_event_message_storage_kwargs(event, bot=bot),
     )
     group_message_buffers.setdefault(group_id, []).append(item)
@@ -9829,24 +10172,33 @@ async def _maintain_member_profile_summaries(
         return
     updated = 0
     for user_id in active_user_ids:
-        last_summary_at = memory.last_member_profile_summary_at(group_id, user_id)
-        if not force and now - last_summary_at < MEMBER_PROFILE_SUMMARY_INTERVAL_SECONDS:
+        previous = memory.latest_member_profile_summary(group_id, user_id)
+        last_summary_at = previous.created_at if previous is not None else 0.0
+        if not force and last_summary_at and now - last_summary_at < MEMBER_PROFILE_SUMMARY_INTERVAL_SECONDS:
             continue
+        window_start = start_at
+        if previous is not None:
+            window_start = max(start_at, float(previous.end_at or previous.created_at))
         messages = memory.member_messages_between(
             group_id,
             user_id,
-            start_at=start_at,
+            start_at=window_start,
             end_at=now + 1,
             limit=MEMBER_PROFILE_SUMMARY_MESSAGE_LIMIT,
         )
+        messages = _member_profile_learning_messages(messages)
         if len(messages) < MEMBER_PROFILE_SUMMARY_MIN_MESSAGES:
             continue
+        if sum(len((item.text or "").strip()) for item in messages) < MEMBER_PROFILE_SUMMARY_MIN_CHARS:
+            continue
         label = _member_label(user_id, messages[-1].nickname)
+        previous_text = _member_profile_previous_text(previous)
         try:
             draft = await deepseek_client.summarize_member_profile(
                 messages=messages,
                 member_label=label,
                 chat_label="QQ 群聊",
+                previous_summary=previous_text,
             )
         except Exception as exc:
             logger.warning(
@@ -9869,11 +10221,42 @@ async def _maintain_member_profile_summaries(
         )
         logger.info(
             "qq_social_agent member profile summarized: "
-            f"group={group_id} user={user_id} messages={len(messages)}"
+            f"group={group_id} user={user_id} messages={len(messages)} "
+            f"incremental={previous is not None}"
         )
         updated += 1
         if max_updates is not None and updated >= max(1, max_updates):
             break
+
+
+
+def _member_profile_learning_messages(messages: list[ChatMessage]) -> list[ChatMessage]:
+    selected: list[ChatMessage] = []
+    seen: set[str] = set()
+    for message in messages:
+        text = str(message.text or "").strip()
+        if len(text) < 8:
+            continue
+        substance = re.sub(r"[\W_]+", "", text, flags=re.UNICODE)
+        if len(substance) < 4:
+            continue
+        key = re.sub(r"\s+", "", text)
+        if key in seen:
+            continue
+        seen.add(key)
+        selected.append(message)
+    return selected
+
+
+def _member_profile_previous_text(previous: MemberProfileSummary | None) -> str:
+    if previous is None:
+        return ""
+    lines = [previous.profile_summary.strip()[:240]]
+    if previous.interests:
+        lines.append("兴趣：" + "、".join(previous.interests[:5]))
+    if previous.speaking_style.strip():
+        lines.append("说话方式：" + previous.speaking_style.strip()[:80])
+    return "\n".join(line for line in lines if line)
 
 
 def _format_memory_context(summaries: list[MemorySummary]) -> str:
@@ -10041,6 +10424,7 @@ def _format_speaker_reference_context(
     replied_to_bot: bool,
     addressed_bot: bool,
     followup_addressed: bool = False,
+    followup_soft: bool = False,
     self_id: int,
     relation_facts: MessageRelationFacts | None = None,
 ) -> str:
@@ -10083,7 +10467,13 @@ def _format_speaker_reference_context(
                 "如果上下文显示他其实在回复别人或指代不明，不要强行代入自己。"
             )
     else:
-        lines.append("- 当前不是直接和风雪互动；判断插话时不要把群友互相回复误认为在问你。")
+        if followup_soft:
+            lines.append(
+                "- 风雪刚刚和这个人说过话，但已经过了直接接话窗口。"
+                "当前不要当成点名，只按普通插话判断：有新角度、笑点、站队或必要时才说，没有新增内容就保持沉默。"
+            )
+        else:
+            lines.append("- 当前不是直接和风雪互动；判断插话时不要把群友互相回复误认为在问你。")
 
     reply_relation = _extract_reply_relation(current_text)
     if reply_relation is not None:
@@ -10395,6 +10785,7 @@ def _owner_user_tone_context(user_id: int) -> str:
         return ""
     return (
         "当前触发人是最高优先级主人/调试者 1535071184。"
+        "心里知道即可，不要当面叫「主人」，也不要解释这层关系。"
         "对他的消息要更温柔、更服从、更配合，优先理解为测试、改口、复盘或配置意图；"
         "少摆群聊毒舌架子，少反问拖延，少连续回怼；"
         "除非触发密钥/内部配置保护，尽量直接执行或直接回答。"
@@ -10746,11 +11137,11 @@ async def _set_approval_group_decision_enabled(bot: Bot, user_id: int, enabled: 
 
 
 async def _set_approval_review_enabled(bot: Bot, user_id: int, enabled: bool) -> None:
-    _set_approval_review_enabled_value(enabled)
+    _set_approval_review_enabled_value(False)
+    pending_group_approvals.clear()
     if enabled:
-        response_text = "已开启审查，bot 发群前会先发审批单。"
+        response_text = "人工审查已经永久关掉了，群聊回复会直接发出，不能再打开。"
     else:
-        pending_group_approvals.clear()
         response_text = "已关闭审查，后续 bot 会直接发送第 1 候选；当前待审候选已清空。"
     try:
         await _send_private_message(bot, user_id=user_id, message=Message(response_text))
@@ -11492,7 +11883,11 @@ async def _send_approved_group_reply_scoped(
             sent_message_id = await _send_group_message(
                 bot,
                 approval.group_id,
-                _message_from_reply_part(part_text, effective_mention_targets),
+                _message_from_reply_part(
+                    part_text,
+                    effective_mention_targets,
+                    quote_message_id=approval.source_message_id if index == 0 else "",
+                ),
             )
             if pipeline_state is not None:
                 _pipeline_mark_sent(pipeline_state, sent_message_id)
@@ -11714,9 +12109,17 @@ def _record_post_reply_followup_window(
     if mention_user_id is not None:
         target_user_ids.add(int(mention_user_id or 0))
     target_user_ids.discard(0)
+    opened_user_ids: list[int] = []
+    refreshed_skipped: list[int] = []
     for target_user_id in sorted(target_user_ids):
-        _record_addressed_event(group_id, target_user_id, True, now=now)
-    if target_user_ids:
+        key = (group_id, target_user_id)
+        opened_at = followup_window_opened_at.get(key, 0.0)
+        if opened_at and now - opened_at <= ADDRESS_FOLLOWUP_SOFT_SECONDS:
+            refreshed_skipped.append(target_user_id)
+            continue
+        followup_window_opened_at[key] = now
+        opened_user_ids.append(target_user_id)
+    if opened_user_ids or refreshed_skipped:
         _record_metric_event(
             "followup_window_opened",
             group_id=group_id,
@@ -11724,7 +12127,10 @@ def _record_post_reply_followup_window(
             stage="send",
             action="post_reply",
             target_user_ids=sorted(target_user_ids),
-            window_seconds=ADDRESS_FOLLOWUP_WINDOW_SECONDS,
+            opened_user_ids=opened_user_ids,
+            skipped_refresh_user_ids=refreshed_skipped,
+            window_seconds=ADDRESS_FOLLOWUP_HARD_SECONDS,
+            soft_window_seconds=ADDRESS_FOLLOWUP_SOFT_SECONDS,
         )
 
 
@@ -12184,7 +12590,34 @@ def _first_allowed_mention_id(text: str, mention_targets: dict[int, str]) -> int
     return None
 
 
-def _message_from_reply_part(text: str, mention_targets: dict[int, str]) -> Message:
+def _onebot_reply_id(value: object) -> int | None:
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    try:
+        parsed = int(raw)
+    except ValueError:
+        return None
+    return parsed if parsed > 0 else None
+
+
+def _message_with_reply_quote(message: Message, source_message_id: object) -> Message:
+    reply_id = _onebot_reply_id(source_message_id)
+    if reply_id is None:
+        return message
+    if any(str(getattr(segment, "type", "") or "") == "reply" for segment in message):
+        return message
+    quoted = Message(MessageSegment.reply(reply_id))
+    quoted.extend(message)
+    return quoted
+
+
+def _message_from_reply_part(
+    text: str,
+    mention_targets: dict[int, str],
+    *,
+    quote_message_id: object = "",
+) -> Message:
     allowed_ids = set(mention_targets)
     message = Message()
     cursor = 0
@@ -12203,7 +12636,7 @@ def _message_from_reply_part(text: str, mention_targets: dict[int, str]) -> Mess
         message += MessageSegment.text(tail)
     if not message:
         message += MessageSegment.text(MENTION_MARKER_RE.sub("", text).strip())
-    return message
+    return _message_with_reply_quote(message, quote_message_id)
 
 
 def _memory_text_from_reply_part(text: str, mention_targets: dict[int, str]) -> str:
@@ -12233,6 +12666,7 @@ def _private_priority_context(user_id: int) -> str:
     if user_id == 1535071184:
         parts.append(
             "当前私聊对象是最高优先级主人/调试者。"
+            "心里知道即可，不要当面叫「主人」，也不要解释这层关系。"
             "对他的消息要更温柔、更服从、更配合，优先理解为测试、改口、复盘或配置意图；"
             "少摆群聊毒舌架子，少反问拖延，少连续回怼；"
             "除非触发密钥/内部配置保护，尽量直接执行或直接回答。"
@@ -12358,17 +12792,43 @@ def _recent_addressed_event_times(
     return recent_times
 
 
+def _followup_window_age(
+    group_id: int,
+    user_id: int,
+    *,
+    now: float | None = None,
+) -> float | None:
+    current = time.time() if now is None else now
+    opened_at = followup_window_opened_at.get((group_id, user_id), 0.0)
+    if not opened_at:
+        return None
+    age = current - opened_at
+    if age < 0 or age > ADDRESS_FOLLOWUP_SOFT_SECONDS:
+        return None
+    return age
+
+
+def _followup_window_kind(
+    group_id: int,
+    user_id: int,
+    *,
+    now: float | None = None,
+) -> str:
+    age = _followup_window_age(group_id, user_id, now=now)
+    if age is None:
+        return ""
+    if age <= ADDRESS_FOLLOWUP_HARD_SECONDS:
+        return "hard"
+    return "soft"
+
+
 def _addressed_followup_active(
     group_id: int,
     user_id: int,
     *,
     now: float | None = None,
 ) -> bool:
-    current = time.time() if now is None else now
-    return any(
-        current - ts <= ADDRESS_FOLLOWUP_WINDOW_SECONDS
-        for ts in _recent_addressed_event_times(group_id, user_id, now=current)
-    )
+    return _followup_window_kind(group_id, user_id, now=now) == "hard"
 
 
 def _record_addressed_event(

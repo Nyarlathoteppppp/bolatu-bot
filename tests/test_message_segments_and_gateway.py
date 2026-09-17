@@ -191,3 +191,35 @@ def test_unified_gateway_times_out_and_records_failure() -> None:
     assert snapshot["apis"][api]["failures"] >= 1
     assert snapshot["apis"][api]["in_flight"] == 0
     assert snapshot["last_api"] == api
+
+
+def test_ocr_image_segments_skip_nested_forward_by_default() -> None:
+    from qq_social_agent.media_context import collect_ocr_image_segments
+
+    event = SimpleNamespace(
+        message=[
+            SimpleNamespace(type="image", data={"url": "https://example.com/current.png"}),
+            SimpleNamespace(
+                type="forward",
+                data={
+                    "content": [
+                        {
+                            "type": "node",
+                            "data": {
+                                "content": [
+                                    {"type": "image", "data": {"url": "https://example.com/fwd.png"}},
+                                ]
+                            },
+                        }
+                    ]
+                },
+            ),
+        ]
+    )
+    urls = [item.get("url") for item in ocr_image_segments_from_event(event)]
+    assert urls == ["https://example.com/current.png"]
+
+    nested = collect_ocr_image_segments(event.message, include_forward=True)
+    nested_urls = [item.get("url") for item in nested]
+    assert "https://example.com/current.png" in nested_urls
+    assert "https://example.com/fwd.png" in nested_urls

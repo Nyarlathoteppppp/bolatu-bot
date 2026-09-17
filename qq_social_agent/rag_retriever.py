@@ -68,6 +68,8 @@ class RAGConfig:
     conversation_episode_gap_seconds: int = 600
     conversation_episode_max_chars: int = 900
     max_expanded_conversation_hits: int = 2
+    conversation_semantic_max_age_seconds: int = 30 * 24 * 3600
+    conversation_semantic_limit: int = 4000
 
     @classmethod
     def from_mapping(cls, raw: object) -> "RAGConfig":
@@ -105,6 +107,13 @@ class RAGConfig:
             ),
             max_expanded_conversation_hits=max(
                 0, min(4, int(retrieval.get("max_expanded_conversation_hits", 2)))
+            ),
+            conversation_semantic_max_age_seconds=max(
+                0,
+                min(365 * 24 * 3600, int(retrieval.get("conversation_semantic_max_age_seconds", 30 * 24 * 3600))),
+            ),
+            conversation_semantic_limit=max(
+                200, min(20000, int(retrieval.get("conversation_semantic_limit", 4000)))
             ),
         )
 
@@ -187,6 +196,36 @@ class RAGService:
         self._source_sync_event.set()
         self._source_sync_task = asyncio.create_task(self._source_sync_loop())
         self._ensure_embedding_task()
+        asyncio.create_task(self._archive_old_conversations_once())
+
+    async def _archive_old_conversations_once(self) -> None:
+        max_age = self.config.conversation_semantic_max_age_seconds
+        if max_age <= 0:
+            return
+        try:
+            stats = await asyncio.to_thread(
+                self._archive_old_conversations_isolated,
+                max_age,
+            )
+            if stats.get("archived"):
+                logger.info(
+                    "qq_social_agent rag archived old conversations: "
+                    f"archived={stats['archived']} embeddings_deleted={stats['embeddings_deleted']}"
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning(f"qq_social_agent rag conversation archive failed: error={exc}")
+
+    def _archive_old_conversations_isolated(self, older_than_seconds: int) -> dict[str, int]:
+        store = RAGStore(self.store.db_path)
+        try:
+            return store.archive_old_conversation_documents(
+                older_than_seconds=older_than_seconds,
+                limit=20000,
+            )
+        finally:
+            store.close()
 
     def request_source_sync(self) -> None:
         if self._source_sync_event is not None:
@@ -346,38 +385,37 @@ class RAGService:
             document_types = self._document_types_for_plan(plan, bool(resolved_members))
             if not include_conversation:
                 document_types = tuple(doc_type for doc_type in document_types if doc_type != "conversation")
-            if plan.lexical:
-                lexical = self.store.lexical_search(
-                    group_id,
-                    search_query,
-                    limit=self.config.lexical_candidates,
-                    doc_types=document_types,
-                    exclude_recent_after=exclude_after,
-                )
-            if target_user_ids and plan.route in {"person_past", "identifier", "explicit_memory"}:
-                direct_person = self.store.person_documents(
-                    group_id,
-                    target_user_ids,
-                    doc_types=document_types,
-                    limit=min(20, self.config.lexical_candidates),
-                )
-                existing_ids = {item.document.id for item in lexical}
-                lexical.extend(item for item in direct_person if item.document.id not in existing_ids)
+            deadline = started + (self.config.online_timeout_ms / 1000)
+            lexical = await self._search_lexical_thread(
+                group_id=group_id,
+                search_query=search_query,
+                document_types=document_types,
+                exclude_after=exclude_after,
+                target_user_ids=target_user_ids,
+                plan_route=plan.route,
+                lexical_enabled=plan.lexical,
+                deadline=deadline,
+            )
             if (
                 plan.semantic
                 and self.config.mode in {"shadow", "hybrid"}
                 and self.embedding.available
             ):
-                vector, cache_hit = await self._query_embedding(search_query)
-                if vector:
-                    semantic = self.store.semantic_search(
-                        group_id,
-                        vector,
-                        model=self.embedding.config.model,
-                        limit=self.config.semantic_candidates,
-                        doc_types=document_types,
-                        exclude_recent_after=exclude_after,
+                remaining = deadline - time.monotonic()
+                if remaining > 0.05:
+                    vector, cache_hit = await self._query_embedding(
+                        search_query,
+                        timeout_seconds=remaining,
                     )
+                    remaining = deadline - time.monotonic()
+                    if vector and remaining > 0.05:
+                        semantic = await self._search_semantic_thread(
+                            group_id=group_id,
+                            vector=vector,
+                            document_types=document_types,
+                            exclude_after=exclude_after,
+                            deadline=deadline,
+                        )
             hits = self._merge_hits(
                 lexical,
                 semantic if self.config.mode == "hybrid" else [],
@@ -389,6 +427,25 @@ class RAGService:
             if include_conversation:
                 hits = self._expand_conversation_hits(hits)
             context = _format_rag_context(hits, max_chars=self.config.max_context_chars)
+        except asyncio.TimeoutError:
+            error = "timeout"
+            self.last_error = error
+            logger.warning(f"qq_social_agent rag retrieval timed out: group={group_id}")
+            if not lexical:
+                hits = []
+                context = ""
+            else:
+                hits = self._merge_hits(
+                    lexical,
+                    [],
+                    query=search_query,
+                    target_user_ids=target_user_ids,
+                    route=plan.route,
+                    required_topic=normalized_query.focused_topic,
+                )
+                if include_conversation:
+                    hits = self._expand_conversation_hits(hits)
+                context = _format_rag_context(hits, max_chars=self.config.max_context_chars)
         except Exception as exc:
             error = str(exc)[:240]
             self.last_error = error
@@ -544,16 +601,132 @@ class RAGService:
             expanded_count += 1
         return expanded
 
-    async def _query_embedding(self, query: str) -> tuple[list[float], bool]:
+    async def _search_lexical_thread(
+        self,
+        *,
+        group_id: int,
+        search_query: str,
+        document_types: tuple[str, ...],
+        exclude_after: float | None,
+        target_user_ids: list[int],
+        plan_route: str,
+        lexical_enabled: bool,
+        deadline: float,
+    ) -> list[RankedDocument]:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise asyncio.TimeoutError
+        return await asyncio.wait_for(
+            asyncio.to_thread(
+                self._search_lexical_isolated,
+                group_id,
+                search_query,
+                document_types,
+                exclude_after,
+                target_user_ids,
+                plan_route,
+                lexical_enabled,
+            ),
+            timeout=remaining,
+        )
+
+    def _search_lexical_isolated(
+        self,
+        group_id: int,
+        search_query: str,
+        document_types: tuple[str, ...],
+        exclude_after: float | None,
+        target_user_ids: list[int],
+        plan_route: str,
+        lexical_enabled: bool,
+    ) -> list[RankedDocument]:
+        store = RAGStore(self.store.db_path)
+        try:
+            lexical: list[RankedDocument] = []
+            if lexical_enabled:
+                lexical = store.lexical_search(
+                    group_id,
+                    search_query,
+                    limit=self.config.lexical_candidates,
+                    doc_types=document_types,
+                    exclude_recent_after=exclude_after,
+                )
+            if target_user_ids and plan_route in {"person_past", "identifier", "explicit_memory"}:
+                direct_person = store.person_documents(
+                    group_id,
+                    target_user_ids,
+                    doc_types=document_types,
+                    limit=min(20, self.config.lexical_candidates),
+                )
+                existing_ids = {item.document.id for item in lexical}
+                lexical.extend(item for item in direct_person if item.document.id not in existing_ids)
+            return lexical
+        finally:
+            store.close()
+
+    async def _search_semantic_thread(
+        self,
+        *,
+        group_id: int,
+        vector: list[float],
+        document_types: tuple[str, ...],
+        exclude_after: float | None,
+        deadline: float,
+    ) -> list[RankedDocument]:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return []
+        try:
+            return await asyncio.wait_for(
+                asyncio.to_thread(
+                    self._search_semantic_isolated,
+                    group_id,
+                    vector,
+                    document_types,
+                    exclude_after,
+                ),
+                timeout=remaining,
+            )
+        except asyncio.TimeoutError:
+            logger.warning(f"qq_social_agent rag semantic search timed out: group={group_id}")
+            return []
+
+    def _search_semantic_isolated(
+        self,
+        group_id: int,
+        vector: list[float],
+        document_types: tuple[str, ...],
+        exclude_after: float | None,
+    ) -> list[RankedDocument]:
+        store = RAGStore(self.store.db_path)
+        try:
+            conversation_after = None
+            if self.config.conversation_semantic_max_age_seconds > 0:
+                conversation_after = time.time() - self.config.conversation_semantic_max_age_seconds
+            return store.semantic_search(
+                group_id,
+                vector,
+                model=self.embedding.config.model,
+                limit=self.config.semantic_candidates,
+                doc_types=document_types,
+                exclude_recent_after=exclude_after,
+                conversation_after=conversation_after,
+                conversation_limit=self.config.conversation_semantic_limit,
+            )
+        finally:
+            store.close()
+
+    async def _query_embedding(self, query: str, timeout_seconds: float | None = None) -> tuple[list[float], bool]:
         cache_key = f"{self.embedding.config.model}\n{query.strip()}"
         cached = self._query_cache.get(cache_key)
         if cached is not None:
             self._query_cache.move_to_end(cache_key)
             return cached, True
+        timeout = self.config.online_timeout_ms / 1000 if timeout_seconds is None else max(0.05, float(timeout_seconds))
         try:
             vectors = await asyncio.wait_for(
                 self.embedding.embed([query.strip()]),
-                timeout=self.config.online_timeout_ms / 1000,
+                timeout=timeout,
             )
         except asyncio.TimeoutError:
             return [], False

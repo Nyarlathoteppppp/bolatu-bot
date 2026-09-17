@@ -2698,6 +2698,14 @@ class MemoryStore:
         ).fetchone()
         return float(row["ts"] or 0.0) if row else 0.0
 
+    def latest_member_profile_summary(
+        self,
+        group_id: int,
+        user_id: int,
+    ) -> MemberProfileSummary | None:
+        summaries = self.recent_member_profile_summaries(group_id, user_id, limit=1)
+        return summaries[0] if summaries else None
+
     def add_member_profile_summary(
         self,
         *,
@@ -2710,7 +2718,7 @@ class MemoryStore:
         start_at: float,
         end_at: float,
         message_count: int,
-        keep_per_member: int = 14,
+        keep_per_member: int = 3,
     ) -> None:
         summary = profile_summary.strip()
         if not summary:
@@ -2751,6 +2759,30 @@ class MemoryStore:
             (group_id, user_id, group_id, user_id, keep_per_member),
         )
         self.conn.commit()
+
+    def prune_member_profile_summaries(self, *, keep_per_member: int = 3) -> int:
+        keep = max(1, int(keep_per_member))
+        pairs = self.conn.execute(
+            "select distinct group_id, user_id from member_profile_summaries"
+        ).fetchall()
+        deleted = 0
+        for row in pairs:
+            cursor = self.conn.execute(
+                """
+                delete from member_profile_summaries
+                where group_id = ? and user_id = ?
+                  and id not in (
+                    select id from member_profile_summaries
+                    where group_id = ? and user_id = ?
+                    order by created_at desc, id desc
+                    limit ?
+                  )
+                """,
+                (row["group_id"], row["user_id"], row["group_id"], row["user_id"], keep),
+            )
+            deleted += int(cursor.rowcount or 0)
+        self.conn.commit()
+        return deleted
 
     def recent_member_profile_summaries(
         self,

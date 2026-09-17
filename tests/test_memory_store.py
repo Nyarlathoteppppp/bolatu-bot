@@ -722,3 +722,50 @@ def test_relevant_memory_atoms_exclude_jargon_candidates(tmp_path) -> None:
 
     atoms = memory.relevant_memory_atoms(1, "南下")
     assert [atom.atom_type for atom in atoms] == ["preference"]
+
+
+def test_latest_member_profile_summary_and_keep_limit(tmp_path) -> None:
+    memory = MemoryStore(tmp_path / "bot.sqlite3")
+    for index in range(5):
+        memory.add_member_profile_summary(
+            group_id=1,
+            user_id=100,
+            profile_summary=f"第{index}份画像",
+            interests=["股票"],
+            speaking_style="短句",
+            representative_texts=["亏了"],
+            start_at=100 + index,
+            end_at=200 + index,
+            message_count=3,
+        )
+    latest = memory.latest_member_profile_summary(1, 100)
+    assert latest is not None
+    assert latest.profile_summary == "第4份画像"
+    remaining = memory.recent_member_profile_summaries(1, 100, limit=10)
+    assert len(remaining) == 3
+    assert [item.profile_summary for item in remaining] == ["第4份画像", "第3份画像", "第2份画像"]
+    assert memory.latest_member_profile_summary(1, 999) is None
+
+
+
+def test_prune_member_profile_summaries_keeps_latest_three(tmp_path) -> None:
+    memory = MemoryStore(tmp_path / "bot.sqlite3")
+    for user_id in (100, 200):
+        for index in range(5):
+            memory.add_member_profile_summary(
+                group_id=1,
+                user_id=user_id,
+                profile_summary=f"user{user_id}-{index}",
+                interests=["股票"],
+                speaking_style="短句",
+                representative_texts=["亏了"],
+                start_at=100 + index,
+                end_at=200 + index,
+                message_count=3,
+                keep_per_member=20,
+            )
+    deleted = memory.prune_member_profile_summaries(keep_per_member=3)
+    assert deleted == 4
+    assert len(memory.recent_member_profile_summaries(1, 100, limit=10)) == 3
+    assert len(memory.recent_member_profile_summaries(1, 200, limit=10)) == 3
+    assert memory.latest_member_profile_summary(1, 100).profile_summary == "user100-4"

@@ -140,7 +140,8 @@ async def test_searxng_provider_uses_local_json_endpoint(monkeypatch) -> None:
 
     assert lookup.status == "ok"
     assert lookup.provider == "searxng"
-    assert lookup.attempted_providers == ("searxng",)
+    assert lookup.attempted_providers[0] == "searxng"
+    assert all(item.startswith("searxng") for item in lookup.attempted_providers)
 
 
 def test_fresh_context_includes_quick_answer() -> None:
@@ -155,7 +156,8 @@ def test_fresh_context_includes_quick_answer() -> None:
         )
     )
 
-    assert "快速摘要：局势仍在变化" in context
+    assert "<synthesized_answer>" in context
+    assert "局势仍在变化" in context
     assert "多来源共同支持" in context
 
 
@@ -393,11 +395,13 @@ async def test_tavily_answer_only_uses_success_cache_ttl(monkeypatch) -> None:
     )
 
     first = await tool.lookup("测试主题", kind="news")
+    first_calls = calls
     second = await tool.lookup("测试主题", kind="news")
 
     assert first.status == "ok"
     assert second.cached
-    assert calls == 1
+    assert first_calls >= 1
+    assert calls == first_calls
 
 
 @pytest.mark.anyio
@@ -562,7 +566,7 @@ async def test_followup_reads_one_page_from_this_round_result_urls(monkeypatch) 
     assert "130.5 billion" in lookup.page_text
     assert "网页正文" in context
     assert "130.5 billion" in context
-    assert context.index("网页正文") < context.index("事实背景")
+    assert context.index("网页正文") < context.index("<facts>")
     assert tool.status_snapshot()["last_request"]["page_status"] == "ok"
 
 
@@ -943,3 +947,295 @@ async def test_wikipedia_extract_uses_api_not_html(monkeypatch) -> None:
     lookup = await tool.lookup("OpenAI 是什么", kind="web")
     assert "人工智能研究公司" in lookup.page_text
     assert lookup.page_url == "https://zh.wikipedia.org/wiki/OpenAI"
+
+def test_research_queries_split_web_topic_into_angles() -> None:
+    queries = fresh_context._research_queries("OpenFOAM 简介", kind="web")
+    assert queries[0] == "OpenFOAM 简介"
+    assert 2 <= len(queries) <= 4
+    assert any("维基百科" in item or "是什么" in item for item in queries)
+
+
+def test_detect_fresh_intent_drops_weak_search_object() -> None:
+    assert detect_fresh_intent("搜一下然后开始想个思路") is None
+    intent = detect_fresh_intent("搜一下 OpenFOAM 简介")
+    assert intent is not None
+    assert "OpenFOAM" in intent.query
+
+
+@pytest.mark.anyio
+async def test_lookup_runs_parallel_angle_queries_without_polluting_attempted_providers(monkeypatch) -> None:
+    seen: list[str] = []
+
+    async def fake_tavily(query: str, *, kind: str, api_key: str):
+        seen.append(query)
+        return "OpenFOAM 是开源 CFD 工具包。", (
+            FreshItem(
+                "OpenFOAM",
+                "openfoam.org",
+                "",
+                summary="The OpenFOAM Foundation",
+                url="https://openfoam.org",
+            ),
+        )
+
+    monkeypatch.setattr(fresh_context, "_fetch_tavily_lookup", fake_tavily)
+    tool = FreshContextTool(
+        provider="tavily",
+        tavily_api_key="test-key",
+        followup_page_max_tries=0,
+        followup_search_hops=1,
+    )
+    lookup = await tool.lookup("OpenFOAM 简介", kind="web")
+    assert lookup.status == "ok"
+    assert lookup.provider == "tavily"
+    assert lookup.attempted_providers == ("tavily",)
+    assert len(lookup.research_queries) >= 2
+    assert len(seen) >= 2
+    assert "OpenFOAM 是开源 CFD 工具包" in lookup.answer
+
+def test_should_run_second_research_round_only_when_evidence_is_thin() -> None:
+    covered = (
+        FreshItem("OpenFOAM 简介", "openfoam.org", "", url="https://openfoam.org/docs"),
+    )
+    pages = (
+        UrlReadResult(
+            "ok",
+            "https://openfoam.org/docs",
+            final_url="https://openfoam.org/docs",
+            title="OpenFOAM",
+            text="OpenFOAM is an open source CFD toolbox.",
+        ),
+    )
+    assert (
+        fresh_context._should_run_second_research_round(
+            query="OpenFOAM 简介",
+            kind="web",
+            items=covered,
+            pages=pages,
+            hops=2,
+            remaining_seconds=3.0,
+        )
+        is False
+    )
+    mismatch = (FreshItem("无关标题", "example.com", "", url="https://example.com/x"),)
+    assert (
+        fresh_context._should_run_second_research_round(
+            query="OpenFOAM 简介",
+            kind="web",
+            items=mismatch,
+            pages=(),
+            hops=2,
+            remaining_seconds=3.0,
+        )
+        is True
+    )
+    assert (
+        fresh_context._should_run_second_research_round(
+            query="OpenFOAM 简介",
+            kind="web",
+            items=mismatch,
+            pages=(),
+            hops=1,
+            remaining_seconds=3.0,
+        )
+        is False
+    )
+
+
+def test_research_round2_queries_are_new_angles() -> None:
+    used = ("OpenFOAM 简介", "OpenFOAM 简介 是什么")
+    queries = fresh_context._research_round2_queries("OpenFOAM 简介", kind="web", used_queries=used)
+    assert queries
+    assert all(item not in used for item in queries)
+    assert any("官网" in item or "wikipedia" in item.lower() for item in queries)
+
+
+@pytest.mark.anyio
+async def test_lookup_second_round_runs_once_when_first_round_misses(monkeypatch) -> None:
+    seen: list[str] = []
+
+    async def fake_tavily(query: str, *, kind: str, api_key: str):
+        seen.append(query)
+        if "维基" in query or "官网" in query:
+            return "OpenFOAM 是开源 CFD 工具包。", (
+                FreshItem(
+                    "OpenFOAM",
+                    "openfoam.org",
+                    "",
+                    summary="Open source CFD toolbox",
+                    url="https://www.openfoam.com",
+                ),
+            )
+        return "无关摘要", (
+            FreshItem("杂讯", "example.com", "", summary="noise", url="https://example.com/noise"),
+        )
+
+    monkeypatch.setattr(fresh_context, "_fetch_tavily_lookup", fake_tavily)
+    tool = FreshContextTool(
+        provider="tavily",
+        tavily_api_key="test-key",
+        followup_page_max_tries=0,
+        followup_search_hops=2,
+        timeout_seconds=8,
+    )
+    lookup = await tool.lookup("OpenFOAM 简介", kind="web")
+    assert lookup.status == "ok"
+    assert lookup.research_rounds == 2
+    assert any(item.endswith(":round2") for item in lookup.attempted_providers)
+    assert any("维基" in query or "官网" in query for query in seen)
+    assert lookup.research_rounds <= 3
+
+
+def test_planned_research_queries_prefer_model_angles() -> None:
+    queries = fresh_context._planned_research_queries(
+        "OpenFOAM 简介",
+        kind="web",
+        planned=("OpenFOAM 官方文档", "OpenFOAM CFD toolbox"),
+    )
+    assert queries[0] == "OpenFOAM 简介"
+    assert "OpenFOAM 官方文档" in queries
+    assert len(queries) <= 4
+
+
+@pytest.mark.anyio
+async def test_lookup_uses_model_queries_as_first_round(monkeypatch) -> None:
+    seen: list[str] = []
+
+    async def fake_tavily(query: str, *, kind: str, api_key: str):
+        seen.append(query)
+        return "OpenFOAM 是开源 CFD 工具包。", (
+            FreshItem(
+                "OpenFOAM",
+                "openfoam.org",
+                "",
+                summary="Open source CFD toolbox",
+                url="https://openfoam.org",
+            ),
+        )
+
+    monkeypatch.setattr(fresh_context, "_fetch_tavily_lookup", fake_tavily)
+    tool = FreshContextTool(
+        provider="tavily",
+        tavily_api_key="test-key",
+        followup_page_max_tries=0,
+        followup_search_hops=1,
+    )
+    lookup = await tool.lookup(
+        "OpenFOAM 简介",
+        kind="web",
+        queries=("OpenFOAM 简介", "OpenFOAM 官方文档", "OpenFOAM CFD toolbox"),
+    )
+    assert lookup.status == "ok"
+    assert lookup.research_queries[0] == "OpenFOAM 简介"
+    assert "OpenFOAM 官方文档" in lookup.research_queries
+    assert "OpenFOAM 官方文档" in seen
+
+
+def test_prompt_context_keeps_source_ids_aligned_with_page_bodies() -> None:
+    context = _prompt_context_from_lookup(
+        FreshLookup(
+            query="NoneBot 文档",
+            kind="web",
+            items=(
+                FreshItem(
+                    title="插件开发",
+                    source="nonebot.dev",
+                    published_at="2026-07-12",
+                    summary="创建插件的方法。",
+                    url="https://nonebot.dev/docs/plugin",
+                ),
+            ),
+            status="ok",
+            provider="bing_web",
+            page_url="https://nonebot.dev/docs/plugin",
+            page_text="Create a plugin with a matcher.",
+            page_urls=("https://nonebot.dev/docs/plugin",),
+            page_texts=("Create a plugin with a matcher.",),
+            research_queries=("NoneBot 文档", "NoneBot 官方文档"),
+            research_rounds=1,
+        )
+    )
+
+    assert "<fresh_research" in context
+    assert "<sources>" in context
+    assert "[S1 正文] https://nonebot.dev/docs/plugin" in context
+    assert "检索词：" in context
+    assert "NoneBot 官方文档" in context
+
+
+def test_should_run_followup_research_round_caps_at_three() -> None:
+    mismatch = (FreshItem("无关标题", "example.com", "", url="https://example.com/x"),)
+    assert fresh_context._should_run_followup_research_round(
+        query="OpenFOAM 简介",
+        kind="web",
+        items=mismatch,
+        pages=(),
+        hops=3,
+        remaining_seconds=3.0,
+        current_round=1,
+    )
+    assert fresh_context._should_run_followup_research_round(
+        query="OpenFOAM 简介",
+        kind="web",
+        items=mismatch,
+        pages=(),
+        hops=3,
+        remaining_seconds=3.0,
+        current_round=2,
+    )
+    assert not fresh_context._should_run_followup_research_round(
+        query="OpenFOAM 简介",
+        kind="web",
+        items=mismatch,
+        pages=(),
+        hops=3,
+        remaining_seconds=3.0,
+        current_round=3,
+    )
+
+
+def test_research_round3_queries_are_new_angles() -> None:
+    used = ("OpenFOAM 简介", "OpenFOAM 官网", "OpenFOAM wikipedia")
+    queries = fresh_context._research_followup_queries(
+        "OpenFOAM 简介",
+        kind="web",
+        used_queries=used,
+        round_index=3,
+    )
+    assert queries
+    assert all(item not in used for item in queries)
+
+
+@pytest.mark.anyio
+async def test_lookup_third_round_runs_when_second_round_still_misses(monkeypatch) -> None:
+    seen: list[str] = []
+
+    async def fake_tavily(query: str, *, kind: str, api_key: str):
+        seen.append(query)
+        if "英文" in query or "site:wikipedia.org" in query:
+            return "OpenFOAM is an open source CFD toolbox.", (
+                FreshItem(
+                    "OpenFOAM",
+                    "openfoam.org",
+                    "",
+                    summary="Open source CFD toolbox",
+                    url="https://www.openfoam.com",
+                ),
+            )
+        return "无关摘要", (
+            FreshItem("杂讯", "example.com", "", summary="noise", url="https://example.com/noise"),
+        )
+
+    monkeypatch.setattr(fresh_context, "_fetch_tavily_lookup", fake_tavily)
+    tool = FreshContextTool(
+        provider="tavily",
+        tavily_api_key="test-key",
+        followup_page_max_tries=0,
+        followup_search_hops=3,
+        timeout_seconds=8,
+    )
+    lookup = await tool.lookup("OpenFOAM 简介", kind="web")
+    assert lookup.status == "ok"
+    assert lookup.research_rounds == 3
+    assert any(item.endswith(":round3") for item in lookup.attempted_providers)
+    assert any("英文" in query or "wikipedia.org" in query for query in seen)

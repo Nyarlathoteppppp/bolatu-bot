@@ -51,10 +51,39 @@ def test_provider_circuit_uses_fallback_after_repeated_failures() -> None:
         client._record_provider_failure("siliconflow")
 
     assert client._candidate_routes("reply") == (fallback,)
+    assert len(client._provider_failures["siliconflow"]) == 3
 
     client._record_provider_success("siliconflow")
 
+    assert len(client._provider_failures["siliconflow"]) == 2
+    assert client._candidate_routes("reply") == (fallback,)
+
+    client._provider_circuit_until["siliconflow"] = 0.0
     assert client._candidate_routes("reply") == (primary, fallback)
+
+
+def test_provider_circuit_mixed_timeouts_still_open() -> None:
+    client = DeepSeekClient.__new__(DeepSeekClient)
+    primary = SimpleNamespace(provider="siliconflow", model="deepseek-ai/DeepSeek-V4-Flash")
+    fallback = SimpleNamespace(provider="deepseek", model="deepseek-v4-flash")
+    client.config = SimpleNamespace(
+        routes={"reply": primary},
+        fallback_routes={"reply": fallback},
+    )
+    client.route_overrides = {}
+    client._provider_failures = {}
+    client._provider_circuit_until = {}
+
+    client._record_provider_failure("siliconflow")
+    client._record_provider_success("siliconflow")
+    client._record_provider_failure("siliconflow")
+    client._record_provider_success("siliconflow")
+    client._record_provider_failure("siliconflow")
+    assert client._candidate_routes("reply") == (primary, fallback)
+
+    client._record_provider_failure("siliconflow")
+    client._record_provider_failure("siliconflow")
+    assert client._candidate_routes("reply") == (fallback,)
 
 
 def test_reply_peak_prefers_siliconflow_but_manual_override_wins() -> None:
@@ -192,6 +221,11 @@ def test_recent_bot_duplicate_filter_blocks_same_core_punchline() -> None:
     )
 
     assert [candidate.text for candidate in filtered] == ["你更像贾诩，突出一个能活"]
+
+
+def test_sanitize_strips_internal_source_markers() -> None:
+    assert _sanitize_reply("加息概率超92%，别把预期当真[S2][S1]。", 120) == "加息概率超92%，别把预期当真。"
+    assert _sanitize_reply("加息概率超92%，别把预期当真S2S1。", 120) == "加息概率超92%，别把预期当真。"
 
 
 def test_sanitize_keeps_normal_reply() -> None:
@@ -1079,7 +1113,50 @@ def test_parse_tool_routing_decision_market() -> None:
     assert decision.symbols[0].display == "特斯拉"
 
 
+def test_parse_tool_routing_decision_splits_queries() -> None:
+    decision = _parse_tool_routing_decision(
+        '{"tool":"fresh_search","kind":"web","query":"OpenFOAM 简介","queries":["OpenFOAM 是什么","OpenFOAM 官方文档","OpenFOAM CFD"],"confidence":0.9,"reason":"专有名词"}'
+    )
+
+    assert decision.tool == "fresh_search"
+    assert decision.query == "OpenFOAM 简介"
+    assert decision.queries[0] == "OpenFOAM 简介"
+    assert "OpenFOAM 是什么" in decision.queries
+    assert 2 <= len(decision.queries) <= 4
+
+
 def test_parse_tool_routing_decision_requires_valid_arguments() -> None:
     assert _parse_tool_routing_decision('{"tool":"fresh_search","query":""}').tool == "none"
     assert _parse_tool_routing_decision('{"tool":"market","symbols":[]}').tool == "none"
     assert _parse_tool_routing_decision('{"tool":"deep_url","query":"没有链接"}').tool == "none"
+
+
+def test_summarize_member_profile_includes_previous_summary() -> None:
+    client = DeepSeekClient.__new__(DeepSeekClient)
+    client.config = SimpleNamespace(temperature=0.2, thinking="disabled", max_tokens=180, reasoning_effort="low")
+    client.prompts = PromptRegistry()
+    captured: dict[str, object] = {}
+
+    async def fake_chat_completion(*, task: str, route_name: str, request: dict[str, object]) -> object:
+        captured["user"] = request["messages"][1]["content"]
+        return SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content='{"summary":"新画像","interests":[],"speaking_style":"","representative_texts":[]}'))]
+        )
+
+    client._chat_completion = fake_chat_completion
+    messages = [
+        ChatMessage(group_id=1, user_id=100, nickname="A", text="今天又聊代码", is_bot=False, created_at=1),
+    ]
+
+    async def run() -> None:
+        await client.summarize_member_profile(
+            messages=messages,
+            member_label="A[#00100]",
+            previous_summary="旧画像：常聊行情",
+        )
+
+    asyncio.run(run())
+    user = str(captured["user"])
+    assert "已有画像：旧画像：常聊行情" in user
+    assert "新增发言" in user
+    assert "今天又聊代码" in user

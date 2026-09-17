@@ -29,3 +29,4 @@ class PendingGroupApproval:
     tool_evidence: str = ""
     trigger_sequence: int = 0
     pipeline_state: PipelineState | None = None
+    source_message_id: str = ""

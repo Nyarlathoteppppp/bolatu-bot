@@ -59,6 +59,7 @@ class FreshSearchDecision:
 class ToolRoutingDecision:
     tool: str = "none"
     query: str = ""
+    queries: tuple[str, ...] = ()
     kind: str = "web"
     symbols: tuple[ToolSymbol, ...] = ()
     confidence: float = 0.0
@@ -332,8 +333,20 @@ class DeepSeekClient:
             )
 
     def _record_provider_success(self, provider: str) -> None:
-        self._provider_failures.pop(provider, None)
-        self._provider_circuit_until.pop(provider, None)
+        now = time.monotonic()
+        failures = [
+            observed_at
+            for observed_at in self._provider_failures.get(provider, [])
+            if now - observed_at <= _PROVIDER_FAILURE_WINDOW_SECONDS
+        ]
+        if failures:
+            failures.pop(0)
+        if failures:
+            self._provider_failures[provider] = failures
+        else:
+            self._provider_failures.pop(provider, None)
+        # An open circuit stays open until cooldown even if a later call
+        # succeeds. Mixed SiliconFlow timeouts otherwise never trip.
 
     def parse_model_route(self, value: str, *, default_provider: str = "siliconflow") -> LLMModelRoute:
         if default_provider not in self.config.providers:
@@ -516,7 +529,7 @@ class DeepSeekClient:
             route_name="search",
             request={
                 "temperature": 0.1,
-                "max_tokens": 240,
+                "max_tokens": 360,
                 "response_format": {"type": "json_object"},
                 "messages": [
                     {"role": "system", "content": system},
@@ -835,10 +848,14 @@ class DeepSeekClient:
         messages: list[ChatMessage],
         member_label: str,
         chat_label: str = "QQ 群聊",
+        previous_summary: str = "",
     ) -> MemberProfileDraft:
         context = "\n".join(_format_learning_source_message(msg) for msg in messages)
         if not context:
             return MemberProfileDraft("", (), "", ())
+        previous = previous_summary.strip()
+        if previous:
+            context = f"已有画像：{previous}\n\n新增发言：\n{context}"
         system = self.prompts.render("member_profile", "system")
         user = self.prompts.render(
             "member_profile",
@@ -852,7 +869,7 @@ class DeepSeekClient:
             route_name="member_profile",
             request={
                 "temperature": 0.2,
-                "max_tokens": 420,
+                "max_tokens": 220,
                 "response_format": {"type": "json_object"},
                 "messages": [
                     {"role": "system", "content": system},
@@ -1248,20 +1265,42 @@ def _format_context_with_local_focus(
     local = messages[local_start:]
     sections: list[str] = []
     if older:
-        sections.append("\n".join(formatter(msg) for msg in older))
-    sections.append(
+        older_block = "\n".join(formatter(msg) for msg in older)
+        sections.append(f"<older_messages>\n{older_block}\n</older_messages>")
+    local_block = (
         "【紧邻当前消息的连续话题（最高优先级）：解释‘这/那/太可怕了/是吧’等省略表达时，"
         "必须优先承接下面这些消息，禁止跨越话题断点拼接旧词】\n"
         + "\n".join(formatter(msg) for msg in local)
     )
+    sections.append(f"<current_topic>\n{local_block}\n</current_topic>")
     return "\n\n".join(sections)
+
+
+_CONTEXT_SECTION_TAGS = {
+    "本轮说话关系": "speaker_relation",
+    "中期聊天回想": "mid_memory",
+    "当前相关群友": "member_profiles",
+    "长期记忆单元": "memory_atoms",
+    "主人撤回反馈": "owner_recall_feedback",
+    "主人撤回/不准奏反馈": "owner_recall_feedback",
+    "审批人标记过的优质发言方向": "approved_style",
+    "最近表情动作": "recent_reactions",
+    "群聊表达风格参考": "style_examples",
+    "群友原文语料参考": "raw_corpus",
+    "群内黑话词典": "group_jargon",
+    "可艾特目标": "mention_targets",
+    "最高优先级语气要求": "priority_tone",
+    "私聊优先级": "private_priority",
+    "后端最新背景候选": "fresh_hint",
+}
 
 
 def _optional_section(title: str, content: str) -> str:
     content = content.strip()
     if not content:
         return ""
-    return f"\n\n{title}：\n{content}"
+    tag = _CONTEXT_SECTION_TAGS.get(title, "context_section")
+    return f'\n\n<{tag} title="{title}">\n{title}：\n{content}\n</{tag}>'
 
 
 def _speaker_label(user_id: int, nickname: str) -> str:
@@ -1293,6 +1332,29 @@ def _parse_fresh_search_decision(content: str) -> FreshSearchDecision:
         confidence=max(0.0, min(1.0, confidence)),
         reason=reason[:60],
     )
+
+
+
+def _parse_research_queries(raw: object, *, primary: str) -> tuple[str, ...]:
+    values: list[str] = []
+    if isinstance(raw, str) and raw.strip():
+        values.append(raw)
+    elif isinstance(raw, (list, tuple)):
+        values.extend(str(item or "") for item in raw)
+    if primary:
+        values.insert(0, primary)
+    cleaned: list[str] = []
+    seen: set[str] = set()
+    for item in values:
+        query = re.sub(r"\s+", " ", str(item or "")).strip()[:160]
+        key = re.sub(r"\s+", "", query.casefold())
+        if len(key) < 2 or key in seen:
+            continue
+        seen.add(key)
+        cleaned.append(query)
+        if len(cleaned) >= 4:
+            break
+    return tuple(cleaned)
 
 
 def _parse_tool_routing_decision(content: str) -> ToolRoutingDecision:
@@ -1354,9 +1416,13 @@ def _parse_tool_routing_decision(content: str) -> ToolRoutingDecision:
     if tool == "none":
         query = ""
         symbols = ()
+    queries = _parse_research_queries(raw.get("queries"), primary=query)
+    if tool != "fresh_search":
+        queries = ()
     return ToolRoutingDecision(
         tool=tool,
         query=query[:160],
+        queries=queries,
         kind=kind,
         symbols=symbols,
         confidence=max(0.0, min(1.0, confidence)),
@@ -2030,6 +2096,14 @@ def _strip_reply_json_artifacts(text: str) -> str:
     return cleaned.strip()
 
 
+def _strip_internal_source_markers(text: str) -> str:
+    cleaned = re.sub(r"\[S\d+\]", "", text)
+    cleaned = re.sub(r"(?<![A-Za-z0-9])S\d+(?:S\d+)+", "", cleaned)
+    cleaned = re.sub(r"[ \t]{2,}", " ", cleaned)
+    cleaned = re.sub(r" *([，。！？,.!?])", r"\1", cleaned)
+    return cleaned.strip()
+
+
 def _sanitize_reply(content: str, max_chars: int) -> str:
     text = content.strip().strip("\"'")
     text = _strip_reply_json_artifacts(text).strip("\"'")
@@ -2039,7 +2113,7 @@ def _sanitize_reply(content: str, max_chars: int) -> str:
     if len(text) > max_chars:
         text = _trim_to_sentence(text, max_chars)
         text = _strip_reply_json_artifacts(text).strip("\"'")
-    return text
+    return _strip_internal_source_markers(text)
 
 
 def _parse_reply_candidates(

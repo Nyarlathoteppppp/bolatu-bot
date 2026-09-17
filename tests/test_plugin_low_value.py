@@ -48,6 +48,7 @@ from qq_social_agent.plugin import (
     _balanced_style_learning_messages,
     _user_reply_cooling_down,
 )
+from nonebot.adapters.onebot.v11 import Message, MessageSegment
 from qq_social_agent.cue_patterns import CueRepeatState
 from qq_social_agent.config import parse_llm_model_route
 from qq_social_agent.deepseek_client import ReplyDecision
@@ -857,7 +858,7 @@ def test_forward_context_text_uses_get_forward_msg(monkeypatch) -> None:
 
     context = asyncio.run(plugin._forward_context_text(FakeForwardBot(), event, nickname="血火"))
 
-    assert context == "血火传了聊天记录，大致内容如下：血火[#56514]: 这个学校不太值"
+    assert context == "血火传了聊天记录，内容如下：\n血火[#56514]: 这个学校不太值"
 
 
 def test_parse_token_report_date_window() -> None:
@@ -1407,16 +1408,15 @@ def test_addressed_question_cannot_be_silenced_by_llm_ignore() -> None:
 
 
 def test_addressed_followup_window_tracks_same_user_only() -> None:
-    plugin.addressed_event_times.clear()
+    plugin.followup_window_opened_at.clear()
+    plugin.followup_window_opened_at[(1, 100)] = 1000.0
 
-    assert plugin._record_addressed_event(1, 100, True, now=1000.0) == 1
-    assert plugin._addressed_followup_active(1, 100, now=1000.0 + 60)
-    assert not plugin._addressed_followup_active(1, 101, now=1000.0 + 60)
-    assert not plugin._addressed_followup_active(
-        1,
-        100,
-        now=1000.0 + plugin.ADDRESS_FOLLOWUP_WINDOW_SECONDS + 1,
-    )
+    assert plugin._followup_window_kind(1, 100, now=1000.0 + 10) == "hard"
+    assert plugin._addressed_followup_active(1, 100, now=1000.0 + 10)
+    assert not plugin._addressed_followup_active(1, 101, now=1000.0 + 10)
+    assert plugin._followup_window_kind(1, 100, now=1000.0 + 20) == "soft"
+    assert not plugin._addressed_followup_active(1, 100, now=1000.0 + 20)
+    assert plugin._followup_window_kind(1, 100, now=1000.0 + 41) == ""
 
 
 def test_followup_addressed_rejects_reply_to_other_user() -> None:
@@ -2098,9 +2098,12 @@ def test_owner_can_enable_review(monkeypatch, tmp_path) -> None:
     handled = asyncio.run(plugin._handle_group_approval_private(bot, 1535071184, "开启审查"))
 
     assert handled
-    assert plugin._approval_review_enabled()
-    assert store.app_kv_get(plugin.APPROVAL_REVIEW_ENABLED_KEY) == "true"
-    assert bot.private_messages[0] == (1535071184, "已开启审查，bot 发群前会先发审批单。")
+    assert not plugin._approval_review_enabled()
+    assert store.app_kv_get(plugin.APPROVAL_REVIEW_ENABLED_KEY) == "false"
+    assert bot.private_messages[0] == (
+        1535071184,
+        "人工审查已经永久关掉了，群聊回复会直接发出，不能再打开。",
+    )
 
 
 def test_owner_can_query_review_status(monkeypatch, tmp_path) -> None:
@@ -2126,8 +2129,8 @@ def test_delegated_approver_can_disable_and_enable_review(monkeypatch, tmp_path)
 
     handled = asyncio.run(plugin._handle_group_approval_private(bot, 3370998238, "开启审查"))
     assert handled
-    assert plugin._approval_review_enabled()
-    assert any("已开启审查" in message for _, message in bot.private_messages)
+    assert not plugin._approval_review_enabled()
+    assert any("不能再打开" in message for _, message in bot.private_messages)
 
 
 def test_owner_can_query_model_status(monkeypatch, tmp_path) -> None:
@@ -2502,15 +2505,11 @@ def test_request_group_approval_auto_sends_by_probability(monkeypatch, tmp_path)
 def test_approval_direct_single_reply_enabled_only_when_deterministic(monkeypatch, tmp_path) -> None:
     store = _use_temp_plugin_memory(monkeypatch, tmp_path)
 
-    assert not plugin._approval_direct_single_reply_enabled()
-
-    plugin._set_approval_auto_send_percent(100)
     assert plugin._approval_direct_single_reply_enabled()
-
     plugin._set_approval_auto_send_percent(60)
-    assert not plugin._approval_direct_single_reply_enabled()
-
-    store.app_kv_set(plugin.APPROVAL_REVIEW_ENABLED_KEY, "false")
+    assert plugin._approval_direct_single_reply_enabled()
+    store.app_kv_set(plugin.APPROVAL_REVIEW_ENABLED_KEY, "true")
+    assert not plugin._approval_review_enabled()
     assert plugin._approval_direct_single_reply_enabled()
 
 
@@ -2606,8 +2605,12 @@ def test_owner_can_manage_private_whitelist(monkeypatch, tmp_path) -> None:
     assert plugin._private_user_allowed(1535071184)
     assert plugin._private_user_can_chat(1535071184)
     assert plugin._private_user_can_chat(plugin.PRIVATE_DEBUG_OWNER_ID)
-    assert "主人/调试者" in plugin._owner_user_tone_context(1535071184)
+    owner_tone = plugin._owner_user_tone_context(1535071184)
+    assert "主人/调试者" in owner_tone
+    assert "不要当面叫「主人」" in owner_tone
+    assert "当面称呼他为「主人」" not in owner_tone
     assert plugin._owner_user_tone_context(plugin.PRIVATE_DEBUG_OWNER_ID) == ""
+    assert plugin._owner_user_tone_context(3115344487) == ""
 
     handled = asyncio.run(plugin._handle_group_approval_private(bot, 1535071184, "加私聊 123456789"))
 
@@ -2656,8 +2659,13 @@ def test_private_force_obey_toggle_and_priority_context(monkeypatch, tmp_path) -
     )
     owner_context = plugin._private_priority_context(1535071184)
     assert "最高优先级主人/调试者" in owner_context
+    assert "不要当面叫「主人」" in owner_context
+    assert "当面称呼他为「主人」" not in owner_context
     assert "强服从调试模式" in owner_context
     assert "主人号 1535071184" in owner_context
+    other_private = plugin._private_priority_context(3115344487)
+    assert "当面称呼他为「主人」" not in other_private
+    assert "不要当面叫「主人」" not in other_private
 
 
 def test_private_force_obey_rejects_non_test_account(monkeypatch, tmp_path) -> None:
@@ -2774,13 +2782,42 @@ def test_format_token_usage_report(monkeypatch, tmp_path) -> None:
 
 
 def test_post_reply_followup_window_records_trigger_and_mention_targets() -> None:
-    plugin.addressed_event_times.clear()
+    plugin.followup_window_opened_at.clear()
 
     plugin._record_post_reply_followup_window(1, trigger_user_id=100, mention_user_id=200)
 
     assert plugin._addressed_followup_active(1, 100)
     assert plugin._addressed_followup_active(1, 200)
     assert not plugin._addressed_followup_active(1, 300)
+
+
+def test_post_reply_followup_window_does_not_refresh_inside_soft_window(monkeypatch) -> None:
+    plugin.followup_window_opened_at.clear()
+    monkeypatch.setattr(plugin.time, "time", lambda: 1000.0)
+    plugin._record_post_reply_followup_window(1, trigger_user_id=100)
+    first = plugin.followup_window_opened_at[(1, 100)]
+    monkeypatch.setattr(plugin.time, "time", lambda: 1010.0)
+    plugin._record_post_reply_followup_window(1, trigger_user_id=100)
+    assert plugin.followup_window_opened_at[(1, 100)] == first
+    assert plugin._followup_window_kind(1, 100, now=1020.0) == "soft"
+
+
+def test_speaker_context_marks_soft_followup_window() -> None:
+    context = plugin._format_speaker_reference_context(
+        current_user_id=100,
+        current_nickname="甲",
+        current_text="我今天刚到",
+        recent_messages=[],
+        reference_resolution=plugin.ReferenceResolution(),
+        mentioned=False,
+        replied_to_bot=False,
+        addressed_bot=False,
+        followup_addressed=False,
+        followup_soft=True,
+        self_id=1801507496,
+    )
+    assert "已经过了直接接话窗口" in context
+    assert "不要当成点名" in context
 
 
 def test_proactive_chat_tick_uses_interval_not_next_hour(monkeypatch) -> None:
@@ -2911,3 +2948,239 @@ def test_empty_mid_memory_skips_window_after_streak(monkeypatch, tmp_path) -> No
     assert plugin._note_empty_mid_memory(1, messages) == "empty_summary"
     assert plugin._note_empty_mid_memory(1, messages) == "skipped_empty_window"
     assert plugin.mid_memory_empty_streak[1] == 0
+
+
+def test_private_followup_probability_is_lower_for_guided_user() -> None:
+    assert plugin._private_followup_probability(1903297906) == 0.08
+    assert plugin._private_followup_probability(1535071184) == plugin.PRIVATE_FOLLOWUP_PROBABILITY
+
+
+def test_private_hourly_skips_when_recently_active() -> None:
+    now = 1_000_000.0
+    recent = [
+        ChatMessage(group_id=1, user_id=1903297906, nickname="A", text="在吗", is_bot=False, created_at=now - 60)
+    ]
+    assert plugin._private_hourly_chat_recently_active(recent, now=now)
+    recent = [
+        ChatMessage(group_id=1, user_id=1903297906, nickname="A", text="在吗", is_bot=False, created_at=now - 46 * 60)
+    ]
+    assert not plugin._private_hourly_chat_recently_active(recent, now=now)
+    assert not plugin._private_hourly_chat_recently_active([], now=now)
+
+
+def test_forward_ocr_stays_on_original_speaker(monkeypatch) -> None:
+    from qq_social_agent.media_context import ImageOcrResult
+
+    class FakeOcr:
+        async def ocr_image_segment(self, bot, data):
+            return ImageOcrResult(image_key="k", text="成绩单上写着 GPA 3.8")
+
+    class RejectTopLevelOcrBot:
+        async def call_api(self, api: str, **data):
+            raise AssertionError(f"unexpected api {api}: {data}")
+
+    monkeypatch.setattr(plugin, "image_ocr_service", FakeOcr())
+    monkeypatch.setattr(plugin, "deepseek_client", None)
+    event = SimpleNamespace(
+        message=[
+            SimpleNamespace(
+                type="forward",
+                data={
+                    "content": [
+                        {
+                            "type": "node",
+                            "data": {
+                                "sender": {"user_id": 184589072, "nickname": "小鸟"},
+                                "content": [
+                                    {"type": "image", "data": {"url": "https://example.com/gpa.png", "summary": "截图"}},
+                                ],
+                            },
+                        }
+                    ]
+                },
+            )
+        ]
+    )
+
+    context = asyncio.run(plugin._forward_context_text(RejectTopLevelOcrBot(), event, nickname="血火"))
+    assert "血火传了聊天记录" in context
+    assert "小鸟[#89072]:" in context
+    assert "GPA 3.8" in context
+    assert "[图片OCR:" not in context
+
+
+def test_compact_forward_fallback_keeps_speakers() -> None:
+    raw = "\n".join(
+        [
+            "甲[#10001]: 第一句",
+            "乙[#10002]: 第二句",
+            "丙[#10003]: 第三句",
+        ]
+    )
+    compact = plugin._compact_forward_fallback(raw)
+    assert "甲[#10001]: 第一句" in compact
+    assert "乙[#10002]: 第二句" in compact
+    assert "\n" in compact
+
+
+def test_member_profile_summary_uses_incremental_window(monkeypatch, tmp_path) -> None:
+    store = _use_temp_plugin_memory(monkeypatch, tmp_path)
+    captured: dict[str, object] = {}
+
+    class FakeProfileClient:
+        async def summarize_member_profile(self, **kwargs):
+            captured.update(kwargs)
+            return plugin.MemberProfileDraft(
+                "更新后的画像",
+                ("股票",),
+                "短句",
+                ("又亏了",),
+            )
+
+    monkeypatch.setattr(plugin, "deepseek_client", FakeProfileClient())
+    now = 2_000_000.0
+    monkeypatch.setattr(plugin.time, "time", lambda: now)
+    store.add_member_profile_summary(
+        group_id=1,
+        user_id=100,
+        profile_summary="旧画像：常聊行情",
+        interests=["股票"],
+        speaking_style="吐槽",
+        representative_texts=["亏麻了"],
+        start_at=now - 8 * 24 * 60 * 60,
+        end_at=now - 25 * 60 * 60,
+        message_count=8,
+    )
+    # Force the previous snapshot to look old enough for a daily refresh.
+    store.conn.execute(
+        "update member_profile_summaries set created_at = ? where user_id = 100",
+        (now - 25 * 60 * 60,),
+    )
+    store.conn.commit()
+    store.add_message(1, 100, "A", "这是旧窗口里的话", created_at=now - 26 * 60 * 60)
+    for index in range(5):
+        store.add_message(1, 100, "A", f"新增发言{index}还挺长", created_at=now - 60 + index)
+
+    asyncio.run(plugin._maintain_member_profile_summaries(1, force=True, max_updates=1))
+
+    messages = captured.get("messages") or []
+    assert [msg.text for msg in messages] == [f"新增发言{index}还挺长" for index in range(5)]
+    assert "旧画像：常聊行情" in str(captured.get("previous_summary"))
+    assert "这是旧窗口里的话" not in [msg.text for msg in messages]
+
+
+def test_generation_context_limits_are_tighter() -> None:
+    assert plugin.MEMBER_PROFILE_SUMMARY_MESSAGE_LIMIT == 24
+    assert plugin.STYLE_RULE_CONTEXT_LIMIT == 4
+    assert plugin.RAW_CORPUS_CONTEXT_LIMIT == 2
+
+
+def test_message_from_reply_part_quotes_source_message() -> None:
+    message = plugin._message_from_reply_part(
+        "接一句",
+        {},
+        quote_message_id="12345",
+    )
+    assert [segment.type for segment in message] == ["reply", "text"]
+    assert message[0].data["id"] == "12345"
+    assert str(message[1]) == "接一句"
+
+
+def test_message_with_reply_quote_skips_invalid_and_duplicate() -> None:
+    plain = Message("你好")
+    assert plugin._message_with_reply_quote(plain, "") is plain
+    assert plugin._message_with_reply_quote(plain, "abc") is plain
+    quoted = plugin._message_with_reply_quote(plain, "88")
+    assert quoted[0].type == "reply"
+    again = plugin._message_with_reply_quote(quoted, "99")
+    assert again is quoted
+
+
+def test_approved_group_reply_quotes_only_first_part(monkeypatch, tmp_path) -> None:
+    from qq_social_agent.delivery import DeliveryPlan
+
+    _use_temp_plugin_memory(monkeypatch, tmp_path)
+    bot = FakeApprovalBot()
+    approval = plugin.PendingGroupApproval(
+        approval_id="quote-approval",
+        group_id=1026813421,
+        trigger_user_id=184589072,
+        trigger_nickname="小鸟",
+        trigger_text="没人理我",
+        persona_name="张风雪",
+        self_id=1801507496,
+        candidates=(plugin.PendingApprovalCandidate(1, "第一段。第二段。", "reply", "自然接话"),),
+        mention_targets={},
+        created_at=1000.0,
+        source_message_id="555001",
+    )
+    monkeypatch.setattr(
+        plugin,
+        "build_delivery_plan",
+        lambda **kwargs: DeliveryPlan(
+            parts=("第一段。", "第二段。"),
+            mention_targets={},
+            sequence_lag=0,
+            forced_trigger_mention=False,
+        ),
+    )
+    asyncio.run(
+        plugin._send_approved_group_reply_scoped(
+            bot,
+            approval,
+            approval.candidates[0],
+            approver_id=None,
+            high_quality=False,
+            notify_success=False,
+        )
+    )
+    assert len(bot.group_messages) == 2
+    first = str(bot.group_messages[0][1])
+    second = str(bot.group_messages[1][1])
+    assert first.startswith("[CQ:reply,id=555001]")
+    assert "第一段。" in first
+    assert "[CQ:reply" not in second
+    assert "第二段。" in second
+
+
+
+def test_member_profile_learning_skips_short_duplicate_lines() -> None:
+    messages = [
+        ChatMessage(1, 100, "A", "嗯", False, 1.0, 1),
+        ChatMessage(1, 100, "A", "哈哈哈哈", False, 2.0, 2),
+        ChatMessage(1, 100, "A", "这周又去操场跑步了感觉还行", False, 3.0, 3),
+        ChatMessage(1, 100, "A", "这周又去操场跑步了感觉还行", False, 4.0, 4),
+        ChatMessage(1, 100, "A", "明天想把作业提前写完", False, 5.0, 5),
+    ]
+    selected = plugin._member_profile_learning_messages(messages)
+    assert [item.text for item in selected] == [
+        "这周又去操场跑步了感觉还行",
+        "明天想把作业提前写完",
+    ]
+
+
+def test_weekly_usage_report_lists_task_share(monkeypatch, tmp_path) -> None:
+    store = _use_temp_plugin_memory(monkeypatch, tmp_path)
+    now = 1_800_000_000.0
+    monkeypatch.setattr(plugin.time, "time", lambda: now)
+    store.add_llm_usage(
+        task="member_profile",
+        model="deepseek/deepseek-v4-flash",
+        prompt_tokens=8000,
+        completion_tokens=2000,
+        total_tokens=10000,
+        created_at=now - 3600,
+    )
+    store.add_llm_usage(
+        task="reply_direct",
+        model="deepseek/deepseek-flash",
+        prompt_tokens=4000,
+        completion_tokens=1000,
+        total_tokens=5000,
+        created_at=now - 1800,
+    )
+    text = plugin._format_weekly_usage_report(now=now)
+    assert "member_profile" in text
+    assert "reply_direct" in text
+    assert "67%" in text or "66%" in text
+    assert "1.5万" in text

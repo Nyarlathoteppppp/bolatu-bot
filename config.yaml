@@ -145,8 +145,10 @@ image_ocr:
   enabled: true
   napcat_ocr_enabled: false
   max_images_per_message: 2
-  max_text_chars_per_image: 220
+  max_text_chars_per_image: 500
   max_calls_per_minute: 18
+  max_fresh_ocr_calls: 6
+  fresh_ocr_window_seconds: 30
   cache_ttl_seconds: 86400
   cache_empty_results: false
   api_timeout_seconds: 8
@@ -184,9 +186,14 @@ fresh_search:
   enabled: true
   # 自建 SearXNG 主搜索；失败时自动回退 Tavily / RSS 搜索。
   provider: searxng
-  max_external_queries_per_minute: 4
-  timeout_seconds: 5
+  max_external_queries_per_minute: 8
+  timeout_seconds: 10
   max_results: 5
+  followup_page_max_tries: 6
+  followup_page_max_chars: 2800
+  followup_page_timeout_seconds: 4
+  followup_page_max_successes: 3
+  followup_search_hops: 3
   cache_max_entries: 256
   cache_ttl_seconds: 300
   news_cache_ttl_seconds: 300
@@ -243,6 +250,8 @@ rag:
     conversation_episode_gap_seconds: 600
     conversation_episode_max_chars: 900
     max_expanded_conversation_hits: 2
+    conversation_semantic_max_age_seconds: 2592000
+    conversation_semantic_limit: 4000
   indexing:
     episode_gap_seconds: 600
     max_chunk_chars: 700

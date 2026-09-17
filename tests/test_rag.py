@@ -583,3 +583,158 @@ def test_knowledge_source_versions_deduplicate_and_soft_delete(tmp_path) -> None
     ).fetchone()[0]
     assert inactive >= first_count
     asyncio.run(service.close())
+
+
+
+def test_semantic_search_caps_old_conversation_vectors(tmp_path) -> None:
+    import math
+    import struct
+
+    db_path = tmp_path / "bot.sqlite3"
+    from qq_social_agent.memory import MemoryStore
+
+    memory = MemoryStore(db_path)
+    memory.conn.close()
+    store = RAGStore(db_path)
+    now = 2_000_000.0
+    query = [1.0, 0.0, 0.0, 0.0]
+    docs = []
+    for index in range(5):
+        doc_id = store.upsert_document(
+            stable_key=f"conv:{index}",
+            group_id=1,
+            doc_type="conversation",
+            content=f"旧话 {index} 菲尔兹奖",
+            source_name="messages",
+            source_row_id=str(index),
+            created_at=now - (4 - index) * 10_000,
+        )
+        docs.append(doc_id)
+    summary_id = store.upsert_document(
+        stable_key="sum:1",
+        group_id=1,
+        doc_type="summary",
+        content="阶段回想 菲尔兹奖",
+        source_name="memory_summaries",
+        source_row_id="1",
+        created_at=now - 100_000,
+    )
+    store.commit()
+    for doc_id in (*docs, summary_id):
+        blob = struct.pack("<4f", 1.0, 0.0, 0.0, 0.0)
+        store.conn.execute(
+            "insert into rag_embeddings(document_id, model, dimensions, vector_blob, norm, created_at) values (?, ?, ?, ?, ?, ?)",
+            (doc_id, "BAAI/bge-m3", 4, blob, 1.0, now),
+        )
+        store.conn.execute(
+            "update rag_documents set embedding_status='ready', embedding_model=?, embedding_dim=? where id=?",
+            ("BAAI/bge-m3", 4, doc_id),
+        )
+    store.commit()
+
+    all_rows = store.semantic_search(
+        1,
+        query,
+        model="BAAI/bge-m3",
+        limit=20,
+        doc_types=("conversation", "summary"),
+    )
+    capped = store.semantic_search(
+        1,
+        query,
+        model="BAAI/bge-m3",
+        limit=20,
+        doc_types=("conversation", "summary"),
+        conversation_limit=2,
+    )
+    aged = store.semantic_search(
+        1,
+        query,
+        model="BAAI/bge-m3",
+        limit=20,
+        doc_types=("conversation", "summary"),
+        conversation_after=now - 5_000,
+    )
+    conversation_ids = {item.document.id for item in capped if item.document.doc_type == "conversation"}
+    aged_ids = {item.document.id for item in aged if item.document.doc_type == "conversation"}
+    assert len(all_rows) == 6
+    assert len(conversation_ids) == 2
+    assert conversation_ids == {docs[-1], docs[-2]}
+    assert aged_ids == {docs[-1]}
+    assert any(item.document.id == summary_id for item in capped)
+    assert any(item.document.id == summary_id for item in aged)
+    store.close()
+
+
+def test_retrieve_runs_sqlite_search_in_to_thread(tmp_path, monkeypatch) -> None:
+    db_path = tmp_path / "bot.sqlite3"
+    from qq_social_agent.memory import MemoryStore
+
+    memory = MemoryStore(db_path)
+    memory.add_message(1, 10001, "代代", "以前认真聊过菲尔兹奖", created_at=1000, source_message_id=1)
+    memory.conn.close()
+    service = RAGService(
+        db_path,
+        {"enabled": True, "embedding": {"enabled": False}, "retrieval": {"exclude_recent_seconds": 0}},
+    )
+    seen: list[str] = []
+    original = asyncio.to_thread
+
+    async def fake_to_thread(func, *args, **kwargs):
+        seen.append(getattr(func, "__name__", str(func)))
+        return await original(func, *args, **kwargs)
+
+    monkeypatch.setattr(asyncio, "to_thread", fake_to_thread)
+    result = asyncio.run(service.retrieve(group_id=1, query="之前聊过菲尔兹奖什么", addressed=True))
+    assert result.hits
+    assert "_search_lexical_isolated" in seen
+    asyncio.run(service.close())
+
+
+
+def test_archive_old_conversation_documents_drops_embeddings(tmp_path) -> None:
+    import struct
+
+    db_path = tmp_path / "bot.sqlite3"
+    from qq_social_agent.memory import MemoryStore
+
+    memory = MemoryStore(db_path)
+    memory.conn.close()
+    store = RAGStore(db_path)
+    now = time.time()
+    old_id = store.upsert_document(
+        stable_key="conv:old",
+        group_id=1,
+        doc_type="conversation",
+        content="很久以前聊过菲尔兹奖",
+        source_name="messages",
+        source_row_id="1",
+        created_at=now - 40 * 24 * 3600,
+    )
+    new_id = store.upsert_document(
+        stable_key="conv:new",
+        group_id=1,
+        doc_type="conversation",
+        content="昨天还在聊菲尔兹奖",
+        source_name="messages",
+        source_row_id="2",
+        created_at=now - 3600,
+    )
+    store.commit()
+    blob = struct.pack("<4f", 1.0, 0.0, 0.0, 0.0)
+    for doc_id in (old_id, new_id):
+        store.conn.execute(
+            "insert into rag_embeddings(document_id, model, dimensions, vector_blob, norm, created_at) values (?, ?, ?, ?, ?, ?)",
+            (doc_id, "BAAI/bge-m3", 4, blob, 1.0, now),
+        )
+    store.commit()
+    stats = store.archive_old_conversation_documents(older_than_seconds=30 * 24 * 3600)
+    assert stats["archived"] == 1
+    assert stats["embeddings_deleted"] == 1
+    old = store.conn.execute("select status from rag_documents where id=?", (old_id,)).fetchone()
+    new = store.conn.execute("select status from rag_documents where id=?", (new_id,)).fetchone()
+    remaining = store.conn.execute("select document_id from rag_embeddings order by document_id").fetchall()
+    assert old["status"] == "inactive"
+    assert new["status"] == "active"
+    assert [row["document_id"] for row in remaining] == [new_id]
+    store.close()

@@ -6,7 +6,7 @@ from typing import Iterable
 
 from .deepseek_client import ReplyDecision, ToolSymbol
 from .pipeline_types import PipelineMode, ToolKind, ToolRequest
-from .tools.fresh_context import FreshIntent, detect_fresh_intent
+from .tools.fresh_context import FreshIntent, _compact_search_query, detect_fresh_intent
 from .tools.market_intent import MarketIntent
 
 
@@ -101,7 +101,7 @@ def route_tools(
         requests.append(
             ToolRequest(
                 ToolKind.FRESH_SEARCH,
-                query=text.strip()[:120],
+                query=(_compact_search_query(text) or text.strip())[:120],
                 reason="academic_concept_or_status",
                 confidence=0.92,
                 required=True,

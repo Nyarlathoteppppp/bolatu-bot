@@ -629,6 +629,8 @@ class RAGStore:
         limit: int,
         doc_types: tuple[str, ...],
         exclude_recent_after: float | None = None,
+        conversation_after: float | None = None,
+        conversation_limit: int | None = None,
     ) -> list[RankedDocument]:
         if not query_vector:
             return []
@@ -636,11 +638,31 @@ class RAGStore:
         if query_norm <= 0:
             return []
         type_clause = ",".join("?" for _ in doc_types)
-        recent_sql = ""
+        extra_sql = ""
         params: list[object] = [int(group_id), *doc_types, model, len(query_vector), time.time(), time.time()]
         if exclude_recent_after is not None:
-            recent_sql = "and not (d.doc_type = 'conversation' and d.created_at >= ?)"
+            extra_sql += "and not (d.doc_type = 'conversation' and d.created_at >= ?)\n"
             params.append(float(exclude_recent_after))
+        if conversation_after is not None:
+            extra_sql += "and not (d.doc_type = 'conversation' and d.created_at < ?)\n"
+            params.append(float(conversation_after))
+        if conversation_limit is not None and int(conversation_limit) > 0:
+            extra_sql += (
+                "and (d.doc_type != 'conversation' or d.id in ("
+                "select d2.id from rag_documents d2 "
+                "join rag_embeddings e2 on e2.document_id = d2.id "
+                "where d2.group_id = d.group_id and d2.doc_type = 'conversation' "
+                "and d2.status = 'active' and e2.model = e.model "
+                "and e2.dimensions = e.dimensions"
+            )
+            if exclude_recent_after is not None:
+                extra_sql += " and d2.created_at < ?"
+                params.append(float(exclude_recent_after))
+            if conversation_after is not None:
+                extra_sql += " and d2.created_at >= ?"
+                params.append(float(conversation_after))
+            extra_sql += " order by d2.created_at desc, d2.id desc limit ?))"
+            params.append(int(conversation_limit))
         rows = self.conn.execute(
             f"""
             select d.*, e.vector_blob, e.norm
@@ -652,7 +674,7 @@ class RAGStore:
               and d.status = 'active'
               and (d.valid_from is null or d.valid_from <= ?)
               and (d.valid_to is null or d.valid_to > ?)
-              {recent_sql}
+              {extra_sql}
             """,
             params,
         ).fetchall()
@@ -808,6 +830,49 @@ class RAGStore:
             source_message_ids=source_ids,
             participant_user_ids=participants or document.participant_user_ids,
         )
+
+    def archive_old_conversation_documents(
+        self,
+        *,
+        older_than_seconds: int,
+        limit: int = 20000,
+    ) -> dict[str, int]:
+        cutoff = time.time() - max(1, int(older_than_seconds))
+        rows = self.conn.execute(
+            """
+            select id from rag_documents
+            where doc_type = 'conversation'
+              and status = 'active'
+              and created_at < ?
+            order by created_at asc, id asc
+            limit ?
+            """,
+            (cutoff, max(1, int(limit))),
+        ).fetchall()
+        archived = 0
+        embeddings_deleted = 0
+        now = time.time()
+        for row in rows:
+            document_id = int(row["id"])
+            cursor = self.conn.execute(
+                "delete from rag_embeddings where document_id = ?",
+                (document_id,),
+            )
+            embeddings_deleted += int(cursor.rowcount or 0)
+            if self.fts_available:
+                self.conn.execute("delete from rag_documents_fts where rowid = ?", (document_id,))
+            self.conn.execute(
+                """
+                update rag_documents
+                set status = 'inactive', valid_to = ?, embedding_status = 'none', updated_at = ?
+                where id = ?
+                """,
+                (now, now, document_id),
+            )
+            archived += 1
+        if archived:
+            self.conn.commit()
+        return {"archived": archived, "embeddings_deleted": embeddings_deleted}
 
     def record_retrieval(
         self,

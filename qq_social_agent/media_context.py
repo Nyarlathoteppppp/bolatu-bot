@@ -46,8 +46,10 @@ class ImageOcrService:
         *,
         enabled: bool = True,
         max_images_per_message: int = 2,
-        max_text_chars_per_image: int = 220,
+        max_text_chars_per_image: int = 500,
         max_calls_per_minute: int = 18,
+        max_fresh_calls_per_window: int = 6,
+        fresh_call_window_seconds: float = 30.0,
         cache_ttl_seconds: int = 24 * 60 * 60,
         api_timeout_seconds: float = 8.0,
         napcat_ocr_enabled: bool = True,
@@ -59,6 +61,8 @@ class ImageOcrService:
         self.max_images_per_message = max(0, int(max_images_per_message))
         self.max_text_chars_per_image = max(40, int(max_text_chars_per_image))
         self.max_calls_per_minute = max(0, int(max_calls_per_minute))
+        self.max_fresh_calls_per_window = max(0, int(max_fresh_calls_per_window))
+        self.fresh_call_window_seconds = max(1.0, float(fresh_call_window_seconds))
         self.cache_ttl_seconds = max(0, int(cache_ttl_seconds))
         self.api_timeout_seconds = max(0.05, float(api_timeout_seconds))
         self.napcat_ocr_enabled = bool(napcat_ocr_enabled)
@@ -67,6 +71,7 @@ class ImageOcrService:
         self.cache_empty_results = bool(cache_empty_results)
         self._cache: dict[str, _OcrCacheEntry] = {}
         self._call_times: deque[float] = deque()
+        self._burst_times: deque[float] = deque()
 
     @classmethod
     def from_config(cls, raw: object) -> "ImageOcrService":
@@ -74,8 +79,10 @@ class ImageOcrService:
         return cls(
             enabled=bool(cfg.get("enabled", True)),
             max_images_per_message=int(cfg.get("max_images_per_message", 2)),
-            max_text_chars_per_image=int(cfg.get("max_text_chars_per_image", 220)),
+            max_text_chars_per_image=int(cfg.get("max_text_chars_per_image", 500)),
             max_calls_per_minute=int(cfg.get("max_calls_per_minute", 18)),
+            max_fresh_calls_per_window=int(cfg.get("max_fresh_ocr_calls", 6)),
+            fresh_call_window_seconds=float(cfg.get("fresh_ocr_window_seconds", 30)),
             cache_ttl_seconds=int(cfg.get("cache_ttl_seconds", 24 * 60 * 60)),
             api_timeout_seconds=float(cfg.get("api_timeout_seconds", 8.0)),
             napcat_ocr_enabled=bool(cfg.get("napcat_ocr_enabled", True)),
@@ -210,10 +217,18 @@ class ImageOcrService:
             return False
         while self._call_times and now - self._call_times[0] > 60:
             self._call_times.popleft()
-        return len(self._call_times) < self.max_calls_per_minute
+        if len(self._call_times) >= self.max_calls_per_minute:
+            return False
+        if self.max_fresh_calls_per_window <= 0:
+            return True
+        window = self.fresh_call_window_seconds
+        while self._burst_times and now - self._burst_times[0] > window:
+            self._burst_times.popleft()
+        return len(self._burst_times) < self.max_fresh_calls_per_window
 
     def _remember_call(self, now: float) -> None:
         self._call_times.append(now)
+        self._burst_times.append(now)
 
     async def aclose(self) -> None:
         for client in (self.primary_ocr, self.fallback_ocr):
@@ -274,7 +289,12 @@ def ocr_image_segments_from_event(event: Any) -> list[dict[str, Any]]:
     return collect_ocr_image_segments(getattr(event, "message", []) or [])
 
 
-def collect_ocr_image_segments(payload: Any, *, limit: int = 8) -> list[dict[str, Any]]:
+def collect_ocr_image_segments(
+    payload: Any,
+    *,
+    limit: int = 8,
+    include_forward: bool = False,
+) -> list[dict[str, Any]]:
     images: list[dict[str, Any]] = []
     seen: set[str] = set()
 
@@ -308,6 +328,8 @@ def collect_ocr_image_segments(payload: Any, *, limit: int = 8) -> list[dict[str
                 node = value.get("data") if isinstance(value.get("data"), dict) else value
                 walk(node.get("content", node.get("message")), depth + 1)
                 return
+            if segment_type == "forward" and not include_forward:
+                return
             for key in ("messages", "message", "content", "data"):
                 if key in value:
                     walk(value.get(key), depth + 1)
@@ -322,10 +344,11 @@ def collect_ocr_image_segments(payload: Any, *, limit: int = 8) -> list[dict[str
                 walk(node.get("content", node.get("message")), depth + 1)
                 return
             if segment_type == "forward" and isinstance(data, dict):
-                for key in ("content", "messages", "message"):
-                    if data.get(key):
-                        walk(data.get(key), depth + 1)
-                        break
+                if include_forward:
+                    for key in ("content", "messages", "message"):
+                        if data.get(key):
+                            walk(data.get(key), depth + 1)
+                            break
                 return
             if segment_type:
                 return
