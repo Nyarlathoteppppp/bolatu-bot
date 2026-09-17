@@ -646,23 +646,63 @@ class RAGStore:
         if conversation_after is not None:
             extra_sql += "and not (d.doc_type = 'conversation' and d.created_at < ?)\n"
             params.append(float(conversation_after))
-        if conversation_limit is not None and int(conversation_limit) > 0:
-            extra_sql += (
-                "and (d.doc_type != 'conversation' or d.id in ("
-                "select d2.id from rag_documents d2 "
-                "join rag_embeddings e2 on e2.document_id = d2.id "
-                "where d2.group_id = d.group_id and d2.doc_type = 'conversation' "
-                "and d2.status = 'active' and e2.model = e.model "
-                "and e2.dimensions = e.dimensions"
-            )
+        if (
+            conversation_limit is not None
+            and int(conversation_limit) > 0
+            and "conversation" in doc_types
+        ):
+            conv_params: list[object] = [
+                int(group_id),
+                model,
+                len(query_vector),
+                time.time(),
+                time.time(),
+            ]
+            conv_extra = ""
             if exclude_recent_after is not None:
-                extra_sql += " and d2.created_at < ?"
-                params.append(float(exclude_recent_after))
+                conv_extra += "and d.created_at < ?\n"
+                conv_params.append(float(exclude_recent_after))
             if conversation_after is not None:
-                extra_sql += " and d2.created_at >= ?"
-                params.append(float(conversation_after))
-            extra_sql += " order by d2.created_at desc, d2.id desc limit ?))"
-            params.append(int(conversation_limit))
+                conv_extra += "and d.created_at >= ?\n"
+                conv_params.append(float(conversation_after))
+            conv_params.append(int(conversation_limit))
+            conv_rows = self.conn.execute(
+                f"""
+                select d.id
+                from rag_documents d
+                join rag_embeddings e on e.document_id = d.id
+                where d.group_id = ?
+                  and d.doc_type = 'conversation'
+                  and e.model = ? and e.dimensions = ?
+                  and d.status = 'active'
+                  and (d.valid_from is null or d.valid_from <= ?)
+                  and (d.valid_to is null or d.valid_to > ?)
+                  {conv_extra}
+                order by d.created_at desc, d.id desc
+                limit ?
+                """,
+                conv_params,
+            ).fetchall()
+            conversation_ids = [int(row["id"]) for row in conv_rows]
+            other_types = tuple(doc_type for doc_type in doc_types if doc_type != "conversation")
+            if conversation_ids and other_types:
+                extra_sql += (
+                    "and (d.doc_type in ("
+                    + ",".join("?" for _ in other_types)
+                    + ") or d.id in ("
+                    + ",".join("?" for _ in conversation_ids)
+                    + "))\n"
+                )
+                params.extend(other_types)
+                params.extend(conversation_ids)
+            elif conversation_ids:
+                extra_sql += "and d.id in (" + ",".join("?" for _ in conversation_ids) + ")\n"
+                params.extend(conversation_ids)
+            elif other_types:
+                extra_sql += "and d.doc_type in (" + ",".join("?" for _ in other_types) + ")\n"
+                params.extend(other_types)
+            else:
+                return []
         rows = self.conn.execute(
             f"""
             select d.*, e.vector_blob, e.norm
