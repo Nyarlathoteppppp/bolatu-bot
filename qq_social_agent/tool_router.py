@@ -10,6 +10,26 @@ from .tools.fresh_context import FreshIntent, _compact_search_query, detect_fres
 from .tools.market_intent import MarketIntent
 
 
+PROBABILITY_TERMS = (
+    "概率",
+    "几率",
+    "可能性",
+    "可能有多大",
+    "有多大可能",
+    "能成吗",
+    "算算概率",
+    "推演概率",
+    "几成把握",
+    "拿到 offer",
+    "能拿到",
+)
+
+
+def is_probability_lookup(text: str) -> bool:
+    compact = re.sub(r"\s+", "", str(text or ""))
+    return any(term in compact for term in PROBABILITY_TERMS)
+
+
 URL_RE = re.compile(r"https?://[^\s<>]+", re.IGNORECASE)
 ACADEMIC_TOPIC_TERMS = (
     "猜想",
@@ -108,6 +128,16 @@ def route_tools(
                 arguments={"kind": "web"},
             )
         )
+    if is_probability_lookup(text) and addressed:
+        requests.append(
+            ToolRequest(
+                ToolKind.PROBABILITY,
+                query=text.strip(),
+                reason="probability_lookup",
+                confidence=0.95,
+                required=True,
+            )
+        )
     if addressed and URL_RE.search(text):
         requests.append(
             ToolRequest(
@@ -126,6 +156,8 @@ def route_mode(plan: ToolRoutePlan) -> PipelineMode:
         return PipelineMode.MARKET
     if plan.first(ToolKind.FRESH_SEARCH) is not None:
         return PipelineMode.SEARCH
+    if plan.first(ToolKind.PROBABILITY) is not None:
+        return PipelineMode.PROBABILITY
     if plan.first(ToolKind.DEEP_URL) is not None:
         return PipelineMode.DEEP_URL
     return PipelineMode.CHAT
@@ -251,6 +283,15 @@ def apply_tool_plan(decision: ReplyDecision, plan: ToolRoutePlan) -> ReplyDecisi
             fresh_query=fresh.query,
             fresh_kind=str(fresh.arguments.get("kind", "web")),
         )
+    probability = plan.first(ToolKind.PROBABILITY)
+    if probability is not None and probability.required:
+        result = replace(
+            result,
+            should_reply=True,
+            action="answer" if result.action in {"ignore", "fresh_context"} else result.action,
+            need_tool=True,
+            tool="probability",
+        )
     return result
 
 
@@ -260,6 +301,8 @@ def compare_legacy_decision(decision: ReplyDecision, plan: ToolRoutePlan) -> Too
         legacy.append(ToolKind.MARKET.value)
     if decision.need_fresh_context:
         legacy.append(ToolKind.FRESH_SEARCH.value)
+    if decision.need_tool and decision.tool == "probability":
+        legacy.append(ToolKind.PROBABILITY.value)
     legacy_kinds = tuple(sorted(set(legacy)))
     routed_kinds = tuple(sorted(set(plan.kinds)))
     return ToolRouteComparison(legacy_kinds == routed_kinds, legacy_kinds, routed_kinds)

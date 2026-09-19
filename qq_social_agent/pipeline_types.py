@@ -17,6 +17,7 @@ class PipelineMode(str, Enum):
     SEARCH = "search"
     MARKET = "market"
     DEEP_URL = "deep_url"
+    PROBABILITY = "probability"
 
 
 class PipelineStage(str, Enum):
@@ -45,6 +46,7 @@ class ToolKind(str, Enum):
     FRESH_SEARCH = "fresh_search"
     DEEP_URL = "deep_url"
     MEMORY = "memory"
+    PROBABILITY = "probability"
 
 
 @dataclass(frozen=True)

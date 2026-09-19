@@ -25,6 +25,7 @@ _MODE_SECTION_BUDGETS: dict[PipelineMode, dict[str, int]] = {
     PipelineMode.SEARCH: {"jargon": 500},
     PipelineMode.MARKET: {"jargon": 500},
     PipelineMode.DEEP_URL: {"jargon": 500},
+    PipelineMode.PROBABILITY: {"jargon": 500},
 }
 
 _MODE_TOTAL_BUDGETS: dict[PipelineMode, int] = {
@@ -32,6 +33,7 @@ _MODE_TOTAL_BUDGETS: dict[PipelineMode, int] = {
     PipelineMode.SEARCH: 500,
     PipelineMode.MARKET: 500,
     PipelineMode.DEEP_URL: 500,
+    PipelineMode.PROBABILITY: 500,
 }
 
 

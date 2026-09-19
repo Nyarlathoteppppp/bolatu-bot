@@ -1,0 +1,19 @@
+id: probability_tools
+name: Jev 概率评估
+version: 0.1.0
+enabled: true
+description: 用 OpenRouter Decisions / Jev 评估事件发生的校准概率，结果交给回复模型用群友语气说出来。
+entrypoint: qq_social_agent.tools.probability_tool
+permissions:
+  - tool.probability
+capabilities:
+  tools:
+    - name: jev_probability
+      handler: qq_social_agent.tools.probability_tool.JevProbabilityTool
+      description: 把群友的可能性问题提炼成命题，再用 Jev noul 给出 0-1 概率。
+      permission: tool.probability
+  commands: []
+  scheduled_tasks: []
+  web_routes: []
+  event_handlers: []
+settings: {}

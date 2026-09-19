@@ -117,6 +117,7 @@ class FreshContextTool:
         followup_page_timeout_seconds: float = 4.0,
         followup_page_max_successes: int = 3,
         followup_search_hops: int = 3,
+        research_judge=None,
     ):
         self.max_external_queries_per_minute = max(0, int(max_external_queries_per_minute))
         self.cache_ttl_seconds = max(0, int(cache_ttl_seconds))
@@ -153,6 +154,7 @@ class FreshContextTool:
         self.followup_page_timeout_seconds = max(1.0, min(8.0, float(followup_page_timeout_seconds)))
         self.followup_page_max_successes = max(1, min(2, int(followup_page_max_successes)))
         self.followup_search_hops = max(1, min(3, int(followup_search_hops)))
+        self.research_judge = research_judge
 
     @classmethod
     def from_config(cls, config: object | None) -> "FreshContextTool":
@@ -196,6 +198,7 @@ class FreshContextTool:
             followup_page_timeout_seconds=_config_float(cfg, "followup_page_timeout_seconds", default=4.0),
             followup_page_max_successes=_config_int(cfg, "followup_page_max_successes", default=3),
             followup_search_hops=_config_int(cfg, "followup_search_hops", default=3),
+            research_judge=None,
         )
 
     async def context_for(
@@ -388,12 +391,11 @@ class FreshContextTool:
         if status == "ok" and items:
             ok_pages, page = await self._read_followup_pages(items, query=normalized_query)
             hop_provider = used_provider or self._resolved_provider(normalized_kind)
-            while _should_run_followup_research_round(
+            while await self._should_followup_round(
                 query=normalized_query,
                 kind=normalized_kind,
                 items=items,
                 pages=ok_pages,
-                hops=self.followup_search_hops,
                 remaining_seconds=deadline - time.monotonic(),
                 current_round=research_rounds,
             ):
@@ -440,6 +442,20 @@ class FreshContextTool:
                 errors.append(f"page:{page.error or page.status}")
         if status == "ok":
             answer = _synthesize_research_answer(answer, items, ok_pages, query=normalized_query)
+            useful, useful_reason = await self._judge_search_useful(
+                query=normalized_query,
+                answer=answer,
+                items=items,
+                pages=ok_pages,
+            )
+            if not useful:
+                status = "no_result"
+                if useful_reason:
+                    errors.append(useful_reason)
+                answer = ""
+                items = ()
+                ok_pages = ()
+                page = None
         first_page = ok_pages[0] if ok_pages else page
         latency_ms = int((time.monotonic() - started) * 1000)
         lookup = FreshLookup(
@@ -468,6 +484,93 @@ class FreshContextTool:
             self._cache.popitem(last=False)
         self._record_lookup(lookup, started=started)
         return lookup
+
+    def _evidence_preview(
+        self,
+        *,
+        answer: str,
+        items: tuple[FreshItem, ...],
+        pages: tuple[UrlReadResult, ...] = (),
+    ) -> str:
+        lines: list[str] = []
+        if answer:
+            lines.append(f"摘要：{answer[:400]}")
+        for item in items[:5]:
+            lines.append(f"- {item.title} | {item.source} | {item.summary[:160]}")
+        for page in pages[:2]:
+            text = (page.text or "")[:280]
+            if text:
+                lines.append(f"正文：{text}")
+        return "\n".join(lines)
+
+    async def _should_followup_round(
+        self,
+        *,
+        query: str,
+        kind: str,
+        items: tuple[FreshItem, ...],
+        pages: tuple[UrlReadResult, ...],
+        remaining_seconds: float,
+        current_round: int,
+    ) -> bool:
+        next_round = int(current_round) + 1
+        if (
+            self.followup_search_hops < next_round
+            or next_round > 3
+            or remaining_seconds <= 0.8
+            or not items
+        ):
+            return False
+        lexical = _should_run_followup_research_round(
+            query=query,
+            kind=kind,
+            items=items,
+            pages=pages,
+            hops=self.followup_search_hops,
+            remaining_seconds=remaining_seconds,
+            current_round=current_round,
+        )
+        judge = self.research_judge
+        should_followup = getattr(judge, "should_followup_search", None) if judge is not None else None
+        if should_followup is None:
+            return lexical
+        try:
+            return bool(
+                await should_followup(
+                    query=query,
+                    kind=kind,
+                    evidence=self._evidence_preview(answer="", items=items, pages=pages),
+                    current_round=current_round,
+                    remaining_seconds=remaining_seconds,
+                )
+            )
+        except Exception:
+            return lexical
+
+    async def _judge_search_useful(
+        self,
+        *,
+        query: str,
+        answer: str,
+        items: tuple[FreshItem, ...],
+        pages: tuple[UrlReadResult, ...],
+    ) -> tuple[bool, str]:
+        if not items and not answer:
+            return False, "empty_evidence"
+        judge = self.research_judge
+        if judge is None:
+            return True, ""
+        useful_fn = getattr(judge, "judge_search_useful", None)
+        if useful_fn is None:
+            return True, ""
+        try:
+            useful, reason = await useful_fn(
+                query=query,
+                evidence=self._evidence_preview(answer=answer, items=items, pages=pages),
+            )
+            return bool(useful), str(reason or "")
+        except Exception:
+            return True, "jev_search_judge_failed"
 
     def _related_cached_lookup(self, kind: str, query: str, *, now: float) -> FreshLookup | None:
         query_key = _cache_query_key(query)
@@ -954,6 +1057,7 @@ def _prompt_context_from_fact_pack(pack: FreshFactPack) -> str:
         "回复时按研究结论写：先给综合判断，再补能核对的依据；"
         "每个具体新事实必须能由对应的 [S编号]、快速摘要或网页正文支持，但群聊回复里不要写出 [S1]/[S2]/S1S2 这类编号；"
         "优先相信多来源共同支持的信息；不要说“我搜索到/我查到”，不要把单条摘要当成绝对事实，也不要编造来源。"
+        "如果状态不是 ok，不要把下面材料当已核实答案。"
     )
     body = "\n".join(inner)
     return (

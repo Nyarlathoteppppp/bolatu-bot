@@ -1,4 +1,5 @@
 from __future__ import annotations
+from .jev_client import JevClient
 
 import asyncio
 import json
@@ -130,8 +131,7 @@ class ReplyCandidateDraft:
     style: str
 
 
-SOCIAL_ACTIONS = {
-    "ignore",
+SPEAKING_ACTIONS = {
     "reply",
     "answer",
     "agree",
@@ -144,11 +144,30 @@ SOCIAL_ACTIONS = {
     "shift_topic",
     "self_comment",
     "relationship_reply",
+    "clarify",
+    "warm_tease",
+    "deflate",
+    "take_side",
+    "share_self",
+    "comfort_joke",
+    "mirror_style",
+    "amp_bit",
+    "deadpan_echo",
+    "commit_bit",
+    "hyperbole",
+    "wrong_register",
+    "protect",
+}
+
+SOCIAL_ACTIONS = SPEAKING_ACTIONS | {
+    "ignore",
     "market_check",
     "fresh_context",
     "react",
     "poke",
 }
+
+ADDRESSED_QUESTION_ACTIONS = {"answer", "ask_back", "clarify", "care"}
 
 LLMUsageRecorder = Callable[[str, str, Optional[int], Optional[int], Optional[int]], None]
 _usage_recorder: LLMUsageRecorder | None = None
@@ -186,6 +205,9 @@ class DeepSeekClient:
         self._provider_failures: dict[str, list[float]] = {}
         self._provider_circuit_until: dict[str, float] = {}
         self.prompts = PromptRegistry()
+        self.jev_client = JevClient(
+            api_key=os.getenv("OPENROUTER_API_KEY", "")
+        )
 
     async def _chat_completion(
         self,
@@ -353,6 +375,19 @@ class DeepSeekClient:
             default_provider = "deepseek"
         return parse_llm_model_route(value, self.config.providers, default_provider=default_provider)
 
+    def _jev_timeout(self, seconds: float = 2.5) -> float:
+        return max(1.0, min(4.0, float(seconds)))
+
+    async def _try_jev(self, factory, *, what: str, timeout: float = 2.5):
+        jev = getattr(self, "jev_client", None)
+        if jev is None or not getattr(jev, "available", False):
+            return None
+        try:
+            return await asyncio.wait_for(factory(), timeout=self._jev_timeout(timeout))
+        except Exception as exc:
+            logger.warning(f"qq_social_agent jev {what} failed, falling back: error={exc}")
+            return None
+
     def set_route_override(self, route_name: str, route: LLMModelRoute | None) -> None:
         if route_name not in self.config.routes:
             raise ValueError(f"unknown route: {route_name}")
@@ -392,6 +427,22 @@ class DeepSeekClient:
         )
         if not context:
             context = "（暂无更多上下文）"
+        # Jev is a decisions API, not a chat-completions model. timing_gate
+        # still uses the configured decision_model; only should_reply hops here.
+        jev_decision = await self._try_jev(
+            lambda: self.jev_client.should_reply(
+                persona=persona,
+                recent_messages=recent_messages,
+                current_text=current_text,
+                current_nickname=current_nickname,
+                mentioned=mentioned,
+                replied_to_bot=replied_to_bot,
+            ),
+            what="decision",
+        )
+        if jev_decision is not None:
+            return jev_decision
+
         addressed = mentioned or replied_to_bot
         interaction_state = "有人艾特或回复了你：必须回应当前实际问题，不得因为对方重复询问而拒答或只反问。"
         if not addressed:
@@ -511,6 +562,18 @@ class DeepSeekClient:
             persona_name=persona.name,
             persona_decision_prompt=persona.decision_prompt,
         )
+        jev_routed = await self._try_jev(
+            lambda: self.jev_client.route_tool(
+                persona=persona,
+                recent_messages=recent_messages,
+                current_text=current_text,
+                current_nickname=current_nickname,
+                addressed=addressed,
+            ),
+            what="tool_router",
+        )
+        if jev_routed is not None:
+            return jev_routed
         user = self.prompts.render(
             "tool_router",
             "user",
@@ -570,6 +633,19 @@ class DeepSeekClient:
             current_nickname=current_nickname,
             current_text=current_text,
         )
+        jev_timing = await self._try_jev(
+            lambda: self.jev_client.timing_gate(
+                persona=persona,
+                recent_messages=recent_messages,
+                current_text=current_text,
+                current_nickname=current_nickname,
+                speaker_context=speaker_context,
+                chat_label=chat_label,
+            ),
+            what="timing_gate",
+        )
+        if jev_timing is not None:
+            return jev_timing
         response = await self._chat_completion(
             task="decision",
             route_name="decision",
@@ -593,43 +669,246 @@ class DeepSeekClient:
         recent_messages: list[ChatMessage],
         candidate: str,
         chat_label: str = "QQ 私聊",
+        addressed: bool = False,
+        current_text: str = "",
     ) -> tuple[bool, str]:
-        """Reject private follow-ups that broadly duplicate a recent bot sentence."""
+        """Block only confident Jev self-repetition; unavailable audits pass."""
 
-        context = _format_context_with_local_focus(
-            recent_messages[-14:],
-            formatter=_format_decision_message,
-        ) or "（暂无更多上下文）"
-        system = self.prompts.render(
-            "proactive_audit",
-            "system",
-            persona_name=persona.name,
-            persona_decision_prompt=persona.decision_prompt,
+        jev_audit = await self._try_jev(
+            lambda: self.jev_client.audit_proactive_reply(
+                persona=persona,
+                recent_messages=recent_messages,
+                candidate=candidate,
+                chat_label=chat_label,
+                addressed=addressed,
+                current_text=current_text,
+            ),
+            what="proactive_audit",
         )
-        user = self.prompts.render(
-            "proactive_audit",
-            "user",
-            chat_label=chat_label,
-            context=context,
-            candidate=candidate,
+        if jev_audit is not None:
+            return jev_audit
+        return True, "jev_unavailable_audit_pass"
+
+    async def should_continue_private_chat(
+        self,
+        *,
+        persona: Persona,
+        recent_messages: list[ChatMessage],
+    ) -> tuple[bool, str]:
+        jev_result = await self._try_jev(
+            lambda: self.jev_client.should_continue_private_chat(
+                persona=persona,
+                recent_messages=recent_messages,
+            ),
+            what="private_continue",
         )
-        response = await self._chat_completion(
-            task="proactive_audit",
-            route_name="decision",
-            request={
-                "temperature": 0.05,
-                "max_tokens": 100,
-                "response_format": {"type": "json_object"},
-                "messages": [
-                    {"role": "system", "content": system},
-                    {"role": "user", "content": user},
-                ],
-            },
+        if jev_result is not None:
+            return jev_result
+        return True, "jev_unavailable_continue"
+
+    async def resolve_referent(
+        self,
+        *,
+        current_text: str,
+        current_label: str,
+        candidates: list | None = None,
+        reply=None,
+        rule_guess=None,
+        state: str | None = None,
+        criteria: dict | None = None,
+    ):
+        return await self._try_jev(
+            lambda: self.jev_client.resolve_referent(
+                current_text=current_text,
+                current_label=current_label,
+                candidates=candidates,
+                reply=reply,
+                rule_guess=rule_guess,
+                state=state,
+                criteria=criteria,
+            ),
+            what="referent",
         )
-        payload = _loads_json_object(response.choices[0].message.content or "")
-        raw_send = payload.get("send", False)
-        send = raw_send is True or str(raw_send).strip().casefold() in {"true", "1", "yes"}
-        return send, str(payload.get("reason", "") or "")[:80]
+
+    async def resolve_ellipsis(
+        self,
+        *,
+        current_text: str,
+        current_label: str,
+        sources: list | None = None,
+        reply=None,
+        reference=None,
+        state: str | None = None,
+        criteria: dict | None = None,
+    ):
+        return await self._try_jev(
+            lambda: self.jev_client.resolve_ellipsis(
+                current_text=current_text,
+                current_label=current_label,
+                sources=sources,
+                reply=reply,
+                reference=reference,
+                state=state,
+                criteria=criteria,
+            ),
+            what="ellipsis",
+        )
+
+    async def resolve_addressee(self, **kwargs):
+        return await self._try_jev(
+            lambda: self.jev_client.resolve_addressee(**kwargs),
+            what="addressee",
+        )
+
+    async def resolve_discourse_first_pass(self, **kwargs):
+        return await self._try_jev(
+            lambda: self.jev_client.resolve_discourse_first_pass(**kwargs),
+            what="discourse_first_pass",
+            timeout=4.0,
+        )
+
+    async def audit_discourse_state(self, **kwargs):
+        return await self._try_jev(
+            lambda: self.jev_client.audit_discourse_state(**kwargs),
+            what="discourse_audit",
+        )
+
+    async def resolve_repair(self, **kwargs):
+        return await self._try_jev(
+            lambda: self.jev_client.resolve_repair(**kwargs),
+            what="repair",
+        )
+
+    async def resolve_memory_effect(self, **kwargs):
+        return await self._try_jev(
+            lambda: self.jev_client.resolve_memory_effect(**kwargs),
+            what="memory_effect",
+        )
+
+    async def resolve_ambiguity(self, **kwargs):
+        return await self._try_jev(
+            lambda: self.jev_client.resolve_ambiguity(**kwargs),
+            what="ambiguity",
+        )
+
+    async def choose_proactive_topic(self, **kwargs):
+        return await self._try_jev(
+            lambda: self.jev_client.choose_proactive_topic(**kwargs),
+            what="proactive_topic",
+        )
+
+    async def political_mask_keys(self, **kwargs):
+        return await self._try_jev(
+            lambda: self.jev_client.political_mask_keys(**kwargs),
+            what="political_mask",
+        )
+
+    async def review_draft(self, **kwargs):
+        result = await self._try_jev(
+            lambda: self.jev_client.review_draft(**kwargs),
+            what="draft_review",
+            timeout=4.0,
+        )
+        return result if result is not None else (None, None)
+
+    async def check_pronoun(self, **kwargs):
+        return await self._try_jev(
+            lambda: self.jev_client.check_pronoun(**kwargs),
+            what="pronoun",
+            timeout=4.0,
+        )
+
+    async def critique_draft(self, **kwargs):
+        return await self._try_jev(
+            lambda: self.jev_client.critique_draft(**kwargs),
+            what="pre_send_critic",
+        )
+
+    async def should_ask_back(
+        self,
+        *,
+        current_text: str,
+        action: str,
+        addressed: bool,
+    ) -> bool | None:
+        return await self._try_jev(
+            lambda: self.jev_client.should_ask_back(
+                current_text=current_text,
+                action=action,
+                addressed=addressed,
+            ),
+            what="ask_back",
+        )
+
+    async def should_read_media(
+        self,
+        *,
+        kind: str,
+        caption: str,
+        addressed: bool,
+        item_count: int,
+    ) -> bool | None:
+        return await self._try_jev(
+            lambda: self.jev_client.should_read_media(
+                kind=kind,
+                caption=caption,
+                addressed=addressed,
+                item_count=item_count,
+            ),
+            what="media_gate",
+            timeout=2.0,
+        )
+
+    async def select_speaking_action(
+        self,
+        *,
+        current_text: str,
+        current_label: str,
+        addressed: bool,
+        baseline_action: str,
+        speaker_context: str = "",
+        recent_messages: list | None = None,
+    ) -> tuple[str, str] | None:
+        return await self._try_jev(
+            lambda: self.jev_client.select_speaking_action(
+                current_text=current_text,
+                current_label=current_label,
+                addressed=addressed,
+                baseline_action=baseline_action,
+                speaker_context=speaker_context,
+                recent_messages=recent_messages,
+            ),
+            what="speaking_action",
+        )
+
+    async def _select_relevant_generation_context(
+        self,
+        messages: list[ChatMessage],
+        *,
+        current_text: str,
+        current_nickname: str,
+        keep_recent: int = 6,
+        target_total: int = 12,
+    ) -> list[ChatMessage]:
+        if len(messages) <= target_total:
+            return list(messages)
+        keep_recent = 6
+        older = list(messages[:-keep_recent])
+        scores = await self._try_jev(
+            lambda: self.jev_client.rank_context_messages(
+                current_nickname=current_nickname,
+                current_text=current_text,
+                candidates=older,
+            ),
+            what="context_rank",
+            timeout=4.0,
+        )
+        return select_relevant_context_messages(
+            messages,
+            scores if isinstance(scores, list) else None,
+            keep_recent=keep_recent,
+            target_total=target_total,
+        )
 
     async def select_jargon_terms(
         self,
@@ -648,6 +927,16 @@ class DeepSeekClient:
         if not context:
             context = "（暂无更多上下文）"
         heuristic_text = "、".join(heuristic_terms) if heuristic_terms else "无"
+        jev_terms = await self._try_jev(
+            lambda: self.jev_client.select_jargon_terms(
+                current_text=current_text,
+                heuristic_terms=heuristic_terms,
+                jargon_catalog=jargon_catalog,
+            ),
+            what="jargon_select",
+        )
+        if jev_terms is not None:
+            return tuple(jev_terms)
         system = self.prompts.render("jargon_select", "system")
         user = self.prompts.render(
             "jargon_select",
@@ -703,6 +992,11 @@ class DeepSeekClient:
         context_messages = _reply_context_messages(
             recent_messages,
             include_bot_history=include_bot_history,
+        )
+        context_messages = await self._select_relevant_generation_context(
+            context_messages,
+            current_text=current_text,
+            current_nickname=current_nickname,
         )
         context = _format_context_with_local_focus(context_messages, formatter=_format_message)
         if not context:
@@ -785,6 +1079,16 @@ class DeepSeekClient:
             reply_text=reply_text,
             candidates=candidates,
         )
+        jev_choice = await self._try_jev(
+            lambda: self.jev_client.select_meme(
+                current_text=current_text,
+                reply_text=reply_text,
+                candidates=candidates,
+            ),
+            what="meme_selector",
+        )
+        if jev_choice is not None:
+            return jev_choice
         response = await self._chat_completion(
             task="private_meme_selector",
             route_name="utility",
@@ -931,6 +1235,12 @@ class DeepSeekClient:
             selected_recent,
             include_bot_history=include_bot_history,
         )
+        if context_message_limit is None or int(context_message_limit) >= 20:
+            context_messages = await self._select_relevant_generation_context(
+                context_messages,
+                current_text=current_text,
+                current_nickname=current_nickname,
+            )
         context = _format_context_with_local_focus(context_messages, formatter=_format_message)
         search_reply = prompt_flow == "search_answer" and candidate_count == 1
         direct_reply = prompt_flow == "reply_direct" and candidate_count == 1
@@ -1214,11 +1524,43 @@ def _format_decision_message(msg: ChatMessage) -> str:
     return _format_message(msg)
 
 
+def select_relevant_context_messages(
+    messages: list[ChatMessage],
+    scores_for_older: list[float] | None,
+    *,
+    keep_recent: int = 6,
+    target_total: int = 12,
+) -> list[ChatMessage]:
+    """Pin the newest 6 lines; only older lines may be dropped or ranked."""
+    if not messages:
+        return []
+    keep_recent = 6 if len(messages) >= 6 else len(messages)
+    target_total = max(keep_recent, int(target_total))
+    if len(messages) <= target_total:
+        return list(messages)
+    recent = list(messages[-keep_recent:])
+    older = list(messages[:-keep_recent])
+    slots = max(0, target_total - len(recent))
+    if not older or slots <= 0:
+        return recent
+    if scores_for_older is None or len(scores_for_older) != len(older):
+        return list(messages[-target_total:])
+    ranked = sorted(
+        range(len(older)),
+        key=lambda index: (-float(scores_for_older[index]), -index),
+    )
+    chosen = {index for index in ranked[:slots] if float(scores_for_older[index]) >= 0.28}
+    if len(chosen) < min(2, slots):
+        return list(messages[-target_total:])
+    selected = [msg for index, msg in enumerate(older) if index in chosen] + recent
+    return selected
+
+
 def _reply_context_messages(
     messages: list[ChatMessage],
     *,
     include_bot_history: bool,
-    limit: int = 30,
+    limit: int = 40,
 ) -> list[ChatMessage]:
     if include_bot_history:
         return messages[-limit:]
@@ -1387,6 +1729,10 @@ def _parse_tool_routing_decision(content: str) -> ToolRoutingDecision:
         "url": "deep_url",
         "webpage": "deep_url",
         "deep_url": "deep_url",
+        "probability": "probability",
+        "prob": "probability",
+        "jev": "probability",
+        "jev_probability": "probability",
     }
     tool = aliases.get(tool, "none")
     query = re.sub(
@@ -1609,6 +1955,33 @@ def _normalize_action(value: str, *, should_reply: bool) -> str:
         "market_check": "market_check",
         "fresh_context": "fresh_context",
         "ignore": "ignore",
+        "clarify": "clarify",
+        "clarification": "clarify",
+        "对齐": "clarify",
+        "warm_tease": "warm_tease",
+        "亲昵吐槽": "warm_tease",
+        "deflate": "deflate",
+        "扎破": "deflate",
+        "take_side": "take_side",
+        "站边": "take_side",
+        "share_self": "share_self",
+        "分享自己": "share_self",
+        "comfort_joke": "comfort_joke",
+        "玩笑安慰": "comfort_joke",
+        "mirror_style": "mirror_style",
+        "学语气": "mirror_style",
+        "amp_bit": "amp_bit",
+        "加码": "amp_bit",
+        "deadpan_echo": "deadpan_echo",
+        "冷接": "deadpan_echo",
+        "commit_bit": "commit_bit",
+        "入戏": "commit_bit",
+        "hyperbole": "hyperbole",
+        "夸张": "hyperbole",
+        "wrong_register": "wrong_register",
+        "错位正经": "wrong_register",
+        "protect": "protect",
+        "挡一句": "protect",
     }
     normalized = aliases.get(action, action)
     if normalized not in SOCIAL_ACTIONS:
@@ -2221,13 +2594,9 @@ def _filter_recent_bot_duplicate_candidates(
     candidates: tuple[ReplyCandidateDraft, ...],
     recent_bot_replies: tuple[str, ...],
 ) -> tuple[ReplyCandidateDraft, ...]:
-    if not recent_bot_replies:
-        return candidates
-    return tuple(
-        candidate
-        for candidate in candidates
-        if not any(_substantially_repeats(candidate.text, previous) for previous in recent_bot_replies)
-    )
+    # Lexical overlap is not a send gate. Pre-send Jev decides whether a draft
+    # is actually repeating 风雪. Keep the helper so generation still has a hook.
+    return candidates
 
 
 def _substantially_repeats(current: str, previous: str, *, min_common: int = 8) -> bool:

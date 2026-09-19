@@ -68,7 +68,13 @@ from .decision_gate import (
     is_low_value_group_text as _is_low_value_group_text,
     pre_decision_gate as _pre_decision_gate,
 )
-from .deepseek_client import DeepSeekClient, MemberProfileDraft, ReplyDecision, ToolSymbol, set_usage_recorder
+from .deepseek_client import (
+    DeepSeekClient,
+    MemberProfileDraft,
+    ReplyDecision,
+    ToolSymbol,
+    set_usage_recorder,
+)
 from .delivery import build_delivery_plan
 from .group_jargon import (
     GroupJargonEntry,
@@ -155,12 +161,55 @@ from .pipeline_stages import (
     mark_sent as _pipeline_mark_sent,
     mark_understood as _pipeline_mark_understood,
 )
-from .political_guard import sanitize_political_output
+from .political_guard import format_gag_memory, political_candidates, sanitize_political_output_detail
 from .rate_limiter import RateLimiter
 from .rag_admin import RAGAdminController
 from .rag_query import normalize_rag_query
 from .rag_retriever import RAGRetrievalResult, RAGService
-from .reference_resolver import ReferenceResolution, resolve_context_reference
+from .discourse_effects import (
+    AmbiguityResolution,
+    MemoryCandidate,
+    MemoryEffectResolution,
+    RepairResolution,
+    apply_jev_memory_judgement,
+    apply_memory_effect,
+    format_ambiguity_prompt_block,
+    format_repair_prompt_block,
+    related_memories_for_candidate,
+    memory_can_commit,
+    should_ask_jev_memory_effect,
+)
+from .discourse_state import (
+    DiscourseState,
+    discourse_decision_trace,
+    draft_violates_media_gate,
+    format_discourse_prompt_block,
+    resolve_group_discourse,
+    segments_have_real_media,
+)
+from .resolver_result import AMBIGUOUS, ERROR, NOT_APPLICABLE, RESOLVED, UNAVAILABLE
+from .ellipsis_resolver import (
+    EllipsisResolution,
+    format_ellipsis_prompt_block,
+)
+from .pre_send_critic import (
+    CriticResult,
+    apply_jev_critic_judgement,
+    critic_prefers_clarify,
+    format_critic_feedback,
+    next_critic_action,
+)
+from .pronoun_guard import (
+    draft_has_person_pronoun,
+    apply_jev_pronoun_judgement,
+    format_pronoun_feedback,
+)
+from .reference_resolver import (
+    ReferenceResolution,
+    ReplyHint,
+    format_referent_prompt_block,
+    has_strong_person_reference,
+)
 from .reply_splitter import split_reply_messages
 from .social_actions import PokeContext, ReactionResult, SocialActionService, reaction_from_action
 from .tools.fresh_context import (
@@ -172,6 +221,7 @@ from .tools.deep_content import DeepContentTool
 from .tools.market import MarketTool
 from .tools.market_intent import MarketIntent, detect_market_intents, is_market_topic
 from .tools.voice_transcript import VoiceTranscriptContext
+from .tools.probability_tool import JevProbabilityTool
 from .tool_router import (
     ToolRoutePlan,
     apply_tool_plan as _apply_tool_plan,
@@ -207,6 +257,7 @@ deep_content_tool = DeepContentTool.from_config(
 )
 fresh_context_tool = FreshContextTool.from_config(app_config.raw.get("fresh_search", {}))
 fresh_context_tool.url_reader = deep_content_tool.reader
+jev_probability_tool: JevProbabilityTool | None = None
 social_action_service = SocialActionService.from_config(app_config.raw.get("social_actions", {}))
 image_ocr_service = ImageOcrService.from_config(app_config.raw.get("image_ocr", {}))
 private_meme_library = PrivateMemeLibrary(
@@ -267,7 +318,6 @@ private_generation_inflight: set[int] = set()
 private_inbound_message_counts: dict[int, int] = {}
 private_followup_tasks: dict[int, asyncio.Task[None]] = {}
 group_addressed_waiters: dict[int, int] = {}
-group_reply_flow_timestamps: dict[int, float] = {}
 group_inbound_sequences: dict[int, int] = {}
 group_passive_retry_buffers: dict[int, list["BufferedGroupMessage"]] = {}
 group_passive_retry_tasks: dict[int, asyncio.Task[None]] = {}
@@ -842,7 +892,7 @@ GROUP_BUFFER_SECONDS = 6.0
 GROUP_INFLIGHT_BUFFER_RETRY_SECONDS = 1.0
 PRIVATE_BUFFER_SECONDS = 2.5
 PRIVATE_INFLIGHT_BUFFER_RETRY_SECONDS = 0.75
-PRIVATE_CONTEXT_LIMIT = 25
+PRIVATE_CONTEXT_LIMIT = 40
 PRIVATE_FOLLOWUP_DELAY_SECONDS = 10.0
 PRIVATE_FOLLOWUP_PROBABILITY = 0.20
 # Keep this as an explicit override hook, but use the same 20% default for
@@ -944,7 +994,18 @@ SOCIAL_TOPIC_KEYWORDS: tuple[str, ...] = (
 GROUP_PROACTIVE_TOPIC_COOLDOWN_SECONDS = 7 * 24 * 60 * 60
 GROUP_PROACTIVE_TOPIC_HISTORY_LIMIT = 80
 GROUP_PROACTIVE_TOPIC_HISTORY_KEY_PREFIX = "group_proactive_topic_history"
-GROUP_REPLY_FLOW_COOLDOWN_SECONDS = 30.0
+
+
+def _social_topic_bucket_name(topic: str) -> str:
+    name, sep, _ = str(topic or "").partition("：")
+    return name.strip() or "其他"
+
+
+def _social_topic_buckets(topics: list[str] | tuple[str, ...]) -> dict[str, list[str]]:
+    buckets: dict[str, list[str]] = {}
+    for topic in topics:
+        buckets.setdefault(_social_topic_bucket_name(topic), []).append(topic)
+    return buckets
 BOT_STATUS_CARD_BASE_NAME = "张风雪"
 BLOCKED_BACKEND_FALLBACK_TEXTS = {
     "风雪觉得先按这个方向看，别把关键点漏了。",
@@ -1253,9 +1314,15 @@ class SuppressionEvent:
 
 @get_driver().on_startup
 async def _init_client() -> None:
-    global deepseek_client, learning_coordinator
+    global deepseek_client, learning_coordinator, jev_probability_tool
     set_usage_recorder(_record_llm_usage if app_config.deepseek.usage_tracking_enabled else None)
     deepseek_client = DeepSeekClient(app_config.deepseek)
+    jev_probability_tool = JevProbabilityTool(
+        deepseek_client.jev_client,
+        deepseek_client,
+    )
+    if deepseek_client.jev_client.available:
+        fresh_context_tool.research_judge = deepseek_client.jev_client
     local_plugin_registry.reload()
     if local_plugin_registry.errors:
         logger.warning(
@@ -1315,6 +1382,14 @@ PLUGIN_TOOL_BINDINGS: tuple[tuple[str, str, ToolKind, str, str, str], ...] = (
         "安全读取群友明确发来的网页正文",
         "_execute_registered_deep_url",
         "tool.deep_url",
+    ),
+    (
+        "probability_tools",
+        "jev_probability",
+        ToolKind.PROBABILITY,
+        "用 Jev 评估事件发生的校准概率",
+        "_execute_registered_probability",
+        "tool.probability",
     ),
 )
 
@@ -1577,6 +1652,7 @@ async def _shutdown_background_tasks() -> None:
         closers.append(learning_coordinator.close())
     if deepseek_client is not None:
         closers.extend(client.close() for client in deepseek_client.clients.values())
+        closers.append(deepseek_client.jev_client.aclose())
     closers.append(image_ocr_service.aclose())
     closers.append(content_ingestion_service.aclose())
     closers.append(deep_content_tool.aclose())
@@ -2314,7 +2390,11 @@ async def _run_private_hourly_chat(bot: Bot, bot_key: str) -> None:
             persona = personas.get(app_config.default_persona)
             if persona is None:
                 continue
-            topic = random.choice(SOCIAL_TOPIC_KEYWORDS)
+            topic, topic_bucket, _ = await _select_proactive_topic(
+                candidates=list(SOCIAL_TOPIC_KEYWORDS),
+                recent_messages=recent,
+                chat_label="QQ 私聊",
+            )
             nickname = _private_nickname_from_recent(recent, PRIVATE_HOURLY_CHAT_USER_ID)
             private_generation_inflight.add(PRIVATE_HOURLY_CHAT_USER_ID)
             try:
@@ -2345,6 +2425,7 @@ async def _run_private_hourly_chat(bot: Bot, bot_key: str) -> None:
                     roll=round(roll, 2),
                     slot=slot,
                     topic=topic,
+                    topic_bucket=topic_bucket,
                     reason=_short_notice_text(str(exc), 160),
                 )
                 continue
@@ -2369,6 +2450,7 @@ async def _run_private_hourly_chat(bot: Bot, bot_key: str) -> None:
                 roll=round(roll, 2),
                 slot=slot,
                 topic=topic,
+                topic_bucket=topic_bucket,
             )
     except asyncio.CancelledError:
         raise
@@ -2434,8 +2516,13 @@ async def _send_proactive_chat_for_group(
         return False
     group_generation_inflight.add(group_id)
     try:
-        topic, cooled_topic_count = _choose_group_proactive_topic(group_id, now=now)
         recent_messages = memory.recent_messages(group_id, PROACTIVE_CHAT_CONTEXT_LIMIT)
+        topic, topic_bucket, cooled_topic_count = await _select_proactive_topic(
+            group_id=group_id,
+            now=now,
+            recent_messages=recent_messages,
+            chat_label="QQ 群聊",
+        )
         context_query = _proactive_chat_context_query(recent_messages)
         related_user_ids = _related_member_user_ids(recent_messages, current_user_id=0)
         memory_context = _format_memory_context(
@@ -2508,8 +2595,6 @@ async def _send_proactive_chat_for_group(
             _record_metric_event("proactive_chat", group_id=group_id, stage="generation", action="skipped", reason="empty_model_reply")
             return False
         reply = _sanitize_generated_text(drafts[0].text)
-        reply, _ = sanitize_political_output(reply)
-        reply = _sanitize_generated_text(reply)
         if not reply or reply in BLOCKED_BACKEND_FALLBACK_TEXTS:
             _record_metric_event("proactive_chat", group_id=group_id, stage="generation", action="skipped", reason="empty_after_guard")
             return False
@@ -2519,11 +2604,20 @@ async def _send_proactive_chat_for_group(
             return False
         sent_ids: list[int] = []
         for part in parts:
-            message_id = await _send_group_message(bot, group_id, Message(part))
+            public_text, memory_text, gag = await _prepare_group_political_send_texts(part, context=reply)
+            message_id = await _send_group_message(bot, group_id, Message(public_text))
+            if gag:
+                await _notify_owner_political_gag(
+                    original=part,
+                    public=public_text,
+                    hits=gag,
+                    group_id=group_id,
+                    source="proactive_chat",
+                )
             _record_bot_sent_message(
                 group_id=group_id,
                 message_id=message_id,
-                bot_reply=part,
+                bot_reply=memory_text,
                 trigger_user_id=0,
                 trigger_nickname="风雪主动发起",
                 trigger_text=f"interval_random probability={probability} roll={roll:.2f} topic={topic}",
@@ -2533,7 +2627,7 @@ async def _send_proactive_chat_for_group(
                 group_id,
                 int(bot.self_id),
                 persona.name,
-                part,
+                memory_text,
                 is_bot=True,
                 source_message_id=message_id,
                 source_kind="proactive_chat",
@@ -2554,6 +2648,7 @@ async def _send_proactive_chat_for_group(
             probability=probability,
             roll=round(roll, 2),
             topic=topic,
+            topic_bucket=topic_bucket,
             cooled_topic_count=cooled_topic_count,
             message_count=len(parts),
             message_ids=sent_ids,
@@ -2609,7 +2704,7 @@ def _recent_group_proactive_topics(group_id: int, *, now: float) -> list[tuple[s
     return selected
 
 
-def _choose_group_proactive_topic(group_id: int, *, now: float) -> tuple[str, int]:
+def _group_proactive_topic_candidates(group_id: int, *, now: float) -> tuple[list[str], int]:
     recent = _recent_group_proactive_topics(group_id, now=now)
     cooled_topics = {topic for topic, _ in recent}
     candidates = [topic for topic in SOCIAL_TOPIC_KEYWORDS if topic not in cooled_topics]
@@ -2618,7 +2713,49 @@ def _choose_group_proactive_topic(group_id: int, *, now: float) -> tuple[str, in
     if not candidates:
         last_sent = {topic: sent_at for topic, sent_at in recent}
         candidates = sorted(SOCIAL_TOPIC_KEYWORDS, key=lambda topic: last_sent.get(topic, 0.0))[:1]
-    return random.choice(candidates), len(cooled_topics)
+    return candidates, len(cooled_topics)
+
+
+def _pick_proactive_topic_bucket(candidates: list[str]) -> tuple[str, list[str]]:
+    buckets = _social_topic_buckets(candidates)
+    bucket = random.choice(list(buckets))
+    return bucket, list(buckets[bucket])
+
+
+def _choose_group_proactive_topic(group_id: int, *, now: float) -> tuple[str, int]:
+    candidates, cooled_count = _group_proactive_topic_candidates(group_id, now=now)
+    _bucket, bucket_topics = _pick_proactive_topic_bucket(candidates)
+    return random.choice(bucket_topics), cooled_count
+
+
+async def _select_proactive_topic(
+    *,
+    candidates: list[str] | None = None,
+    group_id: int | None = None,
+    now: float | None = None,
+    recent_messages: list[ChatMessage] | None = None,
+    chat_label: str = "QQ 群聊",
+) -> tuple[str, str, int]:
+    cooled_count = 0
+    if candidates is None:
+        if group_id is None:
+            candidates = list(SOCIAL_TOPIC_KEYWORDS)
+        else:
+            candidates, cooled_count = _group_proactive_topic_candidates(
+                group_id,
+                now=time.time() if now is None else now,
+            )
+    bucket, bucket_topics = _pick_proactive_topic_bucket(candidates)
+    judged = None
+    if deepseek_client is not None and len(bucket_topics) > 1:
+        judged = await deepseek_client.choose_proactive_topic(
+            bucket=bucket,
+            topics=bucket_topics,
+            recent_messages=recent_messages or [],
+            chat_label=chat_label,
+        )
+    topic = judged if judged in bucket_topics else random.choice(bucket_topics)
+    return topic, bucket, cooled_count
 
 
 def _record_group_proactive_topic(group_id: int, topic: str, *, now: float) -> None:
@@ -2752,7 +2889,6 @@ async def _send_daily_review_for_group(
         return False
     if not review:
         review = "今天群里没怎么留给我发挥，我先记一笔：大家还是挺能聊的。"
-    review, _ = sanitize_political_output(review)
     review = _sanitize_generated_text(review)
     parts = split_reply_messages(review, max_messages=3)
     if not parts:
@@ -2768,11 +2904,20 @@ async def _send_daily_review_for_group(
         return False
     for index, part in enumerate(parts):
         try:
-            message_id = await _send_group_message(bot, group_id, Message(part))
+            public_text, memory_text, gag = await _prepare_group_political_send_texts(part, context=review)
+            message_id = await _send_group_message(bot, group_id, Message(public_text))
+            if gag:
+                await _notify_owner_political_gag(
+                    original=part,
+                    public=public_text,
+                    hits=gag,
+                    group_id=group_id,
+                    source="daily_review",
+                )
             _record_bot_sent_message(
                 group_id=group_id,
                 message_id=message_id,
-                bot_reply=part,
+                bot_reply=memory_text,
                 trigger_user_id=0,
                 trigger_nickname="每日复盘",
                 trigger_text=f"{review_label} {trigger_label}",
@@ -2782,7 +2927,7 @@ async def _send_daily_review_for_group(
                 group_id,
                 int(getattr(bot, "self_id", 0) or 0),
                 persona.name,
-                part,
+                memory_text,
                 is_bot=True,
                 source_message_id=message_id,
                 source_kind="live",
@@ -5150,21 +5295,60 @@ async def _handle_group_message_scoped(
             file_status=content_context.file_status,
             voice_status=content_context.voice_status,
         )
-    ocr_context = await _image_ocr_context_for_event(
-        bot,
-        event,
-        group_allowed=group_allowed,
-        group_id=group_id,
-        user_id=int(event.user_id),
-        correlation_id=correlation_id,
-    )
-    if ocr_context.text:
-        raw_text = _join_context_parts(raw_text, _format_image_ocr_context(ocr_context))
+    ocr_context = ImageOcrContext("", 0, 0)
+    if group_allowed:
+        image_segments = collect_ocr_image_segments(getattr(event, "message", []) or [])
+        if image_segments and await _media_worth_reading(
+            kind="ocr",
+            caption=plain_text,
+            addressed=addressed_bot or followup_addressed,
+            item_count=len(image_segments),
+            group_id=group_id,
+            user_id=int(event.user_id),
+        ):
+            ocr_context = await _image_ocr_context_for_event(
+                bot,
+                event,
+                group_allowed=True,
+                group_id=group_id,
+                user_id=int(event.user_id),
+                correlation_id=correlation_id,
+            )
+            if ocr_context.text:
+                raw_text = _join_context_parts(raw_text, _format_image_ocr_context(ocr_context))
+        elif image_segments:
+            ocr_context = ImageOcrContext("", len(image_segments), 0, "jev_skip")
+            _record_metric_event(
+                "image_ocr",
+                group_id=group_id,
+                user_id=int(event.user_id),
+                stage="media_gate",
+                action="skipped",
+                image_count=len(image_segments),
+                reason="jev_not_worth_reading",
+            )
     forward_context = ""
     if group_allowed and _message_has_forward_context(event):
-        forward_context = await _forward_context_text(bot, event, nickname=_nickname(event))
-        if forward_context:
-            raw_text = _join_context_blocks(raw_text or plain_text, forward_context)
+        if await _media_worth_reading(
+            kind="forward",
+            caption=plain_text,
+            addressed=addressed_bot or followup_addressed,
+            item_count=1,
+            group_id=group_id,
+            user_id=int(event.user_id),
+        ):
+            forward_context = await _forward_context_text(bot, event, nickname=_nickname(event))
+            if forward_context:
+                raw_text = _join_context_blocks(raw_text or plain_text, forward_context)
+        else:
+            _record_metric_event(
+                "content_ingestion",
+                group_id=group_id,
+                user_id=int(event.user_id),
+                stage="forward_gate",
+                action="skipped",
+                reason="jev_not_worth_reading",
+            )
     _record_metric_event(
         "message_received",
         group_id=group_id,
@@ -5783,16 +5967,103 @@ async def _handle_group_message_locked(
         context_recent,
     )
     related_member_user_ids = _related_member_user_ids(context_recent, current_user_id=user_id)
-    reference_resolution = resolve_context_reference(
-        normalized_rag_query.current_utterance,
-        context_recent,
-        current_user_id=user_id,
-        resolve_named_users=lambda candidate: rag_service.resolve_named_user_ids(
-            group_id,
-            candidate,
-            excluded_user_ids={int(event.self_id)},
-        ),
+    named_resolver = lambda candidate: rag_service.resolve_named_user_ids(group_id, candidate)
+    reply_hint = _reply_hint_for_reference(event, current_text=text, self_id=int(event.self_id))
+    at_user_ids = _at_user_ids_from_event(event, bot)
+    current_has_media = segments_have_real_media(getattr(event, "message", None), text=text)
+    reply_event = getattr(event, "reply", None)
+    reply_has_media = bool(reply_hint.exists) and segments_have_real_media(
+        getattr(reply_event, "message", None) if reply_event is not None else None,
+        text=reply_hint.text,
     )
+    discourse_state = await resolve_group_discourse(
+        current_text=normalized_rag_query.current_utterance,
+        current_user_id=user_id,
+        current_nickname=nickname,
+        self_id=int(event.self_id),
+        recent_messages=context_recent,
+        reply=reply_hint,
+        at_user_ids=at_user_ids,
+        named_resolver=named_resolver,
+        jev=deepseek_client,
+        current_has_media=current_has_media,
+        reply_has_media=reply_has_media,
+        relation_user_ids=related_member_user_ids,
+    )
+    reference_resolution = discourse_state.reference
+    ellipsis_resolution = discourse_state.ellipsis
+    repair_resolution = discourse_state.repair
+    ambiguity_resolution = discourse_state.ambiguity_resolution
+    invalidated_layers = list(discourse_state.invalidated_layers)
+    recomputed_layers = list(discourse_state.recomputed_layers)
+    memory_effect_resolution = MemoryEffectResolution()
+    critic_result = CriticResult()
+    regenerated = False
+    if invalidated_layers:
+        logger.info(
+            "qq_social_agent repair invalidation: "
+            f"group={group_id} kind={repair_resolution.kind} "
+            f"target={repair_resolution.target_key} layers={','.join(invalidated_layers)} "
+            f"recomputed={','.join(recomputed_layers)}"
+        )
+    memory_candidate = None
+    related_memories: list = []
+    subject_id = None
+    if "referent" in invalidated_layers and "referent" not in recomputed_layers:
+        recomputed_layers.append("referent")
+    blocked_memory_statuses = {AMBIGUOUS, UNAVAILABLE, ERROR}
+    if (
+        reference_resolution.status not in blocked_memory_statuses
+        and repair_resolution.status not in blocked_memory_statuses
+    ):
+        if (
+            reference_resolution.status == RESOLVED
+            and reference_resolution.kind == "PERSON"
+            and reference_resolution.user_ids
+        ):
+            subject_id = reference_resolution.user_ids[0]
+        elif reference_resolution.kind in {"", "NONE", "NON_PERSON"} or reference_resolution.status == NOT_APPLICABLE:
+            subject_id = user_id
+    fact_like = repair_resolution.kind in {"FACT", "RETRACTION"} and repair_resolution.status == RESOLVED
+    if subject_id is not None and (
+        fact_like
+        or should_ask_jev_memory_effect(
+            normalized_rag_query.current_utterance,
+            repair=repair_resolution,
+            candidate=MemoryCandidate(subject_user_id=subject_id, content=normalized_rag_query.current_utterance),
+        )
+    ):
+        memory_candidate = MemoryCandidate(
+            subject_user_id=subject_id,
+            content=normalized_rag_query.current_utterance.strip()[:180],
+            source_message_id=source_message_id,
+            speaker=nickname,
+        )
+    if should_ask_jev_memory_effect(
+        normalized_rag_query.current_utterance,
+        repair=repair_resolution,
+        candidate=memory_candidate,
+    ) and memory_candidate is not None:
+        related_memories = related_memories_for_candidate(
+            memory,
+            group_id=group_id,
+            candidate=memory_candidate,
+            speaker_user_id=user_id,
+        )
+        judged_memory = None
+        if deepseek_client is not None:
+            judged_memory = await deepseek_client.resolve_memory_effect(
+                current_text=normalized_rag_query.current_utterance,
+                candidate=memory_candidate,
+                related=related_memories,
+            )
+        memory_effect_resolution = apply_jev_memory_judgement(
+            judged_memory,
+            related_memories,
+            candidate=memory_candidate,
+        )
+        if "memory" in invalidated_layers and "memory" not in recomputed_layers:
+            recomputed_layers.append("memory")
     pipeline_state.reference_user_ids = reference_resolution.user_ids
     pipeline_state.reference_reason = reference_resolution.reason
     relation_facts = _message_relation_facts(
@@ -5819,6 +6090,18 @@ async def _handle_group_message_locked(
         followup_soft=followup_soft,
         self_id=int(event.self_id),
         relation_facts=relation_facts,
+        ellipsis_resolution=ellipsis_resolution,
+        repair_resolution=repair_resolution,
+        ambiguity_resolution=ambiguity_resolution,
+        discourse_state=discourse_state,
+    )
+    _record_metric_event(
+        "discourse_decision_trace",
+        group_id=group_id,
+        user_id=user_id,
+        stage="discourse",
+        action=discourse_state.state_audit,
+        **discourse_decision_trace(discourse_state),
     )
     _record_metric_event(
         "message_relation",
@@ -5833,6 +6116,34 @@ async def _handle_group_message_locked(
         reference_user_ids=list(relation_facts.reference_user_ids),
         reference_reason=relation_facts.reference_reason,
         reference_confidence=relation_facts.reference_confidence,
+        reference_status=reference_resolution.status,
+        reference_source=reference_resolution.source,
+        reference_value=reference_resolution.value,
+        ellipsis_kind=ellipsis_resolution.kind,
+        ellipsis_status=ellipsis_resolution.status,
+        ellipsis_source=ellipsis_resolution.source,
+        ellipsis_value=ellipsis_resolution.value,
+        ellipsis_unresolved=ellipsis_resolution.unresolved,
+        ellipsis_reason=ellipsis_resolution.reason,
+        repair_kind=repair_resolution.kind,
+        repair_status=repair_resolution.status,
+        repair_source=repair_resolution.source,
+        repair_value=repair_resolution.value,
+        repair_target=repair_resolution.target_key,
+        repair_unresolved=repair_resolution.unresolved,
+        repair_reason=repair_resolution.reason,
+        repair_invalidates=list(repair_resolution.invalidates),
+        invalidated_states=list(invalidated_layers),
+        recomputed_states=list(recomputed_layers),
+        ambiguity_kind=ambiguity_resolution.kind,
+        ambiguity_status=ambiguity_resolution.status,
+        ambiguity_source=ambiguity_resolution.source,
+        ambiguity_unresolved=ambiguity_resolution.unresolved,
+        memory_action=memory_effect_resolution.action,
+        memory_status=memory_effect_resolution.status,
+        memory_source=memory_effect_resolution.source,
+        memory_unresolved=memory_effect_resolution.unresolved,
+        memory_applied=memory_effect_resolution.applied,
     )
     if fresh_intent is None:
         followup_fresh_intent = _infer_followup_fresh_intent(
@@ -5950,6 +6261,18 @@ async def _handle_group_message_locked(
             tool_plan,
         )
 
+    if decision is None and (direct_addressed_bot or mentioned or replied_to_bot):
+        decision = ReplyDecision(
+            should_reply=True,
+            confidence=1.0,
+            reason="addressed_skip_timing_gate",
+            mode="addressed",
+            action="answer" if _looks_like_addressed_question(text) else "reply",
+        )
+        logger.info(
+            "qq_social_agent skipped timing_gate for addressed message: "
+            f"group={group_id} user={user_id}"
+        )
     if decision is None:
         try:
             timing = await deepseek_client.timing_gate(
@@ -6062,6 +6385,29 @@ async def _handle_group_message_locked(
         or (followup_addressed and _looks_like_addressed_question(text)),
         text=text,
     )
+    decision = await _maybe_apply_speaking_action(
+        decision,
+        text=text,
+        current_label=_member_label(user_id, nickname),
+        addressed_bot=addressed_bot,
+        speaker_context=speaker_context,
+        recent_messages=context_recent,
+        group_id=group_id,
+        user_id=user_id,
+        looks_like_question=_looks_like_addressed_question(text),
+        unresolved_reference=reference_resolution.unresolved,
+        unresolved_ellipsis=ellipsis_resolution.unresolved,
+        unresolved_repair=repair_resolution.unresolved,
+        unresolved_ambiguity=ambiguity_resolution.unresolved,
+        ambiguity_kind=ambiguity_resolution.kind,
+    )
+    decision = await _maybe_apply_ask_back(
+        decision,
+        text=text,
+        addressed_bot=addressed_bot,
+        group_id=group_id,
+        user_id=user_id,
+    )
     _pipeline_apply_decision(
         pipeline_state,
         should_reply=decision.should_reply,
@@ -6123,6 +6469,18 @@ async def _handle_group_message_locked(
                 f"confidence={decision.confidence:.2f} reason={decision.reason}"
             ),
         )
+        memory_effect_resolution = _maybe_commit_memory_effect(
+            group_id=group_id,
+            user_id=user_id,
+            should_reply=False,
+            memory_effect_resolution=memory_effect_resolution,
+            memory_candidate=memory_candidate,
+            reference_resolution=reference_resolution,
+            repair_resolution=repair_resolution,
+            ambiguity_resolution=ambiguity_resolution,
+            pending_recompute=[layer for layer in invalidated_layers if layer not in recomputed_layers],
+            critic=critic_result,
+        )
         _pipeline_mark_completed(pipeline_state)
         return
 
@@ -6140,6 +6498,18 @@ async def _handle_group_message_locked(
             buffered_messages=buffered_messages,
             source_message_id=source_message_id,
         )
+        memory_effect_resolution = _maybe_commit_memory_effect(
+            group_id=group_id,
+            user_id=user_id,
+            should_reply=False,
+            memory_effect_resolution=memory_effect_resolution,
+            memory_candidate=memory_candidate,
+            reference_resolution=reference_resolution,
+            repair_resolution=repair_resolution,
+            ambiguity_resolution=ambiguity_resolution,
+            pending_recompute=[layer for layer in invalidated_layers if layer not in recomputed_layers],
+            critic=critic_result,
+        )
         _pipeline_mark_completed(pipeline_state)
         return
 
@@ -6152,6 +6522,18 @@ async def _handle_group_message_locked(
             user_id=user_id,
             nickname=nickname,
             text=text,
+        )
+        memory_effect_resolution = _maybe_commit_memory_effect(
+            group_id=group_id,
+            user_id=user_id,
+            should_reply=False,
+            memory_effect_resolution=memory_effect_resolution,
+            memory_candidate=memory_candidate,
+            reference_resolution=reference_resolution,
+            repair_resolution=repair_resolution,
+            ambiguity_resolution=ambiguity_resolution,
+            pending_recompute=[layer for layer in invalidated_layers if layer not in recomputed_layers],
+            critic=critic_result,
         )
         _pipeline_mark_completed(pipeline_state)
         return
@@ -6463,6 +6845,25 @@ async def _handle_group_message_locked(
         )
         if deep_result.context:
             fresh_context = _combine_text_sections(fresh_context, deep_result.context)
+    probability_request = tool_plan.first(ToolKind.PROBABILITY)
+    if probability_request is not None:
+        probability_result = await tool_registry.execute(probability_request)
+        pipeline_state.add_tool_result(probability_result)
+        _record_metric_event(
+            "tool_call",
+            group_id=group_id,
+            user_id=user_id,
+            stage="probability",
+            action="registry_execute",
+            tool_kind=ToolKind.PROBABILITY.value,
+            success=probability_result.ok,
+            status=probability_result.status,
+            latency_ms=probability_result.elapsed_ms,
+            error=probability_result.error,
+            **dict(probability_result.metadata),
+        )
+        if probability_result.context:
+            fresh_context = _combine_text_sections(fresh_context, probability_result.context)
 
     suppress_mention_user_id = _repeat_mention_suppressed_user(group_id, user_id)
     mention_targets = _mention_targets(
@@ -6477,6 +6878,7 @@ async def _handle_group_message_locked(
         PipelineMode.SEARCH,
         PipelineMode.MARKET,
         PipelineMode.DEEP_URL,
+        PipelineMode.PROBABILITY,
     }
     reply_candidate_limit = 1 if direct_single_reply or tool_answer_mode else 3
     prompt_flow = (
@@ -6488,84 +6890,142 @@ async def _handle_group_message_locked(
     )
     task_name = "search_answer" if tool_answer_mode else prompt_flow
     generation_started_at = time.monotonic()
-    try:
-        reply_candidates = await deepseek_client.reply_candidates(
-            persona=persona,
-            recent_messages=context_recent,
-            current_text=text,
-            current_nickname=_member_label(user_id, nickname),
-            mentioned=addressed_bot,
-            addressed_repeat_count=addressed_repeat_count,
-            cue_repeat_context=_format_cue_repeat_context(cue_repeat_state),
-            action=decision.action,
-            chat_label="QQ 群聊",
-            market_context=market_context,
-            fresh_context=fresh_context,
-            context_packet=pipeline_state.context,
-            mention_targets=_format_mention_targets(mention_targets),
-            priority_context=_combine_text_sections(
-                _focused_user_tone_context(user_id),
-                _owner_user_tone_context(user_id),
-            ),
-            include_bot_history=tool_answer_mode,
-            context_message_limit=8 if tool_answer_mode else None,
-            candidate_count=reply_candidate_limit,
-            prompt_flow=prompt_flow,
-            task_name=task_name,
-            speaker_context=speaker_context,
-        )
-    except Exception as exc:
-        logger.warning(
-            "qq_social_agent reply candidate generation failed: "
-            f"group={group_id} addressed={addressed_bot} error={exc}"
-        )
-        return
-    if not reply_candidates:
-        if direct_single_reply:
-            logger.info(
-                "qq_social_agent skipped group reply: "
-                f"group={group_id} reason=empty_model_reply_direct_single addressed={addressed_bot}"
+    critic_feedback = ""
+    critic_result = None
+    approval_candidates: list[PendingApprovalCandidate] = []
+    for attempt in range(2):
+        effective_speaker_context = speaker_context
+        if critic_feedback:
+            effective_speaker_context = _combine_text_sections(speaker_context, critic_feedback)
+            if critic_prefers_clarify(critic_result) and attempt > 0:
+                decision = replace(decision, action="clarify")
+        try:
+            reply_candidates = await deepseek_client.reply_candidates(
+                persona=persona,
+                recent_messages=context_recent,
+                current_text=text,
+                current_nickname=_member_label(user_id, nickname),
+                mentioned=addressed_bot,
+                addressed_repeat_count=addressed_repeat_count,
+                cue_repeat_context=_format_cue_repeat_context(cue_repeat_state),
+                action=decision.action,
+                chat_label="QQ 群聊",
+                market_context=market_context,
+                fresh_context=fresh_context,
+                context_packet=pipeline_state.context,
+                mention_targets=_format_mention_targets(mention_targets),
+                priority_context=_combine_text_sections(
+                    _focused_user_tone_context(user_id),
+                    _owner_user_tone_context(user_id),
+                ),
+                include_bot_history=tool_answer_mode,
+                context_message_limit=8 if tool_answer_mode else None,
+                candidate_count=reply_candidate_limit,
+                prompt_flow=prompt_flow,
+                task_name=task_name,
+                speaker_context=effective_speaker_context,
             )
-            _record_metric_event(
-                "reply_suppressed",
-                group_id=group_id,
-                user_id=user_id,
-                stage="generation",
-                action="empty_model_reply_direct_single",
-                addressed=addressed_bot,
+        except Exception as exc:
+            logger.warning(
+                "qq_social_agent reply candidate generation failed: "
+                f"group={group_id} addressed={addressed_bot} error={exc}"
             )
             return
-        logger.info(f"qq_social_agent skipped group={group_id}: empty_model_reply")
-        return
-
-    approval_candidates: list[PendingApprovalCandidate] = []
-    for index, draft in enumerate(reply_candidates, start=1):
-        candidate_text = _sanitize_generated_text(draft.text)
-        if market_report:
-            candidate_text = f"{market_report}\n{candidate_text}".strip()
-        candidate_text, _ = sanitize_political_output(candidate_text)
-        candidate_text = _sanitize_generated_text(candidate_text)
-        if candidate_text in BLOCKED_BACKEND_FALLBACK_TEXTS:
-            logger.info(
-                "qq_social_agent dropped blocked backend fallback candidate: "
-                f"group={group_id} candidate={index} text={candidate_text!r}"
-            )
-            continue
-        if not candidate_text:
-            continue
-        approval_candidates.append(
-            PendingApprovalCandidate(
-                index=index,
-                text=candidate_text,
-                action=draft.action,
-                style=draft.style,
-            )
+        if not reply_candidates:
+            if direct_single_reply:
+                logger.info(
+                    "qq_social_agent skipped group reply: "
+                    f"group={group_id} reason=empty_model_reply_direct_single addressed={addressed_bot}"
+                )
+                _record_metric_event(
+                    "reply_suppressed",
+                    group_id=group_id,
+                    user_id=user_id,
+                    stage="generation",
+                    action="empty_model_reply_direct_single",
+                    addressed=addressed_bot,
+                )
+                return
+            logger.info(f"qq_social_agent skipped group={group_id}: empty_model_reply")
+            return
+        approval_candidates = _approval_candidates_from_drafts(
+            reply_candidates,
+            market_report=market_report,
+            limit=reply_candidate_limit,
         )
-        if len(approval_candidates) >= reply_candidate_limit:
+        if not approval_candidates:
+            logger.info(f"qq_social_agent skipped group={group_id}: empty_candidate_after_guard")
+            return
+        judged_pronoun, judged_critic = None, None
+        if deepseek_client is not None:
+            judged_pronoun, judged_critic = await deepseek_client.review_draft(
+                draft=approval_candidates[0].text,
+                current_text=text,
+                current_label=_member_label(user_id, nickname),
+                action=decision.action,
+                speaker_context=speaker_context,
+                recent_messages=context_recent,
+                memory_context=memory_context,
+                tool_context=_combine_text_sections(fresh_context, market_context),
+                reference=reference_resolution,
+                ellipsis=ellipsis_resolution,
+                repair=repair_resolution,
+                discourse=discourse_state,
+            )
+        pronoun_result = apply_jev_pronoun_judgement(
+            judged_pronoun,
+            has_pronoun=draft_has_person_pronoun(approval_candidates[0].text),
+        )
+        _record_metric_event(
+            "pronoun_guard",
+            group_id=group_id,
+            user_id=user_id,
+            stage="pronoun",
+            action="fix" if pronoun_result.needs_fix else "pass",
+            pronoun_status=pronoun_result.status,
+            pronoun_issue=pronoun_result.issue,
+            pronoun_noul=pronoun_result.noul,
+            attempt=attempt,
+        )
+        if pronoun_result.needs_fix and attempt <= 0:
+            critic_feedback = _combine_text_sections(
+                format_pronoun_feedback(pronoun_result),
+                "【待修人称原草稿】\n" + approval_candidates[0].text,
+            )
+            continue
+        critic_result = apply_jev_critic_judgement(judged_critic)
+        if draft_violates_media_gate(approval_candidates[0].text, discourse_state):
+            failures = tuple(dict.fromkeys([*critic_result.failures, "context_consistent"]))
+            critic_result = CriticResult(
+                intent_covered=critic_result.intent_covered or "YES",
+                referent_consistent=critic_result.referent_consistent or "YES",
+                context_consistent="NO",
+                unsupported_claim=critic_result.unsupported_claim or "NO",
+                reason="media_gate",
+                status=RESOLVED,
+                source=critic_result.source,
+                failures=failures,
+                regenerated=attempt > 0,
+            )
+        critic_result = replace(critic_result, regenerated=attempt > 0)
+        regenerated = attempt > 0
+        action = next_critic_action(critic_result, attempt=attempt)
+        _record_metric_event(
+            "pre_send_critic",
+            group_id=group_id,
+            user_id=user_id,
+            stage="critic",
+            action=action,
+            critic_status=critic_result.status,
+            critic_failed=critic_result.failed,
+            critic_failures=list(critic_result.failures),
+            regenerated=regenerated,
+            attempt=attempt,
+        )
+        if action != "regenerate":
             break
-    if not approval_candidates:
-        logger.info(f"qq_social_agent skipped group={group_id}: empty_candidate_after_guard")
-        return
+        critic_feedback = format_critic_feedback(critic_result)
+        regenerated = True
     generation_elapsed_ms = int((time.monotonic() - generation_started_at) * 1000)
     _pipeline_apply_candidates(
         pipeline_state,
@@ -6594,8 +7054,36 @@ async def _handle_group_message_locked(
         candidate_count=len(approval_candidates),
         elapsed_ms=generation_elapsed_ms,
         flow_elapsed_ms=int((time.monotonic() - flow_started_at) * 1000),
+        critic_status=critic_result.status,
+        critic_failed=critic_result.failed,
+        critic_failures=list(critic_result.failures),
+        regenerated=regenerated,
+        repair_target=repair_resolution.target_key,
+        invalidated_states=list(invalidated_layers),
+        recomputed_states=list(recomputed_layers),
     )
-    _record_group_reply_flow(group_id)
+    memory_effect_resolution = _maybe_commit_memory_effect(
+        group_id=group_id,
+        user_id=user_id,
+        should_reply=True,
+        memory_effect_resolution=memory_effect_resolution,
+        memory_candidate=memory_candidate,
+        reference_resolution=reference_resolution,
+        repair_resolution=repair_resolution,
+        ambiguity_resolution=ambiguity_resolution,
+        pending_recompute=[layer for layer in invalidated_layers if layer not in recomputed_layers],
+        critic=critic_result,
+    )
+    if next_critic_action(critic_result, attempt=1) == "block":
+        _record_metric_event(
+            "reply_suppressed",
+            group_id=group_id,
+            user_id=user_id,
+            stage="critic",
+            action="critic_failed_after_retry",
+            critic_failures=list(critic_result.failures),
+        )
+        return
     approval_id = _new_approval_id(group_id)
     _pipeline_mark_approval_pending(pipeline_state, approval_id)
     await _request_group_approval(
@@ -6789,6 +7277,22 @@ async def _run_private_followup_after_delay(user_id: int, *, expected_message_co
             return
         private_generation_inflight.add(user_id)
         try:
+            should_continue, continue_reason = await deepseek_client.should_continue_private_chat(
+                persona=persona,
+                recent_messages=recent,
+            )
+            if not should_continue:
+                _record_metric_event(
+                    "private_followup",
+                    group_id=chat_id,
+                    user_id=user_id,
+                    stage="precheck",
+                    action="skipped",
+                    probability=probability,
+                    roll=round(roll, 3),
+                    reason=_short_notice_text(continue_reason, 80),
+                )
+                return
             reply = await deepseek_client.reply(
                 persona=persona,
                 recent_messages=recent,
@@ -6830,7 +7334,6 @@ async def _run_private_followup_after_delay(user_id: int, *, expected_message_co
         reply = _sanitize_generated_text(reply)
         if not reply or reply in BLOCKED_BACKEND_FALLBACK_TEXTS:
             return
-        reply, _ = sanitize_political_output(reply)
         bot = _first_connected_onebot_bot()
         if bot is None:
             return
@@ -6964,18 +7467,37 @@ async def _handle_private_message_scoped(
             file_status=content_context.file_status,
             voice_status=content_context.voice_status,
         )
-    ocr_context = await _image_ocr_context_for_event(
-        bot,
-        event,
-        group_allowed=True,
+    ocr_context = ImageOcrContext("", 0, 0)
+    image_segments = collect_ocr_image_segments(getattr(event, "message", []) or [])
+    if image_segments and await _media_worth_reading(
+        kind="ocr",
+        caption=text,
+        addressed=True,
+        item_count=len(image_segments),
         group_id=chat_id,
         user_id=user_id,
-        correlation_id=correlation_id,
-    )
-    if ocr_context.text:
-        text = _join_context_parts(text, _format_image_ocr_context(ocr_context))
+    ):
+        ocr_context = await _image_ocr_context_for_event(
+            bot,
+            event,
+            group_allowed=True,
+            group_id=chat_id,
+            user_id=user_id,
+            correlation_id=correlation_id,
+        )
+        if ocr_context.text:
+            text = _join_context_parts(text, _format_image_ocr_context(ocr_context))
+    elif image_segments:
+        ocr_context = ImageOcrContext("", len(image_segments), 0, "jev_skip")
     forward_context = ""
-    if _message_has_forward_context(event):
+    if _message_has_forward_context(event) and await _media_worth_reading(
+        kind="forward",
+        caption=text,
+        addressed=True,
+        item_count=1,
+        group_id=chat_id,
+        user_id=user_id,
+    ):
         forward_context = await _forward_context_text(bot, event, nickname=_private_nickname(event))
         if not forward_context:
             _record_metric_event(
@@ -7236,6 +7758,32 @@ async def _handle_private_message_scoped(
             error=deep_result.error,
             **dict(deep_result.metadata),
         )
+    probability_request = tool_plan.first(ToolKind.PROBABILITY)
+    if probability_request is not None:
+        probability_result = await tool_registry.execute(
+            replace(
+                probability_request,
+                arguments={
+                    **dict(probability_request.arguments),
+                    "context": str(probability_request.arguments.get("context") or context_query)[:1200],
+                },
+            )
+        )
+        if probability_result.context:
+            fresh_context = _combine_text_sections(fresh_context, probability_result.context)
+        _record_metric_event(
+            "tool_call",
+            group_id=chat_id,
+            user_id=user_id,
+            stage="private_probability",
+            action="registry_execute",
+            tool_kind=ToolKind.PROBABILITY.value,
+            success=probability_result.ok,
+            status=probability_result.status,
+            latency_ms=probability_result.elapsed_ms,
+            error=probability_result.error,
+            **dict(probability_result.metadata),
+        )
 
     rag_result = await rag_task
     summary_context = _format_memory_context(
@@ -7333,7 +7881,6 @@ async def _handle_private_message_scoped(
     if not reply:
         logger.info(f"qq_social_agent skipped private reply: user={user_id} reason=empty_model_reply")
         return
-    reply, _ = sanitize_political_output(reply)
     reply = _sanitize_generated_text(reply)
 
     selected_meme_id: int | None = None
@@ -8552,6 +9099,23 @@ async def _execute_registered_deep_url(request: ToolRequest) -> ToolResult:
     )
 
 
+async def _execute_registered_probability(request: ToolRequest) -> ToolResult:
+    started_at = time.monotonic()
+    if jev_probability_tool is None:
+        return ToolResult(ToolKind.PROBABILITY, "error", error="jev_probability_unavailable")
+    result = await jev_probability_tool.execute(request)
+    elapsed_ms = int((time.monotonic() - started_at) * 1000)
+    return ToolResult(
+        result.kind,
+        result.status,
+        context=result.context,
+        evidence=result.evidence,
+        elapsed_ms=elapsed_ms,
+        error=result.error,
+        metadata=dict(result.metadata),
+    )
+
+
 async def _deep_url_context_for(
     text: str,
     *,
@@ -8928,6 +9492,15 @@ def _tool_request_from_llm_route(route: object, *, fallback_text: str) -> ToolRe
             required=False,
             arguments={},
         )
+    if tool == "probability":
+        return ToolRequest(
+            ToolKind.PROBABILITY,
+            query=(query or fallback_text)[:240],
+            reason=f"llm_tool_router:{reason}"[:120],
+            confidence=confidence,
+            required=True,
+            arguments={"context": fallback_text[:1200]},
+        )
     return None
 
 
@@ -9073,6 +9646,15 @@ def _finalize_routed_tool_plan(
             tool="market",
             symbols=symbols,
             comment_after_tool=bool(getattr(routed, "comment_after_tool", decision.comment_after_tool)),
+        )
+    probability_request = final_plan.first(ToolKind.PROBABILITY)
+    if probability_request is not None and probability_request.required:
+        decision = replace(
+            decision,
+            should_reply=True,
+            action="answer" if decision.action in {"ignore", "fresh_context"} else decision.action,
+            need_tool=True,
+            tool="probability",
         )
     return decision, final_plan
 
@@ -9610,23 +10192,8 @@ def _append_market_intent(
 
 
 
-def _record_group_reply_flow(group_id: int, *, now: float | None = None) -> None:
-    group_reply_flow_timestamps[group_id] = time.monotonic() if now is None else now
-
-
-def _group_reply_flow_cooldown_remaining(group_id: int, *, now: float | None = None) -> float:
-    last_at = group_reply_flow_timestamps.get(group_id)
-    if last_at is None:
-        return 0.0
-    current = time.monotonic() if now is None else now
-    return max(0.0, GROUP_REPLY_FLOW_COOLDOWN_SECONDS - (current - last_at))
-
-
 def _should_defer_group_reply_flow(group_id: int, *, now: float | None = None) -> bool:
-    current = time.monotonic() if now is None else now
-    if group_id in group_generation_inflight or group_addressed_waiters.get(group_id, 0) > 0:
-        return True
-    return _group_reply_flow_cooldown_remaining(group_id, now=current) > 0
+    return group_id in group_generation_inflight or group_addressed_waiters.get(group_id, 0) > 0
 
 def _contextual_followup_search_intent(
     *,
@@ -9704,16 +10271,6 @@ async def _flush_group_buffer_after_delay(group_id: int, *, delay: float = GROUP
             if group_addressed_waiters.get(group_id, 0) > 0:
                 should_reschedule = True
                 return
-            cooldown_remaining = _group_reply_flow_cooldown_remaining(group_id, now=time.monotonic())
-            if cooldown_remaining > 0:
-                logger.info(
-                    "qq_social_agent group reply flow cooldown: "
-                    f"group={group_id} buffer_deferred size={len(group_message_buffers.get(group_id, []))} "
-                    f"remaining={cooldown_remaining:.1f}s"
-                )
-                should_reschedule = True
-                reschedule_delay = min(max(cooldown_remaining, GROUP_INFLIGHT_BUFFER_RETRY_SECONDS), GROUP_REPLY_FLOW_COOLDOWN_SECONDS)
-                return
             if group_id in group_generation_inflight:
                 logger.info(
                     "qq_social_agent group generation inflight: "
@@ -9724,6 +10281,26 @@ async def _flush_group_buffer_after_delay(group_id: int, *, delay: float = GROUP
             items = group_message_buffers.pop(group_id, [])
             if not items:
                 return
+            addressed_users = list(
+                dict.fromkeys(
+                    item.user_id
+                    for item in items
+                    if item.addressed or item.direct_addressed
+                )
+            )
+            if len(addressed_users) > 1:
+                first_user = addressed_users[0]
+                batch = [item for item in items if item.user_id == first_user]
+                rest = [item for item in items if item.user_id != first_user]
+                if rest:
+                    group_message_buffers[group_id] = rest
+                    should_reschedule = True
+                items = batch
+                logger.info(
+                    "qq_social_agent split addressed group buffer: "
+                    f"group={group_id} keep_user={first_user} "
+                    f"batch={len(items)} remaining={len(rest)}"
+                )
             logger.info(
                 "qq_social_agent flushing group buffer: "
                 f"group={group_id} size={len(items)}"
@@ -10427,6 +11004,10 @@ def _format_speaker_reference_context(
     followup_soft: bool = False,
     self_id: int,
     relation_facts: MessageRelationFacts | None = None,
+    ellipsis_resolution: EllipsisResolution | None = None,
+    repair_resolution: RepairResolution | None = None,
+    ambiguity_resolution: AmbiguityResolution | None = None,
+    discourse_state: DiscourseState | None = None,
 ) -> str:
     current_label = _member_label(current_user_id, current_nickname)
     facts = relation_facts or _message_relation_facts(
@@ -10444,8 +11025,13 @@ def _format_speaker_reference_context(
         f"- 当前触发人：{current_label}。",
         "- 当前消息优先级最高；最近聊天只用于理解氛围和指代，不代表当前发言人立场。",
         "- 当前要对着说话的人只有上面这个当前触发人；最近真人发言里的其他人是旁人，不要把上下两个人认成同一个，也不要把旁人的话当成当前触发人说的。",
+        "- 草稿里的「你」默认对当前触发人；「他/她」不能是当前触发人，也不能自动当成 QQ 回复对象。引语里的人称按原说话人判。",
         _format_message_relation_summary(facts),
     ]
+    if discourse_state is not None:
+        discourse_block = format_discourse_prompt_block(discourse_state)
+        if discourse_block:
+            lines.append(discourse_block)
     if addressed_bot:
         if facts.target_scope == "reply_to_other_mentions_bot":
             lines.append(
@@ -10490,7 +11076,10 @@ def _format_speaker_reference_context(
                 "不要把里面的“你/他/她”自动当成风雪。"
             )
 
-    if reference_resolution.user_ids:
+    referent_block = format_referent_prompt_block(reference_resolution)
+    if referent_block:
+        lines.append(referent_block)
+    if reference_resolution.status == RESOLVED and reference_resolution.user_ids:
         labels = _labels_for_user_ids(
             reference_resolution.user_ids,
             recent_messages,
@@ -10504,8 +11093,21 @@ def _format_speaker_reference_context(
                 f"- 代词/省略句候选指向：{label_text}；"
                 f"来源={reference_resolution.reason}，置信度={reference_resolution.confidence:.2f}。"
             )
-    elif _has_ambiguous_reference(current_text):
+    elif reference_resolution.status in {UNAVAILABLE, ERROR}:
+        lines.append("- 指代检查不可用，不要把失败当成没有指代，也不要猜人。")
+    elif reference_resolution.status == AMBIGUOUS:
+        lines.append("- unresolved_reference=true：确实在指人但后端未能唯一解析；优先 clarify，不确定时不要点名或套用某人画像。")
         lines.append("- 当前消息含他/她/这个人/那个人等指代，但后端未能唯一解析；不确定时不要点名或套用某人画像。")
+    elif has_strong_person_reference(current_text) and not reference_resolution.user_ids:
+        lines.append("- unresolved_reference=true：确实在指人但后端未能唯一解析；优先 clarify，不确定时不要点名或套用某人画像。")
+        lines.append("- 当前消息含他/她/这个人/那个人等指代，但后端未能唯一解析；不确定时不要点名或套用某人画像。")
+    elif str(getattr(reference_resolution, "kind", "")) == "NON_PERSON":
+        if ellipsis_resolution is not None and ellipsis_resolution.status == RESOLVED and ellipsis_resolution.source_text:
+            lines.append(
+                f"- 当前「这个/那个」已接到前文：{ellipsis_resolution.source_text[:80]}。按这个对象接，不要问缺图或链接。"
+            )
+        else:
+            lines.append("- 当前「那个/这个」等更像在指事/考试/插件/梗，不要绑成某个群友。")
 
     recent_speakers = _recent_human_speaker_lines(
         recent_messages,
@@ -10515,6 +11117,15 @@ def _format_speaker_reference_context(
     if recent_speakers:
         lines.append("- 最近真人发言顺序（旧到新）：")
         lines.extend(recent_speakers)
+    ellipsis_block = format_ellipsis_prompt_block(ellipsis_resolution or EllipsisResolution())
+    if ellipsis_block:
+        lines.append(ellipsis_block)
+    repair_block = format_repair_prompt_block(repair_resolution or RepairResolution())
+    if repair_block:
+        lines.append(repair_block)
+    ambiguity_block = format_ambiguity_prompt_block(ambiguity_resolution or AmbiguityResolution())
+    if ambiguity_block:
+        lines.append(ambiguity_block)
     return "\n".join(lines)
 
 
@@ -10551,7 +11162,14 @@ def _message_relation_facts(
     reply_target_label = reply_relation[1] if reply_relation is not None else ""
     reply_target_is_bot = replied_to_bot or _label_is_bot_self(reply_target_label, self_id)
     self_name_mentioned = _mentions_bot_self_name(current_text)
-    ambiguous_reference = _has_ambiguous_reference(current_text) and not reference_resolution.user_ids
+    if reference_resolution.status in {UNAVAILABLE, ERROR}:
+        ambiguous_reference = False
+    else:
+        ambiguous_reference = reference_resolution.status == AMBIGUOUS or (
+            has_strong_person_reference(current_text)
+            and not reference_resolution.user_ids
+            and reference_resolution.status != RESOLVED
+        )
 
     if replied_to_bot or reply_target_is_bot:
         target_scope = "reply_to_bot"
@@ -10610,7 +11228,361 @@ def _format_message_relation_summary(facts: MessageRelationFacts) -> str:
     return "- 后端关系摘要：" + "；".join(pieces) + "。"
 
 
+async def _media_worth_reading(
+    *,
+    kind: str,
+    caption: str,
+    addressed: bool,
+    item_count: int,
+    group_id: int,
+    user_id: int,
+) -> bool:
+    if deepseek_client is None:
+        return True
+    judged = await deepseek_client.should_read_media(
+        kind=kind,
+        caption=caption,
+        addressed=addressed,
+        item_count=item_count,
+    )
+    if judged is None:
+        return True
+    _record_metric_event(
+        "media_gate",
+        group_id=group_id,
+        user_id=user_id,
+        stage=kind,
+        action="read" if judged else "skip",
+        addressed=addressed,
+        item_count=item_count,
+    )
+    return bool(judged)
+
+
+def _maybe_commit_memory_effect(
+    *,
+    group_id: int,
+    user_id: int,
+    should_reply: bool,
+    memory_effect_resolution: MemoryEffectResolution,
+    memory_candidate,
+    reference_resolution: ReferenceResolution,
+    repair_resolution: RepairResolution,
+    ambiguity_resolution: AmbiguityResolution,
+    pending_recompute: list[str] | tuple[str, ...] = (),
+    critic: CriticResult | None = None,
+) -> MemoryEffectResolution:
+    pending = [
+        layer
+        for layer in pending_recompute
+        if layer in {"ellipsis", "memory", "ambiguity", "referent"}
+    ]
+    if not memory_can_commit(
+        memory_effect_resolution,
+        candidate=memory_candidate,
+        reference=reference_resolution,
+        repair=repair_resolution,
+        ambiguity=ambiguity_resolution,
+        pending_recompute=pending,
+        critic=critic,
+    ):
+        return memory_effect_resolution
+    applied = apply_memory_effect(
+        memory,
+        memory_effect_resolution,
+        group_id=group_id,
+        candidate=memory_candidate,
+        actor_user_id=user_id,
+    )
+    logger.info(
+        "qq_social_agent memory effect applied: "
+        f"group={group_id} action={applied.action} "
+        f"applied={applied.applied} "
+        f"status={applied.status} "
+        f"target={applied.target_atom_id}"
+    )
+    _record_metric_event(
+        "memory_mutation",
+        group_id=group_id,
+        user_id=user_id,
+        stage="memory",
+        action=applied.action,
+        memory_status=applied.status,
+        memory_source=applied.source,
+        memory_applied=applied.applied,
+        memory_target=applied.target_atom_id,
+        should_reply=should_reply,
+    )
+    return applied
+
+
+def _sanitize_reply_candidate_text(text: str, *, market_report: str = "") -> str:
+    candidate_text = _sanitize_generated_text(text)
+    if market_report:
+        candidate_text = f"{market_report}\n{candidate_text}".strip()
+    candidate_text = _sanitize_generated_text(candidate_text)
+    if candidate_text in BLOCKED_BACKEND_FALLBACK_TEXTS:
+        return ""
+    return candidate_text
+
+
+async def _prepare_group_political_send_texts(
+    text: str, *, context: str = "",
+) -> tuple[str, str, tuple[str, ...]]:
+    keys = None
+    if political_candidates(text) and deepseek_client is not None:
+        try:
+            keys = await deepseek_client.political_mask_keys(text=text, context=context)
+        except Exception as exc:
+            logger.warning(f"qq_social_agent political observation unavailable: {type(exc).__name__}")
+    return _group_political_send_texts(text, contextual_keys=keys)
+
+
+def _group_political_send_texts(
+    text: str, *, contextual_keys: tuple[str, ...] | None = None,
+) -> tuple[str, str, tuple[str, ...]]:
+    result = sanitize_political_output_detail(text, contextual_keys=contextual_keys)
+    public_text = _sanitize_generated_text(result.public_text)
+    if not result.guarded:
+        return public_text, public_text, ()
+    return public_text, format_gag_memory(public_text, result.hits), result.hits
+
+
+async def _notify_owner_political_gag(
+    *,
+    original: str,
+    public: str,
+    hits: tuple[str, ...] | list[str],
+    group_id: int,
+    source: str,
+) -> None:
+    bot = _first_connected_onebot_bot()
+    if bot is None:
+        return
+    hit_text = "、".join(str(item) for item in hits if str(item).strip()) or "（未列出）"
+    message = (
+        f"【口球拦截】群={group_id} source={source}\n"
+        f"命中：{hit_text}\n"
+        f"原文：{original[:800]}\n"
+        f"发出：{public[:400]}"
+    )
+    for owner_id in OWNER_USER_IDS:
+        await _send_private_text(bot, owner_id, message)
+
+
+def _approval_candidates_from_drafts(
+    drafts,
+    *,
+    market_report: str = "",
+    limit: int,
+) -> list[PendingApprovalCandidate]:
+    rows: list[PendingApprovalCandidate] = []
+    for index, draft in enumerate(drafts, start=1):
+        candidate_text = _sanitize_reply_candidate_text(getattr(draft, "text", ""), market_report=market_report)
+        if not candidate_text:
+            continue
+        rows.append(
+            PendingApprovalCandidate(
+                index=index,
+                text=candidate_text,
+                action=getattr(draft, "action", "reply"),
+                style=getattr(draft, "style", ""),
+            )
+        )
+        if len(rows) >= limit:
+            break
+    return rows
+
+
+async def _maybe_apply_speaking_action(
+    decision: ReplyDecision,
+    *,
+    text: str,
+    current_label: str,
+    addressed_bot: bool,
+    speaker_context: str,
+    recent_messages: list[ChatMessage],
+    group_id: int,
+    user_id: int,
+    looks_like_question: bool,
+    unresolved_reference: bool = False,
+    unresolved_ellipsis: bool = False,
+    unresolved_repair: bool = False,
+    unresolved_ambiguity: bool = False,
+    ambiguity_kind: str = "NONE",
+) -> ReplyDecision:
+    from .deepseek_client import ADDRESSED_QUESTION_ACTIONS, SPEAKING_ACTIONS
+
+    if not decision.should_reply or deepseek_client is None:
+        return decision
+    if decision.action in {"ignore", "react", "poke", "market_check", "fresh_context"}:
+        return decision
+    if unresolved_reference and "unresolved_reference=true" not in speaker_context:
+        speaker_context = (
+            speaker_context
+            + "\n- unresolved_reference=true：指人但不确定是谁，优先 clarify，不要硬点名。"
+        ).strip()
+    if unresolved_ellipsis and "unresolved_ellipsis=true" not in speaker_context:
+        speaker_context = (
+            speaker_context
+            + "\n- unresolved_ellipsis=true：省略句找不到可靠前文，优先 clarify，不要编造被省略的内容。"
+        ).strip()
+    if unresolved_repair and "repair_unresolved=true" not in speaker_context:
+        speaker_context = (
+            speaker_context
+            + "\n- repair_unresolved=true：用户在纠正但还不知道正确对象，优先 clarify。"
+        ).strip()
+    if unresolved_ambiguity and ambiguity_kind not in {"", "NONE"} and "[ambiguity]" not in speaker_context:
+        speaker_context = (
+            speaker_context
+            + f"\n[ambiguity]\nkind={ambiguity_kind}"
+        ).strip()
+    judged = await deepseek_client.select_speaking_action(
+        current_text=text,
+        current_label=current_label,
+        addressed=addressed_bot,
+        baseline_action=decision.action,
+        speaker_context=speaker_context,
+        recent_messages=recent_messages,
+    )
+    if judged is None:
+        return decision
+    choice, reason = judged
+    if choice in {"", "none"}:
+        _record_metric_event(
+            "speaking_action",
+            group_id=group_id,
+            user_id=user_id,
+            stage="decision",
+            action="none",
+            previous_action=decision.action,
+            addressed=addressed_bot,
+        )
+        return decision
+    if choice not in SPEAKING_ACTIONS:
+        return decision
+    if looks_like_question and addressed_bot and choice not in ADDRESSED_QUESTION_ACTIONS:
+        _record_metric_event(
+            "speaking_action",
+            group_id=group_id,
+            user_id=user_id,
+            stage="decision",
+            action="blocked",
+            previous_action=decision.action,
+            blocked_action=choice,
+            addressed=True,
+        )
+        return decision
+    _record_metric_event(
+        "speaking_action",
+        group_id=group_id,
+        user_id=user_id,
+        stage="decision",
+        action=choice,
+        previous_action=decision.action,
+        addressed=addressed_bot,
+    )
+    return replace(decision, action=choice, reason=f"{reason}:{decision.reason}"[:80])
+
+
+async def _maybe_apply_ask_back(
+
+    decision: ReplyDecision,
+    *,
+    text: str,
+    addressed_bot: bool,
+    group_id: int,
+    user_id: int,
+) -> ReplyDecision:
+    if not decision.should_reply or deepseek_client is None:
+        return decision
+    if decision.action not in {"reply", "answer", "agree", "tease", "ask_back"}:
+        return decision
+    judged = await deepseek_client.should_ask_back(
+        current_text=text,
+        action=decision.action,
+        addressed=addressed_bot,
+    )
+    if judged is None:
+        return decision
+    _record_metric_event(
+        "ask_back_gate",
+        group_id=group_id,
+        user_id=user_id,
+        stage="decision",
+        action="ask_back" if judged else "hold",
+        previous_action=decision.action,
+        addressed=addressed_bot,
+    )
+    if judged and decision.action != "ask_back":
+        return replace(decision, action="ask_back", reason=f"jev_ask_back:{decision.reason}"[:80])
+    if not judged and decision.action == "ask_back":
+        return replace(decision, action="answer" if addressed_bot else "reply", reason=f"jev_no_ask_back:{decision.reason}"[:80])
+    return decision
+
+
+def _at_user_ids_from_event(event: GroupMessageEvent | PrivateMessageEvent, bot: Bot) -> tuple[int, ...]:
+    bot_ids = {str(bot.self_id), str(getattr(event, "self_id", bot.self_id)), "all"}
+    user_ids: list[int] = []
+    for segment in getattr(event, "message", []) or []:
+        segment_type, data = segment_type_and_data(segment)
+        if segment_type != "at":
+            continue
+        qq = str(data.get("qq") or "").strip()
+        if not qq or qq in bot_ids:
+            continue
+        try:
+            user_ids.append(int(qq))
+        except ValueError:
+            continue
+    return tuple(dict.fromkeys(user_ids))
+
+
+def _reply_hint_for_reference(
+    event: GroupMessageEvent | PrivateMessageEvent,
+    *,
+    current_text: str,
+    self_id: int,
+) -> ReplyHint:
+    reply = getattr(event, "reply", None)
+    message_id = ""
+    user_id = None
+    nickname = ""
+    text = ""
+    if reply is not None:
+        message_id = str(getattr(reply, "message_id", "") or "")
+        user_id = getattr(reply, "user_id", None) or getattr(reply, "sender_id", None)
+        sender = getattr(reply, "sender", None)
+        if user_id is None and sender is not None:
+            user_id = getattr(sender, "user_id", None) or getattr(sender, "id", None)
+        if sender is not None:
+            nickname = str(getattr(sender, "card", "") or getattr(sender, "nickname", "") or "").strip()
+        raw_message = getattr(reply, "message", None)
+        if raw_message is not None:
+            text = message_text_from_payload(raw_message, language="zh")
+    relation = _extract_reply_relation(current_text)
+    if not reply and relation is None:
+        return ReplyHint()
+    if user_id is None and relation is not None and not text:
+        text = current_text
+        nickname = nickname or relation[1]
+    label = ""
+    try:
+        if user_id is not None:
+            label = _member_label(int(user_id), nickname or str(user_id))
+    except (TypeError, ValueError):
+        label = nickname
+    return ReplyHint(
+        exists=True,
+        author_id=int(user_id) if user_id not in {None, ""} else None,
+        author_label=label or nickname,
+        text=str(text or "").strip(),
+        message_id=message_id,
+    )
+
+
 def _has_ambiguous_reference(text: str) -> bool:
+
     return bool(re.search(r"(他|她|这个人|那个人|这人|那人|这鸟|那鸟|你们说的那个)", text))
 
 
@@ -10823,8 +11795,9 @@ async def _selected_group_jargon_context(
     current_nickname: str,
     chat_label: str = "QQ 群聊",
 ) -> str:
-    custom_entries = _matched_custom_group_jargon_entries(group_id, [current_text])
-    heuristic_terms = detect_group_jargon_terms([current_text], extra_entries=custom_entries)
+    lookback_texts = [current_text, *[str(getattr(msg, "text", "") or "") for msg in recent_messages[-JARGON_CONTEXT_LOOKBACK:]]]
+    custom_entries = _matched_custom_group_jargon_entries(group_id, lookback_texts)
+    heuristic_terms = detect_group_jargon_terms(lookback_texts, extra_entries=custom_entries)
     if not heuristic_terms:
         logger.info(
             "qq_social_agent jargon selector: "
@@ -10916,6 +11889,35 @@ async def _request_group_approval(bot: Bot, approval: PendingGroupApproval) -> N
             logger.info(
                 "qq_social_agent auto approval skipped: "
                 f"group={approval.group_id} reason=no_candidate"
+            )
+            return
+        duplicate_send = True
+        duplicate_reason = "jev_unavailable_send"
+        addressed = bool(getattr(approval.pipeline_state, "addressed", False))
+        if deepseek_client is not None:
+            recent = memory.recent_messages(approval.group_id, 16)
+            persona = personas.resolve(approval.persona_name) or personas.resolve(app_config.default_persona)
+            if persona is not None:
+                duplicate_send, duplicate_reason = await deepseek_client.audit_proactive_reply(
+                    persona=persona,
+                    recent_messages=recent,
+                    candidate=candidate.text,
+                    chat_label="QQ 群聊",
+                    addressed=addressed,
+                    current_text=approval.trigger_text,
+                )
+        if not duplicate_send:
+            _record_metric_event(
+                "reply_suppressed",
+                group_id=approval.group_id,
+                user_id=approval.trigger_user_id,
+                stage="pre_send_duplicate",
+                action="skipped",
+                reason=duplicate_reason,
+            )
+            logger.info(
+                "qq_social_agent skipped duplicate group reply: "
+                f"group={approval.group_id} approval_id={approval.approval_id} reason={duplicate_reason}"
             )
             return
         _record_metric_event(
@@ -11880,11 +12882,14 @@ async def _send_approved_group_reply_scoped(
     for index, part_text in enumerate(reply_parts):
         try:
             part_mention_user_id = _first_allowed_mention_id(part_text, effective_mention_targets)
+            public_text, memory_text, gag = await _prepare_group_political_send_texts(
+                part_text, context=approval.trigger_text + "\n" + candidate.text,
+            )
             sent_message_id = await _send_group_message(
                 bot,
                 approval.group_id,
                 _message_from_reply_part(
-                    part_text,
+                    public_text,
                     effective_mention_targets,
                     quote_message_id=approval.source_message_id if index == 0 else "",
                 ),
@@ -11894,7 +12899,15 @@ async def _send_approved_group_reply_scoped(
             if not recorded_user_reply:
                 _record_user_reply(approval.group_id, approval.trigger_user_id)
                 recorded_user_reply = True
-            memory_text = _memory_text_from_reply_part(part_text, effective_mention_targets)
+            if gag:
+                await _notify_owner_political_gag(
+                    original=part_text,
+                    public=public_text,
+                    hits=gag,
+                    group_id=approval.group_id,
+                    source=candidate.action,
+                )
+            memory_text = _memory_text_from_reply_part(memory_text, effective_mention_targets)
             _record_bot_sent_message(
                 group_id=approval.group_id,
                 message_id=sent_message_id,
