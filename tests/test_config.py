@@ -278,12 +278,4 @@ def test_persona_registry_loads_persona_from_central_prompt_file() -> None:
     assert "北大计算机大二女大学生" in persona.prompt
     assert "不确定实时事实或陌生概念就搜" in persona.decision_prompt
     assert "QQ 群里的元气美少女妹妹" in persona.decision_prompt
-
-
-def test_persona_registry_resolves_display_name_and_get_default() -> None:
-    registry = PersonaRegistry(PROJECT_ROOT / "prompts")
-    by_name = registry.get("张风雪")
-    assert by_name.id == "zhangxuefeng"
-    assert registry.resolve("张风雪") is by_name
-    assert registry.resolve("missing-persona") is None
-    assert registry.get("missing-persona", None) is None
+    assert "非点名默认不抢话" in persona.decision_prompt

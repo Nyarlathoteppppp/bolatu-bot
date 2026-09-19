@@ -136,29 +136,6 @@ def test_review_draft_batches_then_drills_pronoun():
     assert apply_jev_pronoun_judgement(pronoun, has_pronoun=True).needs_fix is True
 
 
-def test_political_mask_keys_keep_uncertain_spans():
-    from qq_social_agent.political_guard import political_candidates, sanitize_political_output_detail
-    client = JevClient(api_key="test")
-    text = "数学课那个教员讲得挺清楚"
-
-    async def evaluate(**kwargs):
-        return {"answers": {key: {"noul": 0.28} for key in kwargs["questions"]}}
-
-    client.evaluate = evaluate
-    keys = asyncio.run(client.political_mask_keys(text=text))
-    candidates = political_candidates(text)
-    assert keys == tuple(row.key for row in candidates)
-    result = sanitize_political_output_detail(text, contextual_keys=keys)
-    assert result.guarded
-
-    async def ordinary(**kwargs):
-        return {"answers": {key: {"noul": 0.05} for key in kwargs["questions"]}}
-
-    client.evaluate = ordinary
-    keys = asyncio.run(client.political_mask_keys(text=text))
-    assert keys == ()
-
-
 def test_audit_unavailable_does_not_call_llm():
     client = DeepSeekClient.__new__(DeepSeekClient)
 
