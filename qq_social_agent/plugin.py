@@ -161,7 +161,7 @@ from .pipeline_stages import (
     mark_sent as _pipeline_mark_sent,
     mark_understood as _pipeline_mark_understood,
 )
-from .political_guard import format_gag_memory, political_candidates, sanitize_political_output_detail
+from . import political_guard as _political_guard
 from .rate_limiter import RateLimiter
 from .rag_admin import RAGAdminController
 from .rag_query import normalize_rag_query
@@ -11330,7 +11330,13 @@ async def _prepare_group_political_send_texts(
     text: str, *, context: str = "",
 ) -> tuple[str, str, tuple[str, ...]]:
     keys = None
-    if political_candidates(text) and deepseek_client is not None:
+    candidates_fn = getattr(_political_guard, "political_candidates", None)
+    if callable(candidates_fn):
+        candidates = tuple(candidates_fn(text) or ())
+    else:
+        _, guarded = _political_guard.sanitize_political_output(text)
+        candidates = ("legacy_match",) if guarded else ()
+    if candidates and deepseek_client is not None:
         try:
             keys = await deepseek_client.political_mask_keys(text=text, context=context)
         except Exception as exc:
@@ -11341,11 +11347,18 @@ async def _prepare_group_political_send_texts(
 def _group_political_send_texts(
     text: str, *, contextual_keys: tuple[str, ...] | None = None,
 ) -> tuple[str, str, tuple[str, ...]]:
-    result = sanitize_political_output_detail(text, contextual_keys=contextual_keys)
-    public_text = _sanitize_generated_text(result.public_text)
-    if not result.guarded:
-        return public_text, public_text, ()
-    return public_text, format_gag_memory(public_text, result.hits), result.hits
+    detail_fn = getattr(_political_guard, "sanitize_political_output_detail", None)
+    if callable(detail_fn):
+        result = detail_fn(text, contextual_keys=contextual_keys)
+        public_text = _sanitize_generated_text(result.public_text)
+        if not result.guarded:
+            return public_text, public_text, ()
+        memory_fn = getattr(_political_guard, "format_gag_memory", None)
+        memory_text = memory_fn(public_text, result.hits) if callable(memory_fn) else text
+        return public_text, memory_text, result.hits
+    public_text, guarded = _political_guard.sanitize_political_output(text)
+    public_text = _sanitize_generated_text(public_text)
+    return (public_text, text, ("legacy_match",)) if guarded else (public_text, public_text, ())
 
 
 async def _notify_owner_political_gag(
@@ -11896,7 +11909,17 @@ async def _request_group_approval(bot: Bot, approval: PendingGroupApproval) -> N
         addressed = bool(getattr(approval.pipeline_state, "addressed", False))
         if deepseek_client is not None:
             recent = memory.recent_messages(approval.group_id, 16)
-            persona = personas.resolve(approval.persona_name) or personas.resolve(app_config.default_persona)
+            resolve_persona = getattr(personas, "resolve", None)
+            if callable(resolve_persona):
+                persona = resolve_persona(approval.persona_name) or resolve_persona(app_config.default_persona)
+            else:
+                try:
+                    persona = personas.get(approval.persona_name)
+                except KeyError:
+                    try:
+                        persona = personas.get(app_config.default_persona)
+                    except KeyError:
+                        persona = None
             if persona is not None:
                 duplicate_send, duplicate_reason = await deepseek_client.audit_proactive_reply(
                     persona=persona,
