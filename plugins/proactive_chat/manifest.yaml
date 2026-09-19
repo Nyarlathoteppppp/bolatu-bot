@@ -1,7 +1,7 @@
 id: proactive_chat
 name: 主动聊天
 version: 0.1.0
-enabled: true
+enabled: false
 description: 每隔约45分钟按概率让张风雪根据最近群聊主动发起一句聊天，不走审批。
 entrypoint: qq_social_agent.plugin.proactive_chat
 permissions:
