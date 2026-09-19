@@ -17,7 +17,6 @@ from qq_social_agent.plugin import (
     APPROVAL_REJECT_REASON_RE,
     GROUP_BUFFER_SECONDS,
     GROUP_INFLIGHT_BUFFER_RETRY_SECONDS,
-    GROUP_REPLY_FLOW_COOLDOWN_SECONDS,
     GROUP_PASSIVE_DECISION_EVERY_MESSAGES,
     GROUP_PASSIVE_DECISION_GAP_SECONDS,
     JARGON_ADD_RE,
@@ -113,7 +112,6 @@ def _use_temp_plugin_memory(monkeypatch, tmp_path) -> MemoryStore:
     plugin.group_buffer_tasks.clear()
     plugin.group_generation_inflight.clear()
     plugin.group_addressed_waiters.clear()
-    plugin.group_reply_flow_timestamps.clear()
     plugin.group_inbound_sequences.clear()
     monkeypatch.setattr(plugin, "_private_tool_reply_delay_seconds", lambda: 0.0)
     return store
@@ -162,37 +160,25 @@ def test_status_group_card_labels() -> None:
     assert _status_group_card(False) == "张风雪（关闭）"
 
 
-def test_group_buffer_flush_defers_during_reply_flow_cooldown(monkeypatch) -> None:
+def test_group_buffer_flush_does_not_wait_after_previous_reply(monkeypatch) -> None:
     group_id = 1026813421
     plugin.group_message_buffers.clear()
     plugin.group_buffer_tasks.clear()
     plugin.group_generation_inflight.clear()
     plugin.group_addressed_waiters.clear()
-    plugin.group_reply_flow_timestamps.clear()
     item = _buffered_item(group_id, "刚才生成后来的消息")
     plugin.group_message_buffers[group_id] = [item]
-    plugin._record_group_reply_flow(group_id, now=time.monotonic())
     handled = []
-    scheduled = []
 
     async def fake_handle(*args, **kwargs) -> None:
         handled.append((args, kwargs))
 
     monkeypatch.setattr(plugin, "_handle_group_message_locked", fake_handle)
-    monkeypatch.setattr(
-        plugin,
-        "_schedule_group_buffer_flush",
-        lambda gid, *, delay=GROUP_BUFFER_SECONDS: scheduled.append((gid, delay)),
-    )
 
     asyncio.run(plugin._flush_group_buffer_after_delay(group_id, delay=0))
 
-    assert handled == []
-    assert plugin.group_message_buffers[group_id] == [item]
-    assert scheduled
-    assert scheduled[0][0] == group_id
-    assert 0 < scheduled[0][1] <= GROUP_REPLY_FLOW_COOLDOWN_SECONDS
-    plugin.group_reply_flow_timestamps.clear()
+    assert handled
+    assert plugin.group_message_buffers.get(group_id, []) == []
 
 
 def test_compact_long_message_fallback_keeps_short_marker() -> None:
@@ -300,6 +286,56 @@ def test_group_buffer_flush_defers_while_generation_inflight(monkeypatch) -> Non
     assert plugin.group_message_buffers[group_id] == [item]
     assert scheduled == [(group_id, GROUP_INFLIGHT_BUFFER_RETRY_SECONDS)]
     group_generation_inflight.clear()
+
+
+def test_group_buffer_flush_splits_two_addressed_users(monkeypatch) -> None:
+    group_id = 1026813421
+    plugin.group_message_buffers.clear()
+    plugin.group_buffer_tasks.clear()
+    group_generation_inflight.clear()
+    first = plugin.BufferedGroupMessage(
+        bot=SimpleNamespace(),
+        event=SimpleNamespace(group_id=group_id, user_id=111),
+        text="A问驱动",
+        user_id=111,
+        nickname="A",
+        created_at=1000.0,
+        addressed=True,
+        direct_addressed=True,
+    )
+    second = plugin.BufferedGroupMessage(
+        bot=SimpleNamespace(),
+        event=SimpleNamespace(group_id=group_id, user_id=222),
+        text="B问概率",
+        user_id=222,
+        nickname="B",
+        created_at=1001.0,
+        addressed=True,
+        direct_addressed=True,
+    )
+    plugin.group_message_buffers[group_id] = [first, second]
+    handled = []
+
+    async def fake_handle(*args, **kwargs) -> None:
+        handled.append(kwargs.get("buffered_messages") or args[2:])
+
+    monkeypatch.setattr(plugin, "_handle_group_message_locked", fake_handle)
+    scheduled = []
+    monkeypatch.setattr(
+        plugin,
+        "_schedule_group_buffer_flush",
+        lambda gid, *, delay=GROUP_BUFFER_SECONDS: scheduled.append((gid, delay)),
+    )
+
+    asyncio.run(plugin._flush_group_buffer_after_delay(group_id, delay=0))
+
+    assert len(handled) == 1
+    flushed = handled[0]
+    assert [item.user_id for item in flushed] == [111]
+    assert [item.user_id for item in plugin.group_message_buffers[group_id]] == [222]
+    assert scheduled == [(group_id, GROUP_INFLIGHT_BUFFER_RETRY_SECONDS)]
+    group_generation_inflight.clear()
+    plugin.group_message_buffers.clear()
 
 
 def test_group_buffer_flush_marks_generation_and_reschedules_pending(monkeypatch) -> None:
@@ -2515,6 +2551,7 @@ def test_approval_direct_single_reply_enabled_only_when_deterministic(monkeypatc
 
 def test_changelog_notice_sent_once(monkeypatch, tmp_path) -> None:
     _use_temp_plugin_memory(monkeypatch, tmp_path)
+    monkeypatch.setattr(plugin, "CHANGELOG_NOTICE_MESSAGE", "张风雪后端更新记录：测试通知")
     bot = FakeApprovalBot()
 
     asyncio.run(plugin._send_changelog_notice_to_approvers(bot))
@@ -2522,7 +2559,7 @@ def test_changelog_notice_sent_once(monkeypatch, tmp_path) -> None:
 
     notices = [message for _, message in bot.private_messages if "后端更新记录" in message]
     assert len(notices) == len(plugin._approval_user_ids())
-    assert all("LLM 路由拆细" in message for message in notices)
+    assert all(plugin.CHANGELOG_NOTICE_MESSAGE == message for message in notices)
 
 
 def test_parse_suppression_report_accepts_compact_chinese_limit() -> None:
@@ -3184,3 +3221,90 @@ def test_weekly_usage_report_lists_task_share(monkeypatch, tmp_path) -> None:
     assert "reply_direct" in text
     assert "67%" in text or "66%" in text
     assert "1.5万" in text
+
+
+def test_topic_selection_filters_cooldown_before_jev(monkeypatch, tmp_path) -> None:
+    _use_temp_plugin_memory(monkeypatch, tmp_path)
+    topics = list(plugin.SOCIAL_TOPIC_KEYWORDS)
+    cooled = topics[0]
+    plugin._record_group_proactive_topic(123, cooled, now=1000.0)
+    seen = []
+
+    async def choose(**kwargs):
+        seen.append(kwargs)
+        assert cooled not in kwargs["topics"]
+        return kwargs["topics"][-1]
+
+    monkeypatch.setattr(plugin, "deepseek_client", SimpleNamespace(choose_proactive_topic=choose))
+    monkeypatch.setattr(plugin.random, "choice", lambda items: items[0])
+    topic, bucket, count = asyncio.run(plugin._select_proactive_topic(group_id=123, now=1001.0))
+    assert topic != cooled
+    assert count == 1
+    assert topic in plugin._social_topic_buckets([t for t in topics if t != cooled])[bucket]
+    assert seen
+    assert cooled in plugin._group_proactive_topic_candidates(
+        123, now=1001.0 + plugin.GROUP_PROACTIVE_TOPIC_COOLDOWN_SECONDS)[0]
+
+
+def test_topic_jev_other_or_failure_stays_in_selected_bucket(monkeypatch) -> None:
+    from qq_social_agent.deepseek_client import DeepSeekClient
+
+    buckets = plugin._social_topic_buckets(list(plugin.SOCIAL_TOPIC_KEYWORDS))
+    bucket = next(key for key, values in buckets.items() if len(values) > 1)
+    topics = list(buckets[bucket])
+    monkeypatch.setattr(plugin, "_pick_proactive_topic_bucket", lambda candidates: (bucket, topics))
+    monkeypatch.setattr(plugin.random, "choice", lambda items: items[-1])
+    client = DeepSeekClient.__new__(DeepSeekClient)
+    monkeypatch.setattr(plugin, "deepseek_client", client)
+    for outcome in (None, "outside_bucket", RuntimeError("offline")):
+        async def choose(**kwargs):
+            assert kwargs["topics"] == topics
+            if isinstance(outcome, Exception):
+                raise outcome
+            return outcome
+
+        client.jev_client = SimpleNamespace(available=True, choose_proactive_topic=choose)
+        topic, selected, _ = asyncio.run(plugin._select_proactive_topic(candidates=topics))
+        assert selected == bucket
+        assert topic == topics[-1]
+
+
+def test_ask_back_does_not_override_clarify(monkeypatch) -> None:
+    original = ReplyDecision(True, 0.8, "需要澄清", mode="chat", action="clarify")
+    called = []
+
+    async def fake_ask_back(**kwargs):
+        called.append(kwargs)
+        return True
+
+    monkeypatch.setattr(plugin, "deepseek_client", SimpleNamespace(should_ask_back=fake_ask_back))
+    result = asyncio.run(
+        plugin._maybe_apply_ask_back(
+            original,
+            text="她呢？",
+            addressed_bot=True,
+            group_id=1,
+            user_id=2,
+        )
+    )
+    assert result.action == "clarify"
+    assert called == []
+
+
+def test_ask_back_can_follow_normal_answer(monkeypatch) -> None:
+    original = ReplyDecision(True, 0.8, "正常回答", mode="chat", action="answer")
+
+    async def fake_ask_back(**kwargs):
+        return True
+
+    monkeypatch.setattr(plugin, "deepseek_client", SimpleNamespace(should_ask_back=fake_ask_back))
+    result = asyncio.run(
+        plugin._maybe_apply_ask_back(
+            original,
+            text="驱动炸了",
+            addressed_bot=True,
+            group_id=1,
+            user_id=2,
+        )
+    )
+    assert result.action == "ask_back"

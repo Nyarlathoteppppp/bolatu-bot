@@ -1239,3 +1239,75 @@ async def test_lookup_third_round_runs_when_second_round_still_misses(monkeypatc
     assert lookup.research_rounds == 3
     assert any(item.endswith(":round3") for item in lookup.attempted_providers)
     assert any("英文" in query or "wikipedia.org" in query for query in seen)
+
+
+
+@pytest.mark.anyio
+async def test_lookup_drops_results_when_judge_says_useless(monkeypatch) -> None:
+    async def fake_tavily(query: str, *, kind: str, api_key: str):
+        return "今日股市大涨", (
+            FreshItem("股市", "example.com", "", summary="noise", url="https://example.com/noise"),
+        )
+
+    class RejectJudge:
+        async def judge_search_useful(self, *, query: str, evidence: str):
+            return False, "jev_search_useful_0.10"
+
+        async def should_followup_search(self, **kwargs):
+            return False
+
+    monkeypatch.setattr(fresh_context, "_fetch_tavily_lookup", fake_tavily)
+    tool = FreshContextTool(
+        provider="tavily",
+        tavily_api_key="test-key",
+        followup_page_max_tries=0,
+        followup_search_hops=3,
+        timeout_seconds=8,
+        research_judge=RejectJudge(),
+    )
+    lookup = await tool.lookup("OpenFOAM 简介", kind="web")
+    assert lookup.status == "no_result"
+    assert lookup.items == ()
+    assert "jev_search_useful" in lookup.error
+
+
+@pytest.mark.anyio
+async def test_lookup_jev_can_request_second_round(monkeypatch) -> None:
+    seen: list[str] = []
+
+    async def fake_tavily(query: str, *, kind: str, api_key: str):
+        seen.append(query)
+        if "官方" in query or "路透" in query or "英文" in query or "wikipedia" in query:
+            return "OpenFOAM is an open source CFD toolbox.", (
+                FreshItem(
+                    "OpenFOAM",
+                    "openfoam.org",
+                    "",
+                    summary="Open source CFD toolbox",
+                    url="https://www.openfoam.com",
+                ),
+            )
+        return "OpenFOAM 简介", (
+            FreshItem("OpenFOAM 简介", "example.com", "", summary="简介页面", url="https://example.com/of"),
+        )
+
+    class HopJudge:
+        async def judge_search_useful(self, *, query: str, evidence: str):
+            return True, "jev_search_useful_0.90"
+
+        async def should_followup_search(self, **kwargs):
+            return kwargs["current_round"] < 2
+
+    monkeypatch.setattr(fresh_context, "_fetch_tavily_lookup", fake_tavily)
+    tool = FreshContextTool(
+        provider="tavily",
+        tavily_api_key="test-key",
+        followup_page_max_tries=0,
+        followup_search_hops=3,
+        timeout_seconds=8,
+        research_judge=HopJudge(),
+    )
+    lookup = await tool.lookup("OpenFOAM 简介", kind="web")
+    assert lookup.status == "ok"
+    assert lookup.research_rounds >= 2
+    assert len(seen) > 1

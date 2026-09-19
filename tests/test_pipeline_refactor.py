@@ -358,3 +358,25 @@ def test_followup_search_uses_replied_bot_claim_for_bare_fact_check() -> None:
     assert intent is not None
     assert intent.query.startswith("光华现在确实")
     assert "投档线" not in intent.query
+
+
+
+def test_tool_router_routes_probability_lookup() -> None:
+    from qq_social_agent.tool_router import is_probability_lookup, route_mode
+
+    assert is_probability_lookup("GPA 3.85 GRE 328 拿到 CMU offer 的概率多大")
+    assert not is_probability_lookup("今天吃什么")
+    plan = route_tools(
+        "风雪帮我算算拿到 CMU offer 的概率",
+        market_intents=[],
+        fresh_intent=None,
+        addressed=True,
+    )
+    request = plan.first(ToolKind.PROBABILITY)
+    assert request is not None
+    assert request.required
+    assert route_mode(plan) is PipelineMode.PROBABILITY
+    decision = ReplyDecision(True, 0.8, "回答问题", action="answer")
+    routed = apply_tool_plan(decision, plan)
+    assert routed.need_tool
+    assert routed.tool == "probability"

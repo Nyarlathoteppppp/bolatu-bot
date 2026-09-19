@@ -9,6 +9,7 @@ from qq_social_agent.deepseek_client import (
     DeepSeekClient,
     _log_llm_usage,
     _format_context_with_local_focus,
+    select_relevant_context_messages,
     _filter_recent_bot_duplicate_candidates,
     _parse_jargon_terms,
     _parse_daily_review,
@@ -209,7 +210,7 @@ def test_context_marks_only_contiguous_recent_topic_as_high_priority() -> None:
     assert "墨尔本自来水" in focused
 
 
-def test_recent_bot_duplicate_filter_blocks_same_core_punchline() -> None:
+def test_recent_bot_duplicate_filter_no_longer_lexical() -> None:
     candidates = (
         ReplyCandidateDraft("司马懿吧，苟到最后的才是赢家", "answer", "直接判断"),
         ReplyCandidateDraft("你更像贾诩，突出一个能活", "answer", "换角度"),
@@ -220,7 +221,7 @@ def test_recent_bot_duplicate_filter_blocks_same_core_punchline() -> None:
         ("你啊，司马懿吧——低调苟发育，苟到最后的才是赢家",),
     )
 
-    assert [candidate.text for candidate in filtered] == ["你更像贾诩，突出一个能活"]
+    assert [candidate.text for candidate in filtered] == [item.text for item in candidates]
 
 
 def test_sanitize_strips_internal_source_markers() -> None:
@@ -345,6 +346,11 @@ def test_parse_reply_decision_new_social_actions() -> None:
         ("转话题", "shift_topic"),
         ("自嘲", "self_comment"),
         ("关系回应", "relationship_reply"),
+        ("对齐", "clarify"),
+        ("扎破", "deflate"),
+        ("学语气", "mirror_style"),
+        ("入戏", "commit_bit"),
+        ("挡一句", "protect"),
     ]:
         decision = _parse_reply_decision(
             f'{{"should_reply": true, "confidence": 0.72, "action": "{raw_action}", "reason": "test"}}'
@@ -1160,3 +1166,66 @@ def test_summarize_member_profile_includes_previous_summary() -> None:
     assert "已有画像：旧画像：常聊行情" in user
     assert "新增发言" in user
     assert "今天又聊代码" in user
+
+
+
+def test_parse_tool_routing_decision_probability() -> None:
+    decision = _parse_tool_routing_decision(
+        '{"tool":"probability","query":"CMU offer 概率","confidence":0.9,"reason":"可能性问题"}'
+    )
+    assert decision.tool == "probability"
+    assert "CMU" in decision.query
+
+
+
+def test_select_relevant_context_keeps_recent_and_top_older_in_time_order() -> None:
+    messages = [
+        ChatMessage(1, 1, "A", f"old-{index}", False, float(index))
+        for index in range(20)
+    ]
+    scores = [0.1] * 14
+    scores[2] = 0.9
+    scores[10] = 0.8
+    selected = select_relevant_context_messages(
+        messages,
+        scores,
+        keep_recent=6,
+        target_total=8,
+    )
+    texts = [msg.text for msg in selected]
+    assert texts[-6:] == [f"old-{index}" for index in range(14, 20)]
+    assert "old-2" in texts
+    assert "old-10" in texts
+    assert texts == sorted(texts, key=lambda item: int(item.split("-")[1]))
+
+
+def test_select_relevant_context_falls_back_when_scores_are_weak() -> None:
+    messages = [
+        ChatMessage(1, 1, "A", f"old-{index}", False, float(index))
+        for index in range(20)
+    ]
+    selected = select_relevant_context_messages(
+        messages,
+        [0.05] * 14,
+        keep_recent=6,
+        target_total=12,
+    )
+    assert [msg.text for msg in selected] == [f"old-{index}" for index in range(8, 20)]
+
+
+
+def test_select_relevant_context_always_pins_last_six() -> None:
+    messages = [
+        ChatMessage(1, 1, "A", f"old-{index}", False, float(index))
+        for index in range(20)
+    ]
+    scores = [0.9] * 14
+    selected = select_relevant_context_messages(
+        messages,
+        scores,
+        keep_recent=3,
+        target_total=8,
+    )
+    texts = [msg.text for msg in selected]
+    assert texts[-6:] == [f"old-{index}" for index in range(14, 20)]
+    assert len(texts) == 8
