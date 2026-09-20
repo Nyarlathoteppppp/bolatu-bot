@@ -10,6 +10,7 @@ from qq_social_agent.pre_send_critic import (
     format_critic_feedback,
     format_critic_jev_state,
     next_critic_action,
+    parse_jev_critic_answers,
 )
 from qq_social_agent.reference_resolver import ReferenceResolution
 from qq_social_agent.resolver_result import ERROR, NOT_APPLICABLE, RESOLVED, UNAVAILABLE
@@ -153,4 +154,19 @@ def test_critic_questions_are_self_contained_and_atomic() -> None:
         assert "并且" not in text.replace("也不要", "")
         assert "但是" not in text
         assert "不要判断其他项" in text or key != "intent_covered"
-        assert set(question["criteria"]) == {"YES", "NO"}
+        assert question["type"] == "choice"
+        assert "other" in question["criteria"]
+        assert "not_applicable" in question["criteria"]
+
+
+def test_critic_only_blocks_high_failure_probability() -> None:
+    judged = parse_jev_critic_answers({"answers": {
+        "intent_covered": {"choice": "missed", "probabilities": {"missed": 0.82}},
+        "referent_consistent": {"choice": "conflict", "probabilities": {"conflict": 0.62}},
+        "context_consistent": {"choice": "consistent", "probabilities": {"conflict": 0.10}},
+        "unsupported_claim": {"choice": "supported", "probabilities": {"unsupported": 0.30}},
+    }})
+    result = apply_jev_critic_judgement(judged)
+    assert result.failures == ("intent_covered",)
+    assert result.uncertain == ("referent_consistent",)
+    assert dict(judged.failure_probabilities)["intent_covered"] == 0.82

@@ -599,18 +599,20 @@ def test_discourse_audit_requires_comparable_evidence() -> None:
     assert should_audit_discourse_state(competing) is True
 
 
-def test_resolve_group_discourse_uses_one_first_pass_batch() -> None:
+def test_resolve_group_discourse_isolates_conflicting_addressee_from_batch() -> None:
     class BatchJev(ScriptedJev):
         async def resolve_discourse_first_pass(self, **kwargs):
             self.calls.append("batch")
-            assert kwargs["addressee_candidates"]
+            assert kwargs["addressee_candidates"] is None
             assert kwargs["ellipsis_sources"]
             return {
-                "addressee": AddresseeJudgement("c_mention", 0.91),
                 "ellipsis": EllipsisJudgement("ITEM_DEIXIS", "AUTO", 0.88),
             }
 
-    jev = BatchJev(audit=DiscourseAuditJudgement("none", 0.9))
+    jev = BatchJev(
+        addressee=AddresseeJudgement("c_mention", 0.91),
+        audit=DiscourseAuditJudgement("none", 0.9),
+    )
     state = asyncio.run(
         resolve_group_discourse(
             current_text="[@2002] 看看这个",
@@ -625,7 +627,7 @@ def test_resolve_group_discourse_uses_one_first_pass_batch() -> None:
         )
     )
     assert jev.calls.count("batch") == 1
-    assert "addressee" not in jev.calls
+    assert jev.calls.count("addressee") == 1
     assert "ellipsis" not in jev.calls
     assert state.addressee.target_id == P2
     assert state.deixis.status == RESOLVED

@@ -4,7 +4,8 @@ import os
 import math
 import random
 import re
-from typing import Any
+import time
+from typing import Any, Callable
 import httpx
 from nonebot import logger
 
@@ -16,7 +17,62 @@ from .persona import Persona
 
 
 OPENROUTER_DECISIONS_URL = "https://openrouter.ai/api/alpha/decisions"
-DEFAULT_JEV_MODEL = "~typesafe/jev-latest"
+TYPESAFE_SYSTEM_ONE_URL = "https://api.typesafe.ai/v1/systemone"
+OPENROUTER_JEV_MODEL = "~typesafe/jev-latest"
+TYPESAFE_JEV_MODEL = "jev-latest"
+
+JevTelemetryRecorder = Callable[[dict[str, Any]], None]
+_telemetry_recorder: JevTelemetryRecorder | None = None
+
+
+def set_jev_telemetry_recorder(recorder: JevTelemetryRecorder | None) -> None:
+    global _telemetry_recorder
+    _telemetry_recorder = recorder
+
+
+def _finite_probability(value: Any) -> float | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not math.isfinite(parsed) or not 0.0 <= parsed <= 1.0:
+        return None
+    return parsed
+
+
+def _answer_telemetry(answer: Any) -> dict[str, Any]:
+    if not isinstance(answer, dict):
+        return {"type": "invalid"}
+    kind = str(answer.get("type") or "")
+    if "noul" in answer:
+        return {"type": kind or "noul", "noul": _finite_probability(answer.get("noul"))}
+    probabilities = answer.get("probabilities")
+    clean: dict[str, float] = {}
+    if isinstance(probabilities, dict):
+        for key, value in probabilities.items():
+            parsed = _finite_probability(value)
+            if parsed is not None:
+                clean[str(key)] = parsed
+    ranked = sorted(clean.items(), key=lambda item: item[1], reverse=True)
+    top1 = ranked[0] if ranked else ("", 0.0)
+    top2 = ranked[1] if len(ranked) > 1 else ("", 0.0)
+    result: dict[str, Any] = {
+        "type": kind or "choice",
+        "choice": answer.get("choice"),
+        "confidence": _finite_probability(answer.get("confidence")),
+        "probabilities": clean,
+        "top1": {"choice": top1[0], "probability": top1[1]},
+        "top2": {"choice": top2[0], "probability": top2[1]},
+        "margin": round(top1[1] - top2[1], 6),
+    }
+    escape_probability = sum(
+        value for key, value in clean.items()
+        if key.casefold() in {"other", "none", "not_applicable", "uncertain"}
+    )
+    result["escape_probability"] = round(escape_probability, 6)
+    return result
 
 _TIMING_QUESTION_HINTS = (
     "有没有",
@@ -96,18 +152,35 @@ def _timing_bot_just_spoke(recent_messages: list[ChatMessage]) -> bool:
 
 
 class JevClient:
-    """Client for TypeSafe System One (Jev) through OpenRouter Decisions API."""
+    """Client for TypeSafe System One, preferring the official API when configured."""
 
     def __init__(
         self,
         api_key: str | None = None,
-        base_url: str = OPENROUTER_DECISIONS_URL,
-        model: str = DEFAULT_JEV_MODEL,
+        base_url: str | None = None,
+        model: str | None = None,
         timeout: float = 2.5,
     ) -> None:
-        self.api_key = api_key or os.getenv("OPENROUTER_API_KEY", "")
-        self.base_url = base_url
-        self.model = model
+        direct_key = os.getenv("TYPESAFE_API_KEY", "")
+        openrouter_key = os.getenv("OPENROUTER_API_KEY", "")
+        if base_url is not None:
+            self.base_url = base_url
+            self.provider = "typesafe" if "api.typesafe.ai" in base_url else "openrouter"
+            self.api_key = api_key or (direct_key if self.provider == "typesafe" else openrouter_key)
+        elif api_key is not None:
+            # Explicit keys preserve the historical OpenRouter constructor contract.
+            self.base_url = OPENROUTER_DECISIONS_URL
+            self.provider = "openrouter"
+            self.api_key = api_key
+        elif direct_key:
+            self.base_url = TYPESAFE_SYSTEM_ONE_URL
+            self.provider = "typesafe"
+            self.api_key = direct_key
+        else:
+            self.base_url = OPENROUTER_DECISIONS_URL
+            self.provider = "openrouter"
+            self.api_key = openrouter_key
+        self.model = model or (TYPESAFE_JEV_MODEL if self.provider == "typesafe" else OPENROUTER_JEV_MODEL)
         self.timeout = timeout
         self._http_client: httpx.AsyncClient | None = None
 
@@ -124,7 +197,7 @@ class JevClient:
         timeout: float | None = None,
     ) -> dict[str, Any]:
         if not self.available:
-            raise RuntimeError("OPENROUTER_API_KEY is not configured in environment.")
+            raise RuntimeError("Neither TYPESAFE_API_KEY nor OPENROUTER_API_KEY is configured.")
 
         payload = {
             "model": model or self.model,
@@ -134,20 +207,58 @@ class JevClient:
         headers = {
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",
-            "HTTP-Referer": "https://qq-social-agent.local",
-            "X-Title": "QQ Social Agent",
         }
+        if self.provider == "openrouter":
+            headers.update({
+                "HTTP-Referer": "https://qq-social-agent.local",
+                "X-Title": "QQ Social Agent",
+            })
         timeout_val = self.timeout if timeout is None else timeout
         if self._http_client is None or self._http_client.is_closed:
             self._http_client = httpx.AsyncClient()
-        resp = await self._http_client.post(
-            self.base_url,
-            json=payload,
-            headers=headers,
-            timeout=timeout_val,
-        )
-        resp.raise_for_status()
-        return resp.json()
+        started = time.perf_counter()
+        try:
+            resp = await self._http_client.post(
+                self.base_url,
+                json=payload,
+                headers=headers,
+                timeout=timeout_val,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+        except Exception as exc:
+            self.record_telemetry({
+                "provider": self.provider,
+                "model": payload["model"],
+                "latency_ms": round((time.perf_counter() - started) * 1000, 2),
+                "status": "error",
+                "error_type": type(exc).__name__,
+                "question_ids": list(questions),
+            })
+            raise
+        answers = data.get("answers") if isinstance(data, dict) else None
+        usage = data.get("usage") if isinstance(data, dict) else None
+        self.record_telemetry({
+            "provider": self.provider,
+            "model": data.get("model", payload["model"]) if isinstance(data, dict) else payload["model"],
+            "latency_ms": round((time.perf_counter() - started) * 1000, 2),
+            "status": "ok",
+            "question_ids": list(questions),
+            "answers": {
+                str(key): _answer_telemetry(value)
+                for key, value in answers.items()
+            } if isinstance(answers, dict) else {},
+            "usage": usage if isinstance(usage, dict) else {},
+        })
+        return data
+
+    def record_telemetry(self, event: dict[str, Any]) -> None:
+        if _telemetry_recorder is None:
+            return
+        try:
+            _telemetry_recorder(event)
+        except Exception as exc:
+            logger.warning(f"qq_social_agent failed recording Jev telemetry: {type(exc).__name__}")
 
     async def aclose(self) -> None:
         if self._http_client is not None and not self._http_client.is_closed:

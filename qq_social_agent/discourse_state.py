@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 from dataclasses import dataclass, replace
@@ -1156,24 +1157,36 @@ async def resolve_group_discourse(
     judged_referent = None
     judged_ellipsis = None
     first_pass = getattr(jev, "resolve_discourse_first_pass", None) if jev is not None else None
-    if callable(first_pass) and (need_addressee or need_referent or need_ellipsis):
-        batch = await first_pass(
-            current_text=current_text,
-            current_label=speaker_label,
-            addressee_candidates=addressee_rows if need_addressee else None,
-            referent_candidates=referent_candidates if need_referent else None,
-            ellipsis_sources=sources if need_ellipsis else None,
-            reply=reply,
-            at_user_ids=at_ids,
-            rule_reference=rule_reference,
-        )
-        if isinstance(batch, dict):
-            judged_addressee = batch.get("addressee")
-            judged_referent = batch.get("referent")
-            judged_ellipsis = batch.get("ellipsis")
-    else:
-        if need_addressee:
-            judged_addressee = await _maybe_jev_call(
+    # reply + @ is a competing addressee decision. Keep its state compact and
+    # run it alongside the referent/ellipsis batch instead of contaminating one
+    # shared request. Deterministic single-@ cases were already bound above.
+    isolate_addressee = bool(
+        need_addressee
+        and reply is not None
+        and reply.exists
+        and at_ids
+    )
+    pending: list[tuple[str, object]] = []
+    if callable(first_pass) and (
+        (need_addressee and not isolate_addressee) or need_referent or need_ellipsis
+    ):
+        pending.append((
+            "batch",
+            first_pass(
+                current_text=current_text,
+                current_label=speaker_label,
+                addressee_candidates=addressee_rows if need_addressee and not isolate_addressee else None,
+                referent_candidates=referent_candidates if need_referent else None,
+                ellipsis_sources=sources if need_ellipsis else None,
+                reply=reply,
+                at_user_ids=at_ids,
+                rule_reference=rule_reference,
+            ),
+        ))
+    if need_addressee and (isolate_addressee or not callable(first_pass)):
+        pending.append((
+            "addressee",
+            _maybe_jev_call(
                 jev,
                 "resolve_addressee",
                 current_text=current_text,
@@ -1181,27 +1194,48 @@ async def resolve_group_discourse(
                 candidates=addressee_rows,
                 reply=reply,
                 at_user_ids=at_ids,
-            )
+            ),
+        ))
+    if not callable(first_pass):
         if need_referent and referent_candidates:
-            judged_referent = await _maybe_jev_call(
-                jev,
-                "resolve_referent",
-                current_text=current_text,
-                current_label=speaker_label,
-                candidates=referent_candidates,
-                reply=reply,
-                rule_guess=rule_reference,
-            )
+            pending.append((
+                "referent",
+                _maybe_jev_call(
+                    jev,
+                    "resolve_referent",
+                    current_text=current_text,
+                    current_label=speaker_label,
+                    candidates=referent_candidates,
+                    reply=reply,
+                    rule_guess=rule_reference,
+                ),
+            ))
         if need_ellipsis and sources:
-            judged_ellipsis = await _maybe_jev_call(
-                jev,
-                "resolve_ellipsis",
-                current_text=current_text,
-                current_label=speaker_label,
-                sources=sources,
-                reply=reply,
-                reference=rule_reference,
-            )
+            pending.append((
+                "ellipsis",
+                _maybe_jev_call(
+                    jev,
+                    "resolve_ellipsis",
+                    current_text=current_text,
+                    current_label=speaker_label,
+                    sources=sources,
+                    reply=reply,
+                    reference=rule_reference,
+                ),
+            ))
+    if pending:
+        results = await asyncio.gather(*(call for _, call in pending))
+        for (kind, _), result in zip(pending, results):
+            if kind == "batch" and isinstance(result, dict):
+                judged_addressee = result.get("addressee")
+                judged_referent = result.get("referent")
+                judged_ellipsis = result.get("ellipsis")
+            elif kind == "addressee":
+                judged_addressee = result
+            elif kind == "referent":
+                judged_referent = result
+            elif kind == "ellipsis":
+                judged_ellipsis = result
 
     addressee = direct_addressee or Binding(status=NOT_APPLICABLE, source=SOURCE_RULE)
     if need_addressee:

@@ -75,6 +75,7 @@ from .deepseek_client import (
     ToolSymbol,
     set_usage_recorder,
 )
+from .jev_client import set_jev_telemetry_recorder
 from .delivery import build_delivery_plan
 from .group_jargon import (
     GroupJargonEntry,
@@ -1316,6 +1317,7 @@ class SuppressionEvent:
 async def _init_client() -> None:
     global deepseek_client, learning_coordinator, jev_probability_tool
     set_usage_recorder(_record_llm_usage if app_config.deepseek.usage_tracking_enabled else None)
+    set_jev_telemetry_recorder(_record_jev_telemetry)
     deepseek_client = DeepSeekClient(app_config.deepseek)
     jev_probability_tool = JevProbabilityTool(
         deepseek_client.jev_client,
@@ -1456,6 +1458,18 @@ def _record_llm_usage(
         prompt_tokens=prompt_tokens,
         completion_tokens=completion_tokens,
         total_tokens=total_tokens,
+    )
+
+
+def _record_jev_telemetry(event: dict[str, object]) -> None:
+    status = str(event.get("status") or "unknown")
+    provider = str(event.get("provider") or "unknown")
+    _record_metric_event(
+        "jev_decision",
+        stage="jev",
+        action=status,
+        provider=provider,
+        **{key: value for key, value in event.items() if key not in {"status", "provider"}},
     )
 
 

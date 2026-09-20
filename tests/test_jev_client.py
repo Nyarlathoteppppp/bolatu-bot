@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import os
 from unittest.mock import patch
-from qq_social_agent.jev_client import JevClient
+import httpx
+from qq_social_agent.jev_client import JevClient, set_jev_telemetry_recorder
 from qq_social_agent.memory import ChatMessage
 from qq_social_agent.persona import Persona
 
@@ -674,7 +676,7 @@ def test_jev_resolve_repair_and_ambiguity() -> None:
     assert amb.kind == "PERSON"
 
 
-def test_jev_critique_draft_uses_fixed_yes_no_questions() -> None:
+def test_jev_critique_draft_uses_confidence_gated_choices() -> None:
     from qq_social_agent.reference_resolver import ReferenceResolution
 
     client = JevClient(api_key="test-key")
@@ -688,18 +690,19 @@ def test_jev_critique_draft_uses_fixed_yes_no_questions() -> None:
             "unsupported_claim",
         ]
         for question in questions.values():
-            assert set(question["criteria"]) == {"YES", "NO"}
-            assert "OTHER" not in question["criteria"]
+            assert question["type"] == "choice"
+            assert "other" in question["criteria"]
+            assert "not_applicable" in question["criteria"]
         state = kwargs["state"]
         assert state.startswith("【待发送草稿】")
         assert "【当前消息】" in state
         assert state.rfind("【约束】") > state.find("【待发送草稿】")
         return {
             "answers": {
-                "intent_covered": {"choice": "YES"},
-                "referent_consistent": {"choice": "NO"},
-                "context_consistent": {"choice": "YES"},
-                "unsupported_claim": {"choice": "NO"},
+                "intent_covered": {"choice": "covered", "probabilities": {"missed": 0.10}},
+                "referent_consistent": {"choice": "conflict", "probabilities": {"conflict": 0.90}},
+                "context_consistent": {"choice": "consistent", "probabilities": {"conflict": 0.10}},
+                "unsupported_claim": {"choice": "supported", "probabilities": {"unsupported": 0.10}},
             }
         }
 
@@ -714,6 +717,54 @@ def test_jev_critique_draft_uses_fixed_yes_no_questions() -> None:
     )
     assert judged.referent_consistent == "NO"
     assert judged.unsupported_claim == "NO"
+
+
+def test_jev_prefers_official_api_when_typesafe_key_exists() -> None:
+    with patch.dict(os.environ, {"TYPESAFE_API_KEY": "direct", "OPENROUTER_API_KEY": "router"}):
+        client = JevClient()
+    assert client.provider == "typesafe"
+    assert client.base_url == "https://api.typesafe.ai/v1/systemone"
+    assert client.model == "jev-latest"
+    assert client.api_key == "direct"
+
+
+def test_jev_telemetry_records_full_choice_distribution() -> None:
+    events = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        assert request.headers["authorization"] == "Bearer direct"
+        assert "http-referer" not in request.headers
+        return httpx.Response(200, json={
+            "model": "jev-1.13.0",
+            "answers": {"target": {
+                "type": "choice",
+                "choice": "a",
+                "confidence": 0.7,
+                "probabilities": {"a": 0.7, "b": 0.2, "other": 0.1},
+            }},
+            "usage": {"input_tokens": 10, "output_tokens": 4},
+        })
+
+    async def run() -> None:
+        client = JevClient(api_key="direct", base_url="https://api.typesafe.ai/v1/systemone")
+        client._http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        set_jev_telemetry_recorder(events.append)
+        try:
+            await client.evaluate(
+                state={"message": "x"},
+                questions={"target": {"type": "choice", "instructions": "pick", "criteria": {"a": "A", "b": "B", "other": "Other"}}},
+            )
+        finally:
+            set_jev_telemetry_recorder(None)
+            await client.aclose()
+
+    asyncio.run(run())
+    answer = events[0]["answers"]["target"]
+    assert answer["probabilities"] == {"a": 0.7, "b": 0.2, "other": 0.1}
+    assert answer["top1"] == {"choice": "a", "probability": 0.7}
+    assert answer["top2"] == {"choice": "b", "probability": 0.2}
+    assert answer["margin"] == 0.5
+    assert answer["escape_probability"] == 0.1
 
 
 def test_jev_audit_allows_overlapping_answer() -> None:

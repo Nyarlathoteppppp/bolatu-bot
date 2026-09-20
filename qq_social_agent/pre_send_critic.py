@@ -17,8 +17,12 @@ from .resolver_result import (
 
 YES = "YES"
 NO = "NO"
+UNCERTAIN = "UNCERTAIN"
 CRITIC_CHOICES = (YES, NO)
+CRITIC_VALUES = (YES, NO, UNCERTAIN)
 MAX_CRITIC_RETRIES = 1
+CRITIC_FAIL_THRESHOLD = 0.75
+CRITIC_PASS_THRESHOLD = 0.45
 
 _FAIL_ON_NO = ("intent_covered", "referent_consistent", "context_consistent")
 _FAIL_ON_YES = ("unsupported_claim",)
@@ -30,6 +34,7 @@ class CriticJudgement:
     referent_consistent: str = ""
     context_consistent: str = ""
     unsupported_claim: str = ""
+    failure_probabilities: tuple[tuple[str, float], ...] = ()
     reason: str = ""
 
 
@@ -45,6 +50,7 @@ class CriticResult:
     reason: str = "none"
     failed: bool = False
     failures: tuple[str, ...] = ()
+    uncertain: tuple[str, ...] = ()
     regenerated: bool = False
 
     def __post_init__(self) -> None:
@@ -55,7 +61,7 @@ class CriticResult:
                 status = UNAVAILABLE
             elif reason == "error" or reason.endswith("_error"):
                 status = ERROR
-            elif self.intent_covered in CRITIC_CHOICES:
+            elif self.intent_covered in CRITIC_VALUES:
                 status = RESOLVED
             else:
                 status = NOT_APPLICABLE
@@ -76,6 +82,18 @@ class CriticResult:
             )
             object.__setattr__(self, "failures", failures)
         object.__setattr__(self, "failed", bool(failures) and status == RESOLVED)
+        if not self.uncertain and status == RESOLVED:
+            answers = {
+                "intent_covered": self.intent_covered,
+                "referent_consistent": self.referent_consistent,
+                "context_consistent": self.context_consistent,
+                "unsupported_claim": self.unsupported_claim,
+            }
+            object.__setattr__(
+                self,
+                "uncertain",
+                tuple(key for key, value in answers.items() if value == UNCERTAIN),
+            )
         finalize_result(self, has_value=status == RESOLVED)
 
 
@@ -105,22 +123,30 @@ def _failures_from_answers(
 def critic_choice_criteria(key: str) -> dict[str, str]:
     if key == "intent_covered":
         return {
-            YES: "待发送草稿回应了当前消息里的那个请求、纠正或问题本身",
-            NO: "待发送草稿在谈别的事，或没处理当前消息真正在说的那一点",
+            "covered": "草稿处理了当前请求、问题或纠正；纠正被明确接受也算处理",
+            "missed": "草稿忽略当前消息、转移话题，或仍沿用被纠正掉的值",
+            "not_applicable": "当前消息没有需要处理的请求、问题或纠正",
+            "other": "证据不足或不符合以上情况",
         }
     if key == "referent_consistent":
         return {
-            YES: "待发送草稿里的人/对象与已解析 DiscourseState 一致，或这条根本不需要人物对象",
-            NO: "待发送草稿用了别人，或沿用了已解析修正之前的旧对象",
+            "consistent": "草稿中的人和对象都与已解析字段一致",
+            "conflict": "草稿中至少一个人或对象与已解析字段冲突",
+            "not_applicable": "草稿没有指向具体的人或对象",
+            "other": "证据不足或不符合以上情况",
         }
     if key == "context_consistent":
         return {
-            YES: "待发送草稿没有和 DiscourseState 的 addressee/deixis/repair 打架",
-            NO: "待发送草稿把听话人、这个/那个、省略继承或纠正结果说反了",
+            "consistent": "草稿不与任何已解析 discourse 字段冲突",
+            "conflict": "草稿与至少一个已解析 discourse 字段冲突",
+            "not_applicable": "没有已解析 discourse 字段适用于这份草稿",
+            "other": "证据不足或不符合以上情况",
         }
     return {
-        YES: "待发送草稿写出了近期聊天、memory、tool result 里都没有的具体事实",
-        NO: "待发送草稿没有写出这些来源里找不到的具体事实",
+        "supported": "每个具体事实都由近期聊天、memory 或 tool result 明确支持或直接推出",
+        "unsupported": "至少一个具体事实增加了来源中不存在的人、数字、地点、事件、承诺或工具结论",
+        "not_applicable": "草稿只有建议、观点、提问或确认，没有具体事实主张",
+        "other": "证据不足或不符合以上情况",
     }
 
 
@@ -191,39 +217,35 @@ def critic_questions() -> dict:
         "intent_covered": {
             "type": "choice",
             "instructions": (
-                "只看待发送草稿和当前消息。"
-                "待发送草稿有没有回应当前消息里那个请求、纠正或问题本身？"
-                "不要改写草稿，也不要判断其他项。"
+                "只比较【待发送草稿】和【当前消息】，判断草稿是否处理了当前请求、问题或纠正。"
+                "对于纠正，明确承认或清楚接受纠正后的值算已处理。"
+                "不要改写草稿。不要判断其他项。"
             ),
             "criteria": critic_choice_criteria("intent_covered"),
         },
         "referent_consistent": {
             "type": "choice",
             "instructions": (
-                "只看待发送草稿和已解析 DiscourseState。"
-                "待发送草稿里的人/对象是否与 DiscourseState 一致？"
-                "不要重新解析群聊，只核对草稿有没有和已解析状态打架。"
-                "如果已解析修正改过对象，必须以纠正后的对象为准。"
-                "这条不需要人物对象时选 YES。不要改写草稿。"
+                "只比较【待发送草稿】里的人和对象与【已解析指代】及【已解析修正】。"
+                "不要重新解析群聊。纠正后的对象优先。不要改写草稿。"
             ),
             "criteria": critic_choice_criteria("referent_consistent"),
         },
         "context_consistent": {
             "type": "choice",
             "instructions": (
-                "只看待发送草稿和已解析 DiscourseState。"
-                "待发送草稿有没有把听话人、这个/那个、省略继承或纠正结果说反？"
+                "只比较【待发送草稿】和已解析 discourse 的听话人、指示词、省略继承、纠正结果及 media_present。"
                 "media_present=false 时问缺图或链接也算打架。"
-                "不要重新解析群聊。没有打架选 YES，说反了选 NO。不要改写草稿。"
+                "不要重新解析群聊。不要改写草稿。"
             ),
             "criteria": critic_choice_criteria("context_consistent"),
         },
         "unsupported_claim": {
             "type": "choice",
             "instructions": (
-                "只看待发送草稿、近期聊天、memory、tool result。"
-                "待发送草稿有没有写出这三处都不存在的具体事实，例如人名、数字、地点、承诺、工具结论？"
-                "有选 YES，没有选 NO。不要判断外部世界真假，也不要改写草稿。"
+                "只核对【待发送草稿】中可外部核验的具体事实是否有【近期聊天】、【memory】或【tool result】支持。"
+                "一般建议、观点、带不确定标记的推测及承认纠正都不是具体事实主张。"
+                "不要使用外部知识，也不要判断外部世界真假。不要改写草稿。"
             ),
             "criteria": critic_choice_criteria("unsupported_claim"),
         },
@@ -235,18 +257,59 @@ def parse_jev_critic_answers(data: dict) -> CriticJudgement:
     maybe_answers = payload.get("answers")
     answers: dict = maybe_answers if isinstance(maybe_answers, dict) else {}
 
-    def _choice(key: str) -> str:
+    def _legacy_choice(key: str) -> str:
         candidate = answers.get(key)
         choice = ""
         if isinstance(candidate, dict):
             choice = str(candidate.get("choice") or "").strip().upper()
         return choice if choice in CRITIC_CHOICES else ""
 
+    failure_labels = {
+        "intent_covered": "missed",
+        "referent_consistent": "conflict",
+        "context_consistent": "conflict",
+        "unsupported_claim": "unsupported",
+    }
+
+    def _failure_probability(key: str) -> float | None:
+        candidate = answers.get(key)
+        probabilities = candidate.get("probabilities") if isinstance(candidate, dict) else None
+        value = probabilities.get(failure_labels[key]) if isinstance(probabilities, dict) else None
+        if isinstance(value, bool):
+            return None
+        try:
+            score = float(value)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        return score if 0.0 <= score <= 1.0 else None
+
+    probabilities = {
+        key: score
+        for key in ("intent_covered", "referent_consistent", "context_consistent", "unsupported_claim")
+        if (score := _failure_probability(key)) is not None
+    }
+
+    def _verdict(key: str, *, fail_value: str, pass_value: str) -> str:
+        legacy = _legacy_choice(key)
+        if legacy:
+            return legacy
+        score = probabilities.get(key)
+        if score is None:
+            return ""
+        if score >= CRITIC_FAIL_THRESHOLD:
+            return fail_value
+        if score <= CRITIC_PASS_THRESHOLD:
+            candidate = answers.get(key)
+            choice = str(candidate.get("choice") or "").strip().casefold() if isinstance(candidate, dict) else ""
+            return UNCERTAIN if choice == "other" else pass_value
+        return UNCERTAIN
+
     return CriticJudgement(
-        intent_covered=_choice("intent_covered"),
-        referent_consistent=_choice("referent_consistent"),
-        context_consistent=_choice("context_consistent"),
-        unsupported_claim=_choice("unsupported_claim"),
+        intent_covered=_verdict("intent_covered", fail_value=NO, pass_value=YES),
+        referent_consistent=_verdict("referent_consistent", fail_value=NO, pass_value=YES),
+        context_consistent=_verdict("context_consistent", fail_value=NO, pass_value=YES),
+        unsupported_claim=_verdict("unsupported_claim", fail_value=YES, pass_value=NO),
+        failure_probabilities=tuple(probabilities.items()),
         reason="jev_critic",
     )
 
@@ -260,7 +323,7 @@ def apply_jev_critic_judgement(judgement: CriticJudgement | None) -> CriticResul
         judgement.context_consistent,
         judgement.unsupported_claim,
     )
-    if any(value not in CRITIC_CHOICES for value in values):
+    if any(value not in CRITIC_VALUES for value in values):
         return CriticResult(reason="error", status=ERROR, source=SOURCE_JEV)
     return CriticResult(
         intent_covered=judgement.intent_covered,

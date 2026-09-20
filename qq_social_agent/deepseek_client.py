@@ -205,9 +205,7 @@ class DeepSeekClient:
         self._provider_failures: dict[str, list[float]] = {}
         self._provider_circuit_until: dict[str, float] = {}
         self.prompts = PromptRegistry()
-        self.jev_client = JevClient(
-            api_key=os.getenv("OPENROUTER_API_KEY", "")
-        )
+        self.jev_client = JevClient()
 
     async def _chat_completion(
         self,
@@ -385,6 +383,15 @@ class DeepSeekClient:
         try:
             return await asyncio.wait_for(factory(), timeout=self._jev_timeout(timeout))
         except Exception as exc:
+            recorder = getattr(jev, "record_telemetry", None)
+            if callable(recorder):
+                recorder({
+                    "provider": getattr(jev, "provider", "unknown"),
+                    "model": getattr(jev, "model", ""),
+                    "status": "fallback",
+                    "operation": what,
+                    "error_type": type(exc).__name__,
+                })
             logger.warning(f"qq_social_agent jev {what} failed, falling back: error={exc}")
             return None
 
