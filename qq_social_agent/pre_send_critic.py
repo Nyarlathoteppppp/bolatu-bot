@@ -22,6 +22,7 @@ CRITIC_CHOICES = (YES, NO)
 CRITIC_VALUES = (YES, NO, UNCERTAIN)
 MAX_CRITIC_RETRIES = 1
 CRITIC_FAIL_THRESHOLD = 0.75
+CRITIC_ANSWER_INTENT_FAIL_THRESHOLD = 0.80
 CRITIC_INTENT_FAIL_THRESHOLD = 0.90
 CRITIC_PASS_THRESHOLD = 0.45
 
@@ -223,6 +224,15 @@ def format_critic_jev_state(
     return "\n".join(lines)
 
 
+def format_intent_critic_jev_state(*, draft: str, current_text: str, action: str) -> str:
+    return "\n".join((
+        f"【待发送草稿】{(draft or '')[:400]}",
+        f"【当前消息】{(current_text or '')[:400]}",
+        f"【当前说话动作】{action or 'reply'}",
+        "【约束】只比较当前消息和待发送草稿；不要使用或猜测其他聊天内容。",
+    ))
+
+
 def critic_questions() -> dict:
     return {
         "intent_covered": {
@@ -270,7 +280,7 @@ def critic_questions() -> dict:
     }
 
 
-def parse_jev_critic_answers(data: dict) -> CriticJudgement:
+def parse_jev_critic_answers(data: dict, *, action: str = "") -> CriticJudgement:
     payload = data if isinstance(data, dict) else {}
     maybe_answers = payload.get("answers")
     answers: dict = maybe_answers if isinstance(maybe_answers, dict) else {}
@@ -314,7 +324,14 @@ def parse_jev_critic_answers(data: dict) -> CriticJudgement:
         score = probabilities.get(key)
         if score is None:
             return ""
-        fail_threshold = CRITIC_INTENT_FAIL_THRESHOLD if key == "intent_covered" else CRITIC_FAIL_THRESHOLD
+        if key == "intent_covered":
+            fail_threshold = (
+                CRITIC_ANSWER_INTENT_FAIL_THRESHOLD
+                if str(action or "").strip().lower() == "answer"
+                else CRITIC_INTENT_FAIL_THRESHOLD
+            )
+        else:
+            fail_threshold = CRITIC_FAIL_THRESHOLD
         if score >= fail_threshold:
             return fail_value
         if score <= CRITIC_PASS_THRESHOLD:

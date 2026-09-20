@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import os
 import math
 import random
@@ -1443,7 +1444,7 @@ class JevClient:
             ),
             questions=critic_questions(),
         )
-        return parse_jev_critic_answers(data)
+        return parse_jev_critic_answers(data, action=action)
 
     async def political_mask_keys(self, *, text: str, context: str = "") -> tuple[str, ...]:
         """Observe code-extracted ambiguous occurrences in one batch; never rewrite."""
@@ -1481,8 +1482,13 @@ class JevClient:
         memory_context: str = "", tool_context: str = "",
         reference=None, ellipsis=None, repair=None, discourse=None,
     ):
-        """Batch independent draft observations; drill into pronouns only on a hit."""
-        from .pre_send_critic import critic_questions, format_critic_jev_state, parse_jev_critic_answers
+        """Run intent on compact state; batch the remaining observations concurrently."""
+        from .pre_send_critic import (
+            critic_questions,
+            format_critic_jev_state,
+            format_intent_critic_jev_state,
+            parse_jev_critic_answers,
+        )
         from .pronoun_guard import draft_has_person_pronoun, pronoun_questions
 
         state = format_critic_jev_state(
@@ -1494,11 +1500,26 @@ class JevClient:
             current_label=current_label,
         )
         questions = critic_questions()
+        intent_questions = {"intent_covered": questions.pop("intent_covered")}
         has_pronoun = draft_has_person_pronoun(draft)
         if has_pronoun:
             questions["pronoun_accurate"] = pronoun_questions()["pronoun_accurate"]
-        data = await self.evaluate(state=state, questions=questions)
-        critic = parse_jev_critic_answers(data)
+        intent_state = format_intent_critic_jev_state(
+            draft=draft,
+            current_text=current_text,
+            action=action,
+        )
+        intent_data, shared_data = await asyncio.gather(
+            self.evaluate(state=intent_state, questions=intent_questions),
+            self.evaluate(state=state, questions=questions),
+        )
+        answers = {}
+        for payload in (intent_data, shared_data):
+            candidate = payload.get("answers") if isinstance(payload, dict) else None
+            if isinstance(candidate, dict):
+                answers.update(candidate)
+        data = {"answers": answers}
+        critic = parse_jev_critic_answers(data, action=action)
         # A failed detail branch must not discard a valid critic observation.
         try:
             pronoun = await self._finish_pronoun_check(state, data, has_pronoun=has_pronoun)

@@ -110,15 +110,18 @@ def test_addressed_ask_back_cannot_bypass_high_threshold(action):
     assert not asyncio.run(client.should_ask_back(current_text="怎么修？", action=action, addressed=True))
 
 
-def test_review_draft_batches_then_drills_pronoun():
+def test_review_draft_isolates_intent_then_drills_pronoun():
     client = JevClient(api_key="test")
     seen = []
 
     async def evaluate(**kwargs):
-        seen.append(list(kwargs["questions"]))
-        if "intent_covered" in kwargs["questions"]:
+        seen.append((list(kwargs["questions"]), kwargs["state"]))
+        if list(kwargs["questions"]) == ["intent_covered"]:
             return {"answers": {
                 "intent_covered": {"choice": "YES"},
+            }}
+        if "referent_consistent" in kwargs["questions"]:
+            return {"answers": {
                 "referent_consistent": {"choice": "YES"},
                 "context_consistent": {"choice": "YES"},
                 "unsupported_claim": {"choice": "NO"},
@@ -129,9 +132,11 @@ def test_review_draft_batches_then_drills_pronoun():
     client.evaluate = evaluate
     pronoun, critic = asyncio.run(client.review_draft(
         draft="你刚说过", current_text="啥", current_label="A", action="reply"))
-    assert seen[0][:4] == ["intent_covered", "referent_consistent", "context_consistent", "unsupported_claim"]
-    assert "pronoun_accurate" in seen[0]
-    assert seen[1] == ["pronoun_issue"]
+    assert seen[0][0] == ["intent_covered"]
+    assert "【近期聊天】" not in seen[0][1]
+    assert seen[1][0][:3] == ["referent_consistent", "context_consistent", "unsupported_claim"]
+    assert "pronoun_accurate" in seen[1][0]
+    assert seen[2][0] == ["pronoun_issue"]
     assert critic.intent_covered == "YES"
     assert apply_jev_pronoun_judgement(pronoun, has_pronoun=True).needs_fix is True
 

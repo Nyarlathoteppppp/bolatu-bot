@@ -189,3 +189,17 @@ def test_critic_keeps_borderline_intent_uncertain() -> None:
     result = apply_jev_critic_judgement(judged)
     assert result.failed is False
     assert result.uncertain == ("intent_covered",)
+
+
+def test_answer_action_uses_stricter_intent_threshold() -> None:
+    payload = {"answers": {
+        "intent_covered": {"choice": "missed", "probabilities": {"missed": 0.82}},
+        "referent_consistent": {"choice": "consistent", "probabilities": {"conflict": 0.02}},
+        "context_consistent": {"choice": "consistent", "probabilities": {"conflict": 0.02}},
+        "unsupported_claim": {"choice": "not_applicable", "probabilities": {"unsupported": 0.01}},
+    }}
+    answer = apply_jev_critic_judgement(parse_jev_critic_answers(payload, action="answer"))
+    tease = apply_jev_critic_judgement(parse_jev_critic_answers(payload, action="tease"))
+    assert answer.failures == ("intent_covered",)
+    assert tease.failures == ()
+    assert tease.uncertain == ("intent_covered",)
