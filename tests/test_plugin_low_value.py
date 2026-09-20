@@ -1494,7 +1494,7 @@ def test_followup_addressed_allows_plain_followup_question() -> None:
     assert reason == "followup_text"
 
 
-def test_followup_addressed_allows_substantive_plain_followup() -> None:
+def test_followup_addressed_rejects_substantive_plain_message_without_target() -> None:
     bot = SimpleNamespace(self_id=1801507496)
     event = SimpleNamespace(
         self_id=1801507496,
@@ -1506,8 +1506,8 @@ def test_followup_addressed_allows_substantive_plain_followup() -> None:
 
     allowed, reason = plugin._followup_addressed_allowed(event, bot)
 
-    assert allowed
-    assert reason == "followup_text"
+    assert not allowed
+    assert reason == "not_directed"
 
 
 def test_followup_addressed_rejects_at_other_user() -> None:
@@ -2828,6 +2828,18 @@ def test_post_reply_followup_window_records_trigger_and_mention_targets() -> Non
     assert not plugin._addressed_followup_active(1, 300)
 
 
+def test_passive_reply_does_not_open_followup_window() -> None:
+    plugin.followup_window_opened_at.clear()
+
+    plugin._record_post_reply_followup_window(
+        1,
+        trigger_user_id=100,
+        conversation_engaged=False,
+    )
+
+    assert not plugin._addressed_followup_active(1, 100)
+
+
 def test_post_reply_followup_window_does_not_refresh_inside_soft_window(monkeypatch) -> None:
     plugin.followup_window_opened_at.clear()
     monkeypatch.setattr(plugin.time, "time", lambda: 1000.0)
@@ -2855,6 +2867,7 @@ def test_speaker_context_marks_soft_followup_window() -> None:
     )
     assert "已经过了直接接话窗口" in context
     assert "不要当成点名" in context
+    assert "禁止反问、追问" in context
 
 
 def test_proactive_chat_tick_uses_interval_not_next_hour(monkeypatch) -> None:
@@ -3308,3 +3321,67 @@ def test_ask_back_can_follow_normal_answer(monkeypatch) -> None:
         )
     )
     assert result.action == "ask_back"
+
+
+def test_passive_message_cannot_be_upgraded_to_ask_back(monkeypatch) -> None:
+    original = ReplyDecision(True, 0.8, "普通插话", mode="chat", action="answer")
+    called = []
+
+    async def fake_ask_back(**kwargs):
+        called.append(kwargs)
+        return True
+
+    monkeypatch.setattr(plugin, "deepseek_client", SimpleNamespace(should_ask_back=fake_ask_back))
+    result = asyncio.run(
+        plugin._maybe_apply_ask_back(
+            original,
+            text="群友在聊自己的事",
+            addressed_bot=False,
+            group_id=1,
+            user_id=2,
+        )
+    )
+    assert result.action == "answer"
+    assert called == []
+
+
+def test_passive_message_blocks_clarify_speaking_action(monkeypatch) -> None:
+    original = ReplyDecision(True, 0.8, "普通插话", mode="chat", action="answer")
+    seen = []
+
+    async def select(**kwargs):
+        seen.append(kwargs)
+        return "clarify", "想追问"
+
+    monkeypatch.setattr(plugin, "deepseek_client", SimpleNamespace(select_speaking_action=select))
+    result = asyncio.run(
+        plugin._maybe_apply_speaking_action(
+            original,
+            text="他为什么这么做",
+            current_label="甲",
+            addressed_bot=False,
+            speaker_context="",
+            recent_messages=[],
+            group_id=1,
+            user_id=2,
+            looks_like_question=True,
+        )
+    )
+    assert result.action == "answer"
+    assert "禁止反问" in seen[0]["speaker_context"]
+
+
+def test_passive_approval_candidates_drop_questions() -> None:
+    drafts = [
+        SimpleNamespace(text="你后来怎么处理的？", action="ask_back", style=""),
+        SimpleNamespace(text="你后来怎么处理的", action="ask_back", style=""),
+        SimpleNamespace(text="这驱动确实容易炸。", action="reply", style=""),
+    ]
+
+    candidates = plugin._approval_candidates_from_drafts(
+        drafts,
+        limit=3,
+        allow_questions=False,
+    )
+
+    assert [item.text for item in candidates] == ["这驱动确实容易炸。"]

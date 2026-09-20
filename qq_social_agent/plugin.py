@@ -6966,6 +6966,7 @@ async def _handle_group_message_locked(
             reply_candidates,
             market_report=market_report,
             limit=reply_candidate_limit,
+            allow_questions=addressed_bot,
         )
         if not approval_candidates:
             logger.info(f"qq_social_agent skipped group={group_id}: empty_candidate_after_guard")
@@ -8680,8 +8681,6 @@ def _followup_text_suggests_bot_target(text: str) -> bool:
     if re.search(r"^(?:那|所以|然后|但是|可是|不过)?(?:你|妳)(?:呢|咋说|怎么看|觉得呢|说呢)?$", compact):
         return True
     if any(token in compact for token in ("怎么办", "咋办", "救命", "完了", "崩溃", "难受", "害怕", "怕了")):
-        return True
-    if len(compact) >= 4:
         return True
     return False
 
@@ -11074,6 +11073,10 @@ def _format_speaker_reference_context(
             )
         else:
             lines.append("- 当前不是直接和风雪互动；判断插话时不要把群友互相回复误认为在问你。")
+        lines.append(
+            "- 当前没有人在和风雪对话：如果决定插话，只能陈述或短评；"
+            "禁止反问、追问或用澄清问题把群友对话拉向自己。"
+        )
 
     reply_relation = _extract_reply_relation(current_text)
     if reply_relation is not None:
@@ -11402,11 +11405,14 @@ def _approval_candidates_from_drafts(
     *,
     market_report: str = "",
     limit: int,
+    allow_questions: bool = True,
 ) -> list[PendingApprovalCandidate]:
     rows: list[PendingApprovalCandidate] = []
     for index, draft in enumerate(drafts, start=1):
         candidate_text = _sanitize_reply_candidate_text(getattr(draft, "text", ""), market_report=market_report)
         if not candidate_text:
+            continue
+        if not allow_questions and _draft_asks_question(candidate_text):
             continue
         rows.append(
             PendingApprovalCandidate(
@@ -11419,6 +11425,11 @@ def _approval_candidates_from_drafts(
         if len(rows) >= limit:
             break
     return rows
+
+
+def _draft_asks_question(text: str) -> bool:
+    without_urls = _NEARBY_URL_RE.sub("", str(text or ""))
+    return _looks_like_addressed_question(without_urls)
 
 
 async def _maybe_apply_speaking_action(
@@ -11440,7 +11451,11 @@ async def _maybe_apply_speaking_action(
 ) -> ReplyDecision:
     from .deepseek_client import ADDRESSED_QUESTION_ACTIONS, SPEAKING_ACTIONS
 
-    if not decision.should_reply or deepseek_client is None:
+    if not decision.should_reply:
+        return decision
+    if not addressed_bot and decision.action in {"ask_back", "clarify"}:
+        decision = replace(decision, action="reply", reason=f"passive_no_question:{decision.reason}"[:80])
+    if deepseek_client is None:
         return decision
     if decision.action in {"ignore", "react", "poke", "market_check", "fresh_context"}:
         return decision
@@ -11463,6 +11478,12 @@ async def _maybe_apply_speaking_action(
         speaker_context = (
             speaker_context
             + f"\n[ambiguity]\nkind={ambiguity_kind}"
+        ).strip()
+    if not addressed_bot:
+        speaker_context = (
+            speaker_context
+            + "\n- 最终约束：当前没有点名、回复或短时对话证据。"
+            "即使指代不明也禁止反问、追问或澄清提问；如果插话，只能陈述或短评。"
         ).strip()
     judged = await deepseek_client.select_speaking_action(
         current_text=text,
@@ -11487,6 +11508,19 @@ async def _maybe_apply_speaking_action(
         )
         return decision
     if choice not in SPEAKING_ACTIONS:
+        return decision
+    if not addressed_bot and choice in {"ask_back", "clarify"}:
+        _record_metric_event(
+            "speaking_action",
+            group_id=group_id,
+            user_id=user_id,
+            stage="decision",
+            action="blocked",
+            previous_action=decision.action,
+            blocked_action=choice,
+            addressed=False,
+            reason="passive_question",
+        )
         return decision
     if looks_like_question and addressed_bot and choice not in ADDRESSED_QUESTION_ACTIONS:
         _record_metric_event(
@@ -11521,7 +11555,13 @@ async def _maybe_apply_ask_back(
     group_id: int,
     user_id: int,
 ) -> ReplyDecision:
-    if not decision.should_reply or deepseek_client is None:
+    if not decision.should_reply:
+        return decision
+    if not addressed_bot:
+        if decision.action == "ask_back":
+            return replace(decision, action="reply", reason=f"passive_no_ask_back:{decision.reason}"[:80])
+        return decision
+    if deepseek_client is None:
         return decision
     if decision.action not in {"reply", "answer", "agree", "tease", "ask_back"}:
         return decision
@@ -13018,6 +13058,9 @@ async def _send_approved_group_reply_scoped(
         approval.group_id,
         trigger_user_id=approval.trigger_user_id,
         mention_user_id=sent_mention_user_id,
+        conversation_engaged=bool(
+            approval.pipeline_state is not None and approval.pipeline_state.addressed
+        ),
     )
     await _maybe_send_group_meme(bot, approval, candidate)
     await _execute_approved_side_reaction(bot, approval)
@@ -13153,7 +13196,10 @@ def _record_post_reply_followup_window(
     *,
     trigger_user_id: int,
     mention_user_id: int | None = None,
+    conversation_engaged: bool = True,
 ) -> None:
+    if not conversation_engaged:
+        return
     now = time.time()
     target_user_ids = {int(trigger_user_id or 0)}
     if mention_user_id is not None:
