@@ -48,6 +48,7 @@ AMBIGUITY_KINDS = (
 REPAIR_CUE_RE = re.compile(
     r"(不是.{0,12}是|我说的是|不是这个意思|前面那个|不是刚才|当我没说|刚才那句|撤回|不是贵，是|不是.+是)"
 )
+MACHINE_CONTEXT_RE = re.compile(r"\[(?:图片OCR|转发消息摘要|语音识别)[:：].*?\]", re.DOTALL)
 FACT_CUE_RE = re.compile(r"(准备|不考|改去|改成|后来|其实是|当我没说|不.+了)")
 ORDINAL_RE = re.compile(r"(第[一二三四五六七八九十\d]+(?:个|套|条|项)?|最后一个)")
 ITEM_LIST_RE = re.compile(r"(第[一二三四五六七八九十\d]+(?:个|套|条|项)?[^\s，。！？]{0,24})")
@@ -214,8 +215,9 @@ def should_ask_jev_repair(
     reference: ReferenceResolution | None = None,
     named_in_text: Iterable[int] = (),
 ) -> bool:
-    compact = re.sub(r"\s+", "", str(text or ""))
-    if REPAIR_CUE_RE.search(str(text or "")) or REPAIR_CUE_RE.search(compact):
+    human_text = MACHINE_CONTEXT_RE.sub("", str(text or ""))
+    compact = re.sub(r"\s+", "", human_text)
+    if REPAIR_CUE_RE.search(human_text) or REPAIR_CUE_RE.search(compact):
         return True
     named = tuple(int(uid) for uid in named_in_text if int(uid) > 0)
     if reference is not None and reference.user_ids and named and set(named).isdisjoint(reference.user_ids):

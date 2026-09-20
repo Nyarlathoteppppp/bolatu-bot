@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import copy
 import hashlib
 import json
 import os
@@ -242,6 +243,75 @@ def _load_jsonl(path: Path) -> list[dict[str, Any]]:
     return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
 
 
+def _sample_resolve_kwargs(row: dict[str, Any]) -> dict[str, Any]:
+    current = row["current"]
+    context = row.get("context") or []
+    messages = [
+        ChatMessage(
+            group_id=1,
+            user_id=int(item["user_id"]),
+            nickname=str(item["nickname"]),
+            text=str(item["text"]),
+            is_bot=bool(item.get("is_bot")),
+            created_at=float(item.get("created_at") or 0),
+            source_message_id=str(item.get("index", "")),
+        )
+        for item in context
+    ]
+    known = {str(item["nickname"]): int(item["user_id"]) for item in context}
+    known[str(current["nickname"])] = int(current["user_id"])
+    reply_user_id = current.get("reply_user_id")
+    reply_label = next(
+        (name for name, user_id in known.items() if user_id == reply_user_id),
+        str(reply_user_id or ""),
+    )
+
+    def named_resolver(text: str) -> tuple[int, ...]:
+        return tuple(user_id for name, user_id in known.items() if name in text)
+
+    return {
+        "current_text": str(current["text"]),
+        "current_user_id": int(current["user_id"]),
+        "current_nickname": str(current["nickname"]),
+        "self_id": 999_999,
+        "recent_messages": messages,
+        "reply": ReplyHint(
+            exists=reply_user_id is not None,
+            author_id=int(reply_user_id) if reply_user_id is not None else None,
+            author_label=reply_label,
+            text=str(current.get("reply_text") or ""),
+            message_id="replay" if reply_user_id is not None else "",
+        ),
+        "at_user_ids": tuple(int(value) for value in current.get("at_user_ids") or []),
+        "named_resolver": named_resolver,
+    }
+
+
+def _state_prediction(state: Any) -> dict[str, Any]:
+    return {
+        "addressee_user_id": state.addressee.target_id,
+        "addressee_target": state.addressee.target,
+        "addressee_status": state.addressee.status,
+        "addressee_confidence": state.addressee.confidence,
+        "referent_user_ids": list(state.reference.user_ids),
+        "referent_kind": state.reference.kind,
+        "referent_status": state.reference.status,
+        "referent_confidence": state.reference.confidence,
+        "ellipsis_kind": state.ellipsis.kind,
+        "ellipsis_source_text": state.ellipsis.source_text,
+        "ellipsis_status": state.ellipsis.status,
+        "ellipsis_confidence": state.ellipsis.confidence,
+        "repair_kind": state.repair.kind,
+        "repair_status": state.repair.status,
+        "state_audit": state.state_audit,
+    }
+
+
+async def _resolve_sample(row: dict[str, Any], jev: Any) -> dict[str, Any]:
+    state = await resolve_group_discourse(**_sample_resolve_kwargs(row), jev=jev)
+    return _state_prediction(state)
+
+
 async def predict_cases(input_path: Path, output_path: Path, *, concurrency: int) -> dict[str, Any]:
     rows = _load_jsonl(input_path)
     client = JevClient(timeout=5.0)
@@ -249,66 +319,10 @@ async def predict_cases(input_path: Path, output_path: Path, *, concurrency: int
     latencies: list[float] = []
 
     async def predict(row: dict[str, Any]) -> dict[str, Any]:
-        current = row["current"]
-        context = row.get("context") or []
-        messages = [
-            ChatMessage(
-                group_id=1,
-                user_id=int(item["user_id"]),
-                nickname=str(item["nickname"]),
-                text=str(item["text"]),
-                is_bot=bool(item.get("is_bot")),
-                created_at=float(item.get("created_at") or 0),
-                source_message_id=str(item.get("index", "")),
-            )
-            for item in context
-        ]
-        known = {str(item["nickname"]): int(item["user_id"]) for item in context}
-        known[str(current["nickname"])] = int(current["user_id"])
-        reply_user_id = current.get("reply_user_id")
-        reply_label = next(
-            (name for name, user_id in known.items() if user_id == reply_user_id),
-            str(reply_user_id or ""),
-        )
-
-        def named_resolver(text: str) -> tuple[int, ...]:
-            return tuple(user_id for name, user_id in known.items() if name in text)
-
         async with semaphore:
             started = time.perf_counter()
             try:
-                state = await resolve_group_discourse(
-                    current_text=str(current["text"]),
-                    current_user_id=int(current["user_id"]),
-                    current_nickname=str(current["nickname"]),
-                    self_id=999_999,
-                    recent_messages=messages,
-                    reply=ReplyHint(
-                        exists=reply_user_id is not None,
-                        author_id=int(reply_user_id) if reply_user_id is not None else None,
-                        author_label=reply_label,
-                        text=str(current.get("reply_text") or ""),
-                        message_id="replay" if reply_user_id is not None else "",
-                    ),
-                    at_user_ids=tuple(int(value) for value in current.get("at_user_ids") or []),
-                    named_resolver=named_resolver,
-                    jev=client,
-                )
-                prediction = {
-                    "addressee_user_id": state.addressee.target_id,
-                    "addressee_status": state.addressee.status,
-                    "addressee_confidence": state.addressee.confidence,
-                    "referent_user_ids": list(state.reference.user_ids),
-                    "referent_status": state.reference.status,
-                    "referent_confidence": state.reference.confidence,
-                    "ellipsis_kind": state.ellipsis.kind,
-                    "ellipsis_source_text": state.ellipsis.source_text,
-                    "ellipsis_status": state.ellipsis.status,
-                    "ellipsis_confidence": state.ellipsis.confidence,
-                    "repair_kind": state.repair.kind,
-                    "repair_status": state.repair.status,
-                    "state_audit": state.state_audit,
-                }
+                prediction = await _resolve_sample(row, client)
             except Exception as exc:
                 prediction = {"error": type(exc).__name__}
             latency = round((time.perf_counter() - started) * 1000, 2)
@@ -335,6 +349,217 @@ async def predict_cases(input_path: Path, output_path: Path, *, concurrency: int
         "status_counts": dict(Counter(
             row.get("prediction", {}).get("ellipsis_status", "error") for row in predicted
         )),
+    }
+
+
+class _SeparateJev:
+    """Expose individual resolvers while deliberately disabling first-pass batching."""
+
+    resolve_discourse_first_pass = None
+
+    def __init__(self, client: JevClient) -> None:
+        self._client = client
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._client, name)
+
+
+def _decision_signature(prediction: dict[str, Any], field: str) -> Any:
+    if field == "addressee":
+        return (
+            prediction.get("addressee_user_id"),
+            prediction.get("addressee_target"),
+            prediction.get("addressee_status"),
+        )
+    if field == "referent":
+        return (
+            tuple(prediction.get("referent_user_ids") or ()),
+            prediction.get("referent_kind"),
+            prediction.get("referent_status"),
+        )
+    if field == "ellipsis":
+        return (
+            prediction.get("ellipsis_kind"),
+            prediction.get("ellipsis_source_text"),
+            prediction.get("ellipsis_status"),
+        )
+    return prediction.get("repair_kind"), prediction.get("repair_status")
+
+
+async def compare_batching(
+    input_path: Path,
+    output_path: Path,
+    *,
+    concurrency: int,
+    limit: int,
+) -> dict[str, Any]:
+    rows = [
+        row for row in _load_jsonl(input_path)
+        if row.get("bucket") in {"referent", "ellipsis", "repair", "addressee"}
+    ]
+    random.Random(20260920).shuffle(rows)
+    rows = rows[:max(1, limit)]
+    client = JevClient(timeout=5.0)
+    separate = _SeparateJev(client)
+    semaphore = asyncio.Semaphore(max(1, concurrency))
+    fields = ("addressee", "referent", "ellipsis", "repair")
+
+    async def compare(row: dict[str, Any]) -> dict[str, Any]:
+        async with semaphore:
+            started = time.perf_counter()
+            try:
+                batch_a, batch_b, split = await asyncio.gather(
+                    _resolve_sample(row, client),
+                    _resolve_sample(row, client),
+                    _resolve_sample(row, separate),
+                )
+                error = ""
+            except Exception as exc:
+                batch_a = batch_b = split = {}
+                error = type(exc).__name__
+            elapsed_ms = round((time.perf_counter() - started) * 1000, 2)
+        repeat_diff = [
+            field for field in fields
+            if _decision_signature(batch_a, field) != _decision_signature(batch_b, field)
+        ]
+        split_diff = [
+            field for field in fields
+            if _decision_signature(batch_a, field) != _decision_signature(split, field)
+        ]
+        stable_split_diff = [field for field in split_diff if field not in repeat_diff]
+        return {
+            "sample_id": row.get("sample_id"),
+            "bucket": row.get("bucket"),
+            "error": error,
+            "elapsed_ms": elapsed_ms,
+            "repeat_diff": repeat_diff,
+            "split_diff": split_diff,
+            "stable_split_diff": stable_split_diff,
+            "batch_a": batch_a,
+            "batch_b": batch_b,
+            "split": split,
+        }
+
+    results = await asyncio.gather(*(compare(row) for row in rows))
+    await client.aclose()
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(
+        "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in results),
+        encoding="utf-8",
+    )
+    repeat_counts = Counter(field for row in results for field in row["repeat_diff"])
+    split_counts = Counter(field for row in results for field in row["split_diff"])
+    stable_counts = Counter(field for row in results for field in row["stable_split_diff"])
+    latencies = sorted(float(row["elapsed_ms"]) for row in results)
+    return {
+        "output": str(output_path),
+        "count": len(results),
+        "errors": sum(bool(row["error"]) for row in results),
+        "repeat_instability": dict(repeat_counts),
+        "batch_vs_split": dict(split_counts),
+        "stable_batch_effect": dict(stable_counts),
+        "latency_ms": {
+            "p50": latencies[len(latencies) // 2] if latencies else 0,
+            "p95": latencies[min(len(latencies) - 1, int(len(latencies) * 0.95))] if latencies else 0,
+        },
+    }
+
+
+def _with_irrelevant_context(row: dict[str, Any]) -> dict[str, Any]:
+    mutated = copy.deepcopy(row)
+    context = mutated.setdefault("context", [])
+    insert_at = max(0, len(context) - 5)
+    adjacent_times = [float(item.get("created_at") or 0) for item in context]
+    created_at = adjacent_times[insert_at - 1] + 0.001 if insert_at and adjacent_times else 0.001
+    context.insert(insert_at, {
+        "index": "noise",
+        "user_id": 880_001,
+        "nickname": "noise_user",
+        "text": "我去倒杯水，马上回来。",
+        "is_bot": False,
+        "created_at": created_at,
+    })
+    return mutated
+
+
+async def compare_context_noise(
+    input_path: Path,
+    output_path: Path,
+    *,
+    concurrency: int,
+    limit: int,
+) -> dict[str, Any]:
+    rows = _load_jsonl(input_path)
+    random.Random(20260920).shuffle(rows)
+    rows = rows[:max(1, limit)]
+    client = JevClient(timeout=5.0)
+    semaphore = asyncio.Semaphore(max(1, concurrency))
+    fields = ("addressee", "referent", "ellipsis", "repair")
+
+    async def compare(row: dict[str, Any]) -> dict[str, Any]:
+        async with semaphore:
+            started = time.perf_counter()
+            try:
+                baseline_a, baseline_b, noisy = await asyncio.gather(
+                    _resolve_sample(row, client),
+                    _resolve_sample(row, client),
+                    _resolve_sample(_with_irrelevant_context(row), client),
+                )
+                error = ""
+            except Exception as exc:
+                baseline_a = baseline_b = noisy = {}
+                error = type(exc).__name__
+            elapsed_ms = round((time.perf_counter() - started) * 1000, 2)
+        repeat_diff = [
+            field for field in fields
+            if _decision_signature(baseline_a, field) != _decision_signature(baseline_b, field)
+        ]
+        noise_diff = [
+            field for field in fields
+            if _decision_signature(baseline_a, field) != _decision_signature(noisy, field)
+        ]
+        stable_noise_diff = [field for field in noise_diff if field not in repeat_diff]
+        return {
+            "sample_id": row.get("sample_id"),
+            "bucket": row.get("bucket"),
+            "error": error,
+            "elapsed_ms": elapsed_ms,
+            "repeat_diff": repeat_diff,
+            "noise_diff": noise_diff,
+            "stable_noise_diff": stable_noise_diff,
+            "baseline_a": baseline_a,
+            "baseline_b": baseline_b,
+            "noisy": noisy,
+        }
+
+    results = await asyncio.gather(*(compare(row) for row in rows))
+    await client.aclose()
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(
+        "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in results),
+        encoding="utf-8",
+    )
+    repeat_counts = Counter(field for row in results for field in row["repeat_diff"])
+    noise_counts = Counter(field for row in results for field in row["noise_diff"])
+    stable_counts = Counter(field for row in results for field in row["stable_noise_diff"])
+    by_bucket = Counter(
+        f"{row['bucket']}:{field}"
+        for row in results
+        for field in row["stable_noise_diff"]
+    )
+    latencies = sorted(float(row["elapsed_ms"]) for row in results)
+    return {
+        "output": str(output_path),
+        "count": len(results),
+        "errors": sum(bool(row["error"]) for row in results),
+        "repeat_instability": dict(repeat_counts),
+        "noise_effect": dict(noise_counts),
+        "stable_noise_effect": dict(stable_counts),
+        "stable_noise_effect_by_bucket": dict(by_bucket),
+        "latency_ms": {
+            "p50": latencies[len(latencies) // 2] if latencies else 0,
+            "p95": latencies[min(len(latencies) - 1, int(len(latencies) * 0.95))] if latencies else 0,
+        },
     }
 
 
@@ -367,6 +592,18 @@ def main() -> None:
     predict.add_argument("--output", type=Path, required=True)
     predict.add_argument("--env", type=Path, default=Path(".env"))
     predict.add_argument("--concurrency", type=int, default=8)
+    compare = sub.add_parser("compare-batching")
+    compare.add_argument("--input", type=Path, required=True)
+    compare.add_argument("--output", type=Path, required=True)
+    compare.add_argument("--env", type=Path, default=Path(".env"))
+    compare.add_argument("--concurrency", type=int, default=6)
+    compare.add_argument("--limit", type=int, default=100)
+    noise = sub.add_parser("compare-context-noise")
+    noise.add_argument("--input", type=Path, required=True)
+    noise.add_argument("--output", type=Path, required=True)
+    noise.add_argument("--env", type=Path, default=Path(".env"))
+    noise.add_argument("--concurrency", type=int, default=6)
+    noise.add_argument("--limit", type=int, default=100)
     score = sub.add_parser("score")
     score.add_argument("--input", type=Path, required=True)
     args = parser.parse_args()
@@ -377,6 +614,26 @@ def main() -> None:
         if key:
             os.environ["TYPESAFE_API_KEY"] = key
         result = asyncio.run(predict_cases(args.input, args.output, concurrency=args.concurrency))
+    elif args.command == "compare-batching":
+        key = _read_env_key(args.env)
+        if key:
+            os.environ["TYPESAFE_API_KEY"] = key
+        result = asyncio.run(compare_batching(
+            args.input,
+            args.output,
+            concurrency=args.concurrency,
+            limit=args.limit,
+        ))
+    elif args.command == "compare-context-noise":
+        key = _read_env_key(args.env)
+        if key:
+            os.environ["TYPESAFE_API_KEY"] = key
+        result = asyncio.run(compare_context_noise(
+            args.input,
+            args.output,
+            concurrency=args.concurrency,
+            limit=args.limit,
+        ))
     else:
         result = score_cases(args.input)
     print(json.dumps(result, ensure_ascii=False, indent=2))

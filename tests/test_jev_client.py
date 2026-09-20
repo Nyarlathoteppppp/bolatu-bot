@@ -596,6 +596,9 @@ def test_jev_discourse_first_pass_batches_independent_choices() -> None:
             "ellipsis_kind",
             "inherit_from",
         }
+        inherit_instructions = kwargs["questions"]["inherit_from"]["instructions"]
+        assert "语义上被回答的最近消息" in inherit_instructions
+        assert "same_speaker 只是来源证据" in inherit_instructions
         return {
             "answers": {
                 "addressee_target": {"choice": "c_mention", "confidence": 0.94},

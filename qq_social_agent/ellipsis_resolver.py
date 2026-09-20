@@ -60,6 +60,19 @@ COMPLETE_CLAUSE_RE = re.compile(
 QUESTION_TAIL_RE = re.compile(r"[？?吗呢]$")
 
 
+def semantic_message_text(text: str) -> str:
+    """Extract the actual utterance from a normalized QQ reply envelope."""
+    value = str(text or "").strip()
+    if "消息【" not in value or "回复" not in value or not value.endswith("】"):
+        return value
+    reply_at = value.rfind("回复")
+    colon_positions = [pos for token in ("：", ":") if (pos := value.find(token, reply_at)) >= 0]
+    if not colon_positions:
+        return value
+    current = value[min(colon_positions) + 1 : -1].strip()
+    return current or value
+
+
 @dataclass(frozen=True)
 class EllipsisSource:
     key: str
@@ -209,7 +222,7 @@ def build_ellipsis_candidates(
         key = source_key_for_message(message, index=index if index >= 0 else len(rows))
         if key in seen:
             return False
-        text = str(getattr(message, "text", "") or "").strip()
+        text = semantic_message_text(str(getattr(message, "text", "") or ""))
         if not text:
             return False
         speaker = str(getattr(message, "nickname", "") or getattr(message, "user_id", "") or "")
@@ -275,7 +288,7 @@ def build_ellipsis_candidates(
         add(messages[-1], "previous")
 
     for msg in reversed(messages):
-        if looks_like_question(str(getattr(msg, "text", "") or "")) and add(msg, "recent_question"):
+        if looks_like_question(semantic_message_text(str(getattr(msg, "text", "") or ""))) and add(msg, "recent_question"):
             break
 
     referent_ids = set(reference.user_ids) if reference is not None else set()
@@ -288,14 +301,14 @@ def build_ellipsis_candidates(
         aliases = {name for name in names.values() if name}
         for msg in reversed(messages):
             uid = int(getattr(msg, "user_id", 0) or 0)
-            text = str(getattr(msg, "text", "") or "")
+            text = semantic_message_text(str(getattr(msg, "text", "") or ""))
             if (uid in referent_ids or any(alias and alias in text for alias in aliases)) and add(
                 msg, "referent_related"
             ):
                 break
 
     for msg in reversed(messages):
-        text = str(getattr(msg, "text", "") or "")
+        text = semantic_message_text(str(getattr(msg, "text", "") or ""))
         if looks_like_statement(text) and add(msg, "recent_statement"):
             break
 

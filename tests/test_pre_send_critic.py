@@ -157,11 +157,16 @@ def test_critic_questions_are_self_contained_and_atomic() -> None:
         assert question["type"] == "choice"
         assert "other" in question["criteria"]
         assert "not_applicable" in question["criteria"]
+    intent = questions["intent_covered"]
+    assert "针对缺口追问算已处理" in intent["instructions"]
+    assert "形成直接回应就算已处理" in intent["instructions"]
+    assert "拒绝理由直接对应请求内容" in intent["instructions"]
+    assert "缺少的必要信息进行追问" in intent["criteria"]["covered"]
 
 
 def test_critic_only_blocks_high_failure_probability() -> None:
     judged = parse_jev_critic_answers({"answers": {
-        "intent_covered": {"choice": "missed", "probabilities": {"missed": 0.82}},
+        "intent_covered": {"choice": "missed", "probabilities": {"missed": 0.90}},
         "referent_consistent": {"choice": "conflict", "probabilities": {"conflict": 0.62}},
         "context_consistent": {"choice": "consistent", "probabilities": {"conflict": 0.10}},
         "unsupported_claim": {"choice": "supported", "probabilities": {"unsupported": 0.30}},
@@ -169,4 +174,16 @@ def test_critic_only_blocks_high_failure_probability() -> None:
     result = apply_jev_critic_judgement(judged)
     assert result.failures == ("intent_covered",)
     assert result.uncertain == ("referent_consistent",)
-    assert dict(judged.failure_probabilities)["intent_covered"] == 0.82
+    assert dict(judged.failure_probabilities)["intent_covered"] == 0.90
+
+
+def test_critic_keeps_borderline_intent_uncertain() -> None:
+    judged = parse_jev_critic_answers({"answers": {
+        "intent_covered": {"choice": "missed", "probabilities": {"missed": 0.82}},
+        "referent_consistent": {"choice": "consistent", "probabilities": {"conflict": 0.02}},
+        "context_consistent": {"choice": "consistent", "probabilities": {"conflict": 0.02}},
+        "unsupported_claim": {"choice": "not_applicable", "probabilities": {"unsupported": 0.01}},
+    }})
+    result = apply_jev_critic_judgement(judged)
+    assert result.failed is False
+    assert result.uncertain == ("intent_covered",)

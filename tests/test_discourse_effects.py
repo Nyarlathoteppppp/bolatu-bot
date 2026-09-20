@@ -59,6 +59,12 @@ def test_repair_referent_overrides_old_binding() -> None:
     assert updated.unresolved is False
 
 
+def test_repair_cue_ignores_generated_ocr_description() -> None:
+    text = "[图片] [图片OCR: 这不是梗图，而是游戏截图。]"
+    assert should_ask_jev_repair(text) is False
+    assert should_ask_jev_repair("不是这个图，是上一张") is True
+
+
 def test_repair_item_uses_existing_ordinal_resolver() -> None:
     messages = [_msg("第一套要重写缓存，第二套更稳但慢", mid="10")]
     item = resolve_ordinal_item("我说的是第二个", messages)

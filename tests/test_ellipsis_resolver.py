@@ -6,6 +6,7 @@ from qq_social_agent.ellipsis_resolver import (
     apply_jev_ellipsis_judgement,
     build_ellipsis_candidates,
     format_ellipsis_prompt_block,
+    semantic_message_text,
     should_ask_jev_ellipsis,
     slot_for_query,
 )
@@ -20,6 +21,12 @@ def _msg(user_id: int, nick: str, text: str, *, mid: str = "", is_bot: bool = Fa
 def test_trigger_skips_complete_sentence() -> None:
     assert should_ask_jev_ellipsis("Gemini 写代码其实还行") is False
     assert should_ask_jev_ellipsis("我觉得这个呢其实还不错") is False
+
+
+def test_semantic_message_text_extracts_reply_body() -> None:
+    rendered = "甲[#00001]回复乙[#00002]消息【乙[#00002]说：人生的意义是什么；甲[#00001]回复乙[#00002]：生孩子】"
+    assert semantic_message_text(rendered) == "生孩子"
+    assert semantic_message_text("普通消息") == "普通消息"
 
 
 def test_trigger_hits_short_and_cues() -> None:

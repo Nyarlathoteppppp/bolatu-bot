@@ -23,6 +23,7 @@ from .ellipsis_resolver import (
     EllipsisSource,
     apply_jev_ellipsis_judgement,
     build_ellipsis_candidates,
+    semantic_message_text,
     should_ask_jev_ellipsis,
     source_key_for_message,
 )
@@ -516,7 +517,7 @@ def build_deixis_candidates(
         return DeixisCandidate(
             key=key,
             speaker=speaker,
-            text=str(getattr(message, "text", "") or "").strip(),
+            text=semantic_message_text(str(getattr(message, "text", "") or "")),
             source_reason=reason,
             message_id=str(getattr(message, "source_message_id", "") or getattr(message, "id", "") or ""),
             user_id=int(getattr(message, "user_id", 0) or 0),

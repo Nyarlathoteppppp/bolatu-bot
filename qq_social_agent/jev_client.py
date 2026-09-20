@@ -917,6 +917,8 @@ class JevClient:
                     "如果存在省略，选应继承的那条前文。"
                     "QQ reply 指向的消息优先；"
                     "看看这个/这个优先选同一发言人刚说的具体内容，不要选无关闲聊。"
+                    "短答或直接回应优先选择语义上被回答的最近消息；"
+                    "source_reason=same_speaker 只表示候选来源，不代表它比更近且语义匹配的消息优先。"
                     "多个问题时选和当前指代/话题相关的那条；"
                     "kind 是 NONE 或不该继承时选 NONE。"
                     "不要输出解释。"
@@ -1075,6 +1077,8 @@ class JevClient:
                         "instructions": (
                             "只判断 message.current_text 应继承 ellipsis.sources 的哪一条。"
                             "QQ reply 指向的消息优先；这个/那个优先同一发言人刚说的具体内容。"
+                            "短答或直接回应优先选择语义上被回答的最近消息；"
+                            "source_reason=same_speaker 只是来源证据，不是优先级。"
                             "不需要继承选 NONE，没有匹配或无法判断选 other。"
                         ),
                         "criteria": ellipsis_inherit_criteria(sources),

@@ -22,6 +22,7 @@ CRITIC_CHOICES = (YES, NO)
 CRITIC_VALUES = (YES, NO, UNCERTAIN)
 MAX_CRITIC_RETRIES = 1
 CRITIC_FAIL_THRESHOLD = 0.75
+CRITIC_INTENT_FAIL_THRESHOLD = 0.90
 CRITIC_PASS_THRESHOLD = 0.45
 
 _FAIL_ON_NO = ("intent_covered", "referent_consistent", "context_consistent")
@@ -123,7 +124,11 @@ def _failures_from_answers(
 def critic_choice_criteria(key: str) -> dict[str, str]:
     if key == "intent_covered":
         return {
-            "covered": "草稿处理了当前请求、问题或纠正；纠正被明确接受也算处理",
+            "covered": (
+                "草稿直接回答或执行了当前请求，针对缺少的必要信息进行追问，"
+                "或用与当前话题直接相关的社交回应处理了消息；"
+                "明确说明不执行并给出与请求内容直接相关的拒绝理由也算处理；纠正被明确接受也算处理"
+            ),
             "missed": "草稿忽略当前消息、转移话题，或仍沿用被纠正掉的值",
             "not_applicable": "当前消息没有需要处理的请求、问题或纠正",
             "other": "证据不足或不符合以上情况",
@@ -218,6 +223,10 @@ def critic_questions() -> dict:
             "type": "choice",
             "instructions": (
                 "只比较【待发送草稿】和【当前消息】，判断草稿是否处理了当前请求、问题或纠正。"
+                "缺少必要信息时，针对缺口追问算已处理。"
+                "action=tease/care/agree/reply 时，只要草稿围绕当前消息中的对象或话题形成直接回应就算已处理，"
+                "不要求它完整回答事实问题。"
+                "草稿明确说明不执行当前请求且拒绝理由直接对应请求内容时，也算已处理；空泛说不回答不算。"
                 "对于纠正，明确承认或清楚接受纠正后的值算已处理。"
                 "不要改写草稿。不要判断其他项。"
             ),
@@ -296,7 +305,8 @@ def parse_jev_critic_answers(data: dict) -> CriticJudgement:
         score = probabilities.get(key)
         if score is None:
             return ""
-        if score >= CRITIC_FAIL_THRESHOLD:
+        fail_threshold = CRITIC_INTENT_FAIL_THRESHOLD if key == "intent_covered" else CRITIC_FAIL_THRESHOLD
+        if score >= fail_threshold:
             return fail_value
         if score <= CRITIC_PASS_THRESHOLD:
             candidate = answers.get(key)
