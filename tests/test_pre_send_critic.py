@@ -161,7 +161,9 @@ def test_critic_questions_are_self_contained_and_atomic() -> None:
     assert "针对缺口追问算已处理" in intent["instructions"]
     assert "形成直接回应就算已处理" in intent["instructions"]
     assert "拒绝理由直接对应请求内容" in intent["instructions"]
+    assert "只谈另一个对象算未处理" in intent["instructions"]
     assert "缺少的必要信息进行追问" in intent["criteria"]["covered"]
+    assert "非核心近似数字" in questions["unsupported_claim"]["instructions"]
 
 
 def test_critic_only_blocks_high_failure_probability() -> None:
