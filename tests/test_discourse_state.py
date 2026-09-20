@@ -515,6 +515,56 @@ def test_resolve_group_discourse_end_to_end_with_scripted_jev() -> None:
     assert not draft_violates_media_gate("这折扣能冲", state)
 
 
+def test_reply_only_addressee_is_bound_without_jev() -> None:
+    jev = ScriptedJev(addressee=AddresseeJudgement("generic", 0.99))
+    state = asyncio.run(
+        resolve_group_discourse(
+            current_text="你放心好了",
+            current_user_id=P1,
+            current_nickname="P1",
+            self_id=1801507496,
+            recent_messages=[_msg(P2, "P2", "放你们上去", mid="1", ts=10.0)],
+            reply=ReplyHint(
+                exists=True,
+                author_id=P2,
+                author_label=_label(P2, "P2"),
+                text="放你们上去",
+                message_id="1",
+            ),
+            named_resolver=lambda _text: (),
+            jev=jev,
+        )
+    )
+    assert state.addressee.target_id == P2
+    assert state.addressee.confidence == 1.0
+    assert state.addressee.reason == "single_reply"
+    assert "addressee" not in jev.calls
+
+
+def test_self_reply_is_not_bound_as_addressing_self() -> None:
+    jev = ScriptedJev(addressee=AddresseeJudgement("generic", 0.9))
+    state = asyncio.run(
+        resolve_group_discourse(
+            current_text="补充一下",
+            current_user_id=P1,
+            current_nickname="P1",
+            self_id=1801507496,
+            recent_messages=[_msg(P1, "P1", "前一条", mid="1", ts=10.0)],
+            reply=ReplyHint(
+                exists=True,
+                author_id=P1,
+                author_label=_label(P1, "P1"),
+                text="前一条",
+                message_id="1",
+            ),
+            named_resolver=lambda _text: (),
+            jev=jev,
+        )
+    )
+    assert "addressee" in jev.calls
+    assert state.addressee.target == "generic"
+
+
 def test_resolve_group_discourse_audit_conflict_requeries_only_addressee() -> None:
     recent = [_msg(P1, "P1", "1折", mid="1", ts=10.0)]
     answers = {

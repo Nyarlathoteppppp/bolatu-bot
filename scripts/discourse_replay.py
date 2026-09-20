@@ -38,6 +38,8 @@ URL_RE = re.compile(r"https?://\S+", re.I)
 EMAIL_RE = re.compile(r"[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}")
 LONG_NUMBER_RE = re.compile(r"(?<!\d)\d{7,}(?!\d)")
 AT_RE = re.compile(r"\[@(\d+)\]")
+REPLY_SUFFIX_RE = re.compile(r"回复.{0,40}?\[#(\d{3,})\]消息")
+LABEL_SUFFIX_RE = re.compile(r"\[#\d{3,}\]")
 
 
 def _read_env_key(path: Path) -> str:
@@ -82,6 +84,11 @@ def _bucket(row: sqlite3.Row) -> str:
     return "baseline"
 
 
+def _reply_target_id(text: str, suffix_index: dict[str, int]) -> int | None:
+    match = REPLY_SUFFIX_RE.search(text or "")
+    return suffix_index.get(match.group(1)) if match else None
+
+
 def _alias(index: int) -> str:
     return f"user_{index:02d}"
 
@@ -97,13 +104,18 @@ def _anonymize_text(
     for user_id, (nickname, alias) in sorted(identity.items(), key=lambda item: len(item[1][0]), reverse=True):
         clean = clean.replace(f"[@{user_id}]", f"[@{alias}]")
         clean = clean.replace(str(user_id), alias)
+        if nickname:
+            clean = clean.replace(f"{nickname}[#", f"{alias}[#")
         if nickname and len(nickname.strip()) >= 2:
             clean = clean.replace(nickname, alias)
     local_names = {nickname for nickname, _alias_name in identity.values() if nickname}
     for nickname in sensitive_names:
         if nickname in local_names:
             continue
-        clean = clean.replace(nickname, "<name>")
+        clean = clean.replace(f"{nickname}[#", "<name>[#")
+        if len(nickname) >= 2:
+            clean = clean.replace(nickname, "<name>")
+    clean = LABEL_SUFFIX_RE.sub("[#anon]", clean)
     return LONG_NUMBER_RE.sub("<number>", clean)[:500]
 
 
@@ -117,10 +129,19 @@ def export_cases(db_path: Path, output: Path, *, group_id: int, count: int, seed
         (group_id,),
     ).fetchall()
     sensitive_names = tuple(sorted(
-        {str(row["nickname"] or "").strip() for row in rows if len(str(row["nickname"] or "").strip()) >= 2},
+        {str(row["nickname"] or "").strip() for row in rows if str(row["nickname"] or "").strip()},
         key=len,
         reverse=True,
     ))
+    global_nicknames = {
+        int(row["user_id"]): str(row["nickname"] or "").strip()
+        for row in rows
+        if str(row["nickname"] or "").strip()
+    }
+    suffixes: dict[str, list[int]] = defaultdict(list)
+    for user_id in global_nicknames:
+        suffixes[str(user_id)[-5:]].append(user_id)
+    suffix_index = {suffix: values[0] for suffix, values in suffixes.items() if len(values) == 1}
     candidates: dict[str, list[int]] = defaultdict(list)
     for index, row in enumerate(rows):
         if int(row["is_bot"] or 0) or not str(row["text"] or "").strip():
@@ -148,18 +169,28 @@ def export_cases(db_path: Path, output: Path, *, group_id: int, count: int, seed
         for bucket, index in chosen:
             current = rows[index]
             context_rows = rows[max(0, index - 10):index]
+            reply_user_id = _reply_target_id(str(current["text"] or ""), suffix_index)
             user_ids = list(dict.fromkeys(
-                [int(row["user_id"]) for row in (*context_rows, current)] + list(_at_ids(current))
+                [int(row["user_id"]) for row in (*context_rows, current)]
+                + list(_at_ids(current))
+                + ([reply_user_id] if reply_user_id is not None else [])
             ))
             identity = {
                 user_id: (
-                    next((str(row["nickname"] or "") for row in reversed((*context_rows, current)) if int(row["user_id"]) == user_id), ""),
+                    next(
+                        (str(row["nickname"] or "") for row in reversed((*context_rows, current)) if int(row["user_id"]) == user_id),
+                        global_nicknames.get(user_id, ""),
+                    ),
                     _alias(offset + 1),
                 )
                 for offset, user_id in enumerate(user_ids)
             }
             surrogate = {user_id: 100_000 + offset for offset, user_id in enumerate(user_ids, 1)}
             current_uid = int(current["user_id"])
+            reply_source = next(
+                (row for row in reversed(context_rows) if reply_user_id is not None and int(row["user_id"]) == reply_user_id),
+                None,
+            )
             sample_id = hashlib.sha256(f"{group_id}:{current['id']}:{seed}".encode()).hexdigest()[:16]
             payload = {
                 "sample_id": sample_id,
@@ -171,6 +202,12 @@ def export_cases(db_path: Path, output: Path, *, group_id: int, count: int, seed
                         str(current["text"] or ""), identity, sensitive_names=sensitive_names
                     ),
                     "at_user_ids": [surrogate[user_id] for user_id in _at_ids(current) if user_id in surrogate],
+                    "reply_user_id": surrogate.get(reply_user_id) if reply_user_id is not None else None,
+                    "reply_text": _anonymize_text(
+                        str(reply_source["text"] or "") if reply_source is not None else "",
+                        identity,
+                        sensitive_names=sensitive_names,
+                    ),
                 },
                 "context": [
                     {
@@ -228,6 +265,11 @@ async def predict_cases(input_path: Path, output_path: Path, *, concurrency: int
         ]
         known = {str(item["nickname"]): int(item["user_id"]) for item in context}
         known[str(current["nickname"])] = int(current["user_id"])
+        reply_user_id = current.get("reply_user_id")
+        reply_label = next(
+            (name for name, user_id in known.items() if user_id == reply_user_id),
+            str(reply_user_id or ""),
+        )
 
         def named_resolver(text: str) -> tuple[int, ...]:
             return tuple(user_id for name, user_id in known.items() if name in text)
@@ -241,7 +283,13 @@ async def predict_cases(input_path: Path, output_path: Path, *, concurrency: int
                     current_nickname=str(current["nickname"]),
                     self_id=999_999,
                     recent_messages=messages,
-                    reply=ReplyHint(),
+                    reply=ReplyHint(
+                        exists=reply_user_id is not None,
+                        author_id=int(reply_user_id) if reply_user_id is not None else None,
+                        author_label=reply_label,
+                        text=str(current.get("reply_text") or ""),
+                        message_id="replay" if reply_user_id is not None else "",
+                    ),
                     at_user_ids=tuple(int(value) for value in current.get("at_user_ids") or []),
                     named_resolver=named_resolver,
                     jev=client,

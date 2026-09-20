@@ -1095,7 +1095,24 @@ async def resolve_group_discourse(
         row for row in addressee_rows if row.key not in {"generic", "other"}
     ]
     direct_addressee = None
+    direct_reply = next((row for row in addressee_rows if row.source == "reply"), None)
     if (
+        direct_reply is not None
+        and direct_reply.user_id is not None
+        and int(direct_reply.user_id) != int(current_user_id)
+        and not at_ids
+    ):
+        direct_addressee = Binding(
+            status=RESOLVED,
+            source=SOURCE_RULE,
+            confidence=1.0,
+            target=direct_reply.label,
+            target_id=direct_reply.user_id,
+            reason="single_reply",
+            value=str(direct_reply.user_id),
+            kind="PERSON",
+        )
+    elif (
         (reply is None or not reply.exists)
         and len(explicit_addressee_rows) == 1
         and explicit_addressee_rows[0].source == "at"
