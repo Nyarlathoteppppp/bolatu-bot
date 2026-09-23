@@ -13,28 +13,15 @@ Keep the Compose project name fixed as `qq-social-agent`; NapCat connects to the
 
 ## Branches
 
-```text
-main  Stable branch used by the running server.
-dev   Daily development branch. Merge into main after tests pass.
-```
-
-Server defaults to `main`:
+The production checkout was on `live-hotfix-20260917` on 2026-09-23. Check the branch and working tree before making changes:
 
 ```bash
 cd /opt/qq-social-agent
-git switch main
-git pull --ff-only origin main
+git branch --show-current
+git status --short
 ```
 
-For server-side development:
-
-```bash
-cd /opt/qq-social-agent
-git switch dev
-git pull --ff-only origin dev
-# edit files, run tests, commit
-git push origin dev
-```
+Commit and push the branch that is actually deployed. Do not switch a running checkout to `main` or `dev` as part of a routine update.
 
 Runtime files stay on the server and must not be committed:
 
@@ -43,6 +30,21 @@ Runtime files stay on the server and must not be committed:
 data/
 logs/
 server-data/
+```
+
+The repository had a tracked `data/bot.sqlite3` in older commits. Removing it from the current tree does not remove those historical copies.
+
+## Code-only update
+
+The Python package is bind-mounted into the bot container. Run tests on the Ubuntu host, then recreate only `bot`:
+
+```bash
+cd /opt/qq-social-agent
+PYTHONPATH=. python3 -m pytest -q --tb=short
+napcat_before=$(docker inspect -f '{{.State.StartedAt}}' napcat)
+docker compose -p qq-social-agent -f docker-compose.server.yml up -d --no-deps --force-recreate bot
+curl -fsS http://127.0.0.1:8080/readyz
+test "$napcat_before" = "$(docker inspect -f '{{.State.StartedAt}}' napcat)"
 ```
 
 ## Start
@@ -65,15 +67,6 @@ docker compose -p qq-social-agent -f docker-compose.server.yml down
 cd /opt/qq-social-agent
 docker compose -p qq-social-agent -f docker-compose.server.yml logs -f bot
 docker compose -p qq-social-agent -f docker-compose.server.yml logs -f napcat
-```
-
-## Update
-
-```bash
-cd /opt/qq-social-agent
-git switch main
-git pull --ff-only origin main
-docker compose -p qq-social-agent -f docker-compose.server.yml up -d --build bot
 ```
 
 ## NapCat WebUI

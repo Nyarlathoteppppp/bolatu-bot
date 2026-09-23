@@ -26,7 +26,7 @@ QQ 由 NapCat 接入，NoneBot2 接收 OneBot v11 事件；消息筛选、频率
 - **会搜，但不乱搜**：点名“搜一下”或回复需要最新事实时，走 SearXNG → Tavily / Bing 回退；成功后只从**本轮结果 URL**并行读最多 2 页。维基走 MediaWiki extracts API，不刮 HTML。禁止把空题目扩成热榜/排行。
 - **支持图片和富媒体上下文**：图片可走 OCR/视觉摘要；文件、语音、转发和表情保留结构化安全元数据。
 - **可人工审批，也可自动发送**：候选回复可以私聊审批人选择；审查开启时可配置一部分消息直接发送。
-- **会主动但不刷屏**：按时间段概率主动聊天，话题来自静态词库并有冷却；主动聊不调搜索。群聊每日复盘当前关闭。
+- **主动聊天可配置**：定时群聊主动发言当前关闭；被点名回复、私聊续聊和手动命令按各自规则运行。
 - **可维护地长期运行**：Web 管理台、链路 Trace、Token/模型用量、RAG 评测、SQLite 体检、Docker 清理和腾讯云 COS 冷备份。
 
 ## 架构
@@ -41,7 +41,7 @@ QQ 客户端
   -> 前置筛选：去重、buffer、频控、工作强度、禁言和低价值消息拦截
   -> 社交决策：是否插话 + social action
   -> 工具决策：搜索 / 行情 / 网页读取 / 不调用
-  -> 搜索一跳：SearXNG（约 1.5s）→ Tavily / Bing；读本轮 URL（最多 2 成功 / 4 尝试）
+  -> 搜索一跳：按 config.yaml 选择主服务（当前 Tavily）→ RSS 回退；读本轮 URL（最多 2 成功 / 4 尝试）
   -> 上下文装配：短期群聊 + 引用链 + 记忆 + RAG + 画像 + 黑话 + 风格
   -> 表达生成：候选回复 / 直接回复 / 工具结果短评
   -> 发送层：人工审批或自动发送，附加表情/艾特；输出政治词打码
@@ -94,7 +94,7 @@ action: reply / answer / agree / care / tease / ask_back / at_someone / react / 
 搜索一跳（不是通用 Agent 循环）：
 
 1. 压缩查询词；禁止把空题目扩成热榜/热门话题/排行。
-2. SearXNG 硬顶约 1.5s，失败再走 Tavily / Bing。
+2. 按 `fresh_search.provider` 选择主服务；当前使用 Tavily，失败后走 RSS 回退。选择 SearXNG 时可回退到 Tavily / RSS。
 3. 按 query 重叠和站点权重排序（维基 / GitHub / gov·edu / 国内新闻 / 知乎专栏问答）。
 4. 并行读最多 2 个成功页，总尝试 ≤ 4；维基走 API extracts。
 5. 知乎 hub 跳过，专栏/问答可试读；登录墙或 403 当没读到，只用本轮摘要。
@@ -157,7 +157,7 @@ action: reply / answer / agree / care / tease / ask_back / at_someone / react / 
 | NoneBot2 | 事件入口和 Web 服务 |
 | Python + SQLite WAL | 消息、审批、记忆、画像、指标、用量和 RAG 索引 |
 | SiliconFlow / DeepSeek | 多 provider LLM 路由与 fallback；当前默认模型以 `config.yaml` 为准 |
-| SearXNG + Tavily / Bing | 主搜索与回退；读页走本轮 URL，维基走 MediaWiki API |
+| Tavily + RSS / SearXNG | 当前 Tavily 主搜索、RSS 回退；SearXNG 容器仍在运行，可由配置选择 |
 | FTS5 + bge-m3 + NumPy | 混合 RAG 和向量化语义检索 |
 | Docker Compose | bot / SearXNG / NapCat 三容器 |
 | 腾讯云 COS | SQLite 快照、配置、聊天归档和冷备份 |
@@ -213,7 +213,7 @@ cp .env.example .env
 
 主要修改点：
 
-- `config.yaml`：目标群、私聊白名单、模型路由、频控、主动聊天、搜索和 RAG。`fresh_search.provider` 默认 `searxng`。
+- `config.yaml`：目标群、私聊白名单、模型路由、频控、主动聊天、搜索和 RAG。当前 `fresh_search.provider` 为 `tavily`。
 - `prompts/zhangfengxue.yaml`：人格、决策、工具选择、回复、风格学习、记忆压缩。
 - `plugins/*/manifest.yaml`：本地插件能力和开关。
 
