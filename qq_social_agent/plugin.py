@@ -103,6 +103,12 @@ from .deepseek_client import (
 from .jev_client import set_jev_telemetry_recorder
 from .delivery import build_delivery_plan
 from .daily_review_scheduler_service import DailyReviewSchedulerService
+from .daily_review_service import (
+    DailyReviewDeliveryServices,
+    DailyReviewPolicy,
+    DailyReviewService,
+    DailyReviewServices,
+)
 from .conversation_tool_routing import (
     _NEARBY_URL_RE,
     _apply_tool_use_router as _route_tool_use,
@@ -222,6 +228,13 @@ from .private_tool_execution import PrivateToolServices, plan_and_execute_privat
 from .private_turn_preparation import PrivateTurnServices, prepare_private_turn
 from .plugin_runtime import LocalPluginRegistry
 from .proactive_chat_scheduler_service import ProactiveChatSchedulerService
+from .proactive_group_message_service import (
+    ProactiveGroupContextServices,
+    ProactiveGroupDeliveryServices,
+    ProactiveGroupMessagePolicy,
+    ProactiveGroupMessageService,
+    ProactiveGroupMessageServices,
+)
 from .prompts import PromptRegistry
 from .weekly_usage_report_scheduler_service import WeeklyUsageReportSchedulerService
 from .pipeline_types import (
@@ -364,7 +377,9 @@ pending_group_approvals = approval_state_service.pending
 recent_suppression_events: list["SuppressionEvent"] = []
 private_guided_chat_tasks: dict[str, asyncio.Task[None]] = {}
 private_hourly_chat_tasks: dict[str, asyncio.Task[None]] = {}
-daily_review_send_locks: dict[tuple[int, str], asyncio.Lock] = {}
+daily_review_service = DailyReviewService()
+daily_review_send_locks = daily_review_service.send_locks
+proactive_group_message_service = ProactiveGroupMessageService()
 last_self_mute_reconcile_at: dict[int, float] = {}
 maintenance_tasks: dict[str, asyncio.Task[None]] = {}
 connected_onebot_bots: dict[str, Bot] = {}
@@ -1975,6 +1990,65 @@ def _hour_in_range(hour: int, start: int, end: int) -> bool:
     return hour >= start or hour < end
 
 
+def _proactive_group_message_policy() -> ProactiveGroupMessagePolicy:
+    return ProactiveGroupMessagePolicy(
+        context_limit=PROACTIVE_CHAT_CONTEXT_LIMIT,
+        max_messages=PROACTIVE_CHAT_MAX_MESSAGES,
+        mid_memory_keep_summaries=MID_MEMORY_KEEP_SUMMARIES,
+        member_impression_context_limit=MEMBER_IMPRESSION_CONTEXT_LIMIT,
+        memory_atom_context_limit=MEMORY_ATOM_CONTEXT_LIMIT,
+        style_rule_context_limit=STYLE_RULE_CONTEXT_LIMIT,
+        raw_corpus_context_limit=RAW_CORPUS_CONTEXT_LIMIT,
+        raw_corpus_candidate_limit=RAW_CORPUS_CANDIDATE_LIMIT,
+        raw_corpus_context_radius=RAW_CORPUS_CONTEXT_RADIUS,
+        blocked_backend_fallback_texts=frozenset(BLOCKED_BACKEND_FALLBACK_TEXTS),
+    )
+
+
+def _proactive_group_message_services() -> ProactiveGroupMessageServices:
+    return ProactiveGroupMessageServices(
+        memory=memory,
+        app_config=app_config,
+        get_deepseek_client=lambda: deepseek_client,
+        get_persona=lambda persona_id: personas.get(persona_id),
+        group_generation_inflight=group_generation_inflight,
+        pending_group_approvals=pending_group_approvals,
+        refresh_self_mute_state_if_stale=lambda *args, **kwargs: _refresh_self_mute_state_if_stale(
+            *args, **kwargs
+        ),
+        select_topic=lambda **kwargs: _select_proactive_topic(**kwargs),
+        record_topic=lambda *args, **kwargs: _record_group_proactive_topic(*args, **kwargs),
+        context=ProactiveGroupContextServices(
+            related_member_user_ids=lambda *args, **kwargs: _related_member_user_ids(*args, **kwargs),
+            format_memory_context=lambda *args, **kwargs: _format_memory_context(*args, **kwargs),
+            format_member_context=lambda *args, **kwargs: _format_member_context(*args, **kwargs),
+            format_memory_atom_context=lambda *args, **kwargs: _format_memory_atom_context(*args, **kwargs),
+            format_style_context=lambda *args, **kwargs: _format_style_context(*args, **kwargs),
+            format_raw_corpus_context=lambda *args, **kwargs: _format_raw_corpus_context(*args, **kwargs),
+            selected_group_jargon_context=lambda *args, **kwargs: _selected_group_jargon_context(
+                *args, **kwargs
+            ),
+            social_action_service=social_action_service,
+            assemble_generation_context=lambda *args, **kwargs: assemble_generation_context(*args, **kwargs),
+        ),
+        delivery=ProactiveGroupDeliveryServices(
+            prepare_political_send_texts=lambda *args, **kwargs: _prepare_group_political_send_texts(
+                *args, **kwargs
+            ),
+            send_group_message=lambda *args, **kwargs: _send_group_message(*args, **kwargs),
+            notify_owner_political_gag=lambda *args, **kwargs: _notify_owner_political_gag(*args, **kwargs),
+            record_bot_sent_message=lambda *args, **kwargs: _record_bot_sent_message(*args, **kwargs),
+            record_metric_event=lambda *args, **kwargs: _record_metric_event(*args, **kwargs),
+            action_failed_summary=lambda exc: _action_failed_summary(exc),
+            short_notice_text=lambda text, limit: _short_notice_text(text, limit),
+            logger=logger,
+        ),
+        sanitize_generated_text=lambda text: _sanitize_generated_text(text),
+        split_reply_messages=lambda *args, **kwargs: split_reply_messages(*args, **kwargs),
+        policy=_proactive_group_message_policy(),
+    )
+
+
 async def _send_proactive_chat_for_group(
     bot: Bot,
     *,
@@ -1982,188 +2056,17 @@ async def _send_proactive_chat_for_group(
     probability: int,
     roll: float,
 ) -> bool:
-    if deepseek_client is None:
-        _record_metric_event("proactive_chat", group_id=group_id, stage="generation", action="skipped", reason="deepseek_client_not_ready")
-        return False
-    if group_id in group_generation_inflight:
-        _record_metric_event("proactive_chat", group_id=group_id, stage="generation", action="skipped", reason="group_generation_inflight")
-        return False
-    if group_id in pending_group_approvals:
-        _record_metric_event("proactive_chat", group_id=group_id, stage="generation", action="skipped", reason="pending_approval_exists")
-        return False
-    now = time.time()
-    state = memory.group_state(group_id)
-    group_cfg = app_config.group_config(group_id)
-    if not app_config.group_allowed(group_id) or not bool(group_cfg.get("enabled", True)) or not bool(state["enabled"]):
-        _record_metric_event("proactive_chat", group_id=group_id, stage="check", action="skipped", reason="group_disabled")
-        return False
-    muted_until = await _refresh_self_mute_state_if_stale(bot, group_id, float(state["muted_until"] or 0))
-    if muted_until > now:
-        _record_metric_event("proactive_chat", group_id=group_id, stage="check", action="skipped", reason="self_muted", muted_until=muted_until)
-        return False
-    persona_id = str(state["persona"] or group_cfg.get("persona") or app_config.default_persona)
-    persona = personas.get(persona_id) or personas.get(app_config.default_persona)
-    if persona is None:
-        _record_metric_event("proactive_chat", group_id=group_id, stage="generation", action="skipped", reason="persona_not_found", persona=persona_id)
-        return False
-    group_generation_inflight.add(group_id)
-    try:
-        recent_messages = memory.recent_messages(group_id, PROACTIVE_CHAT_CONTEXT_LIMIT)
-        topic, topic_bucket, cooled_topic_count = await _select_proactive_topic(
-            group_id=group_id,
-            now=now,
-            recent_messages=recent_messages,
-            chat_label="QQ 群聊",
-        )
-        context_query = _proactive_chat_context_query(recent_messages)
-        related_user_ids = _related_member_user_ids(recent_messages, current_user_id=0)
-        memory_context = _format_memory_context(
-            memory.relevant_memory_summaries(group_id, context_query, limit=MID_MEMORY_KEEP_SUMMARIES)
-        )
-        member_context = _format_member_context(
-            memory.member_impressions_for_context(group_id, related_user_ids, limit=MEMBER_IMPRESSION_CONTEXT_LIMIT)
-        )
-        memory_atoms_context = _format_memory_atom_context(
-            memory.relevant_memory_atoms(
-                group_id,
-                context_query,
-                subject_user_ids=related_user_ids,
-                relationship_user_ids=related_user_ids,
-                limit=MEMORY_ATOM_CONTEXT_LIMIT,
-            )
-        )
-        style_context = _format_style_context(
-            memory.relevant_style_rules(group_id, context_query, limit=STYLE_RULE_CONTEXT_LIMIT)
-        )
-        raw_corpus_context = _format_raw_corpus_context(
-            memory.relevant_raw_corpus_examples(
-                group_id,
-                context_query,
-                limit=RAW_CORPUS_CONTEXT_LIMIT,
-                candidate_limit=RAW_CORPUS_CANDIDATE_LIMIT,
-                context_radius=RAW_CORPUS_CONTEXT_RADIUS,
-                exclude_user_id=int(bot.self_id),
-                per_user_limit=1,
-            )
-        )
-        jargon_context = await _selected_group_jargon_context(
-            group_id,
-            recent_messages,
-            current_text=context_query,
-            current_nickname="风雪主动发起",
-        )
-        social_action_context = social_action_service.recent_reaction_context(group_id)
-        context_packet = assemble_generation_context(
-            memory_context=memory_context,
-            member_context=member_context,
-            memory_atoms_context=memory_atoms_context,
-            style_context=style_context,
-            raw_corpus_context=raw_corpus_context,
-            jargon_context=jargon_context,
-            social_action_context=social_action_context,
-        )
-        prompt_text = (
-            "这是风雪按固定间隔随机主动发起聊天。这次抽到的话题方向是："
-            f"{topic}。必须围绕这个方向自然开口；"
-            "如果最近群聊能接上，就把话题方向贴进当前聊天；接不上就轻松开一个新话题。"
-            "不要解释自己为什么突然说话，不要像公告，不要总结全场。"
-        )
-        drafts = await deepseek_client.reply_candidates(
-            persona=persona,
-            recent_messages=recent_messages,
-            current_text=prompt_text,
-            current_nickname="风雪主动发起",
-            mentioned=False,
-            action="reply",
-            chat_label="QQ 群聊",
-            context_packet=context_packet,
-            include_bot_history=True,
-            context_message_limit=PROACTIVE_CHAT_CONTEXT_LIMIT,
-            candidate_count=1,
-            prompt_flow="reply_direct",
-            task_name="proactive_chat",
-        )
-        if not drafts:
-            _record_metric_event("proactive_chat", group_id=group_id, stage="generation", action="skipped", reason="empty_model_reply")
-            return False
-        reply = _sanitize_generated_text(drafts[0].text)
-        if not reply or reply in BLOCKED_BACKEND_FALLBACK_TEXTS:
-            _record_metric_event("proactive_chat", group_id=group_id, stage="generation", action="skipped", reason="empty_after_guard")
-            return False
-        parts = split_reply_messages(reply, max_messages=PROACTIVE_CHAT_MAX_MESSAGES)
-        if not parts:
-            _record_metric_event("proactive_chat", group_id=group_id, stage="generation", action="skipped", reason="empty_after_split")
-            return False
-        sent_ids: list[int] = []
-        for part in parts:
-            public_text, memory_text, gag = await _prepare_group_political_send_texts(part, context=reply)
-            message_id = await _send_group_message(bot, group_id, Message(public_text))
-            if gag:
-                await _notify_owner_political_gag(
-                    original=part,
-                    public=public_text,
-                    hits=gag,
-                    group_id=group_id,
-                    source="proactive_chat",
-                )
-            _record_bot_sent_message(
-                group_id=group_id,
-                message_id=message_id,
-                bot_reply=memory_text,
-                trigger_user_id=0,
-                trigger_nickname="风雪主动发起",
-                trigger_text=f"interval_random probability={probability} roll={roll:.2f} topic={topic}",
-                action="proactive_chat",
-            )
-            memory.add_message(
-                group_id,
-                int(bot.self_id),
-                persona.name,
-                memory_text,
-                is_bot=True,
-                source_message_id=message_id,
-                source_kind="proactive_chat",
-                correlation_id=f"proactive:{group_id}:{int(now)}",
-            )
-            if message_id is not None:
-                sent_ids.append(message_id)
-            await asyncio.sleep(random.uniform(0.8, 1.8))
-        logger.info(
-            "qq_social_agent proactive chat sent: "
-            f"group={group_id} parts={len(parts)} message_ids={sent_ids} probability={probability} roll={roll:.2f} topic={topic!r}"
-        )
-        _record_metric_event(
-            "proactive_chat",
-            group_id=group_id,
-            stage="send",
-            action="sent",
-            probability=probability,
-            roll=round(roll, 2),
-            topic=topic,
-            topic_bucket=topic_bucket,
-            cooled_topic_count=cooled_topic_count,
-            message_count=len(parts),
-            message_ids=sent_ids,
-        )
-        _record_group_proactive_topic(group_id, topic, now=now)
-        return True
-    except ActionFailed as exc:
-        logger.warning(f"qq_social_agent proactive chat send failed: group={group_id} {_action_failed_summary(exc)}")
-        _record_metric_event("proactive_chat", group_id=group_id, stage="send", action="failed", error=_action_failed_summary(exc))
-        return False
-    except Exception as exc:
-        logger.warning(f"qq_social_agent proactive chat failed: group={group_id} error={exc}")
-        _record_metric_event("proactive_chat", group_id=group_id, stage="generation", action="failed", error=_short_notice_text(str(exc), 200))
-        return False
-    finally:
-        group_generation_inflight.discard(group_id)
+    return await proactive_group_message_service.send_for_group(
+        bot,
+        group_id=group_id,
+        probability=probability,
+        roll=roll,
+        services=_proactive_group_message_services(),
+    )
 
 
 def _proactive_chat_context_query(recent_messages: list[ChatMessage]) -> str:
-    lines = [message.text.strip() for message in recent_messages[-8:] if message.text and message.text.strip()]
-    if not lines:
-        return "风雪主动发起轻松群聊话题"
-    return "\n".join(lines)[-800:]
+    return proactive_group_message_service.context_query(recent_messages)
 
 
 def _group_proactive_topic_history_key(group_id: int) -> str:
@@ -2271,43 +2174,50 @@ def _daily_review_within_catch_up_window(now: float | None = None) -> bool:
     return daily_review_scheduler.within_catch_up_window(now)
 
 
+def _daily_review_policy() -> DailyReviewPolicy:
+    return DailyReviewPolicy(
+        timezone=DAILY_REVIEW_TIMEZONE,
+        hour=DAILY_REVIEW_HOUR,
+        minute=DAILY_REVIEW_MINUTE,
+        message_limit=DAILY_REVIEW_MESSAGE_LIMIT,
+        respect_mute=DAILY_REVIEW_RESPECT_MUTE,
+    )
+
+
+def _daily_review_services() -> DailyReviewServices:
+    return DailyReviewServices(
+        memory=memory,
+        app_config=app_config,
+        get_deepseek_client=lambda: deepseek_client,
+        get_persona=lambda persona_id: personas.get(persona_id),
+        refresh_self_mute_state_if_stale=lambda *args, **kwargs: _refresh_self_mute_state_if_stale(
+            *args, **kwargs
+        ),
+        persist_learning=lambda *args, **kwargs: persist_daily_review_learning(*args, **kwargs),
+        sanitize_generated_text=lambda text: _sanitize_generated_text(text),
+        split_reply_messages=lambda *args, **kwargs: split_reply_messages(*args, **kwargs),
+        delivery=DailyReviewDeliveryServices(
+            prepare_political_send_texts=lambda *args, **kwargs: _prepare_group_political_send_texts(
+                *args, **kwargs
+            ),
+            send_group_message=lambda *args, **kwargs: _send_group_message(*args, **kwargs),
+            notify_owner_political_gag=lambda *args, **kwargs: _notify_owner_political_gag(*args, **kwargs),
+            record_bot_sent_message=lambda *args, **kwargs: _record_bot_sent_message(*args, **kwargs),
+            record_metric_event=lambda *args, **kwargs: _record_metric_event(*args, **kwargs),
+            action_failed_summary=lambda exc: _action_failed_summary(exc),
+            short_notice_text=lambda text, limit: _short_notice_text(text, limit),
+            logger=logger,
+        ),
+    )
+
+
 async def _send_due_daily_reviews(bot: Bot, *, now: float | None = None) -> bool:
-    if deepseek_client is None:
-        logger.warning("qq_social_agent daily review skipped: deepseek_client_not_ready")
-        _record_metric_event("daily_review", stage="check", action="skipped", reason="deepseek_client_not_ready")
-        return True
-    target_groups = _daily_review_target_groups()
-    if not target_groups:
-        logger.info("qq_social_agent daily review skipped: no_target_groups")
-        _record_metric_event("daily_review", stage="check", action="skipped", reason="no_target_groups")
-        return False
-    current = time.time() if now is None else now
-    start_at, end_at, review_label = _daily_review_window(current)
-    has_pending = False
-    for group_id in target_groups:
-        if not _daily_review_group_enabled(group_id, now=current):
-            logger.info(f"qq_social_agent daily review skipped: group={group_id} disabled_or_muted")
-            _record_metric_event("daily_review", group_id=group_id, stage="check", action="skipped", reason="disabled_or_muted")
-            continue
-        sent_key = _daily_review_sent_key(group_id, review_label)
-        async with _daily_review_send_lock(group_id, review_label):
-            if memory.app_kv_get(sent_key) == "sent":
-                logger.info(f"qq_social_agent daily review skipped: group={group_id} already_sent date={review_label}")
-                continue
-            success = await _send_daily_review_for_group(
-                bot,
-                group_id=group_id,
-                start_at=start_at,
-                end_at=end_at,
-                review_label=review_label,
-                sent_key=sent_key,
-                mark_sent=True,
-                source="scheduled",
-                trigger_label="定时复盘",
-            )
-        if not success:
-            has_pending = True
-    return has_pending
+    return await daily_review_service.send_due_reviews(
+        bot,
+        now=now,
+        policy=_daily_review_policy(),
+        services=_daily_review_services(),
+    )
 
 
 async def _send_daily_review_for_group(
@@ -2322,161 +2232,19 @@ async def _send_daily_review_for_group(
     source: str,
     trigger_label: str,
 ) -> bool:
-    state = memory.group_state(group_id)
-    muted_until = await _refresh_self_mute_state_if_stale(bot, group_id, float(state["muted_until"] or 0))
-    if muted_until > time.time():
-        logger.info(f"qq_social_agent daily review skipped while self muted: group={group_id} until={muted_until}")
-        _record_metric_event(
-            "daily_review",
-            group_id=group_id,
-            stage="check",
-            action="skipped",
-            review_label=review_label,
-            source=source,
-            reason="self_muted",
-            muted_until=muted_until,
-        )
-        return False
-    persona_id = str(state["persona"] or app_config.group_config(group_id).get("persona") or app_config.default_persona)
-    persona = personas.get(persona_id)
-    messages = memory.messages_between(
-        group_id,
+    return await daily_review_service.send_review_for_group(
+        bot,
+        group_id=group_id,
         start_at=start_at,
         end_at=end_at,
-        limit=DAILY_REVIEW_MESSAGE_LIMIT,
-    )
-    review_draft = None
-    try:
-        review_draft = await deepseek_client.daily_review_draft(
-            persona=persona,
-            messages=messages,
-            chat_label=f"QQ 群 {group_id}",
-            today_label=review_label,
-            feedback_context=_daily_review_feedback_context(
-                group_id,
-                start_at=start_at,
-                end_at=end_at,
-            ),
-        ) if deepseek_client is not None else None
-        review = review_draft.public_reply if review_draft is not None else ""
-    except Exception as exc:
-        logger.warning(f"qq_social_agent daily review generation failed: group={group_id} error={exc}")
-        _record_metric_event(
-            "daily_review",
-            group_id=group_id,
-            stage="generation",
-            action="failed",
-            review_label=review_label,
-            source=source,
-            reason=_short_notice_text(str(exc), 200),
-        )
-        return False
-    if not review:
-        review = "今天群里没怎么留给我发挥，我先记一笔：大家还是挺能聊的。"
-    review = _sanitize_generated_text(review)
-    parts = split_reply_messages(review, max_messages=3)
-    if not parts:
-        _record_metric_event(
-            "daily_review",
-            group_id=group_id,
-            stage="send",
-            action="failed",
-            review_label=review_label,
-            source=source,
-            reason="empty_after_sanitize",
-        )
-        return False
-    for index, part in enumerate(parts):
-        try:
-            public_text, memory_text, gag = await _prepare_group_political_send_texts(part, context=review)
-            message_id = await _send_group_message(bot, group_id, Message(public_text))
-            if gag:
-                await _notify_owner_political_gag(
-                    original=part,
-                    public=public_text,
-                    hits=gag,
-                    group_id=group_id,
-                    source="daily_review",
-                )
-            _record_bot_sent_message(
-                group_id=group_id,
-                message_id=message_id,
-                bot_reply=memory_text,
-                trigger_user_id=0,
-                trigger_nickname="每日复盘",
-                trigger_text=f"{review_label} {trigger_label}",
-                action="daily_review",
-            )
-            memory.add_message(
-                group_id,
-                int(getattr(bot, "self_id", 0) or 0),
-                persona.name,
-                memory_text,
-                is_bot=True,
-                source_message_id=message_id,
-                source_kind="live",
-            )
-        except ActionFailed as exc:
-            logger.warning(
-                "qq_social_agent failed sending daily review: "
-                f"group={group_id} {_action_failed_summary(exc)}"
-            )
-            _record_metric_event(
-                "daily_review",
-                group_id=group_id,
-                stage="send",
-                action="failed",
-                review_label=review_label,
-                source=source,
-                reason=_short_notice_text(_action_failed_summary(exc), 200),
-            )
-            return False
-        if index < len(parts) - 1:
-            await asyncio.sleep(0.9)
-    if mark_sent and sent_key:
-        memory.app_kv_set(sent_key, "sent")
-    if review_draft is not None:
-        try:
-            learned_atom_ids = persist_daily_review_learning(
-                memory,
-                group_id=group_id,
-                review_label=review_label,
-                draft=review_draft,
-                messages=messages,
-            )
-            _record_metric_event(
-                "daily_review_learning",
-                group_id=group_id,
-                stage="memory",
-                action="persisted",
-                atom_count=len(learned_atom_ids),
-                event_count=len(review_draft.events),
-                member_change_count=len(review_draft.member_changes),
-                jargon_count=len(review_draft.jargon_candidates),
-                feedback_lesson_count=len(review_draft.feedback_lessons),
-                style_observation_count=len(review_draft.style_observations),
-            )
-        except Exception as exc:
-            logger.warning(
-                "qq_social_agent daily review learning persist failed: "
-                f"group={group_id} date={review_label} error={exc}"
-            )
-    _record_metric_event(
-        "daily_review",
-        group_id=group_id,
-        stage="send",
-        action="sent",
         review_label=review_label,
-        source=source,
-        message_count=len(messages),
-        part_count=len(parts),
+        sent_key=sent_key,
         mark_sent=mark_sent,
+        source=source,
+        trigger_label=trigger_label,
+        policy=_daily_review_policy(),
+        services=_daily_review_services(),
     )
-    logger.info(
-        "qq_social_agent daily review sent: "
-        f"group={group_id} date={review_label} messages={len(messages)} parts={len(parts)}"
-    )
-    return True
 
 
 def _daily_review_feedback_context(
@@ -2485,122 +2253,50 @@ def _daily_review_feedback_context(
     start_at: float,
     end_at: float,
 ) -> str:
-    lines: list[str] = []
-    for item in memory.recent_recalled_reply_feedback(group_id, 24):
-        if not start_at <= item.reason_at < end_at:
-            continue
-        lines.append(
-            f"- 否决：触发={_short_notice_text(item.trigger_text, 70)}；"
-            f"问题={_short_notice_text(item.owner_reason or item.avoid_rule, 100)}"
-        )
-    for item in memory.recent_approved_reply_feedback(group_id, 24):
-        if not start_at <= item.created_at < end_at:
-            continue
-        lines.append(
-            f"- 优质：action={item.action}；style={_short_notice_text(item.style, 80)}；"
-            f"触发={_short_notice_text(item.trigger_text, 70)}"
-        )
-    return "\n".join(lines[:20]) or "（当天无审批反馈）"
+    return daily_review_service.feedback_context(
+        group_id,
+        start_at=start_at,
+        end_at=end_at,
+        services=_daily_review_services(),
+    )
 
 
 def _daily_review_target_groups() -> tuple[int, ...]:
-    if app_config.allowed_groups:
-        return tuple(sorted(app_config.allowed_groups))
-    group_ids: list[int] = []
-    for raw_group_id in app_config.groups:
-        if str(raw_group_id).isdigit():
-            group_ids.append(int(raw_group_id))
-    return tuple(sorted(set(group_ids)))
+    return daily_review_service.target_groups(_daily_review_services())
 
 
 def _daily_review_group_enabled(group_id: int, *, now: float) -> bool:
-    if not app_config.group_allowed(group_id):
-        return False
-    group_cfg = app_config.group_config(group_id)
-    state = memory.group_state(group_id)
-    if not bool(group_cfg.get("enabled", True)) or not bool(state["enabled"]):
-        return False
-    if DAILY_REVIEW_RESPECT_MUTE:
-        return float(state["muted_until"]) <= now
-    return True
+    return daily_review_service.group_enabled(
+        group_id,
+        now=now,
+        policy=_daily_review_policy(),
+        services=_daily_review_services(),
+    )
 
 
 def _daily_review_sent_key(group_id: int, today_label: str) -> str:
-    return f"daily_review_sent:{group_id}:{today_label}"
+    return daily_review_service.sent_key(group_id, today_label)
 
 
 def _daily_review_send_lock(group_id: int, review_label: str) -> asyncio.Lock:
-    return daily_review_send_locks.setdefault((group_id, review_label), asyncio.Lock())
+    return daily_review_service.send_lock(group_id, review_label)
 
 
 def _daily_review_window(now: float) -> tuple[float, float, str]:
-    end_at = _local_timestamp_for_today(DAILY_REVIEW_HOUR, DAILY_REVIEW_MINUTE, now=now)
-    if now < end_at:
-        end_at -= 24 * 60 * 60
-    start_at = end_at - 24 * 60 * 60
-    local_end = datetime.fromtimestamp(end_at - 1, DAILY_REVIEW_TIMEZONE)
-    label = f"{local_end.year:04d}-{local_end.month:02d}-{local_end.day:02d}"
-    return start_at, end_at, label
+    return daily_review_service.review_window(now, policy=_daily_review_policy())
 
 
 def _daily_review_today_window(now: float) -> tuple[float, float, str]:
-    local_now = datetime.fromtimestamp(now, DAILY_REVIEW_TIMEZONE)
-    start_local = local_now.replace(hour=0, minute=0, second=0, microsecond=0)
-    label = f"{local_now.year:04d}-{local_now.month:02d}-{local_now.day:02d} 今日到现在"
-    return start_local.timestamp(), now, label
+    return daily_review_service.today_window(now, policy=_daily_review_policy())
 
 
 async def _send_manual_daily_reviews(bot: Bot, *, mode: str) -> tuple[int, int]:
-    if deepseek_client is None:
-        logger.warning("qq_social_agent manual daily review skipped: deepseek_client_not_ready")
-        return 0, 0
-    now = time.time()
-    if mode in {"due", "补发", "scheduled", "midnight", "午夜"}:
-        start_at, end_at, review_label = _daily_review_window(now)
-        mark_sent = True
-        source = "manual_due"
-        trigger_label = "补发定时复盘"
-    else:
-        start_at, end_at, review_label = _daily_review_today_window(now)
-        mark_sent = False
-        source = "manual_today"
-        trigger_label = "即时复盘"
-    sent_count = 0
-    total_count = 0
-    for group_id in _daily_review_target_groups():
-        if not _daily_review_group_enabled(group_id, now=now):
-            continue
-        total_count += 1
-        sent_key = _daily_review_sent_key(group_id, review_label) if mark_sent else None
-        if mark_sent:
-            async with _daily_review_send_lock(group_id, review_label):
-                if sent_key and memory.app_kv_get(sent_key) == "sent":
-                    continue
-                if await _send_daily_review_for_group(
-                    bot,
-                    group_id=group_id,
-                    start_at=start_at,
-                    end_at=end_at,
-                    review_label=review_label,
-                    sent_key=sent_key,
-                    mark_sent=mark_sent,
-                    source=source,
-                    trigger_label=trigger_label,
-                ):
-                    sent_count += 1
-        elif await _send_daily_review_for_group(
-            bot,
-            group_id=group_id,
-            start_at=start_at,
-            end_at=end_at,
-            review_label=review_label,
-            sent_key=sent_key,
-            mark_sent=mark_sent,
-            source=source,
-            trigger_label=trigger_label,
-        ):
-            sent_count += 1
-    return sent_count, total_count
+    return await daily_review_service.send_manual_reviews(
+        bot,
+        mode=mode,
+        policy=_daily_review_policy(),
+        services=_daily_review_services(),
+    )
 
 
 def _local_day_start_and_label(now: float) -> tuple[float, str]:
@@ -2611,8 +2307,12 @@ def _local_day_start_and_label(now: float) -> tuple[float, str]:
 
 
 def _local_timestamp_for_today(hour: int, minute: int, *, now: float) -> float:
-    local = datetime.fromtimestamp(now, DAILY_REVIEW_TIMEZONE)
-    return local.replace(hour=hour, minute=minute, second=0, microsecond=0).timestamp()
+    return daily_review_service.local_timestamp_for_today(
+        hour,
+        minute,
+        now=now,
+        policy=_daily_review_policy(),
+    )
 
 
 def _is_owner_user(user_id: int) -> bool:

@@ -2899,6 +2899,218 @@ def test_group_proactive_topic_cooldown_expires(monkeypatch, tmp_path) -> None:
     ) == []
 
 
+def _prepare_proactive_group_send_test(monkeypatch, tmp_path, *, send_group_message):
+    store = _use_temp_plugin_memory(monkeypatch, tmp_path)
+    group_id = 1026813421
+    monkeypatch.setattr(
+        plugin,
+        "app_config",
+        SimpleNamespace(
+            default_persona="test-persona",
+            group_config=lambda _group_id: {"enabled": True},
+            group_allowed=lambda _group_id: True,
+        ),
+    )
+    monkeypatch.setattr(plugin.personas, "get", lambda _persona_id: SimpleNamespace(name="风雪"))
+
+    class FakeClient:
+        async def reply_candidates(self, **kwargs):
+            assert group_id in plugin.group_generation_inflight
+            assert kwargs["task_name"] == "proactive_chat"
+            return [SimpleNamespace(text="生成的主动消息")]
+
+    monkeypatch.setattr(plugin, "deepseek_client", FakeClient())
+    monkeypatch.setattr(plugin, "_refresh_self_mute_state_if_stale", lambda *args: asyncio.sleep(0, result=0.0))
+    proactive_topic = plugin.SOCIAL_TOPIC_KEYWORDS[0]
+    topic_bucket = next(
+        key for key, topics in plugin._social_topic_buckets(plugin.SOCIAL_TOPIC_KEYWORDS).items()
+        if proactive_topic in topics
+    )
+    monkeypatch.setattr(
+        plugin,
+        "_select_proactive_topic",
+        lambda **kwargs: asyncio.sleep(0, result=(proactive_topic, topic_bucket, 0)),
+    )
+    monkeypatch.setattr(plugin, "split_reply_messages", lambda _text, max_messages: ["第一段", "第二段"])
+    async def prepare_send_texts(part: str, **kwargs):
+        events.append(f"prepare:{part}")
+        return f"公开:{part}", f"记忆:{part}", []
+
+    monkeypatch.setattr(plugin, "_prepare_group_political_send_texts", prepare_send_texts)
+    monkeypatch.setattr(plugin, "_send_group_message", send_group_message)
+    monkeypatch.setattr(plugin, "_notify_owner_political_gag", lambda **kwargs: asyncio.sleep(0))
+    events: list[str] = []
+    monkeypatch.setattr(plugin, "_record_bot_sent_message", lambda **kwargs: events.append("trace"))
+    original_add_message = store.add_message
+
+    def record_add_message(*args, **kwargs):
+        events.append("memory")
+        return original_add_message(*args, **kwargs)
+
+    monkeypatch.setattr(store, "add_message", record_add_message)
+    monkeypatch.setattr(plugin.social_action_service, "recent_reaction_context", lambda _group_id: "")
+    monkeypatch.setattr(plugin, "_selected_group_jargon_context", lambda *args, **kwargs: asyncio.sleep(0, result=""))
+    plugin.group_generation_inflight.clear()
+    return store, group_id, events
+
+
+def test_proactive_group_send_records_topic_only_after_all_parts_succeed(monkeypatch, tmp_path) -> None:
+    events: list[str] = []
+
+    async def send_group_message(_bot, _group_id, message):
+        events.append(f"send:{message}")
+        return 2000 + len([event for event in events if event.startswith("send:")])
+
+    store, group_id, events = _prepare_proactive_group_send_test(
+        monkeypatch, tmp_path, send_group_message=send_group_message
+    )
+    original_record_topic = plugin._record_group_proactive_topic
+
+    def record_topic(*args, **kwargs):
+        events.append("topic")
+        return original_record_topic(*args, **kwargs)
+
+    monkeypatch.setattr(plugin, "_record_group_proactive_topic", record_topic)
+    monkeypatch.setattr(plugin, "_record_metric_event", lambda event_type, **kwargs: events.append("sent_metric") if event_type == "proactive_chat" and kwargs.get("stage") == "send" and kwargs.get("action") == "sent" else None)
+
+    success = asyncio.run(
+        plugin._send_proactive_chat_for_group(
+            SimpleNamespace(self_id=1801507496),
+            group_id=group_id,
+            probability=15,
+            roll=4.2,
+        )
+    )
+
+    assert success
+    assert group_id not in plugin.group_generation_inflight
+    assert events == [
+        "prepare:第一段",
+        "send:公开:第一段",
+        "trace",
+        "memory",
+        "prepare:第二段",
+        "send:公开:第二段",
+        "trace",
+        "memory",
+        "sent_metric",
+        "topic",
+    ]
+    assert store.app_kv_get(plugin._group_proactive_topic_history_key(group_id))
+
+
+def test_proactive_group_send_failure_releases_inflight_without_topic_marker(monkeypatch, tmp_path) -> None:
+    from nonebot.adapters.onebot.v11.exception import ActionFailed
+
+    send_count = 0
+    events: list[str] = []
+
+    async def send_group_message(_bot, _group_id, message):
+        nonlocal send_count
+        send_count += 1
+        events.append(f"send:{message}")
+        if send_count == 2:
+            raise ActionFailed(retcode=100, message="send failed")
+        return 2100
+
+    store, group_id, events = _prepare_proactive_group_send_test(
+        monkeypatch, tmp_path, send_group_message=send_group_message
+    )
+    metric_actions: list[str] = []
+    monkeypatch.setattr(
+        plugin,
+        "_record_metric_event",
+        lambda event_type, **kwargs: metric_actions.append(str(kwargs.get("action")))
+        if event_type == "proactive_chat"
+        else None,
+    )
+
+    success = asyncio.run(
+        plugin._send_proactive_chat_for_group(
+            SimpleNamespace(self_id=1801507496),
+            group_id=group_id,
+            probability=15,
+            roll=4.2,
+        )
+    )
+
+    assert not success
+    assert group_id not in plugin.group_generation_inflight
+    assert events == [
+        "prepare:第一段",
+        "send:公开:第一段",
+        "trace",
+        "memory",
+        "prepare:第二段",
+        "send:公开:第二段",
+    ]
+    assert "failed" in metric_actions
+    assert "sent" not in metric_actions
+    assert store.app_kv_get(plugin._group_proactive_topic_history_key(group_id)) is None
+
+
+def test_scheduled_and_manual_due_reviews_share_lock_and_sent_marker(monkeypatch, tmp_path) -> None:
+    store = _use_temp_plugin_memory(monkeypatch, tmp_path)
+    group_id = 1026813421
+    now = 1783872000.0 + 3600
+    monkeypatch.setattr(plugin.time, "time", lambda: now)
+    monkeypatch.setattr(
+        plugin,
+        "app_config",
+        SimpleNamespace(
+            allowed_groups={group_id},
+            groups={},
+            group_config=lambda _group_id: {"enabled": True},
+            group_allowed=lambda _group_id: True,
+            default_persona="test-persona",
+        ),
+    )
+    monkeypatch.setattr(plugin.personas, "get", lambda _persona_id: SimpleNamespace(name="风雪"))
+    monkeypatch.setattr(plugin, "_refresh_self_mute_state_if_stale", lambda *args: asyncio.sleep(0, result=0.0))
+    monkeypatch.setattr(plugin, "split_reply_messages", lambda _text, max_messages: ["复盘"])
+    monkeypatch.setattr(plugin, "_prepare_group_political_send_texts", lambda part, **kwargs: asyncio.sleep(0, result=(part, part, [])))
+    monkeypatch.setattr(plugin, "_send_group_message", lambda *args: asyncio.sleep(0, result=3210))
+    monkeypatch.setattr(plugin, "_record_bot_sent_message", lambda **kwargs: None)
+    monkeypatch.setattr(plugin, "persist_daily_review_learning", lambda *args, **kwargs: [])
+
+    generation_started = asyncio.Event()
+    release_generation = asyncio.Event()
+    generation_calls = 0
+
+    class FakeClient:
+        async def daily_review_draft(self, **kwargs):
+            nonlocal generation_calls
+            generation_calls += 1
+            generation_started.set()
+            await release_generation.wait()
+            return SimpleNamespace(
+                public_reply="今天的复盘",
+                events=[],
+                member_changes=[],
+                jargon_candidates=[],
+                feedback_lessons=[],
+                style_observations=[],
+            )
+
+    monkeypatch.setattr(plugin, "deepseek_client", FakeClient())
+    assert plugin.daily_review_send_locks is plugin.daily_review_service.send_locks
+
+    async def run_both_due_paths():
+        bot = SimpleNamespace(self_id=1801507496)
+        scheduled = asyncio.create_task(plugin._send_due_daily_reviews(bot, now=now))
+        await generation_started.wait()
+        manual = asyncio.create_task(plugin._send_manual_daily_reviews(bot, mode="due"))
+        await asyncio.sleep(0)
+        release_generation.set()
+        return await asyncio.gather(scheduled, manual)
+
+    asyncio.run(run_both_due_paths())
+
+    _, _, review_label = plugin._daily_review_window(now)
+    assert generation_calls == 1
+    assert store.app_kv_get(plugin._daily_review_sent_key(group_id, review_label)) == "sent"
+
+
 def test_recent_http_urls_prefer_current_and_nearby_messages() -> None:
     from qq_social_agent.conversation_tool_routing import _recent_http_urls
 
