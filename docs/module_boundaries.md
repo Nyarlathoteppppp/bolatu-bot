@@ -6,7 +6,7 @@
 
 ## 1. 当前结论
 
-项目已经具备真实分层：消息结构化、决策、工具、上下文、记忆、RAG、审批、发送、观测、后台学习和本地插件都有独立模块。问题集中在 `plugin.py`：它仍同时承担 NoneBot 入口、运行时单例、群/私聊编排、审批命令、定时任务、Web 管理路由和发送协调。群友画像与自我记忆上下文已移到 `member_context.py`；发言人、回复关系和指代提示已移到 `speaker_context.py`；群聊/私聊共用的工具路由已移到 `conversation_tool_routing.py`。主流程仍待分段。
+项目已经具备真实分层：消息结构化、决策、工具、上下文、记忆、RAG、审批、发送、观测、后台学习和本地插件都有独立模块。`plugin.py` 仍承担 NoneBot 入口、运行时单例、群/私聊编排、审批命令、定时任务和 Web 管理路由。群聊主循环已按话语解析、决策、上下文、工具执行、候选生成和审批交接分段；事件和会话状态仍由主文件协调。
 
 策略：**保留 `plugin.py` 作为适配器和组合根，不再向其中放业务规则；新增能力优先落到所属模块，再由主文件显式注册。** 不在缺少回归测试时做一次性大拆分。
 
@@ -17,10 +17,11 @@ NapCat / OneBot Event
   -> plugin.py：事件适配、ChatMessage 持久化、按会话串行化
   -> message_segments + history_sync + reference_resolver
   -> decision_gate + rate_limiter + buffer
-  -> decision LLM / timing_gate
-  -> tool_router + ToolRegistry
-  -> context_assembler + memory + RAG
-  -> deepseek_client：文本生成
+  -> group_discourse_flow：一次解析关系和记忆影响
+  -> group_decision_flow + conversation_tool_routing：发言决策与工具计划
+  -> group_generation_context：memory/RAG/context packet
+  -> group_tool_execution + group_reply_generation：工具证据、候选生成与复核
+  -> group_approval_dispatch：审批单和 PipelineState 交接
   -> approval_rules / approval models
   -> delivery + social_actions + onebot_gateway
   -> observability + background_learning + COS/归档
@@ -41,9 +42,10 @@ entrypoint/plugin -> orchestration -> domain/storage/tools -> provider adapters
 | QQ 接入 | `plugin.py`、`onebot_gateway.py`、`history_sync.py` | OneBot 事件、API、历史同步 | 人格回复判断 |
 | MessageChain | `message_segments.py`、`reference_resolver.py`、`media_context.py` | 原始 segment、引用/艾特/媒体事实 | 凭文本猜人物关系 |
 | 前置筛选 | `decision_gate.py`、`rate_limiter.py` | 去重、低价值、频控、buffer | 社交氛围或搜索词 |
-| 社交决策 | `timing_gate.py`、`pipeline_types.py`、`pipeline_stages.py` | channel、action、状态转移 | 最终回复正文 |
-| 工具 | `tool_router.py`、`conversation_tool_routing.py`、`tool_registry.py`、`tools/` | 路由、参数、缓存、限流、结构化结果 | 客服式 fallback 文案 |
-| 上下文 | `context_assembler.py`、`member_context.py`、`speaker_context.py`、`temporal_evidence.py`、`group_jargon.py` | 来源、群友画像、发言/回复关系提示、时效、预算和输入拼装 | 数据库 schema |
+| 社交决策 | `decision_gate.py`、`group_decision_flow.py`、`pipeline_types.py`、`pipeline_stages.py` | channel、action、状态转移 | 最终回复正文 |
+| 工具 | `tool_router.py`、`conversation_tool_routing.py`、`group_tool_execution.py`、`tool_registry.py`、`tools/` | 路由、执行、缓存、限流、结构化结果 | 客服式 fallback 文案 |
+| 上下文 | `group_discourse_flow.py`、`group_generation_context.py`、`context_assembler.py`、`member_context.py`、`speaker_context.py` | 指代与记忆影响、画像、RAG、预算和输入拼装 | 数据库 schema |
+| 候选与审批交接 | `group_reply_generation.py`、`group_approval_dispatch.py` | 草稿生成、复核、审批状态转移 | QQ 实际发送 |
 | LLM | `deepseek_client.py`、`embedding_client.py`、`prompts.py` | provider、JSON、模型路由、用量 | QQ 发送与审批状态 |
 | 记忆/RAG | `memory.py`、`memory_learning.py`、`rag_*.py` | 原文、画像、atoms、风格、索引 | QQ 生命周期 |
 | 发送 | `delivery.py`、`reply_splitter.py`、`social_actions.py` | 拆分、艾特、表情、节流 | 写长期事实 |
@@ -71,7 +73,7 @@ entrypoint/plugin -> orchestration -> domain/storage/tools -> provider adapters
 - MessageChain、引用/艾特解析和媒体上下文已从纯文本中分离。
 - 后台学习与 RAG 索引不阻塞聊天热路径。
 - WebUI 渲染已在 `admin_ui.py` 中独立。
-- 34 个测试文件覆盖大多数领域模块。
+- 54 个测试文件覆盖大多数领域模块。
 
 主要技术债：
 
@@ -81,11 +83,11 @@ entrypoint/plugin -> orchestration -> domain/storage/tools -> provider adapters
 
 ## 6. 下一步拆分顺序
 
-群聊关系上下文和共用工具路由已优先迁移到 `speaker_context.py` 与 `conversation_tool_routing.py`，因为策略提示和工具调用规则预计最常调整。`plugin.py` 只向工具路由注入当前 LLM、日志和指标回调。后续每次只迁移一块，保持 Trace 事件名与数据库写入不变。
+群聊高频改动路径已按阶段拆出。`plugin.py` 装配当前 LLM、存储、日志和指标回调，并保留事件生命周期与阶段间早退。后续继续按功能边界迁移，保持 Trace 事件名与数据库写入不变。
 
 1. **审批服务**：抽成 `approval_service.py`，负责待审批单、并发抢占、权限、反馈和候选发送。
 2. **定时任务**：抽 `daily_review_service.py` 与 `proactive_chat_service.py`，连接回调只保留启动/停止 task。
-3. **会话编排**：抽 `conversation_orchestrator.py`，承接 buffer、processing lock、followup window、群/私聊 pipeline。
+3. **会话编排**：逐步整理 buffer、processing lock 和 followup window；群聊阶段函数已独立，私聊主流程尚未拆分。
 4. **管理 controller**：抽 `admin_controller.py`，让 `admin_ui.py` 只做 HTML 渲染。
 5. **发送协调**：抽 `message_delivery_service.py`，集中正文、表情、审批回写和 followup 记录。
 

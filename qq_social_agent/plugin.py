@@ -86,6 +86,12 @@ from .conversation_tool_routing import (
     _recent_http_urls,
     _tool_plan_with_runtime_context,
 )
+from .group_approval_dispatch import queue_group_reply_approval
+from .group_decision_flow import GroupDecisionServices, resolve_group_reply_decision
+from .group_discourse_flow import resolve_group_discourse_context
+from .group_generation_context import GroupContextLimits, build_group_generation_context
+from .group_reply_generation import generate_group_reply
+from .group_tool_execution import execute_group_tools
 from .group_jargon import (
     GroupJargonEntry,
     detect_group_jargon_terms,
@@ -172,7 +178,6 @@ from .plugin_runtime import LocalPluginRegistry
 from .prompts import PromptRegistry
 from .pipeline_types import (
     OutputChannel,
-    PipelineMode,
     PipelineState,
     ToolKind,
     ToolRequest,
@@ -181,11 +186,8 @@ from .pipeline_types import (
 from .pipeline_stages import (
     apply_candidates as _pipeline_apply_candidates,
     apply_context as _pipeline_apply_context,
-    apply_decision as _pipeline_apply_decision,
-    mark_approval_pending as _pipeline_mark_approval_pending,
     mark_completed as _pipeline_mark_completed,
     mark_failed as _pipeline_mark_failed,
-    mark_gated as _pipeline_mark_gated,
     mark_sending as _pipeline_mark_sending,
     mark_sent as _pipeline_mark_sent,
     mark_understood as _pipeline_mark_understood,
@@ -197,35 +199,17 @@ from .rag_query import normalize_rag_query
 from .rag_retriever import RAGRetrievalResult, RAGService
 from .discourse_effects import (
     AmbiguityResolution,
-    MemoryCandidate,
     MemoryEffectResolution,
     RepairResolution,
-    apply_jev_memory_judgement,
     apply_memory_effect,
-    related_memories_for_candidate,
     memory_can_commit,
-    should_ask_jev_memory_effect,
 )
-from .discourse_state import (
-    discourse_decision_trace,
-    draft_violates_media_gate,
-    resolve_group_discourse,
-    segments_have_real_media,
-)
+from .discourse_state import segments_have_real_media
 from .jev_policy import GroupReplyBudget
-from .resolver_result import AMBIGUOUS, ERROR, NOT_APPLICABLE, RESOLVED, UNAVAILABLE
 from .pre_send_critic import (
     CriticResult,
-    apply_jev_critic_judgement,
-    critic_prefers_clarify,
-    format_critic_feedback,
     critic_needs_clarify,
     next_critic_action,
-)
-from .pronoun_guard import (
-    draft_has_person_pronoun,
-    apply_jev_pronoun_judgement,
-    format_pronoun_feedback,
 )
 from .reference_resolver import (
     ReferenceResolution,
@@ -5995,15 +5979,6 @@ async def _handle_group_message_locked(
         )
         return
 
-    decision: ReplyDecision | None = None
-    memory_context = ""
-    recall_feedback_context = ""
-    positive_feedback_context = ""
-    member_context = ""
-    memory_atoms_context = ""
-    style_context = ""
-    raw_corpus_context = ""
-    jargon_context = ""
     context_query = _context_query_text(
         normalized_rag_query.current_utterance,
         nickname,
@@ -6019,175 +5994,43 @@ async def _handle_group_message_locked(
         getattr(reply_event, "message", None) if reply_event is not None else None,
         text=reply_hint.text,
     )
-    discourse_state = await resolve_group_discourse(
-        current_text=normalized_rag_query.current_utterance,
-        current_user_id=user_id,
-        current_nickname=nickname,
+    discourse_context = await resolve_group_discourse_context(
+        group_id=group_id,
+        user_id=user_id,
+        nickname=nickname,
+        text=text,
+        normalized_text=normalized_rag_query.current_utterance,
         self_id=int(event.self_id),
         recent_messages=context_recent,
-        reply=reply_hint,
+        reply_hint=reply_hint,
         at_user_ids=at_user_ids,
-        named_resolver=named_resolver,
-        jev=deepseek_client,
         current_has_media=current_has_media,
         reply_has_media=reply_has_media,
-        relation_user_ids=related_member_user_ids,
-    )
-    reference_resolution = discourse_state.reference
-    ellipsis_resolution = discourse_state.ellipsis
-    repair_resolution = discourse_state.repair
-    ambiguity_resolution = discourse_state.ambiguity_resolution
-    invalidated_layers = list(discourse_state.invalidated_layers)
-    recomputed_layers = list(discourse_state.recomputed_layers)
-    memory_effect_resolution = MemoryEffectResolution()
-    critic_result = CriticResult()
-    regenerated = False
-    if invalidated_layers:
-        logger.info(
-            "qq_social_agent repair invalidation: "
-            f"group={group_id} kind={repair_resolution.kind} "
-            f"target={repair_resolution.target_key} layers={','.join(invalidated_layers)} "
-            f"recomputed={','.join(recomputed_layers)}"
-        )
-    memory_candidate = None
-    related_memories: list = []
-    subject_id = None
-    if "referent" in invalidated_layers and "referent" not in recomputed_layers:
-        recomputed_layers.append("referent")
-    blocked_memory_statuses = {AMBIGUOUS, UNAVAILABLE, ERROR}
-    if (
-        reference_resolution.status not in blocked_memory_statuses
-        and repair_resolution.status not in blocked_memory_statuses
-    ):
-        if (
-            reference_resolution.status == RESOLVED
-            and reference_resolution.kind == "PERSON"
-            and reference_resolution.user_ids
-        ):
-            subject_id = reference_resolution.user_ids[0]
-        elif reference_resolution.kind in {"", "NONE", "NON_PERSON"} or reference_resolution.status == NOT_APPLICABLE:
-            subject_id = user_id
-    fact_like = repair_resolution.kind in {"FACT", "RETRACTION"} and repair_resolution.status == RESOLVED
-    if subject_id is not None and (
-        fact_like
-        or should_ask_jev_memory_effect(
-            normalized_rag_query.current_utterance,
-            repair=repair_resolution,
-            candidate=MemoryCandidate(subject_user_id=subject_id, content=normalized_rag_query.current_utterance),
-        )
-    ):
-        memory_candidate = MemoryCandidate(
-            subject_user_id=subject_id,
-            content=normalized_rag_query.current_utterance.strip()[:180],
-            source_message_id=source_message_id,
-            speaker=nickname,
-        )
-    if should_ask_jev_memory_effect(
-        normalized_rag_query.current_utterance,
-        repair=repair_resolution,
-        candidate=memory_candidate,
-    ) and memory_candidate is not None:
-        related_memories = related_memories_for_candidate(
-            memory,
-            group_id=group_id,
-            candidate=memory_candidate,
-            speaker_user_id=user_id,
-        )
-        judged_memory = None
-        if deepseek_client is not None:
-            judged_memory = await deepseek_client.resolve_memory_effect(
-                current_text=normalized_rag_query.current_utterance,
-                candidate=memory_candidate,
-                related=related_memories,
-            )
-        memory_effect_resolution = apply_jev_memory_judgement(
-            judged_memory,
-            related_memories,
-            candidate=memory_candidate,
-        )
-        if "memory" in invalidated_layers and "memory" not in recomputed_layers:
-            recomputed_layers.append("memory")
-    pipeline_state.reference_user_ids = reference_resolution.user_ids
-    pipeline_state.reference_reason = reference_resolution.reason
-    relation_facts = _message_relation_facts(
-        current_user_id=user_id,
-        current_nickname=nickname,
-        current_text=text,
-        reference_resolution=reference_resolution,
-        mentioned=mentioned,
-        replied_to_bot=replied_to_bot,
-        addressed_bot=addressed_bot,
-        followup_addressed=followup_addressed,
-        self_id=int(event.self_id),
-    )
-    speaker_context = _format_speaker_reference_context(
-        current_user_id=user_id,
-        current_nickname=nickname,
-        current_text=text,
-        recent_messages=context_recent,
-        reference_resolution=reference_resolution,
         mentioned=mentioned,
         replied_to_bot=replied_to_bot,
         addressed_bot=addressed_bot,
         followup_addressed=followup_addressed,
         followup_soft=followup_soft,
-        self_id=int(event.self_id),
-        relation_facts=relation_facts,
-        ellipsis_resolution=ellipsis_resolution,
-        repair_resolution=repair_resolution,
-        ambiguity_resolution=ambiguity_resolution,
-        discourse_state=discourse_state,
+        source_message_id=source_message_id,
+        client=deepseek_client,
+        memory=memory,
+        rag_service=rag_service,
+        record_metric_event=_record_metric_event,
+        logger=logger,
     )
-    _record_metric_event(
-        "discourse_decision_trace",
-        group_id=group_id,
-        user_id=user_id,
-        stage="discourse",
-        action=discourse_state.state_audit,
-        **discourse_decision_trace(discourse_state),
-    )
-    _record_metric_event(
-        "message_relation",
-        group_id=group_id,
-        user_id=user_id,
-        stage="relation",
-        action=relation_facts.target_scope,
-        target_note=relation_facts.target_note,
-        reply_target=relation_facts.reply_target_label,
-        reply_target_is_bot=relation_facts.reply_target_is_bot,
-        ambiguous_reference=relation_facts.ambiguous_reference,
-        reference_user_ids=list(relation_facts.reference_user_ids),
-        reference_reason=relation_facts.reference_reason,
-        reference_confidence=relation_facts.reference_confidence,
-        reference_status=reference_resolution.status,
-        reference_source=reference_resolution.source,
-        reference_value=reference_resolution.value,
-        ellipsis_kind=ellipsis_resolution.kind,
-        ellipsis_status=ellipsis_resolution.status,
-        ellipsis_source=ellipsis_resolution.source,
-        ellipsis_value=ellipsis_resolution.value,
-        ellipsis_unresolved=ellipsis_resolution.unresolved,
-        ellipsis_reason=ellipsis_resolution.reason,
-        repair_kind=repair_resolution.kind,
-        repair_status=repair_resolution.status,
-        repair_source=repair_resolution.source,
-        repair_value=repair_resolution.value,
-        repair_target=repair_resolution.target_key,
-        repair_unresolved=repair_resolution.unresolved,
-        repair_reason=repair_resolution.reason,
-        repair_invalidates=list(repair_resolution.invalidates),
-        invalidated_states=list(invalidated_layers),
-        recomputed_states=list(recomputed_layers),
-        ambiguity_kind=ambiguity_resolution.kind,
-        ambiguity_status=ambiguity_resolution.status,
-        ambiguity_source=ambiguity_resolution.source,
-        ambiguity_unresolved=ambiguity_resolution.unresolved,
-        memory_action=memory_effect_resolution.action,
-        memory_status=memory_effect_resolution.status,
-        memory_source=memory_effect_resolution.source,
-        memory_unresolved=memory_effect_resolution.unresolved,
-        memory_applied=memory_effect_resolution.applied,
-    )
+    discourse_state = discourse_context.state
+    speaker_context = discourse_context.speaker_context
+    memory_effect_resolution = discourse_context.memory_effect
+    memory_candidate = discourse_context.memory_candidate
+    invalidated_layers = discourse_context.invalidated_layers
+    recomputed_layers = discourse_context.recomputed_layers
+    reference_resolution = discourse_state.reference
+    ellipsis_resolution = discourse_state.ellipsis
+    repair_resolution = discourse_state.repair
+    ambiguity_resolution = discourse_state.ambiguity_resolution
+    pipeline_state.reference_user_ids = reference_resolution.user_ids
+    pipeline_state.reference_reason = reference_resolution.reason
+    critic_result = CriticResult()
     if fresh_intent is None:
         followup_fresh_intent = _infer_followup_fresh_intent(
             text,
@@ -6217,12 +6060,6 @@ async def _handle_group_message_locked(
                 "qq_social_agent inferred follow-up search: "
                 f"group={group_id} query={fresh_intent.query!r} kind={fresh_intent.kind}"
             )
-    # Retrieval is only useful after we know this message will generate a reply.
-    # Prefetching during decision/ignore burns CPU on the majority silent path.
-    rag_task: asyncio.Task[RAGRetrievalResult] | None = None
-    rag_result: RAGRetrievalResult | None = None
-    rag_context_applied = False
-    fresh_context_task: asyncio.Task[ToolResult] | None = None
     market_context_task: asyncio.Task[ToolResult] | None = None
     # External fresh-context lookup is intentionally delayed until after the
     # reply decision is confirmed. The pre-decision path may use LLM routing
@@ -6246,10 +6083,6 @@ async def _handle_group_message_locked(
         fresh_intent=fresh_intent,
     )
     if pre_decision.skip_reason:
-        if rag_task is not None and not rag_task.done():
-            rag_task.cancel()
-        if fresh_context_task is not None and not fresh_context_task.done():
-            fresh_context_task.cancel()
         if market_context_task is not None and not market_context_task.done():
             market_context_task.cancel()
         logger.info(
@@ -6267,257 +6100,51 @@ async def _handle_group_message_locked(
         )
         _schedule_group_learning(group_id)
         return
-    decision = pre_decision.decision
-    _pipeline_mark_gated(pipeline_state)
-    _record_tool_router_shadow(
-        group_id=group_id,
-        user_id=user_id,
-        decision=decision or ReplyDecision(False, 0.0, "legacy_pending", action="ignore"),
-        tool_plan=tool_plan,
-    )
-    _record_metric_event(
-        "tool_route_plan",
-        group_id=group_id,
-        user_id=user_id,
-        stage="routing",
-        action="deterministic",
-        pipeline_mode=pipeline_state.mode.value,
-        requests=[
-            {
-                "kind": request.kind.value,
-                "required": request.required,
-                "reason": request.reason,
-                "query": _short_notice_text(request.query, 80),
-            }
-            for request in pipeline_state.tool_requests
-        ],
-    )
-    if decision is None and any(request.required for request in tool_plan.requests):
-        decision = _apply_tool_plan(
-            ReplyDecision(
-                should_reply=True,
-                confidence=1.0,
-                reason="deterministic_required_tool",
-                mode="tool",
-                action="answer",
-            ),
-            tool_plan,
-        )
-
-    if decision is None and (direct_addressed_bot or mentioned or replied_to_bot):
-        decision = ReplyDecision(
-            should_reply=True,
-            confidence=1.0,
-            reason="addressed_skip_timing_gate",
-            mode="addressed",
-            action="answer" if _looks_like_addressed_question(text) else "reply",
-        )
-        logger.info(
-            "qq_social_agent skipped timing_gate for addressed message: "
-            f"group={group_id} user={user_id}"
-        )
-    if decision is None:
-        try:
-            timing = await deepseek_client.timing_gate(
-                persona=persona,
-                recent_messages=context_recent,
-                current_text=text,
-                current_nickname=_member_label(user_id, nickname),
-                chat_label="QQ 群聊",
-                speaker_context=speaker_context,
-            )
-            decision = timing.to_reply_decision()
-        except Exception as exc:
-            decision = _decision_failure_fallback(
-                addressed_bot=addressed_bot,
-                reason="timing_gate_error",
-            )
-            logger.warning(
-                "qq_social_agent timing gate failed: "
-                f"group={group_id} addressed={addressed_bot} error={exc}"
-            )
-            if decision is None:
-                await _send_approval_suppression_notice(
-                    bot,
-                    group_id=group_id,
-                    user_id=user_id,
-                    nickname=nickname,
-                    text=text,
-                    stage="llm_decision_error",
-                    reason=f"Timing Gate 调用失败，且非点名没有兜底回复：{exc}",
-                )
-                _schedule_group_learning(group_id)
-                return
-    else:
-        logger.info(
-            "qq_social_agent local pre-decision: "
-            f"group={group_id} should_reply={decision.should_reply} "
-            f"action={decision.action} mode={decision.mode} reason={decision.reason}"
-        )
-    if decision.reason == "invalid_json":
-        fallback_decision = _decision_failure_fallback(
-            addressed_bot=addressed_bot,
-            reason="decision_invalid_json",
-        )
-        if fallback_decision is None:
-            logger.warning(
-                "qq_social_agent decision invalid json ignored: "
-                f"group={group_id} addressed={addressed_bot}"
-            )
-            await _send_approval_suppression_notice(
-                bot,
-                group_id=group_id,
-                user_id=user_id,
-                nickname=nickname,
-                text=text,
-                stage="llm_invalid_json",
-                reason="decision LLM 返回 invalid_json，且非点名没有兜底回复。",
-            )
-            _schedule_group_learning(group_id)
-            return
-        logger.warning(
-            "qq_social_agent decision invalid json fallback: "
-            f"group={group_id} addressed={addressed_bot}"
-        )
-        decision = fallback_decision
-    decision = _apply_backend_tool_decision(
-        decision,
-        text=text,
-        market_intents=market_intents,
-        fresh_intent=fresh_intent,
-    )
-    decision = _apply_tool_plan(decision, tool_plan)
-    decision, tool_plan = await _apply_tool_use_router(
-        decision,
+    resolved_decision = await resolve_group_reply_decision(
+        bot=bot,
+        client=deepseek_client,
+        pre_decision=pre_decision,
+        pipeline_state=pipeline_state,
+        reply_budget=reply_budget,
         tool_plan=tool_plan,
         persona=persona,
         context_recent=context_recent,
         text=text,
         nickname=nickname,
-        addressed_bot=addressed_bot,
-        fresh_intent=fresh_intent,
-        market_intents=market_intents,
         speaker_context=speaker_context,
+        discourse_state=discourse_state,
         group_id=group_id,
         user_id=user_id,
         source_message_id=source_message_id,
-    )
-    pipeline_state.mode = _tool_route_mode(tool_plan)
-    pipeline_state.tool_requests = tool_plan.requests
-    _record_metric_event(
-        "tool_route_plan",
-        group_id=group_id,
-        user_id=user_id,
-        stage="routing",
-        action="final",
-        pipeline_mode=pipeline_state.mode.value,
-        requests=[
-            {
-                "kind": request.kind.value,
-                "required": request.required,
-                "reason": request.reason,
-                "query": _short_notice_text(request.query, 80),
-            }
-            for request in pipeline_state.tool_requests
-        ],
-    )
-    decision = _enforce_addressed_reply_decision(
-        decision,
-        addressed_bot=direct_addressed_bot
-        or synthetic_addressed_bot
-        or (followup_addressed and _looks_like_addressed_question(text)),
-        text=text,
-    )
-    if reply_budget.skip("speaking_action", time.monotonic()):
-        _record_metric_event(
-            "reply_budget",
-            group_id=group_id,
-            user_id=user_id,
-            stage="decision",
-            action="skip_speaking_action",
-            remaining_ms=int(reply_budget.remaining(time.monotonic()) * 1000),
-        )
-    else:
-        decision = await _maybe_apply_speaking_action(
-            decision,
-            text=text,
-            current_label=_member_label(user_id, nickname),
-            addressed_bot=addressed_bot,
-            speaker_context=speaker_context,
-            recent_messages=context_recent,
-            group_id=group_id,
-            user_id=user_id,
-            looks_like_question=_looks_like_addressed_question(text),
-            unresolved_reference=reference_resolution.unresolved,
-            unresolved_ellipsis=ellipsis_resolution.unresolved,
-            unresolved_repair=repair_resolution.unresolved,
-            unresolved_ambiguity=ambiguity_resolution.unresolved,
-            ambiguity_kind=ambiguity_resolution.kind,
-        )
-    if reply_budget.skip("ask_back", time.monotonic()):
-        _record_metric_event(
-            "reply_budget",
-            group_id=group_id,
-            user_id=user_id,
-            stage="decision",
-            action="skip_ask_back",
-            remaining_ms=int(reply_budget.remaining(time.monotonic()) * 1000),
-        )
-    else:
-        decision = await _maybe_apply_ask_back(
-            decision,
-            text=text,
-            addressed_bot=addressed_bot,
-            group_id=group_id,
-            user_id=user_id,
-        )
-    _pipeline_apply_decision(
-        pipeline_state,
-        should_reply=decision.should_reply,
-        action=decision.action,
-        reason=decision.reason,
-        confidence=decision.confidence,
-        side_reaction=decision.side_reaction,
-        elapsed_ms=int((time.monotonic() - decision_started_at) * 1000),
-    )
-    if addressed_bot and "非点名" in decision.reason:
-        logger.warning(
-            "qq_social_agent decision state mismatch: "
-            f"group={group_id} addressed=True reason={decision.reason}"
-        )
-    logger.info(
-        "qq_social_agent llm decision: "
-        f"group={group_id} should_reply={decision.should_reply} "
-        f"confidence={decision.confidence:.2f} action={decision.action} mode={decision.mode} "
-        f"side_reaction={decision.side_reaction} "
-        f"need_fresh={decision.need_fresh_context} fresh_query={decision.fresh_query!r} "
-        f"reason={decision.reason}"
-    )
-    _record_metric_event(
-        "decision_result",
-        group_id=group_id,
-        user_id=user_id,
-        stage="llm" if pre_decision.decision is None else "backend",
-        action=decision.action,
-        should_reply=decision.should_reply,
-        fresh_query=_short_notice_text(decision.fresh_query, 120),
-        fresh_kind=decision.fresh_kind,
-        confidence=round(decision.confidence, 3),
-        decision_reason=decision.reason,
-        side_reaction=decision.side_reaction,
-        need_fresh=decision.need_fresh_context,
-        direct_addressed=direct_addressed_bot,
-        synthetic_addressed=synthetic_addressed_bot,
+        addressed_bot=addressed_bot,
+        direct_addressed_bot=direct_addressed_bot,
+        synthetic_addressed_bot=synthetic_addressed_bot,
         followup_addressed=followup_addressed,
-        elapsed_ms=int((time.monotonic() - decision_started_at) * 1000),
-        flow_elapsed_ms=int((time.monotonic() - flow_started_at) * 1000),
+        mentioned=mentioned,
+        replied_to_bot=replied_to_bot,
+        market_intents=market_intents,
+        fresh_intent=fresh_intent,
+        decision_started_at=decision_started_at,
+        flow_started_at=flow_started_at,
+        services=GroupDecisionServices(
+            record_metric_event=_record_metric_event,
+            record_tool_router_shadow=_record_tool_router_shadow,
+            send_suppression_notice=_send_approval_suppression_notice,
+            schedule_group_learning=_schedule_group_learning,
+            decision_failure_fallback=_decision_failure_fallback,
+            looks_like_addressed_question=_looks_like_addressed_question,
+            apply_tool_use_router=_apply_tool_use_router,
+            enforce_addressed_reply_decision=_enforce_addressed_reply_decision,
+            maybe_apply_speaking_action=_maybe_apply_speaking_action,
+            maybe_apply_ask_back=_maybe_apply_ask_back,
+            logger=logger,
+        ),
     )
-    _schedule_group_learning(group_id)
+    if resolved_decision is None:
+        return
+    decision = resolved_decision.decision
+    tool_plan = resolved_decision.tool_plan
     if pipeline_state.output_channel is OutputChannel.SILENT:
-        if rag_task is not None and not rag_task.done():
-            rag_task.cancel()
-        if fresh_context_task is not None and not fresh_context_task.done():
-            fresh_context_task.cancel()
         if market_context_task is not None and not market_context_task.done():
             market_context_task.cancel()
         await _send_approval_suppression_notice(
@@ -6548,8 +6175,6 @@ async def _handle_group_message_locked(
         return
 
     if pipeline_state.output_channel is OutputChannel.REACT:
-        if rag_task is not None and not rag_task.done():
-            rag_task.cancel()
         await _execute_reaction_action(
             bot,
             event,
@@ -6577,8 +6202,6 @@ async def _handle_group_message_locked(
         return
 
     if pipeline_state.output_channel is OutputChannel.POKE:
-        if rag_task is not None and not rag_task.done():
-            rag_task.cancel()
         await _execute_poke_action(
             bot,
             group_id=group_id,
@@ -6601,356 +6224,86 @@ async def _handle_group_message_locked(
         _pipeline_mark_completed(pipeline_state)
         return
 
-    if not memory_context:
-        memory_context = _format_memory_context(
-            memory.relevant_memory_summaries(
-                group_id,
-                f"{nickname}\n{text}" if _is_self_memory_query(text) else context_query,
-                limit=MID_MEMORY_KEEP_SUMMARIES,
-            )
-        )
-    if not rag_context_applied and _is_self_memory_query(text):
-        rag_context_applied = True
-        _record_metric_event(
-            "rag_retrieval",
-            group_id=group_id,
-            user_id=user_id,
-            stage="generation_context",
-            action="skip_self_memory_rag",
-        )
-    if not rag_context_applied and reply_budget.skip("optional_rag", time.monotonic()):
-        rag_context_applied = True
-        _record_metric_event(
-            "reply_budget",
-            group_id=group_id,
-            user_id=user_id,
-            stage="generation_context",
-            action="skip_optional_rag",
-            remaining_ms=int(reply_budget.remaining(time.monotonic()) * 1000),
-        )
-    if not rag_context_applied:
-        rag_task = asyncio.create_task(
-            rag_service.retrieve(
-                group_id=group_id,
-                query=reference_resolution.expanded_query or text,
-                addressed=addressed_bot,
-                related_user_ids=list(reference_resolution.user_ids),
-                excluded_user_ids=[int(event.self_id)],
-            )
-        )
-        rag_result = await rag_task
-        rag_context_applied = True
-        summary_context = memory_context
-        memory_context = merge_rag_and_summary_context(
-            rag_result.context,
-            summary_context,
-            summary_char_limit=MID_MEMORY_SUMMARY_APPENDIX_CHARS,
-        )
-        _record_metric_event(
-            "rag_retrieval",
-            group_id=group_id,
-            user_id=user_id,
-            stage="generation_context",
-            action="merged" if rag_result.context and summary_context else (
-                "injected" if rag_result.context else "empty"
-            ),
-            route=rag_result.plan.route,
-            lexical_count=rag_result.lexical_count,
-            semantic_count=rag_result.semantic_count,
-            injected_count=len(rag_result.hits),
-            elapsed_ms=rag_result.elapsed_ms,
-            error=rag_result.error,
-            resolved_user_ids=[item.user_id for item in rag_result.resolved_members],
-            resolved_names=[item.matched_name for item in rag_result.resolved_members],
-            reference_reason=reference_resolution.reason,
-            reference_confidence=reference_resolution.confidence,
-            normalized_query=rag_result.normalized_query,
-            focused_topic=rag_result.focused_topic,
-            reply_envelope_removed=rag_result.reply_envelope_removed,
-            hit_document_ids=[hit.document.id for hit in rag_result.hits],
-            hit_doc_types=[hit.document.doc_type for hit in rag_result.hits],
-            hit_scores=[round(hit.score, 4) for hit in rag_result.hits],
-            hit_reasons=[list(hit.reasons) for hit in rag_result.hits],
-            hit_sources=[f"{hit.document.source_name}:{hit.document.source_row_id}" for hit in rag_result.hits],
-        )
-    memory_focus_ids = _member_memory_user_ids(
-        context_recent,
-        current_user_id=user_id,
-        current_text=text,
-    )
-    self_memory_query = _is_self_memory_query(text)
-    memory_focus_query = f"{nickname}\n{text}" if self_memory_query else context_query
-    if not member_context:
-        member_context = _format_member_context(
-            memory.member_impressions_for_context(
-                group_id,
-                memory_focus_ids,
-                limit=MEMBER_IMPRESSION_CONTEXT_LIMIT,
-            ),
-            current_user_id=user_id,
-        )
-    if not memory_atoms_context:
-        memory_atoms_context = _format_memory_atom_context(
-            memory.relevant_memory_atoms(
-                group_id,
-                memory_focus_query,
-                subject_user_ids=memory_focus_ids,
-                speaker_user_id=user_id,
-                relationship_user_ids=memory_focus_ids,
-                limit=MEMORY_ATOM_CONTEXT_LIMIT,
-            )
-        )
-    if not style_context:
-        style_context = _format_style_context(
-            memory.relevant_style_rules(
-                group_id,
-                context_query,
-                limit=STYLE_RULE_CONTEXT_LIMIT,
-                speaker_user_id=user_id,
-            )
-        )
-    raw_corpus_context = _format_raw_corpus_context(
-        memory.relevant_raw_corpus_examples(
-            group_id,
-            context_query,
-            limit=RAW_CORPUS_CONTEXT_LIMIT,
-            candidate_limit=RAW_CORPUS_CANDIDATE_LIMIT,
-            context_radius=RAW_CORPUS_CONTEXT_RADIUS,
-            exclude_user_id=user_id,
-            exclude_text=text,
-            preferred_user_id=user_id,
-            preferred_limit=2,
-            preferred_score_multiplier=1.1,
-            preferred_score_bonus=0.5,
-            per_user_limit=1,
-        )
-    )
-    if not jargon_context:
-        jargon_context = await _selected_group_jargon_context(
-            group_id,
-            context_recent,
-            current_text=text,
-            current_nickname=nickname,
-        )
-    recall_feedback_context = _format_recall_feedback_context(
-        memory.recent_recalled_reply_feedback(group_id, RECALL_FEEDBACK_CONTEXT_LIMIT)
-    )
-    positive_feedback_context = _format_positive_feedback_context(
-        memory.recent_approved_reply_feedback(group_id, POSITIVE_FEEDBACK_CONTEXT_LIMIT)
-    )
-    social_action_context = social_action_service.recent_reaction_context(group_id)
-    context_packet = assemble_generation_context(
-        memory_context=memory_context,
-        member_context=member_context,
-        memory_atoms_context=memory_atoms_context,
-        style_context=style_context,
-        raw_corpus_context=raw_corpus_context,
-        jargon_context=jargon_context,
-        recall_feedback_context=recall_feedback_context,
-        positive_feedback_context=positive_feedback_context,
-        social_action_context=social_action_context,
-        rag_document_ids=tuple(
-            hit.document.id for hit in rag_result.hits
-        ) if rag_result is not None else (),
-        rag_document_types=tuple(
-            hit.document.doc_type for hit in rag_result.hits
-        ) if rag_result is not None else (),
+    context_packet = await build_group_generation_context(
+        group_id=group_id,
+        user_id=user_id,
+        nickname=nickname,
+        text=text,
+        self_id=int(event.self_id),
+        context_query=context_query,
+        recent_messages=context_recent,
+        reference_resolution=reference_resolution,
+        addressed_bot=addressed_bot,
         mode=pipeline_state.mode,
+        reply_budget=reply_budget,
+        memory=memory,
+        rag_service=rag_service,
+        social_action_service=social_action_service,
+        limits=GroupContextLimits(
+            keep_summaries=MID_MEMORY_KEEP_SUMMARIES,
+            summary_appendix_chars=MID_MEMORY_SUMMARY_APPENDIX_CHARS,
+            member_impressions=MEMBER_IMPRESSION_CONTEXT_LIMIT,
+            memory_atoms=MEMORY_ATOM_CONTEXT_LIMIT,
+            style_rules=STYLE_RULE_CONTEXT_LIMIT,
+            raw_corpus=RAW_CORPUS_CONTEXT_LIMIT,
+            raw_corpus_candidates=RAW_CORPUS_CANDIDATE_LIMIT,
+            raw_corpus_radius=RAW_CORPUS_CONTEXT_RADIUS,
+            recall_feedback=RECALL_FEEDBACK_CONTEXT_LIMIT,
+            positive_feedback=POSITIVE_FEEDBACK_CONTEXT_LIMIT,
+        ),
+        select_jargon_context=_selected_group_jargon_context,
+        format_memory_context=_format_memory_context,
+        format_memory_atom_context=_format_memory_atom_context,
+        format_style_context=_format_style_context,
+        format_raw_corpus_context=_format_raw_corpus_context,
+        format_recall_feedback_context=_format_recall_feedback_context,
+        format_positive_feedback_context=_format_positive_feedback_context,
+        record_metric_event=_record_metric_event,
     )
     _pipeline_apply_context(pipeline_state, context_packet)
     memory_context = context_packet.get("memory")
-    member_context = context_packet.get("member")
-    memory_atoms_context = context_packet.get("memory_atoms")
-    style_context = context_packet.get("style")
-    raw_corpus_context = context_packet.get("raw_corpus")
-    jargon_context = context_packet.get("jargon")
-    recall_feedback_context = context_packet.get("recall_feedback")
-    positive_feedback_context = context_packet.get("positive_feedback")
-    social_action_context = context_packet.get("social_actions")
-    _record_metric_event(
-        "context_assembled",
+
+    tool_execution = await execute_group_tools(
+        decision=decision,
+        tool_plan=tool_plan,
+        pipeline_state=pipeline_state,
         group_id=group_id,
         user_id=user_id,
-        stage="generation_context",
-        action="ready",
-        section_names=[section.name for section in context_packet.sections],
-        section_chars={section.name: len(section.content) for section in context_packet.sections},
-        pipeline_mode=context_packet.mode.value,
-        dropped_sections=list(context_packet.dropped_sections),
-        rag_document_ids=list(context_packet.rag_document_ids),
-        rag_document_types=list(context_packet.rag_document_types),
+        text=text,
+        market_intents=market_intents,
+        market_context_task=market_context_task,
+        prefetched_market_request=prefetched_market_request,
+        tool_registry=tool_registry,
+        market_intents_from_decision=_market_intents_from_decision,
+        execute_fresh_tool_request=_execute_fresh_tool_request,
+        fresh_tool_failure_context=_fresh_tool_failure_context,
+        combine_text_sections=_combine_text_sections,
+        record_metric_event=_record_metric_event,
+        logger=logger,
     )
-
-    market_context = ""
-    market_report = ""
-    if decision.need_tool and decision.tool == "market":
-        requested_intents = _market_intents_from_decision(
-            decision,
-            fallback_text=text,
-            fallback_intents=market_intents,
-        )
-        market_request = tool_plan.first(ToolKind.MARKET) or ToolRequest(
-            ToolKind.MARKET,
-            query=text,
-            reason="decision_requires_market",
-            required=True,
-            arguments={
-                "symbols": tuple(
-                    {
-                        "kind": item.kind,
-                        "symbol": item.symbol,
-                        "display": item.display_name,
-                    }
-                    for item in requested_intents[:2]
-                )
-            },
-        )
-        market_result = (
-            await market_context_task
-            if market_context_task is not None and market_request == prefetched_market_request
-            else await tool_registry.execute(market_request)
-        )
-        pipeline_state.add_tool_result(market_result)
-        market_report = market_result.evidence
-        market_context = market_result.context
-        _record_metric_event(
-            "tool_call",
+    market_context = tool_execution.market_context
+    market_report = tool_execution.market_report
+    fresh_context = tool_execution.fresh_context
+    if tool_execution.direct_candidates:
+        await queue_group_reply_approval(
+            bot,
             group_id=group_id,
             user_id=user_id,
-            stage="market",
-            action="registry_execute",
-            tool_kind=ToolKind.MARKET.value,
-            success=market_result.ok,
-            status=market_result.status,
-            latency_ms=market_result.elapsed_ms,
-            error=market_result.error,
-            **dict(market_result.metadata),
+            nickname=nickname,
+            text=text,
+            persona_name=persona.name,
+            self_id=int(event.self_id),
+            candidates=tool_execution.direct_candidates,
+            mention_targets={},
+            trigger_sequence=trigger_sequence,
+            pipeline_state=pipeline_state,
+            source_message_id=source_message_id,
+            correlation_id=current_correlation_id(),
+            new_approval_id=_new_approval_id,
+            request_approval=_request_group_approval,
+            apply_candidates_first=True,
         )
-        if market_report:
-            logger.info(
-                "qq_social_agent pending market report approval: "
-                f"group={group_id} chars={len(market_report)}"
-            )
-            if not decision.comment_after_tool:
-                market_candidates = (
-                    PendingApprovalCandidate(
-                        1,
-                        market_report,
-                        "market_check",
-                        "行情工具报告，不额外编判断",
-                    ),
-                )
-                approval_id = _new_approval_id(group_id)
-                _pipeline_apply_candidates(pipeline_state, market_candidates)
-                _pipeline_mark_approval_pending(pipeline_state, approval_id)
-                await _request_group_approval(
-                    bot,
-                    PendingGroupApproval(
-                        approval_id=approval_id,
-                        group_id=group_id,
-                        trigger_user_id=user_id,
-                        trigger_nickname=nickname,
-                        trigger_text=text,
-                        persona_name=persona.name,
-                        self_id=int(event.self_id),
-                        candidates=market_candidates,
-                        mention_targets={},
-                        created_at=time.time(),
-                        correlation_id=current_correlation_id(),
-                        trigger_sequence=trigger_sequence,
-                        pipeline_state=pipeline_state,
-                        source_message_id=source_message_id,
-                    ),
-                )
-                return
-
-    fresh_context = ""
-    if decision.need_fresh_context:
-        if (
-            fresh_context_task is not None
-            and fresh_intent is not None
-            and decision.fresh_query.strip() == fresh_intent.query
-            and decision.fresh_kind == fresh_intent.kind
-        ):
-            fresh_result = await fresh_context_task
-        else:
-            if fresh_context_task is not None and not fresh_context_task.done():
-                fresh_context_task.cancel()
-            query = _compact_search_query(decision.fresh_query.strip() or text.strip()) or (
-                decision.fresh_query.strip() or text.strip()
-            )
-            fresh_result = await _execute_fresh_tool_request(
-                ToolRequest(
-                    ToolKind.FRESH_SEARCH,
-                    query=query,
-                    reason="reply_requires_fresh_context",
-                    required=True,
-                    arguments={"kind": decision.fresh_kind},
-                ),
-                metric_stage="fresh_context",
-                group_id=group_id,
-                user_id=user_id,
-            )
-        pipeline_state.add_tool_result(fresh_result)
-        fresh_context = fresh_result.context
-        if str(fresh_result.status) != "ok" and not fresh_context.strip():
-            query_text = decision.fresh_query.strip() or text.strip()
-            failure_reason = fresh_result.error or fresh_result.status or "搜索工具没有返回可用结果"
-            fresh_context = _fresh_tool_failure_context(
-                query_text,
-                status=str(fresh_result.status),
-                reason=str(failure_reason),
-            )
-            _record_metric_event(
-                "fresh_context_failure_injected",
-                group_id=group_id,
-                user_id=user_id,
-                stage="fresh_context",
-                action="generation_context",
-                query_preview=_short_notice_text(query_text, 80),
-                status=str(fresh_result.status),
-                error=_short_notice_text(str(failure_reason), 160),
-            )
-    elif fresh_context_task is not None and not fresh_context_task.done():
-        fresh_context_task.cancel()
-    deep_request = tool_plan.first(ToolKind.DEEP_URL)
-    if deep_request is not None:
-        deep_result = await tool_registry.execute(deep_request)
-        pipeline_state.add_tool_result(deep_result)
-        _record_metric_event(
-            "tool_call",
-            group_id=group_id,
-            user_id=user_id,
-            stage="deep_url_reader",
-            action="registry_execute",
-            tool_kind=ToolKind.DEEP_URL.value,
-            success=deep_result.ok,
-            status=deep_result.status,
-            latency_ms=deep_result.elapsed_ms,
-            error=deep_result.error,
-            **dict(deep_result.metadata),
-        )
-        if deep_result.context:
-            fresh_context = _combine_text_sections(fresh_context, deep_result.context)
-    probability_request = tool_plan.first(ToolKind.PROBABILITY)
-    if probability_request is not None:
-        probability_result = await tool_registry.execute(probability_request)
-        pipeline_state.add_tool_result(probability_result)
-        _record_metric_event(
-            "tool_call",
-            group_id=group_id,
-            user_id=user_id,
-            stage="probability",
-            action="registry_execute",
-            tool_kind=ToolKind.PROBABILITY.value,
-            success=probability_result.ok,
-            status=probability_result.status,
-            latency_ms=probability_result.elapsed_ms,
-            error=probability_result.error,
-            **dict(probability_result.metadata),
-        )
-        if probability_result.context:
-            fresh_context = _combine_text_sections(fresh_context, probability_result.context)
+        return
 
     suppress_mention_user_id = _repeat_mention_suppressed_user(group_id, user_id)
     mention_targets = _mention_targets(
@@ -6961,173 +6314,50 @@ async def _handle_group_message_locked(
         suppress_user_id=suppress_mention_user_id,
     )
     direct_single_reply = _approval_direct_single_reply_enabled()
-    tool_answer_mode = pipeline_state.mode in {
-        PipelineMode.SEARCH,
-        PipelineMode.MARKET,
-        PipelineMode.DEEP_URL,
-        PipelineMode.PROBABILITY,
-    }
-    reply_candidate_limit = 1 if direct_single_reply or tool_answer_mode else 3
-    prompt_flow = (
-        "search_answer"
-        if tool_answer_mode
-        else "reply_direct"
-        if direct_single_reply
-        else "reply_candidates"
+    generated_reply = await generate_group_reply(
+        client=deepseek_client,
+        decision=decision,
+        persona=persona,
+        recent_messages=context_recent,
+        text=text,
+        nickname=nickname,
+        current_label=_member_label(user_id, nickname),
+        addressed_bot=addressed_bot,
+        addressed_repeat_count=addressed_repeat_count,
+        cue_repeat_context=_format_cue_repeat_context(cue_repeat_state),
+        market_context=market_context,
+        fresh_context=fresh_context,
+        context_packet=pipeline_state.context,
+        mode=pipeline_state.mode,
+        mention_targets_context=_format_mention_targets(mention_targets),
+        priority_context=_combine_text_sections(
+            _focused_user_tone_context(user_id),
+            _owner_user_tone_context(user_id),
+        ),
+        speaker_context=speaker_context,
+        memory_context=memory_context,
+        reference_resolution=reference_resolution,
+        ellipsis_resolution=ellipsis_resolution,
+        repair_resolution=repair_resolution,
+        discourse_state=discourse_state,
+        direct_single_reply=direct_single_reply,
+        market_report=market_report,
+        reply_budget=reply_budget,
+        group_id=group_id,
+        user_id=user_id,
+        build_approval_candidates=_approval_candidates_from_drafts,
+        combine_text_sections=_combine_text_sections,
+        record_metric_event=_record_metric_event,
+        logger=logger,
     )
-    task_name = "search_answer" if tool_answer_mode else prompt_flow
-    generation_started_at = time.monotonic()
-    critic_feedback = ""
-    critic_result = None
-    approval_candidates: list[PendingApprovalCandidate] = []
-    for attempt in range(2):
-        effective_speaker_context = speaker_context
-        if critic_feedback:
-            effective_speaker_context = _combine_text_sections(speaker_context, critic_feedback)
-            if critic_prefers_clarify(critic_result) and attempt > 0:
-                decision = replace(decision, action="clarify")
-        try:
-            reply_candidates = await deepseek_client.reply_candidates(
-                persona=persona,
-                recent_messages=context_recent,
-                current_text=text,
-                current_nickname=_member_label(user_id, nickname),
-                mentioned=addressed_bot,
-                addressed_repeat_count=addressed_repeat_count,
-                cue_repeat_context=_format_cue_repeat_context(cue_repeat_state),
-                action=decision.action,
-                chat_label="QQ 群聊",
-                market_context=market_context,
-                fresh_context=fresh_context,
-                context_packet=pipeline_state.context,
-                mention_targets=_format_mention_targets(mention_targets),
-                priority_context=_combine_text_sections(
-                    _focused_user_tone_context(user_id),
-                    _owner_user_tone_context(user_id),
-                ),
-                include_bot_history=tool_answer_mode,
-                context_message_limit=8 if tool_answer_mode else None,
-                candidate_count=reply_candidate_limit,
-                prompt_flow=prompt_flow,
-                task_name=task_name,
-                speaker_context=effective_speaker_context,
-            )
-        except Exception as exc:
-            logger.warning(
-                "qq_social_agent reply candidate generation failed: "
-                f"group={group_id} addressed={addressed_bot} error={exc}"
-            )
-            return
-        if not reply_candidates:
-            if direct_single_reply:
-                logger.info(
-                    "qq_social_agent skipped group reply: "
-                    f"group={group_id} reason=empty_model_reply_direct_single addressed={addressed_bot}"
-                )
-                _record_metric_event(
-                    "reply_suppressed",
-                    group_id=group_id,
-                    user_id=user_id,
-                    stage="generation",
-                    action="empty_model_reply_direct_single",
-                    addressed=addressed_bot,
-                )
-                return
-            logger.info(f"qq_social_agent skipped group={group_id}: empty_model_reply")
-            return
-        approval_candidates = _approval_candidates_from_drafts(
-            reply_candidates,
-            market_report=market_report,
-            limit=reply_candidate_limit,
-            allow_questions=addressed_bot,
-        )
-        if not approval_candidates:
-            logger.info(f"qq_social_agent skipped group={group_id}: empty_candidate_after_guard")
-            return
-        judged_pronoun, judged_critic = None, None
-        if deepseek_client is not None:
-            judged_pronoun, judged_critic = await deepseek_client.review_draft(
-                draft=approval_candidates[0].text,
-                current_text=text,
-                current_label=_member_label(user_id, nickname),
-                action=decision.action,
-                speaker_context=speaker_context,
-                recent_messages=context_recent,
-                memory_context=memory_context,
-                tool_context=_combine_text_sections(fresh_context, market_context),
-                reference=reference_resolution,
-                ellipsis=ellipsis_resolution,
-                repair=repair_resolution,
-                discourse=discourse_state,
-            )
-        pronoun_result = apply_jev_pronoun_judgement(
-            judged_pronoun,
-            has_pronoun=draft_has_person_pronoun(approval_candidates[0].text),
-        )
-        _record_metric_event(
-            "pronoun_guard",
-            group_id=group_id,
-            user_id=user_id,
-            stage="pronoun",
-            action="fix" if pronoun_result.needs_fix else "pass",
-            pronoun_status=pronoun_result.status,
-            pronoun_issue=pronoun_result.issue,
-            pronoun_noul=pronoun_result.noul,
-            attempt=attempt,
-        )
-        if pronoun_result.needs_fix and attempt <= 0:
-            critic_feedback = _combine_text_sections(
-                format_pronoun_feedback(pronoun_result),
-                "【待修人称原草稿】\n" + approval_candidates[0].text,
-            )
-            continue
-        critic_result = apply_jev_critic_judgement(judged_critic)
-        if draft_violates_media_gate(approval_candidates[0].text, discourse_state):
-            failures = tuple(dict.fromkeys([*critic_result.failures, "context_consistent"]))
-            critic_result = CriticResult(
-                intent_covered=critic_result.intent_covered or "YES",
-                referent_consistent=critic_result.referent_consistent or "YES",
-                context_consistent="NO",
-                unsupported_claim=critic_result.unsupported_claim or "NO",
-                reason="media_gate",
-                status=RESOLVED,
-                source=critic_result.source,
-                failures=failures,
-                regenerated=attempt > 0,
-            )
-        critic_result = replace(critic_result, regenerated=attempt > 0)
-        regenerated = attempt > 0
-        action = next_critic_action(
-            critic_result, attempt=attempt, addressed=addressed_bot,
-        )
-        if action == "regenerate" and reply_budget.skip("critic_retry", time.monotonic()):
-            action = "send"
-            _record_metric_event(
-                "reply_budget",
-                group_id=group_id,
-                user_id=user_id,
-                stage="critic",
-                action="skip_critic_retry",
-                remaining_ms=int(reply_budget.remaining(time.monotonic()) * 1000),
-            )
-        _record_metric_event(
-            "pre_send_critic",
-            group_id=group_id,
-            user_id=user_id,
-            stage="critic",
-            action=action,
-            critic_status=critic_result.status,
-            critic_failed=critic_result.failed,
-            critic_unavailable=list(critic_result.unavailable),
-            critic_failures=list(critic_result.failures),
-            regenerated=regenerated,
-            attempt=attempt,
-        )
-        if action != "regenerate":
-            break
-        critic_feedback = format_critic_feedback(critic_result)
-        regenerated = True
-    generation_elapsed_ms = int((time.monotonic() - generation_started_at) * 1000)
+    if generated_reply is None:
+        return
+    decision = generated_reply.decision
+    approval_candidates = generated_reply.candidates
+    critic_result = generated_reply.critic
+    regenerated = generated_reply.regenerated
+    prompt_flow = generated_reply.prompt_flow
+    generation_elapsed_ms = generated_reply.elapsed_ms
     _pipeline_apply_candidates(
         pipeline_state,
         approval_candidates,
@@ -7187,29 +6417,24 @@ async def _handle_group_message_locked(
         return
     if addressed_bot and critic_needs_clarify(critic_result) and decision.action != "clarify":
         decision = replace(decision, action="clarify", reason=f"critic_clarify:{decision.reason}"[:80])
-    approval_id = _new_approval_id(group_id)
-    _pipeline_mark_approval_pending(pipeline_state, approval_id)
-    await _request_group_approval(
+    await queue_group_reply_approval(
         bot,
-        PendingGroupApproval(
-            approval_id=approval_id,
-            group_id=group_id,
-            trigger_user_id=user_id,
-            trigger_nickname=nickname,
-            trigger_text=text,
-            persona_name=persona.name,
-            self_id=int(event.self_id),
-            candidates=tuple(approval_candidates),
-            mention_targets=mention_targets,
-            created_at=time.time(),
-            correlation_id=current_correlation_id(),
-            tool_evidence=_approval_evidence_from_context(fresh_context),
-            trigger_sequence=trigger_sequence,
-            pipeline_state=pipeline_state,
-            source_message_id=source_message_id,
-        ),
+        group_id=group_id,
+        user_id=user_id,
+        nickname=nickname,
+        text=text,
+        persona_name=persona.name,
+        self_id=int(event.self_id),
+        candidates=tuple(approval_candidates),
+        mention_targets=mention_targets,
+        trigger_sequence=trigger_sequence,
+        pipeline_state=pipeline_state,
+        source_message_id=source_message_id,
+        correlation_id=current_correlation_id(),
+        new_approval_id=_new_approval_id,
+        request_approval=_request_group_approval,
+        tool_evidence=_approval_evidence_from_context(fresh_context),
     )
-
 
 @private_message.handle()
 async def handle_private_message(bot: Bot, event: PrivateMessageEvent) -> None:
