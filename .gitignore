@@ -25,3 +25,7 @@ data/history/
 data/admin_backups/
 data/manual_backups/
 backups/
+
+/data/
+
+._*
