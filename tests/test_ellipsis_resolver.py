@@ -91,7 +91,7 @@ def test_comparison_speed() -> None:
 
 def test_complete_sentence_none() -> None:
     resolved = apply_jev_ellipsis_judgement(
-        EllipsisJudgement(kind="NONE", inherit_from="NONE", confidence=0.2),
+        EllipsisJudgement(kind="NONE", inherit_from="NONE", confidence=0.9),
         [],
         current_text="Gemini 写代码其实还行",
     )

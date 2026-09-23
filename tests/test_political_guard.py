@@ -1,4 +1,10 @@
-from qq_social_agent.political_guard import has_political_redline, sanitize_political_output
+from qq_social_agent.political_guard import (
+    format_gag_memory,
+    has_political_redline,
+    political_candidates,
+    sanitize_political_output,
+    sanitize_political_output_detail,
+)
 
 
 def test_input_redline_never_blocks_chat() -> None:
@@ -26,14 +32,14 @@ def test_sanitize_output_masks_redline_terms() -> None:
     reply, guarded = sanitize_political_output("中共暴政这个说法可以展开讲")
 
     assert guarded
-    assert reply == "*zg**bz*这个说法可以展开讲"
+    assert reply == "****这个说法可以展开讲"
 
 
 def test_sanitize_output_masks_sensitive_keywords_but_keeps_reply() -> None:
     reply, guarded = sanitize_political_output("文革、64、学生运动、毛泽东、习近平、共产党这几个别直说")
 
     assert guarded
-    assert reply == "*wg*、64、学生运动、*mzd*、*xjp*、*gcd*这几个别直说"
+    assert reply == "**、64、学生运动、***、***、***这几个别直说"
 
 
 def test_sanitize_output_keeps_normal_reply() -> None:
@@ -56,7 +62,7 @@ def test_sanitize_output_masks_expanded_sensitive_keywords() -> None:
     )
 
     assert guarded
-    assert reply == "*srb*、*jq*、*zcq*、*ywy*、*whw*、*fy*、*dyj*、*hwb*、*pd*、*ssxx*、*lbsj*"
+    assert reply == "***、**、***、***、***、**、***、***、**、****、****"
 
 
 def test_sanitize_output_masks_recent_region_and_slang_keywords() -> None:
@@ -65,14 +71,16 @@ def test_sanitize_output_masks_recent_region_and_slang_keywords() -> None:
     )
 
     assert guarded
-    assert reply == "*ls*、*bzyd*、*wlmqhz*、*zzy*、*bxl*、*zyk*、*djy*、*cd*、*qg*、*zjr*"
+    assert reply == "**、****、******、***、***、***、***、**、**、***"
 
 
 def test_sanitize_output_masks_pinyin_abbreviations() -> None:
     reply, guarded = sanitize_political_output("xjp、mzd、gcd、wenge")
 
     assert guarded
-    assert reply == "*xjp*、*mzd*、*gcd*、*wenge*"
+    assert guarded
+    assert "xjp" not in reply.lower()
+    assert "mzd" not in reply.lower()
 
 
 def test_short_ascii_terms_need_word_boundaries() -> None:
@@ -80,3 +88,42 @@ def test_short_ascii_terms_need_word_boundaries() -> None:
 
     assert not guarded
     assert reply == "accp toolkit 和 xjpg 不是敏感词"
+
+
+def test_sanitize_masks_jiaoyuan_star_per_char_keeps_slang() -> None:
+    reply, guarded = sanitize_political_output(
+        "腊肉是网上对教员的黑话，腊爹就是拿这梗套的。"
+    )
+    assert guarded
+    assert reply == "腊肉是网上对**的黑话，腊爹就是拿这梗套的。"
+
+
+def test_gag_memory_keeps_original_term_in_parentheses() -> None:
+    original = "毛泽东死了"
+    result = sanitize_political_output_detail(original)
+    assert result.guarded
+    assert result.public_text == "***死了"
+    assert format_gag_memory(result.public_text, result.hits) == "***死了（内容毛泽东已被风雪你的口球屏蔽成***）"
+
+
+def test_hard_terms_stay_masked_even_if_jev_unmasks() -> None:
+    reply, guarded = sanitize_political_output("习近平说了")
+    assert guarded
+    unmasked = sanitize_political_output_detail("习近平说了", contextual_keys=())
+    assert unmasked.public_text == "***说了"
+
+
+def test_contextual_terms_fail_closed_without_observation() -> None:
+    original = "数学课那个教员讲得挺清楚"
+    candidates = political_candidates(original)
+    assert [row.text for row in candidates] == ["教员"]
+    conservative = sanitize_political_output_detail(original)
+    assert conservative.public_text == "数学课那个**讲得挺清楚"
+    ordinary = sanitize_political_output_detail(original, contextual_keys=())
+    assert ordinary.public_text == original
+
+
+def test_obfuscated_hard_term_is_still_masked() -> None:
+    reply, guarded = sanitize_political_output("习 近 平今天发话了")
+    assert guarded
+    assert "*" in reply

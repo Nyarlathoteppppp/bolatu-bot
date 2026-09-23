@@ -372,11 +372,7 @@ def test_tool_router_routes_probability_lookup() -> None:
         fresh_intent=None,
         addressed=True,
     )
-    request = plan.first(ToolKind.PROBABILITY)
-    assert request is not None
-    assert request.required
-    assert route_mode(plan) is PipelineMode.PROBABILITY
-    decision = ReplyDecision(True, 0.8, "回答问题", action="answer")
-    routed = apply_tool_plan(decision, plan)
-    assert routed.need_tool
-    assert routed.tool == "probability"
+    # A lexical match is not enough: Jev/LLM must distinguish a forecast from
+    # reassurance and mathematical probability before executing the tool.
+    assert plan.first(ToolKind.PROBABILITY) is None
+    assert route_mode(plan) is PipelineMode.CHAT

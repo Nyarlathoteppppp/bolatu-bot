@@ -17,10 +17,16 @@ from .memory import ChatMessage
 from .persona import Persona
 
 
+from .jev_policy import (
+    JEV_TOOL_CHOICE_CONFIDENCE_MIN,
+    JEV_TOOL_NOUL_MIN,
+    OPENROUTER_JEV_MODEL,
+    TYPESAFE_JEV_MODEL,
+)
+
 OPENROUTER_DECISIONS_URL = "https://openrouter.ai/api/alpha/decisions"
 TYPESAFE_SYSTEM_ONE_URL = "https://api.typesafe.ai/v1/systemone"
-OPENROUTER_JEV_MODEL = "~typesafe/jev-latest"
-TYPESAFE_JEV_MODEL = "jev-latest"
+DRAFT_REVIEW_TIMEOUT_SECONDS = 4.0
 
 JevTelemetryRecorder = Callable[[dict[str, Any]], None]
 _telemetry_recorder: JevTelemetryRecorder | None = None
@@ -139,7 +145,9 @@ def _timing_looks_like_question(text: str) -> bool:
 
 
 def _timing_looks_like_reply_to_other(text: str) -> bool:
-    return "回复" in (text or "") and "消息" in (text or "")
+    # Match our structured reply envelope, not words in a technical question.
+    match = re.match(r"^.{1,80}\[#\d+\]回复(?P<target>.{1,80}\[#\d+\])消息【", text or "")
+    return bool(match and not any(name in match.group("target") for name in ("风雪", "张风雪")))
 
 
 def _timing_is_short_ack(text: str) -> bool:
@@ -321,9 +329,13 @@ class JevClient:
         data = await self.evaluate(state=state, questions=questions)
         answers = data.get("answers", {})
 
-        noul_score = float(answers.get("should_reply", {}).get("noul", 0.0))
+        noul_score = _optional_noul(data, "should_reply")
+        if noul_score is None:
+            raise ValueError("Missing or invalid Jev should_reply observation")
         action_data = answers.get("action", {})
-        action_choice = str(action_data.get("choice", "ignore")).strip().lower()
+        action_choice = str(action_data.get("choice", "")).strip().lower()
+        if action_choice not in {"tease", "care", "answer", "agree", "reply", "ignore"}:
+            raise ValueError("Missing or invalid Jev action observation")
 
         if addressed:
             should_reply = action_choice != "ignore" and noul_score >= 0.20
@@ -358,46 +370,30 @@ class JevClient:
         current_text: str,
         current_nickname: str,
         addressed: bool = False,
+        speaker_context: str = "",
     ) -> ToolRoutingDecision:
-        """Use Jev to classify if an external tool is required."""
-        state = (
-            f"【角色设定】\n"
-            f"{persona.decision_prompt.strip()}\n\n"
-            f"【当前发言】\n"
-            f"发言人: {current_nickname}\n"
-            f"内容: {current_text}\n"
-            f"状态: {'被艾特或回复' if addressed else '群聊公开发言'}"
+        """Observe tool need; generating grounded arguments is the LLM's job."""
+        from .tool_observation import tool_routing_questions, tool_routing_state
+        from .resolver_result import choice_confidence
+        data = await self.evaluate(
+            state=tool_routing_state(current_text=current_text, recent_messages=recent_messages,
+                                     speaker_context=speaker_context),
+            questions=tool_routing_questions(),
         )
-
-        questions = {
-            "need_tool": {
-                "type": "noul",
-                "instructions": (
-                    "当前发言是否需要外部专业工具辅助（例如推算事件发生概率、实时联网搜索最新新闻、查询股票加密行情、读取网页链接）？"
-                    "日常打屁闲聊接梗则不需要工具（false）。"
-                ),
-            },
-            "tool_choice": {
-                "type": "choice",
-                "instructions": "如果需要工具，选择最精准的工具类型：",
-                "criteria": {
-                    "none": "不需要工具，直接回复",
-                    "probability": "用户询问某件事发生的可能性、概率多大、会不会发生、测几率、推演未来",
-                    "fresh_search": "需要联网查询最新实时新闻、热点事件、未知学术专有名词或事实资料",
-                    "market": "需要查询股票行情、指数、加密货币价格与走势",
-                    "deep_url": "消息中有明确网页链接需要深入抓取正文分析",
-                },
-            },
-        }
-
-        data = await self.evaluate(state=state, questions=questions)
         answers = data.get("answers", {})
-        need_tool_score = float(answers.get("need_tool", {}).get("noul", 0.0))
-        tool_choice = str(answers.get("tool_choice", {}).get("choice", "none")).strip().lower()
+        need_tool_score = _optional_noul(data, "need_tool")
+        if need_tool_score is None:
+            raise ValueError("Missing or invalid Jev need_tool observation")
+        tool_choice = str(answers.get("tool_choice", {}).get("choice", "")).strip().lower()
+        if tool_choice not in {"none", "probability", "fresh_search", "market", "deep_url", "other"}:
+            raise ValueError("Missing or invalid Jev tool_choice observation")
+        confidence = choice_confidence(answers, "tool_choice")
+        if confidence is None or confidence < JEV_TOOL_CHOICE_CONFIDENCE_MIN or tool_choice == "other":
+            raise ValueError("Uncertain Jev tool choice; use LLM routing")
 
         from .deepseek_client import ToolRoutingDecision
         allowed = {"probability", "fresh_search", "market", "deep_url"}
-        if tool_choice not in allowed or need_tool_score < 0.40:
+        if tool_choice not in allowed or need_tool_score < JEV_TOOL_NOUL_MIN:
             return ToolRoutingDecision(
                 tool="none",
                 confidence=need_tool_score,
@@ -486,8 +482,10 @@ class JevClient:
         }
         data = await self.evaluate(state=state, questions=questions)
         answers = data.get("answers", {})
-        following = max(0.0, min(1.0, float(answers.get("following_bot", {}).get("noul", 0.0))))
-        has_fact = max(0.0, min(1.0, float(answers.get("has_concrete_content", {}).get("noul", 0.0))))
+        following = _optional_noul(data, "following_bot")
+        has_fact = _optional_noul(data, "has_concrete_content")
+        if following is None or has_fact is None:
+            raise ValueError("Missing or invalid Jev timing observation")
         speak_prob = max(following, has_fact) if bot_just_spoke else has_fact
         if speak_prob <= 0.10:
             return TimingDecision(
@@ -834,12 +832,13 @@ class JevClient:
                     "NONE=没有需要解析的指代。"
                     "「那个/这个/后来呢」不要预设为人。"
                     "当前发言人不是他/她。QQ 回复作者也不自动等于他/她；回复文里提到但没开口的人也可以是。"
-                    "不要因为最近说话就选那个人。不确定时选 NONE。"
+                    "不要因为最近说话就选那个人。不确定时选 OTHER。"
                 ),
                 "criteria": {
                     "PERSON": "指某个具体的人，包括风雪自己",
                     "NON_PERSON": "指事/物/考试/插件/梗/消息，不是人",
                     "NONE": "没有需要解析的指代",
+                    "OTHER": "证据不足，无法确定指代类型",
                 },
             },
             "person_target": {
@@ -904,6 +903,7 @@ class JevClient:
                 ),
                 "criteria": {
                     "NONE": "当前句语义自足，不依赖前文",
+                    "OTHER": "无法确定是否省略或不属于这些类型",
                     "SAME_PREDICATE": "换了实体，继承前文谓词/评价维度，如 Claude 写代码很强 → Gemini 呢",
                     "SLOT_QUERY": "询问前文事件的某个 slot，如 我准备考研 → 去哪",
                     "SHORT_ANSWER": "当前是前一问题的短答，如 去哪考研 → 上海",
@@ -928,10 +928,7 @@ class JevClient:
             },
         }
         data = await self.evaluate(state=state_text, questions=questions)
-        judged = parse_jev_ellipsis_answers(data)
-        if judged.kind not in ELLIPSIS_KINDS:
-            judged = EllipsisJudgement(kind="NONE", inherit_from="NONE", confidence=0.0, reason="invalid_kind")
-        return judged
+        return parse_jev_ellipsis_answers(data)
 
     async def resolve_addressee(
         self,
@@ -1032,12 +1029,13 @@ class JevClient:
                         "instructions": (
                             "只判断 message.current_text 是否包含需要解析的人物指代。"
                             "PERSON=指某个具体的人；NON_PERSON=指事、物、消息、模型或梗；"
-                            "NONE=没有需要解析的指代或无法确定。"
+                            "NONE=没有需要解析的指代；OTHER=无法确定指代类型。"
                         ),
                         "criteria": {
                             "PERSON": "指某个具体的人，包括机器人风雪",
                             "NON_PERSON": "指事、物、消息、模型、考试或梗，不是人",
-                            "NONE": "没有需要解析的人物指代或无法确定",
+                            "NONE": "没有需要解析的指代",
+                            "OTHER": "证据不足，无法确定指代类型",
                         },
                     },
                     "person_target": {
@@ -1064,7 +1062,8 @@ class JevClient:
                             "ITEM_DEIXIS=这个/那个指向前文刚出现的对象。"
                         ),
                         "criteria": {
-                            "NONE": "当前句语义自足，或无法确定继承关系",
+                            "NONE": "当前句语义自足",
+                            "OTHER": "无法确定是否省略或不属于这些类型",
                             "SAME_PREDICATE": "换了实体但继承前文谓词或评价维度",
                             "SLOT_QUERY": "询问前文事件的地点、时间、原因、方法或数量",
                             "SHORT_ANSWER": "当前消息是前一问题的短答",
@@ -1508,13 +1507,30 @@ class JevClient:
             draft=draft,
             current_text=current_text,
             action=action,
+            discourse=discourse,
         )
-        intent_data, shared_data = await asyncio.gather(
-            self.evaluate(state=intent_state, questions=intent_questions),
-            self.evaluate(state=state, questions=questions),
-        )
+        deadline = asyncio.get_running_loop().time() + DRAFT_REVIEW_TIMEOUT_SECONDS
+        tasks = [
+            asyncio.create_task(self.evaluate(state=intent_state, questions=intent_questions)),
+            asyncio.create_task(self.evaluate(state=state, questions=questions)),
+        ]
+        try:
+            done, _ = await asyncio.wait(tasks, timeout=DRAFT_REVIEW_TIMEOUT_SECONDS)
+            payloads = []
+            for task in tasks:
+                if task not in done:
+                    continue
+                try:
+                    payloads.append(task.result())
+                except Exception as exc:
+                    logger.warning(f"qq_social_agent Jev review branch unavailable: {type(exc).__name__}")
+        finally:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
         answers = {}
-        for payload in (intent_data, shared_data):
+        for payload in payloads:
             candidate = payload.get("answers") if isinstance(payload, dict) else None
             if isinstance(candidate, dict):
                 answers.update(candidate)
@@ -1522,7 +1538,14 @@ class JevClient:
         critic = parse_jev_critic_answers(data, action=action)
         # A failed detail branch must not discard a valid critic observation.
         try:
-            pronoun = await self._finish_pronoun_check(state, data, has_pronoun=has_pronoun)
+            remaining = deadline - asyncio.get_running_loop().time()
+            if remaining <= 0:
+                pronoun = None
+            else:
+                pronoun = await asyncio.wait_for(
+                    self._finish_pronoun_check(state, data, has_pronoun=has_pronoun),
+                    timeout=remaining,
+                )
         except Exception as exc:
             logger.warning(f"qq_social_agent jev pronoun detail unavailable: {type(exc).__name__}")
             pronoun = None
@@ -1704,5 +1727,7 @@ class JevClient:
             }
         }
         data = await self.evaluate(state=state, questions=questions)
-        answers = data.get("answers", {})
-        return float(answers.get("probability", {}).get("noul", 0.5))
+        score = _optional_noul(data, "probability")
+        if score is None:
+            raise ValueError("Missing or invalid Jev probability observation")
+        return score

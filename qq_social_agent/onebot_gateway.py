@@ -5,7 +5,7 @@ import time
 from dataclasses import dataclass
 from typing import Any, Protocol
 
-from .observability import mark_onebot_api_error, mark_onebot_api_success
+from .observability import SEND_APIS, mark_onebot_api_error, mark_onebot_api_success
 
 
 DEFAULT_API_TIMEOUT_SECONDS = 10.0
@@ -88,7 +88,7 @@ async def call_api(
         if bot_id:
             if outcome == "success":
                 mark_onebot_api_success(bot_id, api_name, elapsed_ms=latency_ms)
-            elif outcome != "cancelled":
+            elif outcome != "cancelled" or api_name in SEND_APIS:
                 mark_onebot_api_error(
                     bot_id,
                     api_name,

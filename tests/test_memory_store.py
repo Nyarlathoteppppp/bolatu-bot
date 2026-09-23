@@ -1,7 +1,13 @@
 import sqlite3
 import time
 
-from qq_social_agent.memory import MemoryStore
+from qq_social_agent.memory import (
+    KEDAI_ALT_USER_ID,
+    KEDAI_PRIMARY_USER_ID,
+    MemoryStore,
+    linked_account_ids,
+    linked_account_note,
+)
 
 
 def test_mid_summary_batch_excludes_recent_messages(tmp_path) -> None:
@@ -769,3 +775,49 @@ def test_prune_member_profile_summaries_keeps_latest_three(tmp_path) -> None:
     assert len(memory.recent_member_profile_summaries(1, 100, limit=10)) == 3
     assert len(memory.recent_member_profile_summaries(1, 200, limit=10)) == 3
     assert memory.latest_member_profile_summary(1, 100).profile_summary == "user100-4"
+
+
+def test_linked_accounts_share_identity_recall(tmp_path) -> None:
+    assert linked_account_ids(KEDAI_ALT_USER_ID) == linked_account_ids(KEDAI_PRIMARY_USER_ID)
+    assert "小号" in linked_account_note(KEDAI_ALT_USER_ID)
+    assert "主号" in linked_account_note(KEDAI_PRIMARY_USER_ID)
+
+    memory = MemoryStore(tmp_path / "bot.sqlite3")
+    memory.upsert_memory_atom(
+        atom_type="identity",
+        group_id=1,
+        subject_user_id=KEDAI_PRIMARY_USER_ID,
+        content="南开本科，北大软微硕士",
+        source="test",
+        confidence=1.0,
+        importance=0.95,
+    )
+    memory.upsert_memory_atom(
+        atom_type="preference",
+        group_id=1,
+        subject_user_id=KEDAI_ALT_USER_ID,
+        content="喜欢安达与岛村",
+        source="test",
+        confidence=0.8,
+        importance=0.4,
+    )
+
+    alt_atoms = memory.relevant_memory_atoms(
+        1, "",
+        speaker_user_id=KEDAI_ALT_USER_ID,
+        limit=5,
+    )
+    assert any("软微" in atom.content for atom in alt_atoms)
+    primary_atoms = memory.relevant_memory_atoms(
+        1, "",
+        speaker_user_id=KEDAI_PRIMARY_USER_ID,
+        limit=5,
+    )
+    assert any("安达" in atom.content for atom in primary_atoms)
+    subject_atoms = memory.active_memory_atoms_for_subject(
+        1,
+        KEDAI_ALT_USER_ID,
+        atom_types=("identity",),
+        limit=10,
+    )
+    assert any("软微" in atom.content for atom in subject_atoms)

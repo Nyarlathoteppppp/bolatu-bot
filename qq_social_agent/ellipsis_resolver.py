@@ -4,9 +4,11 @@ import re
 from dataclasses import dataclass
 from typing import Iterable
 
+from .jev_policy import JEV_ELLIPSIS_CONFIDENCE_MIN
 from .reference_resolver import ReferenceResolution, ReplyHint
 from .resolver_result import (
     AMBIGUOUS,
+    ERROR,
     NOT_APPLICABLE,
     RESOLVED,
     SOURCE_JEV,
@@ -18,7 +20,6 @@ from .resolver_result import (
 )
 
 
-JEV_ELLIPSIS_CONFIDENCE_MIN = 0.35
 MAX_ELLIPSIS_SOURCES = 6
 SHORT_TEXT_CHARS = 12
 TRIGGER_MAX_CHARS = 24
@@ -366,15 +367,15 @@ def parse_jev_ellipsis_answers(data: dict) -> EllipsisJudgement:
         kind_raw = {}
     if not isinstance(inherit_raw, dict):
         inherit_raw = {}
-    kind = str(kind_raw.get("choice") or "NONE").strip().upper()
-    if kind not in ELLIPSIS_KINDS:
-        kind = "NONE"
+    kind = str(kind_raw.get("choice") or "").strip().upper()
+    if kind not in (*ELLIPSIS_KINDS, "OTHER"):
+        return EllipsisJudgement(reason="error")
     inherit_from = str(inherit_raw.get("choice") or "NONE").strip()
     if kind == "NONE":
         inherit_from = "NONE"
     confidence = (
         choice_confidence(answers, "ellipsis_kind")
-        if kind == "NONE"
+        if kind in {"NONE", "OTHER"}
         else joint_choice_confidence(answers, "ellipsis_kind", "inherit_from")
     )
     if confidence is None:
@@ -401,7 +402,17 @@ def apply_jev_ellipsis_judgement(
     rows = list(sources)
     if judgement is None:
         return EllipsisResolution(reason="jev_unavailable", status=UNAVAILABLE, source=SOURCE_JEV)
-    kind = judgement.kind if judgement.kind in ELLIPSIS_KINDS else "NONE"
+    if judgement.reason == "error" or judgement.kind not in (*ELLIPSIS_KINDS, "OTHER"):
+        return EllipsisResolution(reason="error", status=ERROR, source=SOURCE_JEV)
+    kind = judgement.kind
+    if kind == "OTHER" or float(judgement.confidence or 0.0) < JEV_ELLIPSIS_CONFIDENCE_MIN:
+        return EllipsisResolution(
+            kind="NONE" if kind == "OTHER" else kind,
+            reason="jev_other" if kind == "OTHER" else "jev_low_confidence",
+            confidence=float(judgement.confidence or 0.0),
+            status=AMBIGUOUS,
+            source=SOURCE_JEV,
+        )
     if kind == "NONE":
         return EllipsisResolution(
             kind="NONE",

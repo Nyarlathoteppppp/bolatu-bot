@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import ipaddress
 import json
 import random
 import re
@@ -55,7 +56,7 @@ from .admin_ui import (
     render_plugins_page,
     render_private_memory_page,
 )
-from .approval_models import PendingApprovalCandidate, PendingGroupApproval
+from .approval_models import DeliveryProgress, PendingApprovalCandidate, PendingGroupApproval
 from .background_learning import BackgroundLearningCoordinator
 from .config import PROJECT_ROOT, load_config
 from .context_assembler import assemble_generation_context, merge_rag_and_summary_context
@@ -119,6 +120,7 @@ from .memory import (
     MemberProfileSummary,
     MemoryStore,
     MemorySummary,
+    linked_account_note,
     RawCorpusExample,
     RecalledReplyFeedback,
     StyleRule,
@@ -132,6 +134,7 @@ from .observability import (
     build_trace_snapshot,
     correlation_scope,
     current_correlation_id,
+    delivery_health_snapshot,
     event_correlation_id,
     mark_bot_connected,
     mark_bot_disconnected,
@@ -188,6 +191,7 @@ from .discourse_state import (
     resolve_group_discourse,
     segments_have_real_media,
 )
+from .jev_policy import GroupReplyBudget
 from .resolver_result import AMBIGUOUS, ERROR, NOT_APPLICABLE, RESOLVED, UNAVAILABLE
 from .ellipsis_resolver import (
     EllipsisResolution,
@@ -198,6 +202,7 @@ from .pre_send_critic import (
     apply_jev_critic_judgement,
     critic_prefers_clarify,
     format_critic_feedback,
+    critic_needs_clarify,
     next_critic_action,
 )
 from .pronoun_guard import (
@@ -606,6 +611,12 @@ if hasattr(_driver, "server_app"):
         )
 
     @_driver.server_app.get("/admin/summaries/action")
+    async def _http_admin_summary_action_get(request: Request):
+        if not _is_local_admin_request(request):
+            return HTMLResponse("local admin only", status_code=403)
+        return HTMLResponse("summary actions require POST", status_code=405)
+
+    @_driver.server_app.post("/admin/summaries/action")
     async def _http_admin_summary_action_endpoint(
         request: Request,
         summary_id: int,
@@ -757,6 +768,12 @@ if hasattr(_driver, "server_app"):
         )
 
     @_driver.server_app.get("/admin/memory/action")
+    async def _http_admin_memory_action_get(request: Request):
+        if not _is_local_admin_request(request):
+            return HTMLResponse("local admin only", status_code=403)
+        return HTMLResponse("memory actions require POST", status_code=405)
+
+    @_driver.server_app.post("/admin/memory/action")
     async def _http_admin_memory_action_endpoint(
         request: Request,
         atom_id: int,
@@ -1177,6 +1194,9 @@ MEMBER_IMPRESSION_REPORT_COMMAND_RE = re.compile(
     r"^(?:/)?(?:群友画像|成员画像|画像|印象|member(?:s)?|profile)\s*(?P<limit>\d{0,2})$",
     re.IGNORECASE,
 )
+SELF_MEMORY_QUERY_RE = re.compile(
+    r"(?:你)?记录了(?:我|关于我)|你记(?:得|住)我|关于我的哪些|你对我的(?:印象|记忆|记录)|我是谁"
+)
 METRIC_REPORT_COMMAND_RE = re.compile(
     r"^(?:/)?(?:统计|数据|监控|metrics?)\s*(?P<window>.*)$",
     re.IGNORECASE,
@@ -1500,8 +1520,28 @@ def _ensure_builtin_memory_atoms() -> None:
             group_id=group_id,
             subject_user_id=3066256514,
             object_user_id=None,
-            content="邪恶代代/邪恶科代/3066256514 的学历身份：南开本科，北大软微硕士；这条事实不要串到歌迷老蛆或张风雪身上。",
+            content="邪恶代代/科有代/3066256514 与 纯真代代/科无代/2947279300 是同一个人的两个号（主号 3066256514，小号 2947279300）。学历：南开本科，北大软微硕士。不要串到歌迷老蛆或张风雪身上，也不要当成两个群友。",
             source="builtin_xiee_daida_education_identity",
+            confidence=1.0,
+            importance=0.95,
+        )
+        memory.upsert_memory_atom(
+            atom_type="relation",
+            group_id=group_id,
+            subject_user_id=3066256514,
+            object_user_id=2947279300,
+            content="邪恶代代/科有代/3066256514 和 纯真代代/科无代/2947279300 是同一个人的两个号。主号是 3066256514，小号是 2947279300。观点、学历和偏好按同一个人记。",
+            source="builtin_kedai_same_person",
+            confidence=1.0,
+            importance=1.0,
+        )
+        memory.upsert_memory_atom(
+            atom_type="identity",
+            group_id=group_id,
+            subject_user_id=2947279300,
+            object_user_id=3066256514,
+            content="纯真代代/科无代/2947279300 是邪恶代代/科有代/3066256514 的小号，同一人。",
+            source="builtin_kedai_alt_account_identity",
             confidence=1.0,
             importance=0.95,
         )
@@ -1530,11 +1570,7 @@ async def _send_approval_rules_on_connect(bot: Bot) -> None:
         action="connected",
         bot_id=str(bot.self_id),
     )
-    await _reconcile_group_mutes(bot)
-    await _sync_group_status_cards(bot, reason="bot_connect")
-    await _send_approval_rules_to_approvers(bot, reason="bot_connect")
-    await _send_changelog_notice_to_approvers(bot)
-    await _notify_active_group_mutes(bot)
+    # Register independent tasks before best-effort network reconciliation/notices.
     _ensure_daily_review_task(bot)
     _ensure_weekly_usage_report_task(bot)
     _ensure_proactive_chat_task(bot)
@@ -1542,6 +1578,17 @@ async def _send_approval_rules_on_connect(bot: Bot) -> None:
     _ensure_private_hourly_chat_task(bot)
     _ensure_group_directory_task(bot)
     _ensure_history_backfill_task(bot)
+    for name, operation in (
+        ("mutes", lambda: _reconcile_group_mutes(bot)),
+        ("cards", lambda: _sync_group_status_cards(bot, reason="bot_connect")),
+        ("approval_rules", lambda: _send_approval_rules_to_approvers(bot, reason="bot_connect")),
+        ("changelog", lambda: _send_changelog_notice_to_approvers(bot)),
+        ("mute_notice", lambda: _notify_active_group_mutes(bot)),
+    ):
+        try:
+            await operation()
+        except Exception as exc:
+            logger.warning(f"qq_social_agent connect {name} unavailable: {type(exc).__name__}")
 
 
 async def _reconcile_group_mutes(bot: Bot) -> None:
@@ -1870,9 +1917,18 @@ def _runtime_target_groups() -> tuple[int, ...]:
 
 async def _send_approval_rules_to_approvers(bot: Bot, *, reason: str) -> None:
     for approver_id in _approval_user_ids():
+        marker = f"approval_rules_sent:{bot.self_id}:{approver_id}"
+        if reason == "bot_connect":
+            try:
+                last_sent = float(memory.app_kv_get(marker) or 0)
+            except (TypeError, ValueError):
+                last_sent = 0
+            if 0 <= time.time() - last_sent < 600:
+                continue
         try:
             await _send_private_message(bot, user_id=approver_id, message=Message(APPROVAL_RULES_MESSAGE))
-        except ActionFailed as exc:
+            memory.app_kv_set(marker, str(time.time()))
+        except Exception as exc:
             logger.warning(
                 "qq_social_agent failed sending approval rules: "
                 f"reason={reason} approver={approver_id} {_action_failed_summary(exc)}"
@@ -4463,11 +4519,9 @@ async def _admin_apply_tool_action(form: dict[str, str], *, group_id: int | None
             await _sync_group_status_cards(bot, reason="admin_tools")
         return "已开启群聊决策。" if enabled else "已关闭群聊决策，并清空该群待审候选。"
     if action == "review_enabled":
-        enabled = form.get("enabled") == "1"
-        _set_approval_review_enabled_value(enabled)
-        if not enabled:
-            pending_group_approvals.clear()
-        return "已开启人工审查。" if enabled else "已关闭人工审查，待审候选已清空。"
+        _set_approval_review_enabled_value(False)
+        pending_group_approvals.clear()
+        return "人工审查已永久关闭，不能从这里打开。群聊回复会直接发出。"
     if action == "approval_auto_send":
         percent = _set_approval_auto_send_percent(_safe_admin_percent(form.get("percent"), default=_approval_auto_send_percent()))
         return f"已设置免审自动发送概率：{percent}%。"
@@ -4674,7 +4728,16 @@ def _safe_admin_user_id(value: str | None) -> int | None:
 def _is_local_admin_request(request: Request) -> bool:
     client = getattr(request, "client", None)
     host = str(getattr(client, "host", "") or "")
-    return host in {"127.0.0.1", "::1", "localhost"} or host.startswith("172.")
+    if host in {"127.0.0.1", "::1", "localhost"}:
+        return True
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    # Published 127.0.0.1:8080 arrives as the docker bridge gateway (*.*.*.1).
+    # Sibling containers are 172.18.0.2+ and must not get admin. startswith("172.")
+    # also wrongly allowed public 172.32.0.0/11.
+    return bool(ip.is_private and ip.packed[-1] == 1)
 
 
 def _first_connected_onebot_bot() -> Bot | None:
@@ -4736,6 +4799,7 @@ def _http_ready_payload() -> dict[str, object]:
     onebot = onebot_status_snapshot()
     llm_ready = _status_llm_ready()
     onebot_ready = bool(onebot.get("connected_bots"))
+    delivery = delivery_health_snapshot(onebot)
     reasons: list[str] = []
     if not health["ok"]:
         reasons.append("database_unavailable")
@@ -4743,12 +4807,15 @@ def _http_ready_payload() -> dict[str, object]:
         reasons.append("llm_client_unavailable")
     if not onebot_ready:
         reasons.append("onebot_disconnected")
+    if not delivery["ok"]:
+        reasons.append("onebot_send_" + str(delivery["status"]))
     return {
         "ok": not reasons,
         "database_ready": bool(health["ok"]),
         "llm_ready": llm_ready,
         "onebot_ready": onebot_ready,
         "connected_bot_count": len(onebot.get("connected_bots", [])),
+        "delivery": delivery,
         "reasons": reasons,
     }
 
@@ -5898,6 +5965,7 @@ async def _handle_group_message_locked(
 
     cue_repeat_state = None
     decision_started_at = time.monotonic()
+    reply_budget = GroupReplyBudget.start(decision_started_at)
     logger.info(
         "qq_social_agent group decision start: "
         f"group={group_id} user={user_id} mentioned={mentioned} replied_to_bot={replied_to_bot} text={text!r}"
@@ -6399,29 +6467,49 @@ async def _handle_group_message_locked(
         or (followup_addressed and _looks_like_addressed_question(text)),
         text=text,
     )
-    decision = await _maybe_apply_speaking_action(
-        decision,
-        text=text,
-        current_label=_member_label(user_id, nickname),
-        addressed_bot=addressed_bot,
-        speaker_context=speaker_context,
-        recent_messages=context_recent,
-        group_id=group_id,
-        user_id=user_id,
-        looks_like_question=_looks_like_addressed_question(text),
-        unresolved_reference=reference_resolution.unresolved,
-        unresolved_ellipsis=ellipsis_resolution.unresolved,
-        unresolved_repair=repair_resolution.unresolved,
-        unresolved_ambiguity=ambiguity_resolution.unresolved,
-        ambiguity_kind=ambiguity_resolution.kind,
-    )
-    decision = await _maybe_apply_ask_back(
-        decision,
-        text=text,
-        addressed_bot=addressed_bot,
-        group_id=group_id,
-        user_id=user_id,
-    )
+    if reply_budget.skip("speaking_action", time.monotonic()):
+        _record_metric_event(
+            "reply_budget",
+            group_id=group_id,
+            user_id=user_id,
+            stage="decision",
+            action="skip_speaking_action",
+            remaining_ms=int(reply_budget.remaining(time.monotonic()) * 1000),
+        )
+    else:
+        decision = await _maybe_apply_speaking_action(
+            decision,
+            text=text,
+            current_label=_member_label(user_id, nickname),
+            addressed_bot=addressed_bot,
+            speaker_context=speaker_context,
+            recent_messages=context_recent,
+            group_id=group_id,
+            user_id=user_id,
+            looks_like_question=_looks_like_addressed_question(text),
+            unresolved_reference=reference_resolution.unresolved,
+            unresolved_ellipsis=ellipsis_resolution.unresolved,
+            unresolved_repair=repair_resolution.unresolved,
+            unresolved_ambiguity=ambiguity_resolution.unresolved,
+            ambiguity_kind=ambiguity_resolution.kind,
+        )
+    if reply_budget.skip("ask_back", time.monotonic()):
+        _record_metric_event(
+            "reply_budget",
+            group_id=group_id,
+            user_id=user_id,
+            stage="decision",
+            action="skip_ask_back",
+            remaining_ms=int(reply_budget.remaining(time.monotonic()) * 1000),
+        )
+    else:
+        decision = await _maybe_apply_ask_back(
+            decision,
+            text=text,
+            addressed_bot=addressed_bot,
+            group_id=group_id,
+            user_id=user_id,
+        )
     _pipeline_apply_decision(
         pipeline_state,
         should_reply=decision.should_reply,
@@ -6556,9 +6644,28 @@ async def _handle_group_message_locked(
         memory_context = _format_memory_context(
             memory.relevant_memory_summaries(
                 group_id,
-                context_query,
+                f"{nickname}\n{text}" if _is_self_memory_query(text) else context_query,
                 limit=MID_MEMORY_KEEP_SUMMARIES,
             )
+        )
+    if not rag_context_applied and _is_self_memory_query(text):
+        rag_context_applied = True
+        _record_metric_event(
+            "rag_retrieval",
+            group_id=group_id,
+            user_id=user_id,
+            stage="generation_context",
+            action="skip_self_memory_rag",
+        )
+    if not rag_context_applied and reply_budget.skip("optional_rag", time.monotonic()):
+        rag_context_applied = True
+        _record_metric_event(
+            "reply_budget",
+            group_id=group_id,
+            user_id=user_id,
+            stage="generation_context",
+            action="skip_optional_rag",
+            remaining_ms=int(reply_budget.remaining(time.monotonic()) * 1000),
         )
     if not rag_context_applied:
         rag_task = asyncio.create_task(
@@ -6605,25 +6712,30 @@ async def _handle_group_message_locked(
             hit_reasons=[list(hit.reasons) for hit in rag_result.hits],
             hit_sources=[f"{hit.document.source_name}:{hit.document.source_row_id}" for hit in rag_result.hits],
         )
+    memory_focus_ids = _member_memory_user_ids(
+        context_recent,
+        current_user_id=user_id,
+        current_text=text,
+    )
+    self_memory_query = _is_self_memory_query(text)
+    memory_focus_query = f"{nickname}\n{text}" if self_memory_query else context_query
     if not member_context:
         member_context = _format_member_context(
             memory.member_impressions_for_context(
                 group_id,
-                _related_member_user_ids(context_recent, current_user_id=user_id),
+                memory_focus_ids,
                 limit=MEMBER_IMPRESSION_CONTEXT_LIMIT,
-            )
+            ),
+            current_user_id=user_id,
         )
     if not memory_atoms_context:
         memory_atoms_context = _format_memory_atom_context(
             memory.relevant_memory_atoms(
                 group_id,
-                context_query,
-                subject_user_ids=_related_member_user_ids(context_recent, current_user_id=user_id),
+                memory_focus_query,
+                subject_user_ids=memory_focus_ids,
                 speaker_user_id=user_id,
-                relationship_user_ids=_related_member_user_ids(
-                    context_recent,
-                    current_user_id=user_id,
-                ),
+                relationship_user_ids=memory_focus_ids,
                 limit=MEMORY_ATOM_CONTEXT_LIMIT,
             )
         )
@@ -7024,7 +7136,19 @@ async def _handle_group_message_locked(
             )
         critic_result = replace(critic_result, regenerated=attempt > 0)
         regenerated = attempt > 0
-        action = next_critic_action(critic_result, attempt=attempt)
+        action = next_critic_action(
+            critic_result, attempt=attempt, addressed=addressed_bot,
+        )
+        if action == "regenerate" and reply_budget.skip("critic_retry", time.monotonic()):
+            action = "send"
+            _record_metric_event(
+                "reply_budget",
+                group_id=group_id,
+                user_id=user_id,
+                stage="critic",
+                action="skip_critic_retry",
+                remaining_ms=int(reply_budget.remaining(time.monotonic()) * 1000),
+            )
         _record_metric_event(
             "pre_send_critic",
             group_id=group_id,
@@ -7033,6 +7157,7 @@ async def _handle_group_message_locked(
             action=action,
             critic_status=critic_result.status,
             critic_failed=critic_result.failed,
+            critic_unavailable=list(critic_result.unavailable),
             critic_failures=list(critic_result.failures),
             regenerated=regenerated,
             attempt=attempt,
@@ -7089,7 +7214,7 @@ async def _handle_group_message_locked(
         pending_recompute=[layer for layer in invalidated_layers if layer not in recomputed_layers],
         critic=critic_result,
     )
-    if next_critic_action(critic_result, attempt=1) == "block":
+    if next_critic_action(critic_result, attempt=1, addressed=addressed_bot) == "block":
         _record_metric_event(
             "reply_suppressed",
             group_id=group_id,
@@ -7099,6 +7224,8 @@ async def _handle_group_message_locked(
             critic_failures=list(critic_result.failures),
         )
         return
+    if addressed_bot and critic_needs_clarify(critic_result) and decision.action != "clarify":
+        decision = replace(decision, action="clarify", reason=f"critic_clarify:{decision.reason}"[:80])
     approval_id = _new_approval_id(group_id)
     _pipeline_mark_approval_pending(pipeline_state, approval_id)
     await _request_group_approval(
@@ -7809,14 +7936,19 @@ async def _handle_private_message_scoped(
         summary_context,
         summary_char_limit=MID_MEMORY_SUMMARY_APPENDIX_CHARS,
     )
-    related_user_ids = _related_member_user_ids(context_recent, current_user_id=user_id)
+    related_user_ids = _member_memory_user_ids(
+        context_recent,
+        current_user_id=user_id,
+        current_text=text,
+    )
     member_context = _format_member_context(
-        memory.member_impressions_for_context(chat_id, related_user_ids, limit=MEMBER_IMPRESSION_CONTEXT_LIMIT)
+        memory.member_impressions_for_context(chat_id, related_user_ids, limit=MEMBER_IMPRESSION_CONTEXT_LIMIT),
+        current_user_id=user_id,
     )
     memory_atoms_context = _format_memory_atom_context(
         memory.relevant_memory_atoms(
             chat_id,
-            context_query,
+            f"{nickname}\n{text}" if _is_self_memory_query(text) else context_query,
             subject_user_ids=related_user_ids,
             speaker_user_id=user_id,
             relationship_user_ids=related_user_ids,
@@ -8452,8 +8584,7 @@ def _message_context_text(
     )
     if reply_context:
         parts = [reply_context]
-    elif bot_id is not None and _mentions_bot_self_name(" ".join(parts)):
-        parts.insert(0, _bot_self_name_mention_hint())
+    # Identity instructions belong to speaker_context, not the user's utterance.
     text = " ".join(parts).strip()
     return re.sub(r"\s+", " ", text)
 
@@ -8779,17 +8910,11 @@ def _event_reply_context(
         if current_user_id
         else "当前发言人"
     )
-    current_reply = _short_notice_text(reply_text, 100) if reply_text else "空消息"
-    self_identity_hint = ""
-    if bot_id is not None and user_id is not None and int(user_id) == int(bot_id):
-        self_identity_hint = "注：张风雪和风雪都是你自己。当前正在回复风雪/张风雪之前的话，这里的‘你’大概率指风雪；普通未引用消息里的‘你/她/这个人’不要自动代入。"
-    elif bot_id is not None and _mentions_bot_self_name(current_reply):
-        self_identity_hint = _bot_self_name_mention_hint()
+    current_reply = reply_text.strip() if reply_text else "空消息"
     if message_text:
         original_text = _short_notice_text(message_text, 100)
         return (
             f"{current_label}回复{replied_label}消息【"
-            f"{self_identity_hint}"
             f"{replied_label}说：{original_text}；"
             f"{current_label}回复{replied_label}：{current_reply}】"
         )
@@ -8801,7 +8926,6 @@ def _event_reply_context(
         original_hint = f"{replied_label}原消息内容未知，消息ID：{message_id}"
     return (
         f"{current_label}回复{replied_label}消息【"
-        f"{self_identity_hint}"
         f"{original_hint}；"
         f"{current_label}回复{replied_label}：{current_reply}】"
     )
@@ -10377,14 +10501,18 @@ async def _run_passive_decision_retry(group_id: int) -> None:
                 "qq_social_agent passive decision retry flushing: "
                 f"group={group_id} size={len(items)}"
             )
-            with correlation_scope(latest.correlation_id):
-                await _handle_group_message_locked(
-                    latest.bot,
-                    latest.event,
-                    buffered_messages=items,
-                    force_passive_decision=True,
-                    skip_memory_record=True,
-                )
+            group_generation_inflight.add(group_id)
+            try:
+                with correlation_scope(latest.correlation_id):
+                    await _handle_group_message_locked(
+                        latest.bot,
+                        latest.event,
+                        buffered_messages=items,
+                        force_passive_decision=True,
+                        skip_memory_record=True,
+                    )
+            finally:
+                group_generation_inflight.discard(group_id)
     finally:
         task = asyncio.current_task()
         if group_passive_retry_tasks.get(group_id) is task:
@@ -10957,10 +11085,32 @@ def _related_member_user_ids(
     return user_ids
 
 
-def _format_member_context(profiles: list[MemberProfile | MemberImpression]) -> str:
+def _is_self_memory_query(text: str) -> bool:
+    compact = re.sub(r"\s+", "", text or "")
+    return bool(SELF_MEMORY_QUERY_RE.search(text or "") or SELF_MEMORY_QUERY_RE.search(compact))
+
+
+def _member_memory_user_ids(
+    recent_messages: list[ChatMessage],
+    *,
+    current_user_id: int,
+    current_text: str,
+) -> list[int]:
+    if current_user_id and _is_self_memory_query(current_text):
+        return [int(current_user_id)]
+    return _related_member_user_ids(recent_messages, current_user_id=current_user_id)
+
+
+def _format_member_context(
+    profiles: list[MemberProfile | MemberImpression],
+    *,
+    current_user_id: int = 0,
+) -> str:
     if not profiles:
         return ""
     lines: list[str] = []
+    speaker_lines: list[str] = []
+    other_lines: list[str] = []
     for profile in profiles:
         label = _member_label(profile.user_id, profile.display_name)
         aliases = [
@@ -10971,6 +11121,9 @@ def _format_member_context(profiles: list[MemberProfile | MemberImpression]) -> 
         prefix = f"- {label}"
         if aliases:
             prefix = f"{prefix}，曾用名/历史名：{'、'.join(aliases)}"
+        account_note = linked_account_note(profile.user_id)
+        if account_note:
+            prefix = f"{prefix}；{account_note}"
         details: list[str] = []
         if isinstance(profile, MemberImpression):
             if profile.ai_summary:
@@ -10992,9 +11145,24 @@ def _format_member_context(profiles: list[MemberProfile | MemberImpression]) -> 
             if profile.message_count:
                 details.append(f"已记录发言约 {profile.message_count} 条")
         if details:
-            lines.append(f"{prefix}；" + "；".join(details))
+            rendered = f"{prefix}；" + "；".join(details)
         else:
-            lines.append(prefix)
+            rendered = prefix
+        if current_user_id and profile.user_id == current_user_id:
+            speaker_lines.append(rendered)
+        elif current_user_id:
+            other_lines.append(rendered)
+        else:
+            lines.append(rendered)
+    if current_user_id:
+        blocks: list[str] = []
+        if speaker_lines:
+            blocks.append("当前触发人画像（回答「我/你记录了我什么」时只用这段，不要用旁人）：")
+            blocks.extend(speaker_lines)
+        if other_lines:
+            blocks.append("旁人画像（不是当前触发人，禁止说成当前触发人的经历）：")
+            blocks.extend(other_lines)
+        return "\n".join(blocks)
     return "\n".join(lines)
 
 
@@ -11035,6 +11203,7 @@ def _format_speaker_reference_context(
         self_id=self_id,
     )
     lines = [
+        _bot_self_name_mention_hint(),
         f"- 当前触发人：{current_label}。",
         "- 当前消息优先级最高；最近聊天只用于理解氛围和指代，不代表当前发言人立场。",
         "- 当前要对着说话的人只有上面这个当前触发人；最近真人发言里的其他人是旁人，不要把上下两个人认成同一个，也不要把旁人的话当成当前触发人说的。",
@@ -11745,6 +11914,13 @@ def _handle_memory_atom_command_text(user_id: int, group_id: int | None, text: s
         return "没找到要写入的群。"
     if user_id not in TOOL_ADMIN_USER_IDS:
         return BASIC_APPROVAL_DENIED_MESSAGE
+
+    def _scoped_atom(atom_id: int):
+        atom = memory.memory_atom(atom_id)
+        if atom is None or int(atom.group_id) != int(group_id):
+            return None
+        return atom
+
     if add_match is not None:
         content = add_match.group("content").strip()
         if not content:
@@ -11763,7 +11939,7 @@ def _handle_memory_atom_command_text(user_id: int, group_id: int | None, text: s
         return f"已写入记忆单元：{atom_id}"
     if audit_match is not None:
         atom_id = int(audit_match.group("atom_id"))
-        atom = memory.memory_atom(atom_id)
+        atom = _scoped_atom(atom_id)
         if atom is None:
             return "没找到这个记忆单元。"
         events = memory.memory_atom_audit_trail(atom_id, limit=20)
@@ -11780,6 +11956,8 @@ def _handle_memory_atom_command_text(user_id: int, group_id: int | None, text: s
         return "\n".join(lines)
     if correct_match is not None:
         atom_id = int(correct_match.group("atom_id"))
+        if _scoped_atom(atom_id) is None:
+            return "没找到这个记忆单元。"
         new_atom_id = memory.correct_memory_atom(
             atom_id,
             content=correct_match.group("content").strip(),
@@ -11795,6 +11973,8 @@ def _handle_memory_atom_command_text(user_id: int, group_id: int | None, text: s
         )
     if dispute_match is not None:
         atom_id = int(dispute_match.group("atom_id"))
+        if _scoped_atom(atom_id) is None:
+            return "没找到这个记忆单元。"
         disputed = memory.dispute_memory_atom(
             atom_id,
             content=dispute_match.group("content").strip(),
@@ -11805,6 +11985,8 @@ def _handle_memory_atom_command_text(user_id: int, group_id: int | None, text: s
         )
         return "已记录反证，这条记忆暂停注入，等待纠正。" if disputed else "没找到这个记忆单元。"
     atom_id = int(delete_match.group("atom_id"))
+    if _scoped_atom(atom_id) is None:
+        return "没找到这个记忆单元。"
     return "已将记忆软过期并保留审计记录。" if memory.delete_memory_atom(atom_id) else "没找到这个记忆单元。"
 
 
@@ -11948,6 +12130,61 @@ def _approval_evidence_from_context(context: str) -> str:
     return "\n".join(selected)[:900]
 
 
+
+def _compact_reply_text(text: str) -> str:
+    return re.sub(r"\s+", "", (text or "").strip())
+
+
+def _is_near_duplicate_bot_reply(candidate: str, recent_messages: list[ChatMessage]) -> bool:
+    cand = _compact_reply_text(candidate)
+    if len(cand) < 10:
+        return False
+    for msg in recent_messages[-12:]:
+        if not getattr(msg, "is_bot", False):
+            continue
+        prev = _compact_reply_text(msg.text)
+        if len(prev) < 10:
+            continue
+        if cand == prev:
+            return True
+        shorter, longer = (cand, prev) if len(cand) <= len(prev) else (prev, cand)
+        if len(shorter) >= 12 and shorter in longer and (len(shorter) / len(longer)) >= 0.72:
+            return True
+    return False
+
+
+
+async def _duplicate_group_reply_verdict(approval: PendingGroupApproval, candidate) -> tuple[bool, str]:
+    """Return whether a candidate may be sent, and why."""
+    addressed = bool(getattr(approval.pipeline_state, "addressed", False))
+    recent = memory.recent_messages(approval.group_id, 16)
+    if _is_near_duplicate_bot_reply(candidate.text, recent):
+        return False, "lexical_near_duplicate_bot_reply"
+    if deepseek_client is None:
+        return True, "jev_unavailable_send"
+    resolve_persona = getattr(personas, "resolve", None)
+    if callable(resolve_persona):
+        persona = resolve_persona(approval.persona_name) or resolve_persona(app_config.default_persona)
+    else:
+        try:
+            persona = personas.get(approval.persona_name)
+        except KeyError:
+            try:
+                persona = personas.get(app_config.default_persona)
+            except KeyError:
+                persona = None
+    if persona is None:
+        return True, "jev_unavailable_send"
+    return await deepseek_client.audit_proactive_reply(
+        persona=persona,
+        recent_messages=recent,
+        candidate=candidate.text,
+        chat_label="QQ 群聊",
+        addressed=addressed,
+        current_text=approval.trigger_text,
+    )
+
+
 async def _request_group_approval(bot: Bot, approval: PendingGroupApproval) -> None:
     if not _approval_review_enabled():
         pending_group_approvals.pop(approval.group_id, None)
@@ -11958,31 +12195,7 @@ async def _request_group_approval(bot: Bot, approval: PendingGroupApproval) -> N
                 f"group={approval.group_id} reason=no_candidate"
             )
             return
-        duplicate_send = True
-        duplicate_reason = "jev_unavailable_send"
-        addressed = bool(getattr(approval.pipeline_state, "addressed", False))
-        if deepseek_client is not None:
-            recent = memory.recent_messages(approval.group_id, 16)
-            resolve_persona = getattr(personas, "resolve", None)
-            if callable(resolve_persona):
-                persona = resolve_persona(approval.persona_name) or resolve_persona(app_config.default_persona)
-            else:
-                try:
-                    persona = personas.get(approval.persona_name)
-                except KeyError:
-                    try:
-                        persona = personas.get(app_config.default_persona)
-                    except KeyError:
-                        persona = None
-            if persona is not None:
-                duplicate_send, duplicate_reason = await deepseek_client.audit_proactive_reply(
-                    persona=persona,
-                    recent_messages=recent,
-                    candidate=candidate.text,
-                    chat_label="QQ 群聊",
-                    addressed=addressed,
-                    current_text=approval.trigger_text,
-                )
+        duplicate_send, duplicate_reason = await _duplicate_group_reply_verdict(approval, candidate)
         if not duplicate_send:
             _record_metric_event(
                 "reply_suppressed",
@@ -12026,6 +12239,21 @@ async def _request_group_approval(bot: Bot, approval: PendingGroupApproval) -> N
             logger.info(
                 "qq_social_agent probabilistic auto approval skipped: "
                 f"group={approval.group_id} reason=no_candidate percent={auto_send_percent}"
+            )
+            return
+        duplicate_send, duplicate_reason = await _duplicate_group_reply_verdict(approval, candidate)
+        if not duplicate_send:
+            _record_metric_event(
+                "reply_suppressed",
+                group_id=approval.group_id,
+                user_id=approval.trigger_user_id,
+                stage="pre_send_duplicate",
+                action="skipped",
+                reason=duplicate_reason,
+            )
+            logger.info(
+                "qq_social_agent skipped duplicate group reply: "
+                f"group={approval.group_id} approval_id={approval.approval_id} reason={duplicate_reason}"
             )
             return
         _record_metric_event(
@@ -12859,6 +13087,36 @@ async def _send_approved_group_reply_scoped(
     high_quality: bool,
     notify_success: bool = True,
 ) -> None:
+    async with approval.delivery_lock:
+        try:
+            await _send_approved_group_reply_inner(
+                bot, approval, candidate, approver_id=approver_id,
+                high_quality=high_quality, notify_success=notify_success,
+            )
+        except asyncio.CancelledError:
+            if approval.pipeline_state is not None:
+                _pipeline_mark_failed(approval.pipeline_state, "delivery_cancelled")
+            raise
+        except Exception as exc:
+            if approval.pipeline_state is not None:
+                _pipeline_mark_failed(approval.pipeline_state, f"delivery_error:{type(exc).__name__}")
+            _record_metric_event(
+                "group_send_failed", group_id=approval.group_id,
+                stage="send", action="delivery_error",
+                approval_id=approval.approval_id, error=type(exc).__name__,
+            )
+            logger.warning(f"qq_social_agent delivery error: {type(exc).__name__}")
+
+
+async def _send_approved_group_reply_inner(
+    bot: Bot,
+    approval: PendingGroupApproval,
+    candidate: PendingApprovalCandidate,
+    *,
+    approver_id: int | None,
+    high_quality: bool,
+    notify_success: bool = True,
+) -> None:
     send_started_at = time.monotonic()
     pipeline_state = approval.pipeline_state
     if pipeline_state is not None:
@@ -12953,15 +13211,38 @@ async def _send_approved_group_reply_scoped(
             action="force_mention",
             newer_message_count=delivery_plan.sequence_lag,
         )
-    reply_parts = delivery_plan.parts
+    progress = approval.delivery_progress.setdefault(candidate.text, DeliveryProgress(parts=delivery_plan.parts))
+    if progress.completed:
+        if pipeline_state is not None:
+            _pipeline_mark_completed(pipeline_state)
+        return
+    if progress.uncertain_index is not None:
+        if pipeline_state is not None:
+            _pipeline_mark_failed(pipeline_state, "delivery_unknown_requires_verification")
+        _record_metric_event(
+            "group_send_failed", group_id=approval.group_id, stage="send",
+            action="unknown_no_retry", approval_id=approval.approval_id,
+            part_index=progress.uncertain_index,
+        )
+        if approver_id is not None:
+            await _send_private_text(bot, approver_id, "上一段发送结果未知，已阻止重复发送；请先核对群内是否收到。")
+        return
+    reply_parts = progress.parts
     sent_mention_user_id: int | None = None
-    recorded_user_reply = False
+    recorded_user_reply = bool(progress.sent_message_ids)
     for index, part_text in enumerate(reply_parts):
+        if index < len(progress.sent_message_ids):
+            if sent_mention_user_id is None:
+                sent_mention_user_id = _first_allowed_mention_id(part_text, effective_mention_targets)
+            continue
+        attempted = False
+        acknowledged = False
         try:
             part_mention_user_id = _first_allowed_mention_id(part_text, effective_mention_targets)
             public_text, memory_text, gag = await _prepare_group_political_send_texts(
                 part_text, context=approval.trigger_text + "\n" + candidate.text,
             )
+            attempted = True
             sent_message_id = await _send_group_message(
                 bot,
                 approval.group_id,
@@ -12971,6 +13252,8 @@ async def _send_approved_group_reply_scoped(
                     quote_message_id=approval.source_message_id if index == 0 else "",
                 ),
             )
+            acknowledged = True
+            progress.sent_message_ids.append(sent_message_id)
             if pipeline_state is not None:
                 _pipeline_mark_sent(pipeline_state, sent_message_id)
             if not recorded_user_reply:
@@ -13006,8 +13289,17 @@ async def _send_approved_group_reply_scoped(
                 source_kind="live",
                 correlation_id=approval.correlation_id,
             )
-        except ActionFailed as exc:
-            blocked = _is_group_send_blocked_error(exc)
+        except asyncio.CancelledError:
+            if attempted and not acknowledged:
+                progress.uncertain_index = index
+            raise
+        except Exception as exc:
+            blocked = isinstance(exc, ActionFailed) and _is_group_send_blocked_error(exc)
+            unknown = attempted and not acknowledged and (
+                not isinstance(exc, ActionFailed) or "timeout" in str(exc).lower()
+            )
+            if unknown:
+                progress.uncertain_index = index
             if pipeline_state is not None:
                 _pipeline_mark_failed(pipeline_state, _action_failed_summary(exc))
             logger.warning(
@@ -13019,7 +13311,10 @@ async def _send_approved_group_reply_scoped(
                 group_id=approval.group_id,
                 user_id=approval.trigger_user_id,
                 stage="send",
-                action="blocked_120" if blocked else "action_failed",
+                action="unknown" if unknown else "blocked_120" if blocked else "action_failed",
+                delivered_parts=len(progress.sent_message_ids),
+                failed_part_index=index,
+                delivery_status="unknown" if unknown else "partial" if progress.sent_message_ids else "failed",
                 approval_id=approval.approval_id,
                 error=_action_failed_summary(exc),
                 candidate_index=candidate.index,
@@ -13031,7 +13326,7 @@ async def _send_approved_group_reply_scoped(
                 pending_group_approvals[approval.group_id] = approval
                 notice = (
                     f"群 {approval.group_id} 发言失败：QQ 内核返回 result=120，"
-                    "通常是机器人被群禁言或发送受限。候选已保留，未计为成功发送。\n"
+                    f"通常是机器人被群禁言或发送受限。已确认发送 {len(progress.sent_message_ids)} 段，剩余候选已保留。\n"
                     f"审批ID：{approval.approval_id}\n"
                     f"候选 {candidate.index}：{_short_notice_text(candidate.text, 180)}\n"
                     "解除禁言后可再次回复对应候选编号发送。"
@@ -13045,11 +13340,12 @@ async def _send_approved_group_reply_scoped(
                         user_id=approver_id,
                         message=Message(f"发送失败：{_action_failed_summary(exc)}"),
                     )
-            except ActionFailed:
+            except Exception:
                 pass
             return
         if index < len(reply_parts) - 1:
             await asyncio.sleep(0.9)
+    progress.completed = True
     if sent_mention_user_id is not None:
         last_group_mention_targets[approval.group_id] = (sent_mention_user_id, time.time())
     else:

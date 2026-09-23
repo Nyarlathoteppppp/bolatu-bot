@@ -6,6 +6,7 @@ from qq_social_agent.pre_send_critic import (
     CriticJudgement,
     apply_jev_critic_judgement,
     critic_blocks_memory,
+    critic_needs_clarify,
     critic_questions,
     format_critic_feedback,
     format_critic_jev_state,
@@ -203,3 +204,33 @@ def test_answer_action_uses_stricter_intent_threshold() -> None:
     assert answer.failures == ("intent_covered",)
     assert tease.failures == ()
     assert tease.uncertain == ("intent_covered",)
+
+
+def test_addressed_unsupported_claim_rewrites_once_then_sends() -> None:
+    failed = apply_jev_critic_judgement(
+        CriticJudgement(
+            intent_covered="YES",
+            referent_consistent="YES",
+            context_consistent="YES",
+            unsupported_claim="YES",
+        )
+    )
+    assert next_critic_action(failed, attempt=0, addressed=True) == "regenerate"
+    assert next_critic_action(failed, attempt=1, addressed=True) == "send"
+    assert next_critic_action(failed, attempt=1, addressed=False) == "block"
+    assert "点名也必须出声" in format_critic_feedback(failed)
+    assert critic_needs_clarify(failed) is False
+
+
+def test_addressed_referent_conflict_still_sends_after_retry() -> None:
+    failed = apply_jev_critic_judgement(
+        CriticJudgement(
+            intent_covered="YES",
+            referent_consistent="NO",
+            context_consistent="NO",
+            unsupported_claim="NO",
+        )
+    )
+    assert next_critic_action(failed, attempt=0, addressed=True) == "regenerate"
+    assert next_critic_action(failed, attempt=1, addressed=True) == "send"
+    assert critic_needs_clarify(failed) is True

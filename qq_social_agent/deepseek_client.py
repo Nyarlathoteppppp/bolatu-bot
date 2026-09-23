@@ -6,7 +6,7 @@ import json
 import os
 import re
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from typing import Callable, Optional
 from zoneinfo import ZoneInfo
@@ -376,11 +376,14 @@ class DeepSeekClient:
     def _jev_timeout(self, seconds: float = 2.5) -> float:
         return max(1.0, min(4.0, float(seconds)))
 
-    async def _try_jev(self, factory, *, what: str, timeout: float = 2.5):
+    async def _try_jev(self, factory, *, what: str, timeout: float | None = 2.5):
         jev = getattr(self, "jev_client", None)
         if jev is None or not getattr(jev, "available", False):
             return None
         try:
+            # Draft review owns its deadline so completed branch results survive.
+            if timeout is None:
+                return await factory()
             return await asyncio.wait_for(factory(), timeout=self._jev_timeout(timeout))
         except Exception as exc:
             recorder = getattr(jev, "record_telemetry", None)
@@ -576,11 +579,27 @@ class DeepSeekClient:
                 current_text=current_text,
                 current_nickname=current_nickname,
                 addressed=addressed,
+                speaker_context=speaker_context,
             ),
             what="tool_router",
         )
-        if jev_routed is not None:
+        if jev_routed is not None and jev_routed.tool in {"none", "probability"}:
+            # ProbabilityTool already refines its own event; do not refine twice.
             return jev_routed
+        if jev_routed is not None and jev_routed.tool == "deep_url":
+            urls = re.findall(r"https?://[^\s<>\"']+", current_text)
+            if len(urls) == 1:
+                return replace(jev_routed, query=urls[0])
+        from .tool_observation import tool_routing_questions
+        system += "\n实际工具能力与边界：" + json.dumps(
+            tool_routing_questions()["tool_choice"]["criteria"], ensure_ascii=False,
+        )
+        if jev_routed is not None:
+            system += (
+                f"\n本轮工具已确定为 {jev_routed.tool}，只补全该工具的 query/kind/symbols 参数，不切换工具。"
+                "结合当前句和已解析上下文补全对象，不把‘那个/刚才那个’原样当搜索词。"
+                "若上下文无法确定对象，返回 tool=none，不猜查询主题。"
+            )
         user = self.prompts.render(
             "tool_router",
             "user",
@@ -607,7 +626,10 @@ class DeepSeekClient:
                 ],
             },
         )
-        return _parse_tool_routing_decision(response.choices[0].message.content or "")
+        result = _parse_tool_routing_decision(response.choices[0].message.content or "")
+        if jev_routed is not None and result.tool not in {"none", jev_routed.tool}:
+            return ToolRoutingDecision(tool="none", reason="tool_parameters_mismatch")
+        return result
 
     async def timing_gate(
         self,
@@ -814,7 +836,7 @@ class DeepSeekClient:
         result = await self._try_jev(
             lambda: self.jev_client.review_draft(**kwargs),
             what="draft_review",
-            timeout=4.0,
+            timeout=None,
         )
         return result if result is not None else (None, None)
 

@@ -5,6 +5,7 @@ import re
 import sqlite3
 import time
 from collections import Counter
+from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -12,6 +13,44 @@ from pathlib import Path
 MEMORY_ATOM_EVIDENCE_TYPES = frozenset({"message", "event", "manual"})
 MEMORY_ATOM_STATUSES = frozenset({"active", "superseded", "disputed", "expired"})
 PRIVATE_CHAT_ID_OFFSET = 10_000_000_000_000
+KEDAI_PRIMARY_USER_ID = 3066256514
+KEDAI_ALT_USER_ID = 2947279300
+LINKED_ACCOUNT_GROUPS: tuple[frozenset[int], ...] = (
+    frozenset({KEDAI_PRIMARY_USER_ID, KEDAI_ALT_USER_ID}),
+)
+
+
+def linked_account_ids(user_id: int | None) -> frozenset[int]:
+    if user_id is None:
+        return frozenset()
+    try:
+        uid = int(user_id)
+    except (TypeError, ValueError):
+        return frozenset()
+    if uid <= 0:
+        return frozenset()
+    for group in LINKED_ACCOUNT_GROUPS:
+        if uid in group:
+            return group
+    return frozenset({uid})
+
+
+def expand_linked_account_ids(user_ids: Iterable[int | None]) -> set[int]:
+    expanded: set[int] = set()
+    for user_id in user_ids:
+        expanded.update(linked_account_ids(user_id))
+    return {uid for uid in expanded if uid > 0}
+
+
+def linked_account_note(user_id: int | None) -> str:
+    uid = int(user_id or 0)
+    if uid == KEDAI_PRIMARY_USER_ID:
+        return "与 2947279300（纯真代代/科无代）是同一人的主号"
+    if uid == KEDAI_ALT_USER_ID:
+        return "与 3066256514（邪恶代代/科有代）是同一人的小号"
+    return ""
+
+
 _MEMORY_ATOM_SELECT_COLUMNS = """
     id, atom_type, group_id, subject_user_id, object_user_id, content,
     source, evidence_type, source_message_id, observed_at,
@@ -3788,8 +3827,12 @@ class MemoryStore:
     ) -> list[MemoryAtom]:
         if subject_user_id is None:
             return []
-        clauses = ["group_id = ?", "status = 'active'", "subject_user_id = ?"]
-        params: list[object] = [int(group_id), int(subject_user_id)]
+        subject_ids = sorted(linked_account_ids(subject_user_id))
+        if not subject_ids:
+            return []
+        placeholders = ",".join("?" for _ in subject_ids)
+        clauses = ["group_id = ?", "status = 'active'", f"subject_user_id in ({placeholders})"]
+        params: list[object] = [int(group_id), *subject_ids]
         if atom_types:
             placeholders = ",".join("?" for _ in atom_types)
             clauses.append(f"atom_type in ({placeholders})")
@@ -3820,13 +3863,14 @@ class MemoryStore:
         now: float | None = None,
     ) -> list[MemoryAtom]:
         current = time.time() if now is None else float(now)
-        subject_set = {
-            int(user_id)
-            for user_id in (*(subject_user_ids or ()), *(relationship_user_ids or ()))
-            if user_id is not None and int(user_id) > 0
-        }
-        if speaker_user_id is not None and int(speaker_user_id) > 0:
-            subject_set.add(int(speaker_user_id))
+        subject_set = expand_linked_account_ids(
+            (
+                *(subject_user_ids or ()),
+                *(relationship_user_ids or ()),
+                speaker_user_id,
+            )
+        )
+        speaker_set = linked_account_ids(speaker_user_id)
         has_query_terms = bool(_relevance_terms(query))
         clauses = [
             "group_id = ?",
@@ -3879,9 +3923,9 @@ class MemoryStore:
                 score += 3.0
             if subject_set and obj in subject_set:
                 score += 2.25
-            if speaker_user_id is not None and subject == int(speaker_user_id):
+            if speaker_set and subject in speaker_set:
                 score += 1.5
-            elif speaker_user_id is not None and obj == int(speaker_user_id):
+            elif speaker_set and obj in speaker_set:
                 score += 0.75
             if atom_type == "relation" and subject_set:
                 if subject in subject_set or obj in subject_set:

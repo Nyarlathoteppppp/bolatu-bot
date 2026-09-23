@@ -389,7 +389,7 @@ class FreshContextTool:
         page = None
         research_rounds = 1
         if status == "ok" and items:
-            ok_pages, page = await self._read_followup_pages(items, query=normalized_query)
+            ok_pages, page = await self._read_followup_pages(items, query=normalized_query, deadline=deadline)
             hop_provider = used_provider or self._resolved_provider(normalized_kind)
             while await self._should_followup_round(
                 query=normalized_query,
@@ -409,7 +409,9 @@ class FreshContextTool:
                 if not round_queries:
                     break
                 remaining = deadline - time.monotonic()
-                hop_timeout = min(2.5, max(0.8, remaining))
+                if remaining <= 0:
+                    break
+                hop_timeout = min(2.5, remaining)
                 round_results = await asyncio.gather(
                     *[
                         self._lookup_provider_quiet(
@@ -437,17 +439,21 @@ class FreshContextTool:
                 attempted.append(f"{hop_provider}:round{next_round}")
                 research_queries = _dedupe_strings([*research_queries, *round_queries])
                 items = _merge_fresh_items(items, round_items)
-                ok_pages, page = await self._read_followup_pages(items, query=round_queries[0])
+                ok_pages, page = await self._read_followup_pages(items, query=round_queries[0], deadline=deadline)
             if page is not None and not page.ok and not ok_pages:
                 errors.append(f"page:{page.error or page.status}")
         if status == "ok":
             answer = _synthesize_research_answer(answer, items, ok_pages, query=normalized_query)
-            useful, useful_reason = await self._judge_search_useful(
-                query=normalized_query,
-                answer=answer,
-                items=items,
-                pages=ok_pages,
-            )
+            remaining = deadline - time.monotonic()
+            useful, useful_reason = True, "judge_budget_exhausted"
+            if remaining > 0:
+                try:
+                    useful, useful_reason = await asyncio.wait_for(
+                        self._judge_search_useful(query=normalized_query, answer=answer, items=items, pages=ok_pages),
+                        timeout=remaining,
+                    )
+                except asyncio.TimeoutError:
+                    useful_reason = "judge_budget_exhausted"
             if not useful:
                 status = "no_result"
                 if useful_reason:
@@ -536,14 +542,19 @@ class FreshContextTool:
             return lexical
         try:
             return bool(
-                await should_followup(
-                    query=query,
-                    kind=kind,
-                    evidence=self._evidence_preview(answer="", items=items, pages=pages),
-                    current_round=current_round,
-                    remaining_seconds=remaining_seconds,
+                await asyncio.wait_for(
+                    should_followup(
+                        query=query,
+                        kind=kind,
+                        evidence=self._evidence_preview(answer="", items=items, pages=pages),
+                        current_round=current_round,
+                        remaining_seconds=remaining_seconds,
+                    ),
+                    timeout=remaining_seconds,
                 )
             )
+        except asyncio.TimeoutError:
+            return False
         except Exception:
             return lexical
 
@@ -766,6 +777,7 @@ class FreshContextTool:
         items: tuple[FreshItem, ...],
         *,
         query: str,
+        deadline: float | None = None,
     ) -> tuple[tuple[UrlReadResult, ...], UrlReadResult | None]:
         if self.followup_page_max_tries <= 0:
             return (), None
@@ -776,6 +788,11 @@ class FreshContextTool:
         index = 0
         batch_size = max(1, min(2, self.followup_page_max_successes))
         while index < len(ranked) and tried < self.followup_page_max_tries:
+            budget = self.followup_page_timeout_seconds
+            if deadline is not None:
+                budget = min(budget, deadline - time.monotonic())
+            if budget <= 0:
+                break
             remaining_tries = self.followup_page_max_tries - tried
             remaining_successes = self.followup_page_max_successes - len(successes)
             if remaining_successes <= 0:
@@ -792,7 +809,23 @@ class FreshContextTool:
                 batch.append(item)
             if not batch:
                 continue
-            results = await asyncio.gather(*[self._read_one_followup_url(item.url) for item in batch])
+            tasks = [asyncio.create_task(self._read_one_followup_url(item.url)) for item in batch]
+            try:
+                done, _ = await asyncio.wait(tasks, timeout=budget)
+                results = []
+                for item, task in zip(batch, tasks):
+                    if task not in done:
+                        results.append(UrlReadResult("timeout", item.url, error="page_budget_exhausted"))
+                        continue
+                    try:
+                        results.append(task.result())
+                    except Exception as exc:
+                        results.append(UrlReadResult("fetch_error", item.url, error=type(exc).__name__))
+            finally:
+                for task in tasks:
+                    if not task.done():
+                        task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
             tried += len(batch)
             for result in results:
                 last = result

@@ -326,3 +326,31 @@ def test_admin_dashboard_renders_runtime_status(tmp_path) -> None:
     assert "owner rejected" in html
     assert "柏拉图学院" in html
 
+
+
+def test_admin_tools_does_not_offer_review_toggle() -> None:
+    html = render_admin_tools_page(
+        state={
+            "groups": [{"group_id": 1026813421, "enabled": True, "persona": "zhangxuefeng", "muted_left_seconds": 0}],
+            "approval": {"review_enabled": False, "mode": "免审直发", "auto_send_percent": 100, "pending_count": 0, "owners": [], "basic_users": [], "all_users": []},
+            "work_intensity": {"current_percent": 8, "base_percent": 8, "band": "day"},
+            "private_chat": {"config_ids": [], "runtime_ids": [], "implicit_chat_ids": [], "command_only_ids": [], "force_obey_enabled": False},
+            "models": [],
+            "model_catalog": [],
+            "jargon_entries": [],
+            "tool_docs": {},
+        },
+        selected_group_id=1026813421,
+        report_title="",
+        report_text="",
+    )
+    assert "永久关闭" in html
+    assert 'value="review_enabled"' not in html
+
+
+def test_summary_actions_are_post_forms(tmp_path) -> None:
+    memory = MemoryStore(tmp_path / "bot.sqlite3")
+    memory.admin_add_memory_summary(group_id=1, summary="测试回想", recall_cues=["测试"], locked=False)
+    html = render_memory_summaries_page(memory=memory, groups=(1,), selected_group_id=1, status="active", limit=20)
+    assert 'method="post" action="/admin/summaries/action' in html
+    assert 'href="/admin/summaries/action' not in html

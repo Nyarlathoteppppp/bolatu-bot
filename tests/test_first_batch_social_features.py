@@ -131,7 +131,7 @@ def test_resolve_reply_reference_uses_get_msg_when_event_reply_has_no_text() -> 
     assert reference == ReplyReference("42", 1801507496, "张风雪", "风雪觉得这个可以")
 
     text = plugin._message_context_text(event, bot_id=1801507496, resolved_reply=reference)
-    assert "张风雪和风雪都是你自己" in text
+    assert "张风雪和风雪都是你自己" not in text
     assert "张风雪[#07496]说：风雪觉得这个可以" in text
 
 

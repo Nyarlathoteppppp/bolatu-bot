@@ -4,6 +4,12 @@ from dataclasses import dataclass
 
 from .discourse_state import format_discourse_prompt_block
 from .ellipsis_resolver import EllipsisResolution
+from .jev_policy import (
+    CRITIC_ANSWER_INTENT_FAIL_THRESHOLD,
+    CRITIC_FAIL_THRESHOLD,
+    CRITIC_INTENT_FAIL_THRESHOLD,
+    CRITIC_PASS_THRESHOLD,
+)
 from .reference_resolver import ReferenceResolution
 from .resolver_result import (
     ERROR,
@@ -21,10 +27,6 @@ UNCERTAIN = "UNCERTAIN"
 CRITIC_CHOICES = (YES, NO)
 CRITIC_VALUES = (YES, NO, UNCERTAIN)
 MAX_CRITIC_RETRIES = 1
-CRITIC_FAIL_THRESHOLD = 0.75
-CRITIC_ANSWER_INTENT_FAIL_THRESHOLD = 0.80
-CRITIC_INTENT_FAIL_THRESHOLD = 0.90
-CRITIC_PASS_THRESHOLD = 0.45
 
 _FAIL_ON_NO = ("intent_covered", "referent_consistent", "context_consistent")
 _FAIL_ON_YES = ("unsupported_claim",)
@@ -37,6 +39,7 @@ class CriticJudgement:
     context_consistent: str = ""
     unsupported_claim: str = ""
     failure_probabilities: tuple[tuple[str, float], ...] = ()
+    unavailable: tuple[str, ...] = ()
     reason: str = ""
 
 
@@ -53,6 +56,7 @@ class CriticResult:
     failed: bool = False
     failures: tuple[str, ...] = ()
     uncertain: tuple[str, ...] = ()
+    unavailable: tuple[str, ...] = ()
     regenerated: bool = False
 
     def __post_init__(self) -> None:
@@ -224,12 +228,19 @@ def format_critic_jev_state(
     return "\n".join(lines)
 
 
-def format_intent_critic_jev_state(*, draft: str, current_text: str, action: str) -> str:
+def format_intent_critic_jev_state(*, draft: str, current_text: str, action: str, discourse=None) -> str:
+    resolved = ""
+    if discourse is not None:
+        # Supply established bindings, never ask the intent critic to re-parse history.
+        ellipsis = discourse.ellipsis
+        if ellipsis.status == RESOLVED and ellipsis.source_text:
+            resolved = f"【已解析的省略继承】{ellipsis.source_text[:240]}"
     return "\n".join((
         f"【待发送草稿】{(draft or '')[:400]}",
         f"【当前消息】{(current_text or '')[:400]}",
         f"【当前说话动作】{action or 'reply'}",
-        "【约束】只比较当前消息和待发送草稿；不要使用或猜测其他聊天内容。",
+        resolved,
+        "【约束】只比较当前消息、明确提供的已解析省略继承和草稿；不要猜测其他聊天内容。",
     ))
 
 
@@ -239,6 +250,7 @@ def critic_questions() -> dict:
             "type": "choice",
             "instructions": (
                 "只比较【待发送草稿】和【当前消息】，判断草稿是否处理了当前请求、问题或纠正。"
+                "若提供【已解析的省略继承】，用它补全当前请求的对象；不得重新解析历史。"
                 "缺少必要信息时，针对缺口追问算已处理。"
                 "action=tease/care/agree/reply 时，只要草稿围绕当前消息中的对象或话题形成直接回应就算已处理，"
                 "不要求它完整回答事实问题。"
@@ -303,7 +315,7 @@ def parse_jev_critic_answers(data: dict, *, action: str = "") -> CriticJudgement
         candidate = answers.get(key)
         probabilities = candidate.get("probabilities") if isinstance(candidate, dict) else None
         value = probabilities.get(failure_labels[key]) if isinstance(probabilities, dict) else None
-        if isinstance(value, bool):
+        if value is None or isinstance(value, bool):
             return None
         try:
             score = float(value)
@@ -340,11 +352,15 @@ def parse_jev_critic_answers(data: dict, *, action: str = "") -> CriticJudgement
             return UNCERTAIN if choice == "other" else pass_value
         return UNCERTAIN
 
+    verdicts = {
+        "intent_covered": _verdict("intent_covered", fail_value=NO, pass_value=YES),
+        "referent_consistent": _verdict("referent_consistent", fail_value=NO, pass_value=YES),
+        "context_consistent": _verdict("context_consistent", fail_value=NO, pass_value=YES),
+        "unsupported_claim": _verdict("unsupported_claim", fail_value=YES, pass_value=NO),
+    }
     return CriticJudgement(
-        intent_covered=_verdict("intent_covered", fail_value=NO, pass_value=YES),
-        referent_consistent=_verdict("referent_consistent", fail_value=NO, pass_value=YES),
-        context_consistent=_verdict("context_consistent", fail_value=NO, pass_value=YES),
-        unsupported_claim=_verdict("unsupported_claim", fail_value=YES, pass_value=NO),
+        **verdicts,
+        unavailable=tuple(key for key, value in verdicts.items() if not value),
         failure_probabilities=tuple(probabilities.items()),
         reason="jev_critic",
     )
@@ -359,14 +375,18 @@ def apply_jev_critic_judgement(judgement: CriticJudgement | None) -> CriticResul
         judgement.context_consistent,
         judgement.unsupported_claim,
     )
-    if any(value not in CRITIC_VALUES for value in values):
-        return CriticResult(reason="error", status=ERROR, source=SOURCE_JEV)
+    names = ("intent_covered", "referent_consistent", "context_consistent", "unsupported_claim")
+    unavailable = tuple(key for key, value in zip(names, values) if value not in CRITIC_VALUES)
+    if len(unavailable) == len(names):
+        return CriticResult(reason="error", status=ERROR, source=SOURCE_JEV, unavailable=unavailable)
+    clean = tuple(value if value in CRITIC_VALUES else UNCERTAIN for value in values)
     return CriticResult(
-        intent_covered=judgement.intent_covered,
-        referent_consistent=judgement.referent_consistent,
-        context_consistent=judgement.context_consistent,
-        unsupported_claim=judgement.unsupported_claim,
-        reason=judgement.reason or "jev_critic",
+        intent_covered=clean[0],
+        referent_consistent=clean[1],
+        context_consistent=clean[2],
+        unsupported_claim=clean[3],
+        unavailable=unavailable,
+        reason="jev_critic_partial" if unavailable else judgement.reason or "jev_critic",
         status=RESOLVED,
         source=SOURCE_JEV,
         value=",".join(values),
@@ -390,6 +410,10 @@ def format_critic_feedback(result: CriticResult) -> str:
         "failures=" + ",".join(result.failures),
         "按失败项重写，不要沿用被纠正前的对象，不要编造上下文没有的信息。不要解释检查过程。",
     ]
+    if "unsupported_claim" in result.failures:
+        lines.append(
+            "点名也必须出声：查不到的事实改成不确定或点出这是群梗，不要编，不要空回复。"
+        )
     return "\n".join(lines)
 
 
@@ -405,11 +429,25 @@ def critic_prefers_clarify(result: CriticResult | None) -> bool:
     return any(key in result.failures for key in ("referent_consistent", "context_consistent", "intent_covered"))
 
 
-def next_critic_action(result: CriticResult | None, *, attempt: int) -> str:
+def next_critic_action(
+    result: CriticResult | None,
+    *,
+    attempt: int,
+    addressed: bool = False,
+) -> str:
     if result is None or result.status in {UNAVAILABLE, ERROR, NOT_APPLICABLE}:
         return "send"
     if not result.failed:
         return "send"
     if int(attempt) <= 0:
         return "regenerate"
+    # Addressed messages must still go out. Silence looks like the bot ignored @/reply.
+    if addressed:
+        return "send"
     return "block"
+
+
+def critic_needs_clarify(result: CriticResult | None) -> bool:
+    if result is None or result.status != RESOLVED or not result.failed:
+        return False
+    return any(key in result.failures for key in ("referent_consistent", "context_consistent"))

@@ -4,6 +4,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Callable, Iterable
 
+from .jev_policy import JEV_PERSON_CONFIDENCE_MIN
 from .resolver_result import (
     AMBIGUOUS,
     ERROR,
@@ -20,7 +21,6 @@ from .resolver_result import (
 
 
 HIGH_CONFIDENCE_SKIP_JEV = 0.85
-JEV_PERSON_CONFIDENCE_MIN = 0.55
 MAX_REFERENT_CANDIDATES = 10
 BOT_SELF_ALIASES = ("张风雪", "风雪")
 
@@ -343,8 +343,16 @@ def apply_jev_referent_judgement(
         )
 
     kind = str(judgement.kind or "NONE").upper()
-    if kind not in {"PERSON", "NON_PERSON", "NONE"}:
-        kind = "NONE"
+    if kind not in {"PERSON", "NON_PERSON", "NONE", "OTHER"}:
+        return ReferenceResolution(reason="error", status=ERROR, source=SOURCE_JEV)
+    if kind == "OTHER" or float(judgement.confidence or 0.0) < JEV_PERSON_CONFIDENCE_MIN:
+        return ReferenceResolution(
+            kind="PERSON" if has_strong_person_reference(current_text) else "NONE",
+            reason="jev_other" if kind == "OTHER" else "jev_low_confidence",
+            confidence=float(judgement.confidence or 0.0),
+            status=AMBIGUOUS,
+            source=SOURCE_JEV,
+        )
     if kind != "PERSON":
         return ReferenceResolution(
             reason="jev_non_person" if kind == "NON_PERSON" else "jev_none",
@@ -496,7 +504,9 @@ def parse_jev_referent_answers(data: dict) -> ReferentJudgement:
     kind_choice = str(kind_raw.get("choice") or "").strip().upper()
     if not kind_choice:
         return ReferentJudgement(kind="NONE", person_key="NONE", confidence=0.0, reason="error")
-    kind = kind_choice if kind_choice in {"PERSON", "NON_PERSON", "NONE"} else "NONE"
+    if kind_choice not in {"PERSON", "NON_PERSON", "NONE", "OTHER"}:
+        return ReferentJudgement(reason="error")
+    kind = kind_choice
     person_key = str(target_raw.get("choice") or "NONE").strip() or "NONE"
     if kind != "PERSON":
         person_key = "NONE"

@@ -535,8 +535,8 @@ def test_reply_to_bot_context_marks_zhangfengxue_as_self() -> None:
 
     text = plugin._message_context_text(event, bot_id=1801507496)
 
-    assert "当前正在回复风雪/张风雪之前的话" in text
-    assert "这里的‘你’大概率指风雪" in text
+    assert "当前正在回复风雪/张风雪之前的话" not in text
+    assert "这里的‘你’大概率指风雪" not in text
     assert "歌迷老蛆[#71184]回复张风雪[#07496]消息" in text
     assert "张风雪[#07496]说：风雪觉得这个有点离谱" in text
 
@@ -554,8 +554,7 @@ def test_plain_mention_of_fengxue_marks_self_context() -> None:
 
     text = plugin._message_context_text(event, bot_id=1801507496)
 
-    assert text.startswith("注：风雪和张风雪都是你自己")
-    assert "风雪你怎么看这个" in text
+    assert text == "风雪你怎么看这个"
 
 
 def test_reply_to_other_that_mentions_fengxue_marks_self_context() -> None:
@@ -577,7 +576,7 @@ def test_reply_to_other_that_mentions_fengxue_marks_self_context() -> None:
 
     text = plugin._message_context_text(event, bot_id=1801507496)
 
-    assert "风雪和张风雪都是你自己" in text
+    assert "风雪和张风雪都是你自己" not in text
     assert "歌迷老蛆[#71184]回复安钰与雨与余[#56789]" in text
     assert "歌迷老蛆[#71184]回复安钰与雨与余[#56789]：问问风雪呗" in text
 

@@ -18,6 +18,9 @@ class Persona:
     passive_reply_probability: float
 
 
+_MISSING = object()
+
+
 class PersonaRegistry:
     def __init__(self, persona_dir: Path):
         self.persona_dir = persona_dir
@@ -44,14 +47,28 @@ class PersonaRegistry:
             personas[persona.id] = persona
         return personas
 
-    def get(self, persona_id: str) -> Persona:
-        if persona_id not in self._personas:
-            available = ", ".join(sorted(self._personas))
-            raise KeyError(f"Unknown persona {persona_id!r}. Available: {available}")
-        return self._personas[persona_id]
+    def get(self, persona_id: str, default: Persona | None | object = _MISSING) -> Persona | None:
+        persona = self.resolve(persona_id)
+        if persona is not None:
+            return persona
+        if default is not _MISSING:
+            return default  # type: ignore[return-value]
+        available = ", ".join(sorted(self._personas))
+        raise KeyError(f"Unknown persona {persona_id!r}. Available: {available}")
+
+    def resolve(self, persona_id: str | None) -> Persona | None:
+        key = str(persona_id or "").strip()
+        if not key:
+            return None
+        if key in self._personas:
+            return self._personas[key]
+        for persona in self._personas.values():
+            if persona.name == key or persona.id == key:
+                return persona
+        return None
 
     def has(self, persona_id: str) -> bool:
-        return persona_id in self._personas
+        return self.resolve(persona_id) is not None
 
     def ids(self) -> list[str]:
         return sorted(self._personas)

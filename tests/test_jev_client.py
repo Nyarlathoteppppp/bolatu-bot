@@ -28,7 +28,7 @@ def test_jev_route_tool_returns_none_below_threshold() -> None:
         return {
             "answers": {
                 "need_tool": {"noul": 0.2},
-                "tool_choice": {"choice": "probability"},
+                "tool_choice": {"choice": "probability", "confidence": 0.9},
             }
         }
 
@@ -52,7 +52,7 @@ def test_jev_route_tool_keeps_probability_choice() -> None:
         return {
             "answers": {
                 "need_tool": {"noul": 0.81},
-                "tool_choice": {"choice": "probability"},
+                "tool_choice": {"choice": "probability", "confidence": 0.9},
             }
         }
 
@@ -727,7 +727,7 @@ def test_jev_prefers_official_api_when_typesafe_key_exists() -> None:
         client = JevClient()
     assert client.provider == "typesafe"
     assert client.base_url == "https://api.typesafe.ai/v1/systemone"
-    assert client.model == "jev-latest"
+    assert client.model == "jev-1.13.0"
     assert client.api_key == "direct"
 
 

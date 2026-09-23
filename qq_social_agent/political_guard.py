@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass
 
 
 SAFE_POLITICAL_REDIRECT = ""
@@ -13,6 +14,7 @@ _ATTACK_RE = re.compile(
 )
 
 # 只保留直球敏感专名。过短、过日常的词（64/包子/连任/新疆/白纸/喝茶）不打码，避免误伤闲聊。
+# 黑话（腊肉、腊爹、咱妈、火宅）不在此列。
 _SENSITIVE_TERMS = (
     "文化大革命",
     "cultural revolution",
@@ -59,6 +61,17 @@ _SENSITIVE_TERMS = (
     "毛泽东",
     "mzd",
     "毛主席",
+    "教员",
+    "邓小平",
+    "江泽民",
+    "胡锦涛",
+    "总书记",
+    "维尼",
+    "习禁评",
+    "习总",
+    "邓公",
+    "小平同志",
+    "梁家河",
     "赵紫阳",
     "刘晓波",
     "胡耀邦",
@@ -129,45 +142,44 @@ _EXTRA_SENSITIVE_PATTERNS = (
 
 _SHORT_ASCII_TERMS = frozenset({"ccp", "xjp", "mzd", "gcd", "wenge", "tankman"})
 
-# 敏感词输出用整词 “*拼音首字母*”：习近平 -> *xjp*，共产党 -> *gcd*。
-_PINYIN_CHARS = "三上下世东中丰丹主乌九习乡书事五产人件任会伞佳修元光克党全八公六共兵再刁刘刚制功加动劳包化南占卫县反取台右吾周命哥喝四困国场坎坦城基墙士大天太失夹女姚媒子学安宪家封尔尼局山工帅师希帝席帮平年广庆店康开张强彪彭律志态总慧批摘政教文斗新族时明春晓晟晶智朗期木李来林桥毛民永江沟河治法波泽洪活派海消涛清港湾潮火灭灾焚熙犬独王班瓶生疆登白禅离种秦突立站章类紫红纪纸终绝维网耀育胡自色茶荒营蔡薄藏蟹被西记许评诚贵赖赵跃身轮辱边达运近进连迫退送通速邦郭铁铜链锣锦门阳陈难集雨零霞青革颜饥香高鲁黑齐"
-_PINYIN_INITIALS = "ssxsdzfdzwjxxsswcrjrhsjxygkdqbglgbzdlgzgjdlbhnzwxfqtywzmghskgcktcjqsdttsjnymzxaxjfenjsgssxdxbpngqdkkzqbplztzhpzzjwdxzsmcxcjzlqmlllqmmyjghzfbzhhphxtqgwchmzfxqdwbpsjdbclzqtlzzlzhjzzjwwyyhzschycbcxbxjxpcglzyslrbdyjjlptstsbgttlljmycnjylxqgyjxglhq"
-_PINYIN_INITIAL_MAP = dict(zip(_PINYIN_CHARS, _PINYIN_INITIALS))
-_PINYIN_INITIAL_MAP.update(
-    {
-        "暴": "b",
-        "打": "d",
-        "倒": "d",
-        "推": "t",
-        "翻": "f",
-        "下": "x",
-        "灭": "m",
-        "亡": "w",
-        "垮": "k",
-        "裁": "c",
-        "纳": "n",
-        "粹": "c",
-        "屠": "t",
-        "杀": "s",
-        "血": "x",
-        "债": "z",
-        "腐": "f",
-        "败": "b",
-        "透": "t",
-        "顶": "d",
-    }
-)
-
 
 def _term_pattern(term: str) -> str:
     escaped = re.escape(term)
+    # Match simple obfuscation without normalizing or rewriting the source text.
+    separator = r"[\s·._\u200b-\u200d\ufeff]{0,3}"
     if term.isascii() and term.lower() in _SHORT_ASCII_TERMS:
-        return rf"(?<![A-Za-z0-9]){escaped}(?![A-Za-z0-9])"
+        spaced = separator.join(re.escape(char) for char in term)
+        return rf"(?<![A-Za-z0-9]){spaced}(?![A-Za-z0-9])"
+    if len(term) >= 2 and all("\u4e00" <= char <= "\u9fff" for char in term):
+        return separator.join(re.escape(char) for char in term)
     return escaped
 
 
+# These existing entries have common non-political senses. Keep them out of the
+# hard mask and ask Jev about each occurrence, not the entire message/topic.
+_CONTEXTUAL_TERMS = frozenset({"教员", "维尼", "gcd", "wenge"})
+_CONTEXTUAL_RE = re.compile(
+    "|".join(_term_pattern(term) for term in sorted(_CONTEXTUAL_TERMS)), re.IGNORECASE,
+)
+
+
+@dataclass(frozen=True)
+class PoliticalCandidate:
+    key: str
+    start: int
+    end: int
+    text: str
+
+
+def political_candidates(text: str) -> tuple[PoliticalCandidate, ...]:
+    return tuple(
+        PoliticalCandidate(f"span_{index}", match.start(), match.end(), match.group())
+        for index, match in enumerate(_CONTEXTUAL_RE.finditer(text or ""))
+    )
+
+
 _SENSITIVE_DOMESTIC_RE = re.compile(
-    "|".join(_term_pattern(term) for term in sorted(_SENSITIVE_TERMS, key=len, reverse=True))
+    "|".join(_term_pattern(term) for term in sorted(set(_SENSITIVE_TERMS) - _CONTEXTUAL_TERMS, key=len, reverse=True))
     + "|"
     + "|".join(_EXTRA_SENSITIVE_PATTERNS),
     re.IGNORECASE,
@@ -188,32 +200,76 @@ def political_safe_reply() -> str:
     return SAFE_POLITICAL_REDIRECT
 
 
+@dataclass(frozen=True)
+class PoliticalSanitizeResult:
+    public_text: str
+    original_text: str
+    hits: tuple[str, ...]
+    guarded: bool
+
+
 def sanitize_political_output(reply: str) -> tuple[str, bool]:
+    result = sanitize_political_output_detail(reply)
+    return result.public_text, result.guarded
+
+
+def sanitize_political_output_detail(
+    reply: str, *, contextual_keys: tuple[str, ...] | None = None,
+) -> PoliticalSanitizeResult:
     if not reply:
-        return reply, False
-    masked, count = _MASK_RE.subn(_mask_match, reply)
+        return PoliticalSanitizeResult(reply, reply, (), False)
+    hits: list[str] = []
+
+    def collect(match: re.Match[str]) -> str:
+        hits.append(match.group(0))
+        return _mask_match(match)
+
+    masked, count = _MASK_RE.subn(collect, reply)
     if _TARGET_PARTY_RE.search(reply) and _ATTACK_RE.search(reply):
-        masked, attack_count = _MASK_ATTACK_RE.subn(_mask_match, masked)
+        masked, attack_count = _MASK_ATTACK_RE.subn(collect, masked)
         count += attack_count
-    return masked, count > 0
+    # Keys resolve only against code-extracted spans in this exact text. Jev
+    # cannot supply replacement text or arbitrary offsets. Masks preserve length.
+    candidates = political_candidates(reply)
+    # Political output is the explicitly fail-closed exception: unavailable
+    # contextual judgement preserves the original conservative mask policy.
+    selected = {candidate.key for candidate in candidates} if contextual_keys is None else set(contextual_keys)
+    for candidate in candidates:
+        if candidate.key not in selected:
+            continue
+        masked = masked[:candidate.start] + "*" * (candidate.end - candidate.start) + masked[candidate.end:]
+        hits.append(candidate.text)
+        count += 1
+    unique_hits = tuple(dict.fromkeys(hits))
+    return PoliticalSanitizeResult(
+        public_text=masked,
+        original_text=reply,
+        hits=unique_hits,
+        guarded=count > 0,
+    )
+
+
+def format_gag_memory(public_text: str, hits: tuple[str, ...] | list[str]) -> str:
+    if not public_text or not hits:
+        return public_text
+    joined = "、".join(dict.fromkeys(str(item) for item in hits if str(item).strip()))
+    if not joined:
+        return public_text
+    return f"{public_text}（内容{joined}已被风雪你的口球屏蔽成***）"
+
+
+def prepare_group_political_output(reply: str) -> PoliticalSanitizeResult:
+    result = sanitize_political_output_detail(reply)
+    if not result.guarded:
+        return result
+    return PoliticalSanitizeResult(
+        public_text=result.public_text,
+        original_text=result.original_text,
+        hits=result.hits,
+        guarded=True,
+    )
 
 
 def _mask_match(match: re.Match[str]) -> str:
     raw = match.group(0)
-    initials: list[str] = []
-    for ch in raw:
-        if ch.isspace():
-            continue
-        initials.append(_initial_for_mask(ch))
-    token = "".join(initials) or "*"
-    return f"*{token}*"
-
-
-def _initial_for_mask(ch: str) -> str:
-    if "\u4e00" <= ch <= "\u9fff":
-        return _PINYIN_INITIAL_MAP.get(ch, "*")
-    if ch.isalpha():
-        return ch.lower()
-    if ch.isdigit():
-        return ch
-    return "*"
+    return "".join("*" if not ch.isspace() else ch for ch in raw)

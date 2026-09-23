@@ -10,7 +10,7 @@ from ..pipeline_types import ToolKind, ToolRequest, ToolResult
 
 
 class JevProbabilityTool:
-    """Tool that uses DeepSeek to refine user queries and Jev to compute calibrated event probabilities."""
+    """Use Jev for an explicitly requested subjective estimate, not actuarial odds."""
 
     def __init__(
         self,
@@ -32,6 +32,7 @@ class JevProbabilityTool:
             prompt = (
                 "群友向张风雪询问某件事情发生的可能性、几率或概率。\n"
                 "请结合上下文，将该问题提炼为给 Jev (TypeSafe System One) 评估的标准输入。\n"
+                "背景只能使用用户或上下文已提供的证据，不得补造录取率、统计样本或个人经历。\n"
                 "必须输出合法 JSON，包含：\n"
                 "- \"state\": 包含背景和具体情况的客观描述（去除口语命令词如'风雪你觉得'、'算算概率'等）\n"
                 "- \"instructions\": 供 noul (yes/no 概率) 评估的问题陈述（明确陈述该事件为真或将要发生）\n\n"
@@ -76,8 +77,9 @@ class JevProbabilityTool:
         pct = prob * 100.0
         context = (
             f"【概率评估】命题：{instructions}\n"
-            f"校准概率：{pct:.1f}%（noul={prob:.4f}）。\n"
-            f"这是量化可能性，不是保证；回复时直接给出这个数字和你的判断，不要编造计算过程。"
+            f"模型主观估计：约 {pct:.0f}%（noul={prob:.4f}）。\n"
+            "这是基于给定信息的粗略判断，不是该现实事件经过统计校准的发生率。"
+            "用户明确要求数值时才给粗略数字并说明关键依据；不要称为测算结果，不编造样本或计算过程。"
         )
         return ToolResult(
             ToolKind.PROBABILITY,

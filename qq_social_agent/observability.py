@@ -233,15 +233,61 @@ def mark_bot_seen(bot_id: int | str) -> None:
     """Record activity observed from a bot without changing connection ownership."""
 
     bot_key = str(bot_id)
+    now = time.time()
     state = dict(_bot_connections.get(bot_key, {"bot_id": bot_key}))
     state.update(
         {
             "bot_id": bot_key,
             "connected": bot_key in _connected_bots,
-            "last_seen_at": time.time(),
+            "last_seen_at": now,
+            "last_inbound_event_at": now,
         }
     )
     _bot_connections[bot_key] = state
+
+
+SEND_APIS = frozenset({"send_group_msg", "send_private_msg", "send_msg", "send_group_forward_msg", "send_private_forward_msg"})
+SEND_HEALTH_TTL_SECONDS = 600.0
+
+
+def _record_send_outcome(state: dict[str, Any], api: str, outcome: str, now: float, error: object = "") -> None:
+    if api not in SEND_APIS:
+        return
+    channels = dict(state.get("send_channels") or {})
+    channel = dict(channels.get(api) or {})
+    channel.update(last_attempt_at=now, outcome=outcome)
+    if outcome == "success":
+        channel.update(last_success_at=now, consecutive_failures=0, last_error="")
+    else:
+        channel.update(last_failure_at=now, last_error=_error_summary(error),
+                       consecutive_failures=int(channel.get("consecutive_failures") or 0) + 1)
+    channels[api] = channel
+    state["send_channels"] = channels
+
+
+def delivery_health_snapshot(onebot: dict[str, Any]) -> dict[str, Any]:
+    now = time.time()
+    channels = {}
+    for bot in onebot.get("bots", []):
+        if not bot.get("connected"):
+            continue
+        observed = {"send_group_msg": {}, "send_private_msg": {}, **(bot.get("send_channels") or {})}
+        for api, value in observed.items():
+            entry = dict(value)
+            outcome = value.get("outcome")
+            if outcome is None:
+                status = "unverified"
+            elif outcome == "success":
+                status = "verified" if now - value.get("last_success_at", 0) <= SEND_HEALTH_TTL_SECONDS else "unverified"
+            else:
+                status = "unknown" if outcome == "unknown" else "failed"
+            entry["status"] = status
+            channels[f"{bot.get('bot_id')}:{api}"] = entry
+    failed = any(v["status"] == "failed" for v in channels.values())
+    unknown = any(v["status"] == "unknown" for v in channels.values())
+    return {"ok": not (failed or unknown), "status": "failed" if failed else "unknown" if unknown else
+            "verified" if channels and all(v["status"] == "verified" for v in channels.values()) else "unverified",
+            "channels": channels}
 
 
 def mark_onebot_api_success(
@@ -270,6 +316,7 @@ def mark_onebot_api_success(
             "consecutive_api_errors": 0,
         }
     )
+    _record_send_outcome(state, api, "success", now)
     _bot_connections[bot_key] = state
 
 
@@ -303,6 +350,11 @@ def mark_onebot_api_error(
             "consecutive_api_errors": int(state.get("consecutive_api_errors") or 0) + 1,
         }
     )
+    unknown = timeout or isinstance(error, (TimeoutError, ConnectionError)) or "timeout" in str(error).lower()
+    # Transport failures lack a QQ rejection; their delivery result is unknown.
+    if not isinstance(error, str) and type(error).__name__ in {"NetworkError", "CancelledError"}:
+        unknown = True
+    _record_send_outcome(state, api, "unknown" if unknown else "failed", now, error)
     _bot_connections[bot_key] = state
 
 

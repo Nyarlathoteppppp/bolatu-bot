@@ -1,0 +1,91 @@
+[
+  {
+    "id": "ellipsis_this_who",
+    "scene": "ellipsis",
+    "current_text": "这是谁",
+    "history": [{"speaker": "U1", "text": "怕你们不知道"}, {"speaker": "U1", "text": "[图片]"}],
+    "expect": {
+      "ask_ellipsis": true,
+      "ellipsis_status_forbidden": ["NOT_APPLICABLE"],
+      "force_probability_tool": false,
+      "addressed_by_name": false
+    }
+  },
+  {
+    "id": "ellipsis_size_followup",
+    "scene": "ellipsis",
+    "current_text": "最大只有xl吗",
+    "history": [{"speaker": "U2", "text": "这件外套好看"}],
+    "expect": {
+      "ask_ellipsis": true,
+      "force_probability_tool": false
+    }
+  },
+  {
+    "id": "named_address_code",
+    "scene": "addressed",
+    "current_text": "风雪，如何用C实现闭包",
+    "history": [],
+    "expect": {
+      "addressed_by_name": true,
+      "force_probability_tool": false
+    }
+  },
+  {
+    "id": "comfort_not_forecast",
+    "scene": "tool",
+    "current_text": "又被拒了，我是不是这辈子都拿不到offer了",
+    "history": [],
+    "expect": {
+      "force_probability_tool": false,
+      "addressed_by_name": false
+    }
+  },
+  {
+    "id": "math_probability_not_tool",
+    "scene": "tool",
+    "current_text": "两枚公平硬币同时正面的概率怎么算",
+    "history": [],
+    "expect": {
+      "force_probability_tool": false
+    }
+  },
+  {
+    "id": "reply_to_other_envelope",
+    "scene": "timing",
+    "current_text": "甲[#11111]回复乙[#22222]消息【乙说：hi；甲回复乙：你好】",
+    "history": [],
+    "expect": {
+      "timing_reply_to_other": true
+    }
+  },
+  {
+    "id": "technical_reply_words",
+    "scene": "timing",
+    "current_text": "消息回复不了，怎么修？",
+    "history": [],
+    "expect": {
+      "timing_reply_to_other": false
+    }
+  },
+  {
+    "id": "jev_unavailable_not_none",
+    "scene": "unavailable",
+    "current_text": "这个呢",
+    "history": [{"speaker": "U1", "text": "第一套方案要重写缓存"}],
+    "expect": {
+      "ask_ellipsis": true,
+      "unavailable_is_not_none": true
+    }
+  },
+  {
+    "id": "reply_and_at_conflict",
+    "scene": "addressee",
+    "current_text": "你怎么看",
+    "reply_to_other": true,
+    "at_bot": true,
+    "expect": {
+      "isolate_addressee": true
+    }
+  }
+]

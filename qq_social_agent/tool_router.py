@@ -128,16 +128,8 @@ def route_tools(
                 arguments={"kind": "web"},
             )
         )
-    if is_probability_lookup(text) and addressed:
-        requests.append(
-            ToolRequest(
-                ToolKind.PROBABILITY,
-                query=text.strip(),
-                reason="probability_lookup",
-                confidence=0.95,
-                required=True,
-            )
-        )
+    # Probability words are only hints: math, reassurance and predictions share
+    # them. The semantic tool router decides; never force a forecast here.
     if addressed and URL_RE.search(text):
         requests.append(
             ToolRequest(

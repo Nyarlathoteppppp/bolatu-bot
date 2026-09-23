@@ -61,7 +61,7 @@ deepseek:
     - siliconflow/Qwen/Qwen3.5-35B-A3B
     - siliconflow/MiniMaxAI/MiniMax-M2.5
     - siliconflow/Pro/moonshotai/Kimi-K2.6
-    - openrouter/~typesafe/jev-latest
+    - openrouter/typesafe/jev-1.13
   fallback_models:
     decision: deepseek/deepseek-v4-flash
     reply: siliconflow/deepseek-ai/DeepSeek-V4-Flash
@@ -189,8 +189,8 @@ meme_library:
 
 fresh_search:
   enabled: true
-  # 自建 SearXNG 主搜索；失败时自动回退 Tavily / RSS 搜索。
-  provider: searxng
+  # 当前宿主机 SearXNG 引擎持续超时；使用已验证可达的 Tavily，失败仍走 RSS 回退。
+  provider: tavily
   max_external_queries_per_minute: 8
   timeout_seconds: 10
   max_results: 5

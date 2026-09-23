@@ -608,10 +608,7 @@ def _tools_switch_forms(state: dict[str, Any]) -> str:
     )
     review = state.get('approval') if isinstance(state.get('approval'), dict) else {}
     review_form = (
-        '<form class="inline" method="post" action="/admin/tools/action">'
-        '<input type="hidden" name="action" value="review_enabled">'
-        '<div class="field"><label>人工审查</label><select name="enabled"><option value="1">开启审查</option><option value="0">关闭审查</option></select></div>'
-        '<button type="submit">应用</button></form>'
+        '<p class="muted">人工审查已永久关闭，群聊回复直接发出，不能从这里打开。</p>'
     )
     auto_form = (
         '<form class="inline" method="post" action="/admin/tools/action">'
@@ -866,7 +863,10 @@ def _summary_table(
         action_links = [f'<a class="btn" href="/admin/summaries/{summary.id}{_query_suffix(params)}">详情/编辑</a>']
         for action, label in (("lock", "锁定"), ("unlock", "解锁"), ("active", "恢复"), ("archive", "归档"), ("expire", "过期")):
             cls = 'btn danger' if action in {'archive', 'expire'} else 'btn'
-            action_links.append(f'<a class="{cls}" href="/admin/summaries/action{_query_suffix({**params, "summary_id": summary.id, "action": action})}">{label}</a>')
+            action_links.append(
+                f'<form method="post" action="/admin/summaries/action{_query_suffix({**params, "summary_id": summary.id, "action": action})}" class="inline">'
+                f'<button class="{cls}" type="submit">{label}</button></form>'
+            )
         out.append(
             f'<tr><td><a href="/admin/summaries/{summary.id}">#{summary.id}</a></td>'
             f'<td class="small">{_fmt_time(summary.start_at)} - {_fmt_time(summary.end_at)}<br>更新 {_fmt_time(summary.updated_at)}</td>'
@@ -1125,7 +1125,10 @@ def _memory_actions(
     for action, label in specs:
         cls = 'btn danger' if action in {'wrong_person', 'expire'} else 'btn'
         action_params = {**params, 'atom_id': atom_id, 'action': action}
-        links.append(f'<a class="{cls}" href="/admin/memory/action{_query_suffix(action_params)}">{label}</a>')
+        links.append(
+            f'<form method="post" action="/admin/memory/action{_query_suffix(action_params)}" class="inline">'
+            f'<button class="{cls}" type="submit">{label}</button></form>'
+        )
     return ''.join(links)
 
 
