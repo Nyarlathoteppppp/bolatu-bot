@@ -174,6 +174,14 @@ from .observability import (
     render_trace_html,
 )
 from .persona import PersonaRegistry
+from .private_generation_context import (
+    PrivateGenerationContextServices,
+    build_private_generation_context,
+)
+from .private_message_types import BufferedPrivateMessage, PrivateTurn
+from .private_reply_delivery import PrivateReplyServices, generate_and_send_private_reply
+from .private_tool_execution import PrivateToolServices, plan_and_execute_private_tools
+from .private_turn_preparation import PrivateTurnServices, prepare_private_turn
 from .plugin_runtime import LocalPluginRegistry
 from .prompts import PromptRegistry
 from .pipeline_types import (
@@ -1270,18 +1278,6 @@ class BufferedGroupMessage:
     message_segments_json: str = ""
     raw_message_json: str = ""
     sender_json: str = ""
-
-
-@dataclass(frozen=True)
-class BufferedPrivateMessage:
-    bot: Bot
-    event: PrivateMessageEvent
-    text: str
-    user_id: int
-    nickname: str
-    created_at: float
-    source_message_id: str = ""
-    correlation_id: str = ""
 
 
 @dataclass(frozen=True)
@@ -6705,614 +6701,133 @@ async def _handle_private_message_scoped(
     buffered_items = list(buffered_messages or ())
     if buffered_items:
         latest = buffered_items[-1]
-        bot = latest.bot
-        event = latest.event
+        bot, event = latest.bot, latest.event
         correlation_id = latest.correlation_id
-        text = latest.text
+        received_text = latest.text
     else:
-        text = _message_context_text(event, bot_id=int(bot.self_id))
-    if not text:
-        logger.info("qq_social_agent ignored private: empty_text")
-        return
+        received_text = _message_context_text(event, bot_id=int(bot.self_id))
 
-    user_id = int(event.user_id)
-    chat_id = _private_chat_id(user_id)
-    source_message_id = event_message_source_id(event)
-    claim_items = buffered_items or [
-        BufferedPrivateMessage(
-            bot=bot,
-            event=event,
-            text=text,
-            user_id=user_id,
-            nickname=_private_nickname(event),
-            created_at=float(getattr(event, "time", 0) or time.time()),
-            source_message_id=source_message_id,
-            correlation_id=correlation_id,
-        )
-    ]
-    accepted_items: list[BufferedPrivateMessage] = []
-    for item in claim_items:
-        if memory.claim_inbound_message(
-            chat_id,
-            item.source_message_id,
-            correlation_id=item.correlation_id,
-            created_at=item.created_at,
-        ):
-            accepted_items.append(item)
-    if not accepted_items:
-        logger.info(
-            "qq_social_agent ignored duplicate private message: "
-            f"user={user_id} source_message_id={source_message_id}"
-        )
-        _record_metric_event(
-            "message_duplicate",
-            group_id=chat_id,
-            user_id=user_id,
-            stage="private",
-            action="duplicate",
-            source_message_id=source_message_id,
-            correlation_id=correlation_id,
-        )
-        return
-    if buffered_items:
-        latest = accepted_items[-1]
-        bot = latest.bot
-        event = latest.event
-        correlation_id = latest.correlation_id
-        source_message_id = latest.source_message_id
-        text = latest.text
-    if await _handle_group_approval_private(bot, user_id, text):
-        return
-
-    if user_id in COMMAND_ONLY_PRIVATE_USER_IDS:
-        logger.info(f"qq_social_agent ignored private: user={user_id} command_only")
-        return
-
-    if not _private_user_can_chat(user_id):
-        logger.info(f"qq_social_agent ignored private: user={user_id} not_allowed")
-        return
-
-    file_context = await file_metadata_context_for_event(bot, event)
-    if file_context and file_context not in text:
-        text = _join_context_parts(text, file_context)
-    content_context = await content_ingestion_service.context_for_event(
+    turn = await prepare_private_turn(
         bot,
         event,
-        allow_file_content=True,
-        voice_context=VoiceTranscriptContext(mentioned=True),
-    )
-    if content_context.text:
-        text = _join_context_parts(text, content_context.text)
-    if content_context.file_count or content_context.voice_count:
-        _record_metric_event(
-            "content_ingestion",
-            group_id=chat_id,
-            user_id=user_id,
-            stage="private_media_context",
-            action="recognized" if content_context.text else "skipped",
-            file_count=content_context.file_count,
-            voice_count=content_context.voice_count,
-            file_status=content_context.file_status,
-            voice_status=content_context.voice_status,
-        )
-    ocr_context = ImageOcrContext("", 0, 0)
-    image_segments = collect_ocr_image_segments(getattr(event, "message", []) or [])
-    if image_segments and await _media_worth_reading(
-        kind="ocr",
-        caption=text,
-        addressed=True,
-        item_count=len(image_segments),
-        group_id=chat_id,
-        user_id=user_id,
-    ):
-        ocr_context = await _image_ocr_context_for_event(
-            bot,
-            event,
-            group_allowed=True,
-            group_id=chat_id,
-            user_id=user_id,
-            correlation_id=correlation_id,
-        )
-        if ocr_context.text:
-            text = _join_context_parts(text, _format_image_ocr_context(ocr_context))
-    elif image_segments:
-        ocr_context = ImageOcrContext("", len(image_segments), 0, "jev_skip")
-    forward_context = ""
-    if _message_has_forward_context(event) and await _media_worth_reading(
-        kind="forward",
-        caption=text,
-        addressed=True,
-        item_count=1,
-        group_id=chat_id,
-        user_id=user_id,
-    ):
-        forward_context = await _forward_context_text(bot, event, nickname=_private_nickname(event))
-        if not forward_context:
-            _record_metric_event(
-                "content_ingestion",
-                group_id=chat_id,
-                user_id=user_id,
-                stage="private_forward_context",
-                action="unavailable",
-                source_message_id=source_message_id,
-            )
-
-    force_obey_response = _private_force_obey_command_response(user_id, text)
-    if force_obey_response is not None:
-        await _send_private_message(bot, user_id=user_id, message=Message(force_obey_response))
-        logger.info(f"qq_social_agent private force obey command: user={user_id} text={text!r}")
-        return
-
-    if text in PRIVATE_CONTEXT_RESET_COMMANDS:
-        memory.reset_group_messages(chat_id)
-        await _send_private_message(bot, user_id=user_id, message=Message("私聊上下文已清空，重新开始。"))
-        logger.info(f"qq_social_agent private context reset: user={user_id}")
-        return
-
-    forced_once_context = ""
-    forced_once_text = _extract_private_force_obey_once_text(user_id, text)
-    if forced_once_text is not None:
-        text = forced_once_text
-        forced_once_context = _private_force_obey_context(user_id, one_shot=True)
-
-    if not forward_context:
-        text = await _message_text_for_context(
-            text,
-            nickname=_private_nickname(event),
-            chat_label="QQ 私聊",
-        )
-    elif len((text or "").strip()) > LONG_MESSAGE_SUMMARY_THRESHOLD:
-        text = await _message_text_for_context(
-            text,
-            nickname=_private_nickname(event),
-            chat_label="QQ 私聊",
-        )
-    if forward_context:
-        text = _join_context_blocks(text, forward_context)
-    prompt_text = text
-    if len(accepted_items) > 1:
-        earlier = [
-            _short_notice_text(item.text, 240)
-            for item in accepted_items[:-1]
-            if item.text.strip()
-        ]
-        if earlier:
-            prompt_text = "[对方连续发了多条私聊]\n" + "\n".join(earlier + [text])
-    logger.info(f"qq_social_agent private start: user={user_id} text={text!r}")
-    nickname = _private_nickname(event)
-    for item in accepted_items[:-1]:
-        memory.add_message(
-            chat_id,
-            user_id,
-            item.nickname,
-            item.text,
-            is_bot=False,
-            source_message_id=item.source_message_id,
-            correlation_id=item.correlation_id,
-            **_event_message_storage_kwargs(item.event, bot=item.bot),
-        )
-    memory.add_message(
-        chat_id,
-        user_id,
-        nickname,
-        text,
-        is_bot=False,
-        source_message_id=source_message_id,
         correlation_id=correlation_id,
-        **_event_message_storage_kwargs(event, bot=bot),
-    )
-    private_state = memory.private_conversation_state(chat_id)
-    if private_state is None or "display_name" not in private_state.frozen_fields:
-        memory.update_private_conversation_state(
-            chat_id=chat_id,
-            user_id=user_id,
-            display_name=nickname,
-        )
-    text = prompt_text
-    # Private chats share the same retrieval and learning pipeline as groups,
-    # but their synthetic chat_id keeps every stored fact and source isolated.
-    rag_service.request_source_sync()
-    _schedule_private_memory_maintenance(chat_id)
-
-    state = memory.group_state(chat_id)
-    if not bool(state["enabled"]):
-        logger.info(f"qq_social_agent ignored private: user={user_id} disabled")
-        return
-
-    persona_id = str(state["persona"] or app_config.default_persona)
-    persona = personas.get(persona_id)
-    recent = memory.recent_messages(chat_id, PRIVATE_CONTEXT_LIMIT)
-    context_recent = _without_current_message(recent, user_id=user_id, text=text)
-    market_intents = detect_market_intents(text, limit=2)
-    rate = rate_limiter.allow(chat_id, mentioned=True)
-    if not rate.allowed:
-        logger.info(f"qq_social_agent suppressed private by rate: user={user_id} reason={rate.reason}")
-        return
-
-    if deepseek_client is None:
-        logger.warning("qq_social_agent skipped private: deepseek_client_not_ready")
-        return
-
-    normalized_rag_query = normalize_rag_query(text)
-    context_query = normalized_rag_query.current_utterance or text
-    market_intents = detect_market_intents(context_query, limit=2)
-    fresh_intent = detect_fresh_intent(context_query)
-    tool_plan = _tool_plan_with_runtime_context(
-        _route_tools(
-            context_query,
-            market_intents=market_intents,
-            fresh_intent=fresh_intent,
-            addressed=True,
-            market_required=bool(market_intents) and _is_explicit_market_lookup(context_query),
+        received_text=received_text,
+        buffered_messages=buffered_items,
+        services=PrivateTurnServices(
+            memory=memory,
+            rag_service=rag_service,
+            content_ingestion=content_ingestion_service,
+            approval_handler=_handle_group_approval_private,
+            private_user_can_chat=_private_user_can_chat,
+            private_chat_id=_private_chat_id,
+            source_message_id=event_message_source_id,
+            private_nickname=_private_nickname,
+            file_metadata_context=file_metadata_context_for_event,
+            media_worth_reading=_media_worth_reading,
+            image_ocr_context_for_event=_image_ocr_context_for_event,
+            format_image_ocr_context=_format_image_ocr_context,
+            message_has_forward_context=_message_has_forward_context,
+            forward_context_text=_forward_context_text,
+            force_obey_command_response=_private_force_obey_command_response,
+            extract_force_obey_once_text=_extract_private_force_obey_once_text,
+            force_obey_context=_private_force_obey_context,
+            message_text_for_context=_message_text_for_context,
+            event_message_storage_kwargs=_event_message_storage_kwargs,
+            schedule_private_memory_maintenance=_schedule_private_memory_maintenance,
+            send_private_message=_send_private_message,
+            record_metric_event=_record_metric_event,
+            message_factory=Message,
+            short_notice_text=_short_notice_text,
+            private_context_reset_commands=frozenset(PRIVATE_CONTEXT_RESET_COMMANDS),
+            command_only_private_user_ids=frozenset(COMMAND_ONLY_PRIVATE_USER_IDS),
+            long_message_summary_threshold=LONG_MESSAGE_SUMMARY_THRESHOLD,
+            logger=logger,
         ),
-        addressed=True,
-        group_id=chat_id,
-        user_id=user_id,
-        source_message_id=source_message_id,
     )
-    decision = _apply_backend_tool_decision(
-        ReplyDecision(
-            should_reply=True,
-            confidence=1.0,
-            reason="private_direct_conversation",
-            mode="reply",
-            action="answer",
+    if turn is None:
+        return
+
+    tool_stage = await plan_and_execute_private_tools(
+        turn,
+        services=PrivateToolServices(
+            memory=memory,
+            rag_service=rag_service,
+            rate_limiter=rate_limiter,
+            personas=personas,
+            app_config=app_config,
+            get_deepseek_client=lambda: deepseek_client,
+            tool_registry=tool_registry,
+            route_tools=_route_tools,
+            tool_plan_with_runtime_context=_tool_plan_with_runtime_context,
+            apply_backend_tool_decision=_apply_backend_tool_decision,
+            apply_tool_plan=_apply_tool_plan,
+            is_explicit_market_lookup=_is_explicit_market_lookup,
+            market_intents_from_decision=_market_intents_from_decision,
+            apply_tool_use_router=_apply_tool_use_router,
+            execute_fresh_tool_request=_execute_fresh_tool_request,
+            compact_search_query=_compact_search_query,
+            fresh_tool_failure_context=_fresh_tool_failure_context,
+            normalize_rag_query=normalize_rag_query,
+            detect_market_intents=detect_market_intents,
+            detect_fresh_intent=detect_fresh_intent,
+            without_current_message=_without_current_message,
+            combine_text_sections=_combine_text_sections,
+            private_conversation_state_context=_private_conversation_state_context,
+            private_priority_context=_private_priority_context,
+            member_label=_member_label,
+            record_metric_event=_record_metric_event,
+            logger=logger,
+            private_context_limit=PRIVATE_CONTEXT_LIMIT,
+            mid_memory_keep_summaries=MID_MEMORY_KEEP_SUMMARIES,
         ),
-        text=context_query,
-        market_intents=market_intents,
-        fresh_intent=fresh_intent,
     )
-    decision = _apply_tool_plan(decision, tool_plan)
-    private_speaker_context = (
-        f"当前是和{_member_label(user_id, nickname)}的一对一私聊。"
-        "不要把普通代词误当成群友或机器人；不要艾特第三人、点群表情或假装在群里说话。"
-    )
-    private_state_context = _private_conversation_state_context(chat_id)
-    decision, tool_plan = await _apply_tool_use_router(
-        decision,
-        tool_plan=tool_plan,
-        persona=persona,
-        context_recent=context_recent,
-        text=context_query,
-        nickname=nickname,
-        addressed_bot=True,
-        fresh_intent=fresh_intent,
-        market_intents=market_intents,
-        speaker_context=private_speaker_context,
-        group_id=chat_id,
-        user_id=user_id,
-        source_message_id=source_message_id,
-        chat_label="QQ 私聊",
-    )
-    _record_metric_event(
-        "private_tool_route_plan",
-        group_id=chat_id,
-        user_id=user_id,
-        stage="routing",
-        action=decision.action,
-        need_fresh=decision.need_fresh_context,
-        need_tool=decision.need_tool,
-        requests=[request.kind.value for request in tool_plan.requests],
-    )
-
-    rag_task: asyncio.Task[RAGRetrievalResult] = asyncio.create_task(
-        rag_service.retrieve(
-            group_id=chat_id,
-            query=context_query,
-            addressed=True,
-            related_user_ids=[user_id],
-            excluded_user_ids=[int(event.self_id)],
-            include_conversation=False,
-        )
-    )
-    market_context = ""
-    if decision.need_tool and decision.tool == "market":
-        requested_intents = _market_intents_from_decision(
-            decision,
-            fallback_text=context_query,
-            fallback_intents=market_intents,
-        )
-        market_request = tool_plan.first(ToolKind.MARKET) or ToolRequest(
-            ToolKind.MARKET,
-            query=context_query,
-            reason="private_reply_requires_market",
-            required=True,
-            arguments={
-                "symbols": tuple(
-                    {
-                        "kind": item.kind,
-                        "symbol": item.symbol,
-                        "display": item.display_name,
-                    }
-                    for item in requested_intents[:2]
-                )
-            },
-        )
-        market_result = await tool_registry.execute(market_request)
-        market_context = market_result.context
-        _record_metric_event(
-            "tool_call",
-            group_id=chat_id,
-            user_id=user_id,
-            stage="private_market",
-            action="registry_execute",
-            tool_kind=ToolKind.MARKET.value,
-            success=market_result.ok,
-            status=market_result.status,
-            latency_ms=market_result.elapsed_ms,
-            error=market_result.error,
-            **dict(market_result.metadata),
-        )
-
-    fresh_context = ""
-    if decision.need_fresh_context:
-        query = _compact_search_query(decision.fresh_query.strip() or context_query) or (
-            decision.fresh_query.strip() or context_query
-        )
-        fresh_result = await _execute_fresh_tool_request(
-            ToolRequest(
-                ToolKind.FRESH_SEARCH,
-                query=query,
-                reason="private_reply_requires_fresh_context",
-                required=True,
-                arguments={"kind": decision.fresh_kind},
-            ),
-            metric_stage="private_fresh_context",
-            group_id=chat_id,
-            user_id=user_id,
-        )
-        fresh_context = fresh_result.context
-        if str(fresh_result.status) != "ok" and not fresh_context.strip():
-            fresh_context = _fresh_tool_failure_context(
-                query,
-                status=str(fresh_result.status),
-                reason=str(fresh_result.error or fresh_result.status or "搜索工具没有返回可用结果"),
-            )
-    deep_request = tool_plan.first(ToolKind.DEEP_URL)
-    if deep_request is not None:
-        deep_result = await tool_registry.execute(deep_request)
-        if deep_result.context:
-            fresh_context = _combine_text_sections(fresh_context, deep_result.context)
-        _record_metric_event(
-            "tool_call",
-            group_id=chat_id,
-            user_id=user_id,
-            stage="private_deep_url_reader",
-            action="registry_execute",
-            tool_kind=ToolKind.DEEP_URL.value,
-            success=deep_result.ok,
-            status=deep_result.status,
-            latency_ms=deep_result.elapsed_ms,
-            error=deep_result.error,
-            **dict(deep_result.metadata),
-        )
-    probability_request = tool_plan.first(ToolKind.PROBABILITY)
-    if probability_request is not None:
-        probability_result = await tool_registry.execute(
-            replace(
-                probability_request,
-                arguments={
-                    **dict(probability_request.arguments),
-                    "context": str(probability_request.arguments.get("context") or context_query)[:1200],
-                },
-            )
-        )
-        if probability_result.context:
-            fresh_context = _combine_text_sections(fresh_context, probability_result.context)
-        _record_metric_event(
-            "tool_call",
-            group_id=chat_id,
-            user_id=user_id,
-            stage="private_probability",
-            action="registry_execute",
-            tool_kind=ToolKind.PROBABILITY.value,
-            success=probability_result.ok,
-            status=probability_result.status,
-            latency_ms=probability_result.elapsed_ms,
-            error=probability_result.error,
-            **dict(probability_result.metadata),
-        )
-
-    rag_result = await rag_task
-    summary_context = _format_memory_context(
-        memory.relevant_memory_summaries(chat_id, context_query, limit=MID_MEMORY_KEEP_SUMMARIES)
-    )
-    memory_context = merge_rag_and_summary_context(
-        rag_result.context,
-        summary_context,
-        summary_char_limit=MID_MEMORY_SUMMARY_APPENDIX_CHARS,
-    )
-    related_user_ids = _member_memory_user_ids(
-        context_recent,
-        current_user_id=user_id,
-        current_text=text,
-    )
-    member_context = _format_member_context(
-        memory.member_impressions_for_context(chat_id, related_user_ids, limit=MEMBER_IMPRESSION_CONTEXT_LIMIT),
-        current_user_id=user_id,
-    )
-    memory_atoms_context = _format_memory_atom_context(
-        memory.relevant_memory_atoms(
-            chat_id,
-            f"{nickname}\n{text}" if _is_self_memory_query(text) else context_query,
-            subject_user_ids=related_user_ids,
-            speaker_user_id=user_id,
-            relationship_user_ids=related_user_ids,
-            limit=MEMORY_ATOM_CONTEXT_LIMIT,
-        )
-    )
-    style_context = _format_style_context(
-        memory.relevant_style_rules(chat_id, context_query, limit=STYLE_RULE_CONTEXT_LIMIT, speaker_user_id=user_id)
-    )
-    raw_corpus_context = _format_raw_corpus_context(
-        memory.relevant_raw_corpus_examples(
-            chat_id,
-            context_query,
-            limit=RAW_CORPUS_CONTEXT_LIMIT,
-            candidate_limit=RAW_CORPUS_CANDIDATE_LIMIT,
-            context_radius=RAW_CORPUS_CONTEXT_RADIUS,
-            exclude_user_id=user_id,
-            exclude_text=text,
-            preferred_user_id=user_id,
-            preferred_limit=2,
-            preferred_score_multiplier=1.1,
-            preferred_score_bonus=0.5,
-            per_user_limit=1,
-        )
-    )
-    jargon_context = await _selected_group_jargon_context(
-        chat_id,
-        context_recent,
-        current_text=context_query,
-        current_nickname=nickname,
-        chat_label="QQ 私聊",
-    )
-    recall_feedback_context = _format_recall_feedback_context(
-        memory.recent_recalled_reply_feedback(chat_id, RECALL_FEEDBACK_CONTEXT_LIMIT)
-    )
-    _record_metric_event(
-        "rag_retrieval",
-        group_id=chat_id,
-        user_id=user_id,
-        stage="private_generation_context",
-        action="injected" if rag_result.context else "empty",
-        route=rag_result.plan.route,
-        lexical_count=rag_result.lexical_count,
-        semantic_count=rag_result.semantic_count,
-        injected_count=len(rag_result.hits),
-        elapsed_ms=rag_result.elapsed_ms,
-        error=rag_result.error,
-    )
-    try:
-        reply = await deepseek_client.reply(
-            persona=persona,
-            recent_messages=context_recent,
-            current_text=text,
-            current_nickname=nickname,
-            mentioned=True,
-            chat_label="QQ 私聊",
-            action=decision.action,
-            market_context=market_context,
-            fresh_context=fresh_context,
-            memory_context=memory_context,
-            member_context=member_context,
-            memory_atoms_context=memory_atoms_context,
-            style_context=style_context,
-            raw_corpus_context=raw_corpus_context,
-            jargon_context=jargon_context,
-            recall_feedback_context=recall_feedback_context,
-            speaker_context=private_speaker_context,
-            priority_context=_combine_text_sections(
-                _private_priority_context(user_id),
-                private_state_context,
-                forced_once_context,
-            ),
-        )
-    except Exception as exc:
-        logger.warning(f"qq_social_agent private reply generation failed: user={user_id} error={exc}")
+    if tool_stage is None:
         return
-    if not reply:
-        logger.info(f"qq_social_agent skipped private reply: user={user_id} reason=empty_model_reply")
-        return
-    reply = _sanitize_generated_text(reply)
 
-    selected_meme_id: int | None = None
-    meme_gate = private_meme_library.turn_gate(user_id, received_messages=len(accepted_items))
-    if meme_gate.allowed and _private_meme_context_eligible(
-        decision=decision,
-        reply=reply,
-        market_context=market_context,
-        fresh_context=fresh_context,
-    ):
-        meme_candidates = private_meme_library.candidates(user_id, query=f"{context_query}\n{reply}")
-        if meme_candidates:
-            try:
-                meme_choice = await deepseek_client.select_private_meme(
-                    current_text=context_query,
-                    reply_text=reply,
-                    candidates=private_meme_library.candidate_text(meme_candidates),
-                )
-            except Exception as exc:
-                logger.warning(f"qq_social_agent private meme selector failed: user={user_id} error={exc}")
-                meme_choice = None
-            candidate_ids = {asset.id for asset in meme_candidates}
-            if meme_choice is not None and meme_choice.send and meme_choice.meme_id in candidate_ids:
-                selected_meme_id = meme_choice.meme_id
-            _record_metric_event(
-                "private_meme_selector",
-                group_id=chat_id,
-                user_id=user_id,
-                stage="selection",
-                action="selected" if selected_meme_id else "skipped",
-                gate_reason=meme_gate.reason,
-                turn_count=meme_gate.messages_since_last_meme,
-                selected_meme_id=selected_meme_id,
-                reason=meme_choice.reason if meme_choice is not None else "selector_error",
-            )
-    else:
-        _record_metric_event(
-            "private_meme_selector",
-            group_id=chat_id,
-            user_id=user_id,
-            stage="eligibility",
-            action="skipped",
-            gate_reason=meme_gate.reason,
-            turn_count=meme_gate.messages_since_last_meme,
-        )
-
-    reply_parts = split_reply_messages(reply, max_messages=3)
-    logger.info(
-        "qq_social_agent sending private reply: "
-        f"user={user_id} chars={len(reply)} parts={len(reply_parts)}"
+    generation_context = await build_private_generation_context(
+        tool_stage,
+        services=PrivateGenerationContextServices(
+            memory=memory,
+            format_memory_context=_format_memory_context,
+            merge_rag_and_summary_context=merge_rag_and_summary_context,
+            member_memory_user_ids=_member_memory_user_ids,
+            is_self_memory_query=_is_self_memory_query,
+            format_member_context=_format_member_context,
+            format_memory_atom_context=_format_memory_atom_context,
+            format_style_context=_format_style_context,
+            format_raw_corpus_context=_format_raw_corpus_context,
+            selected_group_jargon_context=_selected_group_jargon_context,
+            format_recall_feedback_context=_format_recall_feedback_context,
+            private_priority_context=_private_priority_context,
+            combine_text_sections=_combine_text_sections,
+            record_metric_event=_record_metric_event,
+            mid_memory_keep_summaries=MID_MEMORY_KEEP_SUMMARIES,
+            mid_memory_summary_appendix_chars=MID_MEMORY_SUMMARY_APPENDIX_CHARS,
+            member_impression_context_limit=MEMBER_IMPRESSION_CONTEXT_LIMIT,
+            memory_atom_context_limit=MEMORY_ATOM_CONTEXT_LIMIT,
+            style_rule_context_limit=STYLE_RULE_CONTEXT_LIMIT,
+            raw_corpus_context_limit=RAW_CORPUS_CONTEXT_LIMIT,
+            raw_corpus_candidate_limit=RAW_CORPUS_CANDIDATE_LIMIT,
+            raw_corpus_context_radius=RAW_CORPUS_CONTEXT_RADIUS,
+            recall_feedback_context_limit=RECALL_FEEDBACK_CONTEXT_LIMIT,
+        ),
     )
-    for index, part in enumerate(reply_parts):
-        try:
-            await _send_private_message(
-                bot,
-                user_id=user_id,
-                message=_message_with_reply_quote(Message(part), source_message_id if index == 0 else ""),
-            )
-            memory.add_message(chat_id, int(event.self_id), persona.name, part, is_bot=True)
-        except ActionFailed as exc:
-            logger.warning(
-                "qq_social_agent failed sending private reply: "
-                f"user={user_id} {_action_failed_summary(exc)}"
-            )
-            return
-        if index < len(reply_parts) - 1:
-            await asyncio.sleep(0.9)
-    if selected_meme_id is not None:
-        image_ref = private_meme_library.image_base64_ref(selected_meme_id)
-        if image_ref:
-            try:
-                await _send_private_message(
-                    bot,
-                    user_id=user_id,
-                    message=Message(MessageSegment.image(file=image_ref)),
-                )
-            except ActionFailed as exc:
-                logger.warning(
-                    "qq_social_agent failed sending private meme: "
-                    f"user={user_id} meme={selected_meme_id} {_action_failed_summary(exc)}"
-                )
-            else:
-                private_meme_library.mark_sent(user_id, selected_meme_id)
-                asset = memory.meme_asset(selected_meme_id)
-                memory.add_message(
-                    chat_id,
-                    int(event.self_id),
-                    persona.name,
-                    f"[风雪附了一张私人表情包：{asset.description if asset else selected_meme_id}]",
-                    is_bot=True,
-                )
-                _record_metric_event(
-                    "private_meme_selector",
-                    group_id=chat_id,
-                    user_id=user_id,
-                    stage="delivery",
-                    action="sent",
-                    meme_id=selected_meme_id,
-                )
+    await generate_and_send_private_reply(
+        turn,
+        generation_context,
+        services=PrivateReplyServices(
+            memory=memory,
+            private_meme_library=private_meme_library,
+            get_deepseek_client=lambda: deepseek_client,
+            send_private_message=_send_private_message,
+            message_with_reply_quote=_message_with_reply_quote,
+            sanitize_generated_text=_sanitize_generated_text,
+            private_meme_context_eligible=_private_meme_context_eligible,
+            action_failed_summary=_action_failed_summary,
+            record_metric_event=_record_metric_event,
+            logger=logger,
+        ),
+    )
 
 
 bot_command = on_command("bot", priority=10, block=True)

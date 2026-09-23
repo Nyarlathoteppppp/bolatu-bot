@@ -1,12 +1,12 @@
 # 模块边界与维护手册
 
-最后更新：2026-09-23。
+最后更新：2026-09-24。
 
 这份文档给在服务器上继续维护张风雪的开发者和 AI 使用。目标是让功能继续增长，但不再把所有事情塞进 `qq_social_agent/plugin.py`。
 
 ## 1. 当前结论
 
-项目已经具备真实分层：消息结构化、决策、工具、上下文、记忆、RAG、审批、发送、观测、后台学习和本地插件都有独立模块。`plugin.py` 仍承担 NoneBot 入口、运行时单例、群/私聊编排、审批命令、定时任务和 Web 管理路由。群聊主循环已按话语解析、决策、上下文、工具执行、候选生成和审批交接分段；事件和会话状态仍由主文件协调。
+项目已经具备真实分层：消息结构化、决策、工具、上下文、记忆、RAG、审批、发送、观测、后台学习和本地插件都有独立模块。`plugin.py` 仍承担 NoneBot 入口、运行时单例装配、群聊编排、私聊阶段依赖装配、会话调度、审批命令和 Web 管理路由。群聊主循环已按话语解析、决策、上下文、工具执行、候选生成和审批交接分段；私聊主循环也已按轮次准备、工具执行、上下文检索和生成发送分段。
 
 策略：**保留 `plugin.py` 作为适配器和组合根，不再向其中放业务规则；新增能力优先落到所属模块，再由主文件显式注册。** 不在缺少回归测试时做一次性大拆分。
 
@@ -24,6 +24,8 @@ NapCat / OneBot Event
   -> group_approval_dispatch：审批单和 PipelineState 交接
   -> approval_rules / approval models
   -> delivery + social_actions + onebot_gateway
+  -> 私聊入口：private_turn_preparation -> private_tool_execution
+     -> private_generation_context -> private_reply_delivery
   -> observability + background_learning + COS/归档
 ```
 
@@ -40,6 +42,9 @@ entrypoint/plugin -> orchestration -> domain/storage/tools -> provider adapters
 | 边界 | 主要文件 | 责任 | 不应承担 |
 | --- | --- | --- | --- |
 | QQ 接入 | `plugin.py`、`onebot_gateway.py`、`history_sync.py` | OneBot 事件、API、历史同步 | 人格回复判断 |
+| 私聊轮次 | `private_message_types.py`、`private_turn_preparation.py` | 合并后的 `PrivateTurn`、去重与审批优先、媒体/语音/OCR/转发上下文、命令处理和用户消息入库 | 工具决策、模型 Prompt 拼装、QQ 回复发送 |
+| 私聊工具与上下文 | `private_tool_execution.py`、`private_generation_context.py`、`conversation_tool_routing.py`、`tool_registry.py` | 共享工具路由、工具执行、并行 RAG 与记忆上下文，使用有类型的阶段结果交接 | 原始 OneBot 事件适配、审批状态 |
+| 私聊生成与发送 | `private_reply_delivery.py`、`reply_splitter.py`、`meme_library.py` | 私聊模型调用、表情包选择、分段回复、首段引用及成功后的机器人消息入库 | 入口注册、会话 buffer 调度 |
 | MessageChain | `message_segments.py`、`reference_resolver.py`、`media_context.py` | 原始 segment、引用/艾特/媒体事实 | 凭文本猜人物关系 |
 | 前置筛选 | `decision_gate.py`、`rate_limiter.py` | 去重、低价值、频控、buffer | 社交氛围或搜索词 |
 | 社交决策 | `decision_gate.py`、`group_decision_flow.py`、`pipeline_types.py`、`pipeline_stages.py` | channel、action、状态转移 | 最终回复正文 |
