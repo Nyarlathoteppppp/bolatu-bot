@@ -32,7 +32,7 @@ NapCat / OneBot Event
 entrypoint/plugin -> orchestration -> domain/storage/tools -> provider adapters
 ```
 
-`memory.py`、`onebot_gateway.py`、`deepseek_client.py` 和工具实现都不能反向导入 `plugin.py`。Prompt 文本只应存在于 `prompts/zhangfengxue.yaml`。
+`memory.py`、`onebot_gateway.py`、`deepseek_client.py` 和工具实现都不能反向导入 `plugin.py`。固定人格 Prompt 放在 `prompts/zhangfengxue.yaml`；基于解析结果生成的上下文提示由所属模块格式化。
 
 ## 3. 模块地图
 
