@@ -180,6 +180,11 @@ from .private_generation_context import (
 )
 from .private_message_types import BufferedPrivateMessage, PrivateTurn
 from .private_reply_delivery import PrivateReplyServices, generate_and_send_private_reply
+from .private_session_service import (
+    PrivateFollowupServices,
+    PrivateSessionService,
+    private_nickname_from_recent as _private_nickname_from_recent,
+)
 from .private_tool_execution import PrivateToolServices, plan_and_execute_private_tools
 from .private_turn_preparation import PrivateTurnServices, prepare_private_turn
 from .plugin_runtime import LocalPluginRegistry
@@ -324,12 +329,13 @@ learning_coordinator: BackgroundLearningCoordinator | None = None
 group_message_buffers: dict[int, list["BufferedGroupMessage"]] = {}
 group_buffer_tasks: dict[int, asyncio.Task[None]] = {}
 group_generation_inflight: set[int] = set()
-private_processing_locks: dict[int, asyncio.Lock] = {}
-private_message_buffers: dict[int, list["BufferedPrivateMessage"]] = {}
-private_buffer_tasks: dict[int, asyncio.Task[None]] = {}
-private_generation_inflight: set[int] = set()
-private_inbound_message_counts: dict[int, int] = {}
-private_followup_tasks: dict[int, asyncio.Task[None]] = {}
+private_session_service = PrivateSessionService()
+private_processing_locks = private_session_service.processing_locks
+private_message_buffers = private_session_service.message_buffers
+private_buffer_tasks = private_session_service.buffer_tasks
+private_generation_inflight = private_session_service.generation_inflight
+private_inbound_message_counts = private_session_service.inbound_message_counts
+private_followup_tasks = private_session_service.followup_tasks
 group_addressed_waiters: dict[int, int] = {}
 group_inbound_sequences: dict[int, int] = {}
 group_passive_retry_buffers: dict[int, list["BufferedGroupMessage"]] = {}
@@ -6473,222 +6479,98 @@ def _buffer_private_message(
     text: str,
     correlation_id: str,
 ) -> None:
-    user_id = int(event.user_id)
-    item = BufferedPrivateMessage(
-        bot=bot,
-        event=event,
+    private_session_service.buffer_message(
+        bot,
+        event,
         text=text,
-        user_id=user_id,
-        nickname=_private_nickname(event),
-        created_at=float(getattr(event, "time", 0) or time.time()),
-        source_message_id=event_message_source_id(event),
         correlation_id=correlation_id,
-    )
-    private_message_buffers.setdefault(user_id, []).append(item)
-    _schedule_private_buffer_flush(user_id)
-    logger.info(
-        "qq_social_agent buffered private message: "
-        f"user={user_id} size={len(private_message_buffers.get(user_id, []))}"
+        private_nickname=_private_nickname,
+        delay=PRIVATE_BUFFER_SECONDS,
+        flush=_flush_private_buffer_after_delay,
+        logger=logger,
     )
 
 
 def _schedule_private_buffer_flush(user_id: int, *, delay: float = PRIVATE_BUFFER_SECONDS) -> None:
-    task = private_buffer_tasks.get(user_id)
-    if task is None or task.done():
-        private_buffer_tasks[user_id] = asyncio.create_task(
-            _flush_private_buffer_after_delay(user_id, delay=delay)
-        )
+    private_session_service.schedule_buffer_flush(
+        user_id,
+        flush=_flush_private_buffer_after_delay,
+        delay=delay,
+    )
 
 
 def _private_processing_lock(user_id: int) -> asyncio.Lock:
-    lock = private_processing_locks.get(user_id)
-    if lock is None:
-        lock = asyncio.Lock()
-        private_processing_locks[user_id] = lock
-    return lock
+    return private_session_service.processing_lock(user_id)
 
 
-async def _flush_private_buffer_after_delay(user_id: int, *, delay: float = PRIVATE_BUFFER_SECONDS) -> None:
-    should_reschedule = False
-    reschedule_delay = PRIVATE_INFLIGHT_BUFFER_RETRY_SECONDS
-    try:
-        await asyncio.sleep(delay)
-        async with _private_processing_lock(user_id):
-            if user_id in private_generation_inflight:
-                should_reschedule = True
-                logger.info(
-                    "qq_social_agent private generation inflight: "
-                    f"user={user_id} buffer_deferred size={len(private_message_buffers.get(user_id, []))}"
-                )
-                return
-            items = private_message_buffers.pop(user_id, [])
-            if not items:
-                return
-            private_generation_inflight.add(user_id)
-            try:
-                latest = items[-1]
-                with correlation_scope(latest.correlation_id):
-                    await _handle_private_message_scoped(
-                        latest.bot,
-                        latest.event,
-                        correlation_id=latest.correlation_id,
-                        buffered_messages=items,
-                    )
-            finally:
-                private_generation_inflight.discard(user_id)
-            _schedule_private_followup_if_due(user_id, added_messages=len(items))
-            if private_message_buffers.get(user_id):
-                should_reschedule = True
-    finally:
-        task = asyncio.current_task()
-        if private_buffer_tasks.get(user_id) is task:
-            private_buffer_tasks.pop(user_id, None)
-        if should_reschedule and private_message_buffers.get(user_id):
-            _schedule_private_buffer_flush(user_id, delay=reschedule_delay)
+async def _flush_private_buffer_after_delay(
+    user_id: int,
+    *,
+    delay: float = PRIVATE_BUFFER_SECONDS,
+) -> None:
+    await private_session_service.flush_after_delay(
+        user_id,
+        delay=delay,
+        retry_delay=PRIVATE_INFLIGHT_BUFFER_RETRY_SECONDS,
+        handle_private_message=_handle_private_message_scoped,
+        correlation_scope=correlation_scope,
+        schedule_followup=_schedule_private_followup_if_due,
+        schedule_buffer_flush=_schedule_private_buffer_flush,
+        logger=logger,
+    )
 
 
 def _schedule_private_followup_if_due(user_id: int, *, added_messages: int) -> None:
-    total = private_inbound_message_counts.get(user_id, 0) + max(0, added_messages)
-    private_inbound_message_counts[user_id] = total
-    if total < 2 or total % 2:
-        return
-    previous = private_followup_tasks.get(user_id)
-    if previous is not None and not previous.done():
-        previous.cancel()
-    private_followup_tasks[user_id] = asyncio.create_task(
-        _run_private_followup_after_delay(user_id, expected_message_count=total)
+    private_session_service.schedule_followup_if_due(
+        user_id,
+        added_messages=added_messages,
+        delay=PRIVATE_FOLLOWUP_DELAY_SECONDS,
+        run_followup=_run_private_followup_after_delay,
     )
 
 
 def _private_followup_probability(user_id: int) -> float:
-    return max(0.0, min(1.0, PRIVATE_FOLLOWUP_PROBABILITY_BY_USER.get(user_id, PRIVATE_FOLLOWUP_PROBABILITY)))
+    return private_session_service.followup_probability(
+        user_id,
+        probability_by_user=PRIVATE_FOLLOWUP_PROBABILITY_BY_USER,
+        default=PRIVATE_FOLLOWUP_PROBABILITY,
+    )
 
 
-async def _run_private_followup_after_delay(user_id: int, *, expected_message_count: int) -> None:
-    try:
-        await asyncio.sleep(PRIVATE_FOLLOWUP_DELAY_SECONDS)
-        if private_inbound_message_counts.get(user_id, 0) != expected_message_count:
-            return
-        if private_message_buffers.get(user_id) or user_id in private_generation_inflight:
-            return
-        roll = random.random()
-        probability = _private_followup_probability(user_id)
-        if roll >= probability:
-            _record_metric_event(
-                "private_followup",
-                group_id=_private_chat_id(user_id),
-                user_id=user_id,
-                stage="probability",
-                action="skipped",
-                probability=probability,
-                roll=round(roll, 3),
-            )
-            return
-        if deepseek_client is None or not _private_user_can_chat(user_id):
-            return
-        chat_id = _private_chat_id(user_id)
-        state = memory.group_state(chat_id)
-        if not bool(state["enabled"]):
-            return
-        rate = rate_limiter.allow(chat_id, mentioned=True)
-        if not rate.allowed:
-            return
-        persona = personas.get(str(state["persona"] or app_config.default_persona))
-        if persona is None:
-            return
-        recent = memory.recent_messages(chat_id, PRIVATE_CONTEXT_LIMIT)
-        if len(recent) < 2:
-            return
-        private_generation_inflight.add(user_id)
-        try:
-            should_continue, continue_reason = await deepseek_client.should_continue_private_chat(
-                persona=persona,
-                recent_messages=recent,
-            )
-            if not should_continue:
-                _record_metric_event(
-                    "private_followup",
-                    group_id=chat_id,
-                    user_id=user_id,
-                    stage="precheck",
-                    action="skipped",
-                    probability=probability,
-                    roll=round(roll, 3),
-                    reason=_short_notice_text(continue_reason, 80),
-                )
-                return
-            reply = await deepseek_client.reply(
-                persona=persona,
-                recent_messages=recent,
-                current_text=(
-                    "对方刚连续和你聊了几句，现在停了十秒。"
-                    "如果能自然延续刚才的话题、补一个有用观点或轻轻开个新话题，就主动发一句；"
-                    "如果没有自然的话，不要回复。"
-                ),
-                current_nickname=_member_label(user_id, _private_nickname_from_recent(recent, user_id)),
-                mentioned=False,
-                action="reply",
-                chat_label="QQ 私聊",
-                memory_context=_format_memory_context(
-                    memory.relevant_memory_summaries(chat_id, " ".join(msg.text for msg in recent[-4:]), limit=MID_MEMORY_KEEP_SUMMARIES)
-                ),
-                priority_context=_private_priority_context(user_id),
-                speaker_context="当前是一对一私聊。只能自然续聊，不要提群聊、审批或工具流程。",
-            )
-            audit_send, audit_reason = await deepseek_client.audit_proactive_reply(
-                persona=persona,
-                recent_messages=recent,
-                candidate=reply,
-                chat_label="QQ 私聊",
-            )
-        finally:
-            private_generation_inflight.discard(user_id)
-        if not audit_send:
-            _record_metric_event(
-                "private_followup",
-                group_id=chat_id,
-                user_id=user_id,
-                stage="audit",
-                action="rejected",
-                probability=probability,
-                roll=round(roll, 3),
-                reason=_short_notice_text(audit_reason or "模型判定与近期句子大致重复", 80),
-            )
-            return
-        reply = _sanitize_generated_text(reply)
-        if not reply or reply in BLOCKED_BACKEND_FALLBACK_TEXTS:
-            return
-        bot = _first_connected_onebot_bot()
-        if bot is None:
-            return
-        for part in split_reply_messages(reply, max_messages=2):
-            await _send_private_message(bot, user_id=user_id, message=Message(part))
-            memory.add_message(chat_id, int(bot.self_id), persona.name, part, is_bot=True)
-        _record_metric_event(
-            "private_followup",
-            group_id=chat_id,
-            user_id=user_id,
-            stage="generation",
-            action="sent",
-            probability=probability,
-            roll=round(roll, 3),
-            audit_reason=_short_notice_text(audit_reason, 80),
-        )
-    except asyncio.CancelledError:
-        raise
-    except Exception as exc:
-        logger.warning(f"qq_social_agent private follow-up failed: user={user_id} error={exc}")
-    finally:
-        task = asyncio.current_task()
-        if private_followup_tasks.get(user_id) is task:
-            private_followup_tasks.pop(user_id, None)
-
-
-def _private_nickname_from_recent(recent: list[ChatMessage], user_id: int) -> str:
-    for item in reversed(recent):
-        if not item.is_bot and item.user_id == user_id:
-            return item.nickname
-    return "对方"
+async def _run_private_followup_after_delay(
+    user_id: int,
+    *,
+    expected_message_count: int,
+    delay: float = PRIVATE_FOLLOWUP_DELAY_SECONDS,
+) -> None:
+    await private_session_service.run_followup_after_delay(
+        user_id,
+        expected_message_count=expected_message_count,
+        delay=delay,
+        services=PrivateFollowupServices(
+            memory=memory,
+            get_deepseek_client=lambda: deepseek_client,
+            private_user_can_chat=_private_user_can_chat,
+            private_chat_id=_private_chat_id,
+            rate_limiter=rate_limiter,
+            personas=personas,
+            default_persona=app_config.default_persona,
+            format_memory_context=_format_memory_context,
+            private_priority_context=_private_priority_context,
+            member_label=_member_label,
+            first_connected_onebot_bot=_first_connected_onebot_bot,
+            send_private_message=_send_private_message,
+            record_metric_event=_record_metric_event,
+            short_notice_text=_short_notice_text,
+            sanitize_generated_text=_sanitize_generated_text,
+            blocked_backend_fallback_texts=frozenset(BLOCKED_BACKEND_FALLBACK_TEXTS),
+            probability_by_user=PRIVATE_FOLLOWUP_PROBABILITY_BY_USER,
+            default_probability=PRIVATE_FOLLOWUP_PROBABILITY,
+            private_context_limit=PRIVATE_CONTEXT_LIMIT,
+            mid_memory_keep_summaries=MID_MEMORY_KEEP_SUMMARIES,
+            logger=logger,
+        ),
+    )
 
 
 async def _handle_private_message_scoped(

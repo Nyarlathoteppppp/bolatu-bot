@@ -6,7 +6,7 @@
 
 ## 1. 当前结论
 
-项目已经具备真实分层：消息结构化、决策、工具、上下文、记忆、RAG、审批、发送、观测、后台学习和本地插件都有独立模块。`plugin.py` 仍承担 NoneBot 入口、运行时单例装配、群聊编排、私聊阶段依赖装配、会话调度、审批命令和 Web 管理路由。群聊主循环已按话语解析、决策、上下文、工具执行、候选生成和审批交接分段；私聊主循环也已按轮次准备、工具执行、上下文检索和生成发送分段。
+项目已经具备真实分层：消息结构化、决策、工具、上下文、记忆、RAG、审批、发送、观测、后台学习和本地插件都有独立模块。`plugin.py` 仍承担 NoneBot 入口、运行时单例装配、群聊编排、私聊阶段依赖装配、审批命令和 Web 管理路由；`private_session_service.py` 管理私聊缓冲与 followup 调度。群聊主循环已按话语解析、决策、上下文、工具执行、候选生成和审批交接分段；私聊主循环也已按轮次准备、工具执行、上下文检索和生成发送分段。
 
 策略：**保留 `plugin.py` 作为适配器和组合根，不再向其中放业务规则；新增能力优先落到所属模块，再由主文件显式注册。** 不在缺少回归测试时做一次性大拆分。
 
@@ -14,18 +14,14 @@
 
 ```text
 NapCat / OneBot Event
-  -> plugin.py：事件适配、ChatMessage 持久化、按会话串行化
-  -> message_segments + history_sync + reference_resolver
-  -> decision_gate + rate_limiter + buffer
-  -> group_discourse_flow：一次解析关系和记忆影响
-  -> group_decision_flow + conversation_tool_routing：发言决策与工具计划
-  -> group_generation_context：memory/RAG/context packet
-  -> group_tool_execution + group_reply_generation：工具证据、候选生成与复核
-  -> group_approval_dispatch：审批单和 PipelineState 交接
-  -> approval_rules / approval models
-  -> delivery + social_actions + onebot_gateway
-  -> 私聊入口：private_turn_preparation -> private_tool_execution
-     -> private_generation_context -> private_reply_delivery
+  -> plugin.py：NoneBot 事件入口和运行时装配
+     -> 群聊：message_segments -> decision_gate -> group_discourse_flow
+        -> group_decision_flow + conversation_tool_routing
+        -> group_generation_context -> group_tool_execution + group_reply_generation
+        -> group_approval_dispatch -> delivery + social_actions + onebot_gateway
+     -> 私聊：private_session_service -> plugin.py 阶段协调
+        -> private_turn_preparation -> private_tool_execution
+        -> private_generation_context -> private_reply_delivery
   -> observability + background_learning + COS/归档
 ```
 
@@ -43,6 +39,7 @@ entrypoint/plugin -> orchestration -> domain/storage/tools -> provider adapters
 | --- | --- | --- | --- |
 | QQ 接入 | `plugin.py`、`onebot_gateway.py`、`history_sync.py` | OneBot 事件、API、历史同步 | 人格回复判断 |
 | 私聊轮次 | `private_message_types.py`、`private_turn_preparation.py` | 合并后的 `PrivateTurn`、去重与审批优先、媒体/语音/OCR/转发上下文、命令处理和用户消息入库 | 工具决策、模型 Prompt 拼装、QQ 回复发送 |
+| 私聊会话 | `private_session_service.py` | 按用户缓冲与顺序 flush、processing lock、生成 inflight 状态、followup 计数/取消/延时/概率 | 读取 OneBot 事件正文、私聊模型上下文和审批状态 |
 | 私聊工具与上下文 | `private_tool_execution.py`、`private_generation_context.py`、`conversation_tool_routing.py`、`tool_registry.py` | 共享工具路由、工具执行、并行 RAG 与记忆上下文，使用有类型的阶段结果交接 | 原始 OneBot 事件适配、审批状态 |
 | 私聊生成与发送 | `private_reply_delivery.py`、`reply_splitter.py`、`meme_library.py` | 私聊模型调用、表情包选择、分段回复、首段引用及成功后的机器人消息入库 | 入口注册、会话 buffer 调度 |
 | MessageChain | `message_segments.py`、`reference_resolver.py`、`media_context.py` | 原始 segment、引用/艾特/媒体事实 | 凭文本猜人物关系 |
@@ -82,7 +79,7 @@ entrypoint/plugin -> orchestration -> domain/storage/tools -> provider adapters
 
 主要技术债：
 
-- `plugin.py` 同时承载生命周期、scheduler、审批、私聊/群聊编排、HTTP controller 和发送协调。
+- `plugin.py` 仍承载生命周期、审批命令、群聊编排、私聊依赖装配和 HTTP controller。
 - `memory.py`、`deepseek_client.py`、`rag_store.py` 仍大，但数据契约密集，暂不宜粗暴拆分。
 - manifest 能声明能力，但实际 handler 注册仍集中在主文件。
 
@@ -90,11 +87,10 @@ entrypoint/plugin -> orchestration -> domain/storage/tools -> provider adapters
 
 群聊高频改动路径已按阶段拆出。`plugin.py` 装配当前 LLM、存储、日志和指标回调，并保留事件生命周期与阶段间早退。后续继续按功能边界迁移，保持 Trace 事件名与数据库写入不变。
 
-1. **审批服务**：抽成 `approval_service.py`，负责待审批单、并发抢占、权限、反馈和候选发送。
+1. **审批服务**：拆出命令解析与权限、待审批单状态、实际发送及结果回写；保留并发选择、delivery progress 断点恢复和不确定发送保护。
 2. **定时任务**：抽 `daily_review_service.py` 与 `proactive_chat_service.py`，连接回调只保留启动/停止 task。
-3. **会话编排**：逐步整理 buffer、processing lock 和 followup window；群聊阶段函数已独立，私聊主流程尚未拆分。
-4. **管理 controller**：抽 `admin_controller.py`，让 `admin_ui.py` 只做 HTML 渲染。
-5. **发送协调**：抽 `message_delivery_service.py`，集中正文、表情、审批回写和 followup 记录。
+3. **管理 controller**：抽 `admin_controller.py`，让 `admin_ui.py` 只做 HTML 渲染。
+4. **普通消息发送**：评估 `message_delivery_service.py`，集中普通正文与表情发送结果回写。
 
 不要优先拆 `memory.py` 或 `deepseek_client.py`。先补 repository/service 边界和表级测试，再动内部结构。
 
