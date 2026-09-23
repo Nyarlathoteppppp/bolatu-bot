@@ -142,6 +142,87 @@ def test_connect_registers_tasks_even_if_reconciliation_fails(monkeypatch):
     assert calls[-3:] == ["notice"] * 3
 
 
+def test_weekly_scheduler_rebinds_bot_on_reconnect_and_shutdown_is_idempotent(monkeypatch):
+    started = []
+    release = None
+
+    async def hold(bot, bot_key):
+        started.append((bot, bot_key))
+        await release.wait()
+
+    monkeypatch.setattr(plugin.weekly_usage_report_scheduler, "_run", hold)
+    monkeypatch.setattr(plugin.daily_review_scheduler, "_run", hold)
+    monkeypatch.setattr(plugin.proactive_chat_scheduler, "_run", hold)
+    monkeypatch.setattr(plugin, "_plugin_task_enabled", lambda *args: True)
+    monkeypatch.setattr(plugin, "PROACTIVE_CHAT_ENABLED", True)
+
+    async def run():
+        nonlocal release
+        release = asyncio.Event()
+        old_bot = SimpleNamespace(self_id="scheduler-reconnect-test")
+        plugin._ensure_weekly_usage_report_task(old_bot)
+        old_task = plugin.weekly_usage_report_tasks["scheduler-reconnect-test"]
+        while len(started) < 1:
+            await asyncio.sleep(0)
+        assert started[0][0] is old_bot
+
+        await plugin._cancel_bot_lifecycle_tasks("scheduler-reconnect-test")
+        assert old_task.cancelled()
+        assert "scheduler-reconnect-test" not in plugin.weekly_usage_report_tasks
+
+        new_bot = SimpleNamespace(self_id="scheduler-reconnect-test")
+        plugin._ensure_weekly_usage_report_task(new_bot)
+        new_task = plugin.weekly_usage_report_tasks["scheduler-reconnect-test"]
+        while len(started) < 2:
+            await asyncio.sleep(0)
+        assert new_task is not old_task
+        assert started[1][0] is new_bot
+
+        plugin._ensure_daily_review_task(new_bot)
+        plugin._ensure_proactive_chat_task(new_bot)
+        while len(started) < 4:
+            await asyncio.sleep(0)
+        scheduled_tasks = [
+            plugin.daily_review_tasks["scheduler-reconnect-test"],
+            plugin.weekly_usage_report_tasks["scheduler-reconnect-test"],
+            plugin.proactive_chat_tasks["scheduler-reconnect-test"],
+        ]
+        await plugin._cancel_task_registries(
+            plugin.daily_review_tasks,
+            plugin.weekly_usage_report_tasks,
+            plugin.proactive_chat_tasks,
+        )
+        await plugin._cancel_task_registries(
+            plugin.daily_review_tasks,
+            plugin.weekly_usage_report_tasks,
+            plugin.proactive_chat_tasks,
+        )
+        assert all(task.cancelled() for task in scheduled_tasks)
+        assert not plugin.daily_review_tasks
+        assert not plugin.weekly_usage_report_tasks
+        assert not plugin.proactive_chat_tasks
+
+    asyncio.run(run())
+
+
+def test_scheduler_enablement_stays_in_plugin_adapter(monkeypatch):
+    calls = []
+    monkeypatch.setattr(plugin.daily_review_scheduler, "ensure_task", lambda bot: calls.append("daily"))
+    monkeypatch.setattr(plugin.weekly_usage_report_scheduler, "ensure_task", lambda bot: calls.append("weekly"))
+    monkeypatch.setattr(plugin.proactive_chat_scheduler, "ensure_task", lambda bot: calls.append("proactive"))
+    monkeypatch.setattr(plugin, "_plugin_task_enabled", lambda *args: False)
+    monkeypatch.setattr(plugin, "PROACTIVE_CHAT_ENABLED", False)
+    bot = SimpleNamespace(self_id="scheduler-disabled-test")
+
+    plugin._ensure_daily_review_task(bot)
+    plugin._ensure_weekly_usage_report_task(bot)
+    plugin._ensure_proactive_chat_task(bot)
+    monkeypatch.setattr(plugin, "PROACTIVE_CHAT_ENABLED", True)
+    plugin._ensure_proactive_chat_task(bot)
+
+    assert calls == ["weekly"]
+
+
 def test_reconnect_notice_has_cooldown_but_manual_switch_does_not(monkeypatch, tmp_path):
     monkeypatch.setattr(plugin, "memory", MemoryStore(tmp_path / "bot.sqlite3"))
     monkeypatch.setattr(plugin, "_approval_user_ids", lambda: [200])

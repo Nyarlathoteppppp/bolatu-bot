@@ -6,7 +6,7 @@
 
 ## 1. 当前结论
 
-项目已经具备真实分层：消息结构化、决策、工具、上下文、记忆、RAG、审批、发送、观测、后台学习和本地插件都有独立模块。`plugin.py` 仍承担 NoneBot 入口、运行时单例装配、群聊编排、私聊阶段依赖装配和 Web 管理路由；`private_session_service.py` 管理私聊缓冲与 followup 调度。群聊主循环已按话语解析、决策、上下文、工具执行、候选生成和审批交接分段；私聊主循环也已按轮次准备、工具执行、上下文检索和生成发送分段。
+项目已经具备真实分层：消息结构化、决策、工具、上下文、记忆、RAG、审批、发送、观测、后台学习和本地插件都有独立模块。`plugin.py` 仍承担 NoneBot 入口、运行时单例装配、群聊编排、私聊阶段依赖装配和 Web 管理路由；`private_session_service.py` 管理私聊缓冲与 followup 调度；三个 scheduler service 管理 daily review、weekly usage report 和 proactive chat 的后台 task 生命周期与周期策略。群聊主循环已按话语解析、决策、上下文、工具执行、候选生成和审批交接分段；私聊主循环也已按轮次准备、工具执行、上下文检索和生成发送分段。
 
 策略：**保留 `plugin.py` 作为适配器和组合根，不再向其中放业务规则；新增能力优先落到所属模块，再由主文件显式注册。** 不在缺少回归测试时做一次性大拆分。
 
@@ -57,6 +57,7 @@ entrypoint/plugin -> orchestration -> domain/storage/tools -> provider adapters
 | LLM | `deepseek_client.py`、`embedding_client.py`、`prompts.py` | provider、JSON、模型路由、用量 | QQ 发送与审批状态 |
 | 记忆/RAG | `memory.py`、`memory_learning.py`、`rag_*.py` | 原文、画像、atoms、风格、索引 | QQ 生命周期 |
 | 发送 | `delivery.py`、`reply_splitter.py`、`social_actions.py` | 拆分、艾特、表情、节流 | 写长期事实 |
+| 定时任务调度 | `daily_review_scheduler_service.py`、`weekly_usage_report_scheduler_service.py`、`proactive_chat_scheduler_service.py` | 按 Bot 管理 task 去重、时间窗口/概率策略、周期 tick、异常记录和取消清理 | daily review/proactive 生成发送用例、周报格式化与发送 |
 | 管理/观测 | `admin_ui.py`、`observability.py`、`approval_rules.py` | WebUI、Trace、工具单 | 聊天热路径判断 |
 | 安全输出 | `political_guard.py` | 输出脱敏和明确语义拦截 | 裸匹配消息 ID/QQ/时间戳 |
 
@@ -93,7 +94,7 @@ entrypoint/plugin -> orchestration -> domain/storage/tools -> provider adapters
 
 群聊高频改动路径已按阶段拆出。`plugin.py` 装配当前 LLM、存储、日志和指标回调，并保留事件生命周期与阶段间早退。后续继续按功能边界迁移，保持 Trace 事件名与数据库写入不变。
 
-1. **定时任务**：抽 `daily_review_service.py` 与 `proactive_chat_service.py`，连接回调只保留启动/停止 task。
+1. **定时任务（第一批已完成）**：三个 scheduler service 管理 daily review、weekly usage report、proactive chat 的生命周期和 tick 策略。`plugin.py` 在 connect 时按 manifest/config 开关调用 `_ensure_*`，disconnect/shutdown 取消同一组 service task registry。daily review/proactive 的生成发送流程、周报统计格式与投递仍由 `plugin.py` 适配，后续按领域依赖再迁移；这一批不改生成和发送行为。
 2. **管理 controller**：抽 `admin_controller.py`，让 `admin_ui.py` 只做 HTML 渲染。
 3. **普通消息发送**：评估 `message_delivery_service.py`，集中普通正文与表情发送结果回写。
 

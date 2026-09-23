@@ -3239,6 +3239,15 @@ def test_weekly_usage_report_lists_task_share(monkeypatch, tmp_path) -> None:
     assert "1.5万" in text
 
 
+def test_weekly_usage_scheduler_uses_sunday_2100_window() -> None:
+    before = datetime(2026, 7, 19, 20, 59, tzinfo=plugin.DAILY_REVIEW_TIMEZONE).timestamp()
+    due = datetime(2026, 7, 19, 21, 0, tzinfo=plugin.DAILY_REVIEW_TIMEZONE).timestamp()
+
+    assert not plugin._weekly_usage_report_due(before)
+    assert plugin._weekly_usage_report_due(due)
+    assert plugin._seconds_until_next_weekly_usage_report(due) == 7 * 24 * 60 * 60
+
+
 def test_topic_selection_filters_cooldown_before_jev(monkeypatch, tmp_path) -> None:
     _use_temp_plugin_memory(monkeypatch, tmp_path)
     topics = list(plugin.SOCIAL_TOPIC_KEYWORDS)

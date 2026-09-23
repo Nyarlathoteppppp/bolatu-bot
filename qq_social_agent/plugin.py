@@ -97,6 +97,7 @@ from .deepseek_client import (
 )
 from .jev_client import set_jev_telemetry_recorder
 from .delivery import build_delivery_plan
+from .daily_review_scheduler_service import DailyReviewSchedulerService
 from .conversation_tool_routing import (
     _NEARBY_URL_RE,
     _apply_tool_use_router as _route_tool_use,
@@ -208,7 +209,9 @@ from .private_session_service import (
 from .private_tool_execution import PrivateToolServices, plan_and_execute_private_tools
 from .private_turn_preparation import PrivateTurnServices, prepare_private_turn
 from .plugin_runtime import LocalPluginRegistry
+from .proactive_chat_scheduler_service import ProactiveChatSchedulerService
 from .prompts import PromptRegistry
+from .weekly_usage_report_scheduler_service import WeeklyUsageReportSchedulerService
 from .pipeline_types import (
     OutputChannel,
     PipelineState,
@@ -367,9 +370,6 @@ notice_directory_refresh_tasks: dict[int, asyncio.Task[None]] = {}
 approval_state_service = ApprovalStateService()
 pending_group_approvals = approval_state_service.pending
 recent_suppression_events: list["SuppressionEvent"] = []
-daily_review_tasks: dict[str, asyncio.Task[None]] = {}
-weekly_usage_report_tasks: dict[str, asyncio.Task[None]] = {}
-proactive_chat_tasks: dict[str, asyncio.Task[None]] = {}
 private_guided_chat_tasks: dict[str, asyncio.Task[None]] = {}
 private_hourly_chat_tasks: dict[str, asyncio.Task[None]] = {}
 daily_review_send_locks: dict[tuple[int, str], asyncio.Lock] = {}
@@ -1717,6 +1717,7 @@ async def _cancel_bot_lifecycle_tasks(bot_key: str) -> None:
     tasks: list[asyncio.Task[object]] = []
     for registry in (
         daily_review_tasks,
+        weekly_usage_report_tasks,
         proactive_chat_tasks,
         private_guided_chat_tasks,
         private_hourly_chat_tasks,
@@ -1969,6 +1970,46 @@ WEEKLY_USAGE_REPORT_MINUTE = 0
 WEEKLY_USAGE_REPORT_POLL_SECONDS = 5 * 60
 WEEKLY_USAGE_REPORT_KV_KEY = "weekly_usage_report_sent_week"
 
+daily_review_scheduler = DailyReviewSchedulerService(
+    timezone=DAILY_REVIEW_TIMEZONE,
+    hour=DAILY_REVIEW_HOUR,
+    minute=DAILY_REVIEW_MINUTE,
+    catch_up_seconds=DAILY_REVIEW_CATCH_UP_SECONDS,
+    retry_seconds=DAILY_REVIEW_RETRY_SECONDS,
+    poll_seconds=DAILY_REVIEW_POLL_SECONDS,
+    send_due_reviews=lambda bot, now: _send_due_daily_reviews(bot, now=now),
+    record_metric_event=lambda *args, **kwargs: _record_metric_event(*args, **kwargs),
+    logger=logger,
+    summarize_error=lambda message, limit: _short_notice_text(message, limit),
+)
+weekly_usage_report_scheduler = WeeklyUsageReportSchedulerService(
+    timezone=DAILY_REVIEW_TIMEZONE,
+    weekday=WEEKLY_USAGE_REPORT_WEEKDAY,
+    hour=WEEKLY_USAGE_REPORT_HOUR,
+    minute=WEEKLY_USAGE_REPORT_MINUTE,
+    poll_seconds=WEEKLY_USAGE_REPORT_POLL_SECONDS,
+    send_report=lambda bot, now: _send_weekly_usage_report(bot, now=now),
+    logger=logger,
+)
+proactive_chat_scheduler = ProactiveChatSchedulerService(
+    timezone=PROACTIVE_CHAT_TIMEZONE,
+    interval_seconds=PROACTIVE_CHAT_INTERVAL_SECONDS,
+    poll_jitter_seconds=PROACTIVE_CHAT_POLL_JITTER_SECONDS,
+    daytime_percent=PROACTIVE_CHAT_DAYTIME_PERCENT,
+    quiet_percent=PROACTIVE_CHAT_QUIET_PERCENT,
+    quiet_start_hour=PROACTIVE_CHAT_QUIET_START_HOUR,
+    quiet_end_hour=PROACTIVE_CHAT_QUIET_END_HOUR,
+    target_groups=lambda: _runtime_target_groups(),
+    send_for_group=lambda bot, group_id, probability, roll: _send_proactive_chat_for_group(
+        bot, group_id=group_id, probability=probability, roll=roll
+    ),
+    record_metric_event=lambda *args, **kwargs: _record_metric_event(*args, **kwargs),
+    logger=logger,
+)
+daily_review_tasks = daily_review_scheduler.tasks
+weekly_usage_report_tasks = weekly_usage_report_scheduler.tasks
+proactive_chat_tasks = proactive_chat_scheduler.tasks
+
 
 def _weekly_usage_report_week_id(now: float | None = None) -> str:
     current = datetime.fromtimestamp(time.time() if now is None else now, DAILY_REVIEW_TIMEZONE)
@@ -1982,27 +2023,11 @@ def _weekly_usage_report_window(now: float | None = None) -> tuple[float, float]
 
 
 def _seconds_until_next_weekly_usage_report(now: float | None = None) -> float:
-    current = time.time() if now is None else now
-    local = datetime.fromtimestamp(current, DAILY_REVIEW_TIMEZONE)
-    days_ahead = (WEEKLY_USAGE_REPORT_WEEKDAY - local.weekday()) % 7
-    target_date = (local + timedelta(days=days_ahead)).replace(
-        hour=WEEKLY_USAGE_REPORT_HOUR,
-        minute=WEEKLY_USAGE_REPORT_MINUTE,
-        second=0,
-        microsecond=0,
-    )
-    if target_date.timestamp() <= current:
-        target_date = target_date + timedelta(days=7)
-    return max(1.0, target_date.timestamp() - current)
+    return weekly_usage_report_scheduler.seconds_until_next_report(now)
 
 
 def _weekly_usage_report_due(now: float | None = None) -> bool:
-    current = datetime.fromtimestamp(time.time() if now is None else now, DAILY_REVIEW_TIMEZONE)
-    if current.weekday() != WEEKLY_USAGE_REPORT_WEEKDAY:
-        return False
-    return current.hour > WEEKLY_USAGE_REPORT_HOUR or (
-        current.hour == WEEKLY_USAGE_REPORT_HOUR and current.minute >= WEEKLY_USAGE_REPORT_MINUTE
-    )
+    return weekly_usage_report_scheduler.report_due(now)
 
 
 def _format_token_count(value: int) -> str:
@@ -2084,87 +2109,14 @@ async def _send_weekly_usage_report(bot: Bot, *, now: float | None = None, force
 
 
 def _ensure_weekly_usage_report_task(bot: Bot) -> None:
-    bot_key = str(getattr(bot, "self_id", "default"))
-    task = weekly_usage_report_tasks.get(bot_key)
-    if task is not None and not task.done():
-        return
-    weekly_usage_report_tasks[bot_key] = asyncio.create_task(
-        _run_weekly_usage_report_scheduler(bot, bot_key)
-    )
-    logger.info(f"qq_social_agent weekly usage report scheduler started: bot={bot_key}")
-
-
-async def _run_weekly_usage_report_scheduler(bot: Bot, bot_key: str) -> None:
-    try:
-        while True:
-            delay = WEEKLY_USAGE_REPORT_POLL_SECONDS
-            try:
-                now = time.time()
-                if _weekly_usage_report_due(now):
-                    await _send_weekly_usage_report(bot, now=now)
-                delay = min(
-                    _seconds_until_next_weekly_usage_report(time.time()),
-                    WEEKLY_USAGE_REPORT_POLL_SECONDS,
-                )
-            except Exception as exc:
-                logger.warning(
-                    f"qq_social_agent weekly usage report tick failed: bot={bot_key} error={exc}"
-                )
-            await asyncio.sleep(max(1.0, delay))
-    except asyncio.CancelledError:
-        raise
-    except Exception as exc:
-        logger.warning(
-            f"qq_social_agent weekly usage report scheduler stopped: bot={bot_key} error={exc}"
-        )
-    finally:
-        if weekly_usage_report_tasks.get(bot_key) is asyncio.current_task():
-            weekly_usage_report_tasks.pop(bot_key, None)
+    weekly_usage_report_scheduler.ensure_task(bot)
 
 
 def _ensure_daily_review_task(bot: Bot) -> None:
     if not _plugin_task_enabled("daily_review", "daily_review_midnight"):
         logger.info("qq_social_agent daily review scheduler disabled by plugin manifest")
         return
-    bot_key = str(getattr(bot, "self_id", "default"))
-    task = daily_review_tasks.get(bot_key)
-    if task is not None and not task.done():
-        return
-    daily_review_tasks[bot_key] = asyncio.create_task(_run_daily_review_scheduler(bot, bot_key))
-    logger.info(f"qq_social_agent daily review scheduler started: bot={bot_key}")
-
-
-async def _run_daily_review_scheduler(bot: Bot, bot_key: str) -> None:
-    try:
-        while True:
-            delay = DAILY_REVIEW_RETRY_SECONDS
-            try:
-                now = time.time()
-                within_catch_up = _daily_review_within_catch_up_window(now)
-                has_pending = False
-                if within_catch_up:
-                    has_pending = await _send_due_daily_reviews(bot, now=now)
-                delay = (
-                    DAILY_REVIEW_RETRY_SECONDS
-                    if within_catch_up and has_pending
-                    else min(_seconds_until_next_daily_review(time.time()), DAILY_REVIEW_POLL_SECONDS)
-                )
-            except Exception as exc:
-                logger.warning(f"qq_social_agent daily review scheduler tick failed: bot={bot_key} error={exc}")
-                _record_metric_event(
-                    "daily_review",
-                    stage="scheduler",
-                    action="tick_failed",
-                    reason=_short_notice_text(str(exc), 200),
-                )
-            await asyncio.sleep(max(1.0, delay))
-    except asyncio.CancelledError:
-        raise
-    except Exception as exc:
-        logger.warning(f"qq_social_agent daily review scheduler stopped: bot={bot_key} error={exc}")
-    finally:
-        if daily_review_tasks.get(bot_key) is asyncio.current_task():
-            daily_review_tasks.pop(bot_key, None)
+    daily_review_scheduler.ensure_task(bot)
 
 
 def _ensure_proactive_chat_task(bot: Bot) -> None:
@@ -2173,51 +2125,7 @@ def _ensure_proactive_chat_task(bot: Bot) -> None:
     if not _plugin_task_enabled("proactive_chat", "hourly_random_proactive_chat"):
         logger.info("qq_social_agent proactive chat scheduler disabled by plugin manifest")
         return
-    bot_key = str(getattr(bot, "self_id", "default"))
-    task = proactive_chat_tasks.get(bot_key)
-    if task is not None and not task.done():
-        return
-    proactive_chat_tasks[bot_key] = asyncio.create_task(_run_proactive_chat_scheduler(bot, bot_key))
-    logger.info(
-        "qq_social_agent proactive chat scheduler started: "
-        f"bot={bot_key} interval={int(PROACTIVE_CHAT_INTERVAL_SECONDS)}s "
-        f"daytime={PROACTIVE_CHAT_DAYTIME_PERCENT}% quiet={PROACTIVE_CHAT_QUIET_PERCENT}%"
-    )
-
-
-async def _run_proactive_chat_scheduler(bot: Bot, bot_key: str) -> None:
-    try:
-        if PROACTIVE_CHAT_POLL_JITTER_SECONDS > 0:
-            await asyncio.sleep(random.uniform(1.0, PROACTIVE_CHAT_POLL_JITTER_SECONDS))
-        while True:
-            await asyncio.sleep(_seconds_until_next_proactive_chat_tick())
-            now = time.time()
-            probability = _proactive_chat_probability_percent(now)
-            for group_id in _runtime_target_groups():
-                roll = random.uniform(0.0, 100.0)
-                if roll >= probability:
-                    logger.info(
-                        "qq_social_agent proactive chat skipped by probability: "
-                        f"group={group_id} probability={probability} roll={roll:.2f}"
-                    )
-                    _record_metric_event(
-                        "proactive_chat",
-                        group_id=group_id,
-                        stage="probability",
-                        action="skipped",
-                        probability=probability,
-                        roll=round(roll, 2),
-                    )
-                    continue
-                await _send_proactive_chat_for_group(bot, group_id=group_id, probability=probability, roll=roll)
-                await asyncio.sleep(0.5)
-    except asyncio.CancelledError:
-        raise
-    except Exception as exc:
-        logger.warning(f"qq_social_agent proactive chat scheduler stopped: bot={bot_key} error={exc}")
-    finally:
-        if proactive_chat_tasks.get(bot_key) is asyncio.current_task():
-            proactive_chat_tasks.pop(bot_key, None)
+    proactive_chat_scheduler.ensure_task(bot)
 
 
 def _private_guided_chat_sent_key(step_key: str) -> str:
@@ -2524,17 +2432,15 @@ async def _run_private_hourly_chat(bot: Bot, bot_key: str) -> None:
 
 
 def _seconds_until_next_proactive_chat_tick(now: float | None = None) -> float:
-    base = PROACTIVE_CHAT_INTERVAL_SECONDS
-    jitter = random.uniform(0.0, PROACTIVE_CHAT_POLL_JITTER_SECONDS) if PROACTIVE_CHAT_POLL_JITTER_SECONDS > 0 else 0.0
-    return max(1.0, base + jitter)
+    return proactive_chat_scheduler.seconds_until_next_tick(
+        now,
+        interval_seconds=PROACTIVE_CHAT_INTERVAL_SECONDS,
+        poll_jitter_seconds=PROACTIVE_CHAT_POLL_JITTER_SECONDS,
+    )
 
 
 def _proactive_chat_probability_percent(now: float | None = None) -> int:
-    current = time.time() if now is None else now
-    hour = datetime.fromtimestamp(current, PROACTIVE_CHAT_TIMEZONE).hour
-    if _hour_in_range(hour, PROACTIVE_CHAT_QUIET_START_HOUR, PROACTIVE_CHAT_QUIET_END_HOUR):
-        return PROACTIVE_CHAT_QUIET_PERCENT
-    return PROACTIVE_CHAT_DAYTIME_PERCENT
+    return proactive_chat_scheduler.probability_percent(now)
 
 
 def _hour_in_range(hour: int, start: int, end: int) -> bool:
@@ -2834,19 +2740,11 @@ def _record_group_proactive_topic(group_id: int, topic: str, *, now: float) -> N
 
 
 def _seconds_until_next_daily_review(now: float | None = None) -> float:
-    current = time.time() if now is None else now
-    target = _local_timestamp_for_today(DAILY_REVIEW_HOUR, DAILY_REVIEW_MINUTE, now=current)
-    if current <= target:
-        return max(1.0, target - current)
-    if current - target <= 90:
-        return 1.0
-    return max(1.0, target + 24 * 60 * 60 - current)
+    return daily_review_scheduler.seconds_until_next_review(now)
 
 
 def _daily_review_within_catch_up_window(now: float | None = None) -> bool:
-    current = time.time() if now is None else now
-    target = _local_timestamp_for_today(DAILY_REVIEW_HOUR, DAILY_REVIEW_MINUTE, now=current)
-    return 0 <= current - target <= DAILY_REVIEW_CATCH_UP_SECONDS
+    return daily_review_scheduler.within_catch_up_window(now)
 
 
 async def _send_due_daily_reviews(bot: Bot, *, now: float | None = None) -> bool:
