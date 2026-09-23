@@ -58,7 +58,8 @@ entrypoint/plugin -> orchestration -> domain/storage/tools -> provider adapters
 | 记忆/RAG | `memory.py`、`memory_learning.py`、`rag_*.py` | 原文、画像、atoms、风格、索引 | QQ 生命周期 |
 | 发送 | `delivery.py`、`reply_splitter.py`、`social_actions.py` | 拆分、艾特、表情、节流 | 写长期事实 |
 | 定时任务调度 | `daily_review_scheduler_service.py`、`weekly_usage_report_scheduler_service.py`、`proactive_chat_scheduler_service.py` | 按 Bot 管理 task 去重、时间窗口/概率策略、周期 tick、异常记录和取消清理 | daily review/proactive 生成发送用例、周报格式化与发送 |
-| 管理/观测 | `admin_ui.py`、`observability.py`、`approval_rules.py` | WebUI、Trace、工具单 | 聊天热路径判断 |
+| 管理 HTTP | `admin_controller.py`、`admin_tools_controller.py`、`admin_edit_controller.py`、`admin_summaries_controller.py`、`admin_memory_controller.py`、`admin_http.py` | 本地管理路由、鉴权委托、表单适配、资源操作和重定向；编辑服务保留路径白名单、内容校验、备份与原子替换 | 群聊/私聊热路径，页面 HTML 拼装 |
+| 管理页面与观测 | `admin_ui.py`、`observability.py`、`approval_rules.py` | HTML 渲染、Trace、工具单 | HTTP request parsing、管理业务规则、聊天热路径判断 |
 | 安全输出 | `political_guard.py` | 输出脱敏和明确语义拦截 | 裸匹配消息 ID/QQ/时间戳 |
 
 ## 4. 插件化现状
@@ -86,7 +87,7 @@ entrypoint/plugin -> orchestration -> domain/storage/tools -> provider adapters
 
 主要技术债：
 
-- `plugin.py` 仍承载生命周期、群聊编排、私聊阶段依赖装配和 HTTP controller。
+- `plugin.py` 仍承载生命周期、群聊编排和私聊阶段依赖装配；26 条 `/admin` 路由已迁入资源 controller，`plugin.py` 只保留本地鉴权策略、运行时依赖组装和 `/status`、`/healthz`、`/readyz`、`/trace(s)` 观测路由。
 - `memory.py`、`deepseek_client.py`、`rag_store.py` 仍大，但数据契约密集，暂不宜粗暴拆分。
 - manifest 能声明能力，但实际 handler 注册仍集中在主文件。
 
@@ -95,7 +96,7 @@ entrypoint/plugin -> orchestration -> domain/storage/tools -> provider adapters
 群聊高频改动路径已按阶段拆出。`plugin.py` 装配当前 LLM、存储、日志和指标回调，并保留事件生命周期与阶段间早退。后续继续按功能边界迁移，保持 Trace 事件名与数据库写入不变。
 
 1. **定时任务（第一批已完成）**：三个 scheduler service 管理 daily review、weekly usage report、proactive chat 的生命周期和 tick 策略。`plugin.py` 在 connect 时按 manifest/config 开关调用 `_ensure_*`，disconnect/shutdown 取消同一组 service task registry。daily review/proactive 的生成发送流程、周报统计格式与投递仍由 `plugin.py` 适配，后续按领域依赖再迁移；这一批不改生成和发送行为。
-2. **管理 controller**：抽 `admin_controller.py`，让 `admin_ui.py` 只做 HTML 渲染。
+2. **管理 controller（本批完成）**：26 条 `/admin` 路由由 `admin_controller.py` 聚合，并按 tools、editable files、summaries、memory/private-memory 划分资源 controller；`admin_ui.py` 只负责渲染。各 controller 通过窄依赖对象调用运行时，不反向导入 `plugin.py`。原有本地请求判定和注册顺序保留；状态与 Trace 路由仍由入口注册。编辑服务保留项目路径校验、YAML/Prompt/config 校验、保存前备份、临时文件替换及 Docker 单文件 bind mount 的原地写入处理。
 3. **普通消息发送**：评估 `message_delivery_service.py`，集中普通正文与表情发送结果回写。
 
 不要优先拆 `memory.py` 或 `deepseek_client.py`。先补 repository/service 边界和表级测试，再动内部结构。

@@ -11,10 +11,6 @@ from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
-from urllib.parse import parse_qs, urlencode
-
-import yaml
-
 from dotenv import load_dotenv
 from nonebot import get_driver, logger, on_command, on_message, on_notice
 from nonebot.adapters import Event
@@ -24,7 +20,7 @@ from nonebot.matcher import Matcher
 from nonebot.params import CommandArg
 from nonebot.rule import Rule
 from starlette.requests import Request
-from starlette.responses import HTMLResponse, JSONResponse, RedirectResponse
+from starlette.responses import HTMLResponse, JSONResponse
 
 from . import onebot_gateway
 
@@ -48,18 +44,27 @@ from .approval_rules import (
     JARGON_LIST_RE,
     TOKEN_REPORT_COMMAND_ALIASES,
 )
-from .admin_ui import (
-    render_admin_dashboard,
-    render_admin_edit_page,
-    render_admin_tools_page,
-    render_memory_audit_page,
-    render_memory_atom_detail_page,
-    render_memory_summaries_page,
-    render_memory_summary_detail_page,
-    render_message_detail_page,
-    render_plugins_page,
-    render_private_memory_page,
+from .admin_controller import (
+    AdminController,
+    AdminDashboardController,
+    AdminDashboardServices,
+    AdminMessageController,
+    AdminMessageServices,
+    AdminOperationsController,
+    AdminOperationsServices,
+    AdminPluginsController,
+    AdminPluginsServices,
 )
+from .admin_edit_controller import (
+    ADMIN_BACKUP_DIR,
+    ADMIN_EDITABLE_FILES,
+    AdminEditController,
+    AdminEditServices,
+    AdminEditableFileService,
+)
+from .admin_memory_controller import AdminMemoryController, AdminMemoryServices
+from .admin_summaries_controller import AdminSummariesController, AdminSummariesServices
+from .admin_tools_controller import AdminToolsController, AdminToolsServices
 from .approval_models import DeliveryProgress, PendingApprovalCandidate, PendingGroupApproval
 from .approval_command_service import (
     PrivateApprovalCommandServices,
@@ -77,7 +82,7 @@ from .approval_request_service import (
 from .approval_state_service import ApprovalStateService, ApprovalStateServices
 from .approved_reply_delivery import ApprovedReplyDeliveryServices, send_approved_group_reply_inner
 from .background_learning import BackgroundLearningCoordinator
-from .config import PROJECT_ROOT, load_config
+from .config import load_config
 from .context_assembler import assemble_generation_context, merge_rag_and_summary_context
 from .content_ingestion import ContentIngestionService, explicit_file_read_requested
 from .cue_patterns import CuePatternTracker, CueRepeatState
@@ -311,23 +316,6 @@ rag_admin = RAGAdminController(rag_service)
 tool_registry = ToolRegistry()
 local_plugin_registry = LocalPluginRegistry(Path(__file__).resolve().parent.parent / "plugins")
 local_plugin_registry.reload()
-ADMIN_EDITABLE_FILES: tuple[dict[str, object], ...] = (
-    {
-        "key": "prompt",
-        "label": "人格 / Prompt",
-        "path": PROJECT_ROOT / "prompts" / "zhangfengxue.yaml",
-        "description": "集中人格、action_guides 和所有 LLM flow。保存后会立即热重载到当前 bot。",
-        "reload": "prompt",
-    },
-    {
-        "key": "config",
-        "label": "后端配置 config.yaml",
-        "path": PROJECT_ROOT / "config.yaml",
-        "description": "工作强度、模型、白名单、搜索、频率等配置。保存会校验 YAML；多数配置需要重启后端才完整生效。",
-        "reload": "restart_required",
-    },
-)
-ADMIN_BACKUP_DIR = PROJECT_ROOT / "data" / "admin_backups"
 TOOL_ROUTER_SHADOW_SAMPLE_LIMIT = 200
 tool_router_shadow_samples = memory.metric_event_count("tool_router_shadow")
 _jargon_selection_config = app_config.raw.get("jargon_selection", {})
@@ -427,474 +415,6 @@ if hasattr(_driver, "server_app"):
     async def _http_trace_endpoint(trace_id: str = "", limit: int = 50) -> HTMLResponse:
         snapshot = _http_trace_payload(trace_id=trace_id, limit=limit)
         return HTMLResponse(render_trace_html(snapshot, title="张风雪消息链路 Trace"))
-
-    @_driver.server_app.post("/admin/daily-review/{mode}")
-    async def _http_daily_review_endpoint(request: Request, mode: str) -> JSONResponse:
-        if not _is_local_admin_request(request):
-            return JSONResponse({"ok": False, "reason": "local_admin_only"}, status_code=403)
-        payload, status_code = await _http_daily_review_payload(mode=mode)
-        return JSONResponse(payload, status_code=status_code)
-
-    @_driver.server_app.post("/admin/proactive-chat")
-    async def _http_proactive_chat_endpoint(request: Request) -> JSONResponse:
-        if not _is_local_admin_request(request):
-            return JSONResponse({"ok": False, "reason": "local_admin_only"}, status_code=403)
-        try:
-            payload = await request.json()
-        except Exception:
-            payload = {}
-        try:
-            group_id = int(str(payload.get("group_id") or "").strip())
-        except (TypeError, ValueError):
-            group_id = None
-        payload, status_code = await _http_proactive_chat_payload(group_id=group_id)
-        return JSONResponse(payload, status_code=status_code)
-
-    @_driver.server_app.post("/admin/send-group")
-    async def _http_admin_send_group_endpoint(request: Request) -> JSONResponse:
-        if not _is_local_admin_request(request):
-            return JSONResponse({"ok": False, "reason": "local_admin_only"}, status_code=403)
-        try:
-            payload = await request.json()
-        except Exception:
-            payload = {}
-        try:
-            group_id = int(str(payload.get("group_id") or "").strip())
-        except (TypeError, ValueError):
-            group_id = None
-        message_text = str(payload.get("message") or "").strip()
-        if group_id is None or not message_text:
-            return JSONResponse({"ok": False, "reason": "missing_group_id_or_message"}, status_code=400)
-        bot = _first_connected_onebot_bot()
-        if bot is None:
-            return JSONResponse({"ok": False, "reason": "onebot_disconnected"}, status_code=503)
-        message_id = await _send_group_message(bot, group_id, Message(message_text))
-        _record_bot_sent_message(
-            group_id=group_id,
-            message_id=message_id,
-            bot_reply=message_text,
-            trigger_user_id=0,
-            trigger_nickname="Codex手动发起",
-            trigger_text=str(payload.get("reason") or "manual proactive topic")[:500],
-            action="manual_proactive",
-        )
-        return JSONResponse({"ok": True, "group_id": group_id, "message_id": message_id})
-
-    @_driver.server_app.post("/admin/send-private")
-    async def _http_admin_send_private_endpoint(request: Request) -> JSONResponse:
-        if not _is_local_admin_request(request):
-            return JSONResponse({"ok": False, "reason": "local_admin_only"}, status_code=403)
-        try:
-            payload = await request.json()
-        except Exception:
-            payload = {}
-        try:
-            user_id = int(str(payload.get("user_id") or "").strip())
-        except (TypeError, ValueError):
-            user_id = None
-        message_text = str(payload.get("message") or "").strip()
-        if user_id is None or not message_text:
-            return JSONResponse({"ok": False, "reason": "missing_user_id_or_message"}, status_code=400)
-        bot = _first_connected_onebot_bot()
-        if bot is None:
-            return JSONResponse({"ok": False, "reason": "onebot_disconnected"}, status_code=503)
-        try:
-            result = await _send_private_message(bot, user_id=user_id, message=Message(message_text))
-        except ActionFailed as exc:
-            return JSONResponse({"ok": False, "reason": _action_failed_summary(exc)}, status_code=502)
-        memory.add_message(
-            _private_chat_id(user_id),
-            int(bot.self_id),
-            BOT_STATUS_CARD_BASE_NAME,
-            message_text,
-            is_bot=True,
-        )
-        return JSONResponse({"ok": True, "user_id": user_id, "result": str(result)[:160]})
-
-    @_driver.server_app.get("/admin")
-    async def _http_admin_endpoint(request: Request, group_id: int | None = None) -> HTMLResponse:
-        if not _is_local_admin_request(request):
-            return HTMLResponse("local admin only", status_code=403)
-        return HTMLResponse(
-            render_admin_dashboard(
-                memory=memory,
-                groups=_runtime_target_groups(),
-                selected_group_id=group_id,
-                ready=_http_ready_payload(),
-                health=_http_health_payload(),
-                status=_http_status_payload(),
-                model_routes=_status_model_routes(),
-                pending_approvals=list(pending_group_approvals.values()),
-                plugins=local_plugin_registry.summary(),
-            )
-        )
-
-    @_driver.server_app.get("/admin/tools")
-    async def _http_admin_tools_endpoint(
-        request: Request,
-        group_id: int | None = None,
-        notice: str = "",
-    ) -> HTMLResponse:
-        if not _is_local_admin_request(request):
-            return HTMLResponse("local admin only", status_code=403)
-        selected_group_id = _admin_selected_group_id(group_id)
-        return HTMLResponse(
-            render_admin_tools_page(
-                state=_admin_tools_state(selected_group_id),
-                selected_group_id=selected_group_id,
-                notice=notice,
-            )
-        )
-
-    @_driver.server_app.get("/admin/tools/report")
-    async def _http_admin_tools_report_endpoint(
-        request: Request,
-        kind: str = "metrics",
-        group_id: int | None = None,
-        limit: int = 20,
-        window: str = "today",
-        query: str = "",
-    ) -> HTMLResponse:
-        if not _is_local_admin_request(request):
-            return HTMLResponse("local admin only", status_code=403)
-        selected_group_id = _admin_selected_group_id(group_id)
-        title, report = await _admin_tools_report(
-            kind=kind,
-            group_id=selected_group_id,
-            limit=limit,
-            window=window,
-            query=query,
-        )
-        return HTMLResponse(
-            render_admin_tools_page(
-                state=_admin_tools_state(selected_group_id),
-                selected_group_id=selected_group_id,
-                report_title=title,
-                report_text=report,
-            )
-        )
-
-    @_driver.server_app.post("/admin/tools/action")
-    async def _http_admin_tools_action_endpoint(request: Request):
-        if not _is_local_admin_request(request):
-            return HTMLResponse("local admin only", status_code=403)
-        form = await _admin_form_data(request)
-        group_id = _admin_selected_group_id(_admin_form_int(form, "group_id"))
-        notice = await _admin_apply_tool_action(form, group_id=group_id)
-        return RedirectResponse(url=_admin_tools_url(group_id=group_id, notice=notice), status_code=303)
-
-    @_driver.server_app.get("/admin/edit")
-    async def _http_admin_edit_endpoint(request: Request, file: str = "prompt", notice: str = "") -> HTMLResponse:
-        if not _is_local_admin_request(request):
-            return HTMLResponse("local admin only", status_code=403)
-        item = _admin_editable_file(file)
-        content, read_notice = _admin_read_editable_file(str(item["key"]))
-        merged_notice = notice or read_notice
-        return HTMLResponse(
-            render_admin_edit_page(
-                editable_files=_admin_editable_files_summary(),
-                selected_key=str(item["key"]),
-                content=content,
-                notice=merged_notice,
-            )
-        )
-
-    @_driver.server_app.post("/admin/edit/save")
-    async def _http_admin_edit_save_endpoint(request: Request):
-        if not _is_local_admin_request(request):
-            return HTMLResponse("local admin only", status_code=403)
-        form = await _admin_form_data(request)
-        key = form.get("file", "prompt").strip() or "prompt"
-        content = form.get("content", "")
-        item = _admin_editable_file(key)
-        try:
-            notice = _admin_save_editable_file(str(item["key"]), content)
-        except Exception as exc:
-            return HTMLResponse(
-                render_admin_edit_page(
-                    editable_files=_admin_editable_files_summary(),
-                    selected_key=str(item["key"]),
-                    content=content,
-                    notice=f"保存失败：{exc}",
-                ),
-                status_code=400,
-            )
-        return RedirectResponse(url=_admin_edit_url(str(item["key"]), notice=notice), status_code=303)
-
-    @_driver.server_app.get("/admin/summaries")
-    async def _http_admin_summaries_endpoint(
-        request: Request,
-        group_id: int | None = None,
-        status: str = "active",
-        limit: int = 80,
-        q: str = "",
-        notice: str = "",
-    ) -> HTMLResponse:
-        if not _is_local_admin_request(request):
-            return HTMLResponse("local admin only", status_code=403)
-        return HTMLResponse(
-            render_memory_summaries_page(
-                memory=memory,
-                groups=_runtime_target_groups(),
-                selected_group_id=group_id,
-                status=status,
-                limit=limit,
-                q=q,
-                notice=notice,
-            )
-        )
-
-    @_driver.server_app.get("/admin/summaries/action")
-    async def _http_admin_summary_action_get(request: Request):
-        if not _is_local_admin_request(request):
-            return HTMLResponse("local admin only", status_code=403)
-        return HTMLResponse("summary actions require POST", status_code=405)
-
-    @_driver.server_app.post("/admin/summaries/action")
-    async def _http_admin_summary_action_endpoint(
-        request: Request,
-        summary_id: int,
-        action: str,
-        group_id: int | None = None,
-        status: str = "active",
-        limit: int = 80,
-        q: str = "",
-    ):
-        if not _is_local_admin_request(request):
-            return HTMLResponse("local admin only", status_code=403)
-        ok = memory.admin_set_memory_summary_state(summary_id, action=action)
-        notice = "已更新回想状态" if ok else "没有找到回想或动作无效"
-        return RedirectResponse(
-            url=_admin_summaries_url(group_id=group_id, status=status, limit=limit, q=q, notice=notice),
-            status_code=303,
-        )
-
-    @_driver.server_app.post("/admin/summaries/add")
-    async def _http_admin_summary_add_endpoint(request: Request):
-        if not _is_local_admin_request(request):
-            return HTMLResponse("local admin only", status_code=403)
-        form = await _admin_form_data(request)
-        group_id = _admin_form_int(form, "group_id")
-        if group_id is None:
-            return RedirectResponse(
-                url=_admin_summaries_url(notice="新增失败：需要填写群号"),
-                status_code=303,
-            )
-        summary = form.get("summary", "")
-        recall_cues = _split_admin_cues(form.get("recall_cues", ""))
-        locked = form.get("locked") == "1"
-        summary_id = memory.admin_add_memory_summary(
-            group_id=group_id,
-            summary=summary,
-            recall_cues=recall_cues,
-            locked=locked,
-        )
-        if not summary_id:
-            return RedirectResponse(
-                url=_admin_summaries_url(group_id=group_id, notice="新增失败：回想内容为空"),
-                status_code=303,
-            )
-        return RedirectResponse(url=_admin_summary_detail_url(summary_id, notice="已新增人工回想"), status_code=303)
-
-    @_driver.server_app.post("/admin/summaries/save")
-    async def _http_admin_summary_save_endpoint(request: Request):
-        if not _is_local_admin_request(request):
-            return HTMLResponse("local admin only", status_code=403)
-        form = await _admin_form_data(request)
-        summary_id = _admin_form_int(form, "summary_id") or 0
-        ok = memory.admin_update_memory_summary(
-            summary_id,
-            summary=form.get("summary", ""),
-            recall_cues=_split_admin_cues(form.get("recall_cues", "")),
-            status=form.get("status", "active"),
-            locked=form.get("locked") == "1",
-        )
-        notice = "已保存回想" if ok else "保存失败：回想不存在或内容为空"
-        return RedirectResponse(url=_admin_summary_detail_url(summary_id, notice=notice), status_code=303)
-
-    @_driver.server_app.get("/admin/summaries/{summary_id}")
-    async def _http_admin_summary_detail_endpoint(
-        request: Request,
-        summary_id: int,
-        notice: str = "",
-    ) -> HTMLResponse:
-        if not _is_local_admin_request(request):
-            return HTMLResponse("local admin only", status_code=403)
-        return HTMLResponse(
-            render_memory_summary_detail_page(
-                memory=memory,
-                summary_id=summary_id,
-                groups=_runtime_target_groups(),
-                notice=notice,
-            )
-        )
-
-    @_driver.server_app.get("/admin/private-memory")
-    async def _http_admin_private_memory_endpoint(request: Request, notice: str = "") -> HTMLResponse:
-        if not _is_local_admin_request(request):
-            return HTMLResponse("local admin only", status_code=403)
-        return HTMLResponse(render_private_memory_page(memory=memory, notice=notice))
-
-    @_driver.server_app.post("/admin/private-memory/save")
-    async def _http_admin_private_memory_save_endpoint(request: Request):
-        if not _is_local_admin_request(request):
-            return HTMLResponse("local admin only", status_code=403)
-        form = await _admin_form_data(request)
-        chat_id = _admin_form_int(form, "chat_id")
-        user_id = _admin_form_int(form, "user_id")
-        if chat_id is None or user_id is None:
-            return RedirectResponse(url="/admin/private-memory?notice=保存失败：缺少会话编号", status_code=303)
-        memory.update_private_conversation_state(
-            chat_id=chat_id,
-            user_id=user_id,
-            display_name=form.get("display_name", ""),
-            relationship_note=form.get("relationship_note", ""),
-            interaction_tone=form.get("interaction_tone", ""),
-            current_topic=form.get("current_topic", ""),
-            open_threads=[item.strip() for item in form.get("open_threads", "").splitlines() if item.strip()],
-            frozen_fields=[item.strip() for item in form.get("frozen_fields", "").split(",") if item.strip()],
-        )
-        return RedirectResponse(url="/admin/private-memory?notice=私聊状态已保存", status_code=303)
-
-    @_driver.server_app.get("/admin/plugins")
-    async def _http_admin_plugins_endpoint(request: Request) -> HTMLResponse:
-        if not _is_local_admin_request(request):
-            return HTMLResponse("local admin only", status_code=403)
-        local_plugin_registry.reload()
-        return HTMLResponse(
-            render_plugins_page(
-                plugins=local_plugin_registry.summary(),
-                errors=[error.to_summary() for error in local_plugin_registry.errors],
-            )
-        )
-
-    @_driver.server_app.get("/admin/messages/{message_id}")
-    async def _http_admin_message_detail_endpoint(request: Request, message_id: int) -> HTMLResponse:
-        if not _is_local_admin_request(request):
-            return HTMLResponse("local admin only", status_code=403)
-        return HTMLResponse(render_message_detail_page(memory=memory, message_id=message_id))
-
-    @_driver.server_app.get("/admin/memory")
-    async def _http_admin_memory_endpoint(
-        request: Request,
-        group_id: int | None = None,
-        status: str = "active",
-        limit: int = 80,
-        notice: str = "",
-        user_id: int | None = None,
-        atom_type: str = "",
-        q: str = "",
-    ) -> HTMLResponse:
-        if not _is_local_admin_request(request):
-            return HTMLResponse("local admin only", status_code=403)
-        return HTMLResponse(
-            render_memory_audit_page(
-                memory=memory,
-                groups=_runtime_target_groups(),
-                selected_group_id=group_id,
-                status=status,
-                limit=limit,
-                notice=notice,
-                user_id=user_id,
-                atom_type=atom_type,
-                q=q,
-            )
-        )
-
-    @_driver.server_app.get("/admin/memory/action")
-    async def _http_admin_memory_action_get(request: Request):
-        if not _is_local_admin_request(request):
-            return HTMLResponse("local admin only", status_code=403)
-        return HTMLResponse("memory actions require POST", status_code=405)
-
-    @_driver.server_app.post("/admin/memory/action")
-    async def _http_admin_memory_action_endpoint(
-        request: Request,
-        atom_id: int,
-        action: str,
-        group_id: int | None = None,
-        status: str = "active",
-        limit: int = 80,
-        user_id: int | None = None,
-        atom_type: str = "",
-        q: str = "",
-    ):
-        if not _is_local_admin_request(request):
-            return HTMLResponse("local admin only", status_code=403)
-        ok = memory.admin_review_memory_atom(atom_id, action=action, actor_user_id=0)
-        notice = "已更新" if ok else "没有找到记忆或动作无效"
-        return RedirectResponse(
-            url=_admin_memory_url(
-                group_id=group_id,
-                status=status,
-                limit=limit,
-                user_id=user_id,
-                atom_type=atom_type,
-                q=q,
-                notice=notice,
-            ),
-            status_code=303,
-        )
-
-    @_driver.server_app.post("/admin/memory/correct")
-    async def _http_admin_memory_correct_endpoint(request: Request):
-        if not _is_local_admin_request(request):
-            return HTMLResponse("local admin only", status_code=403)
-        form = await _admin_form_data(request)
-        atom_id = _admin_form_int(form, "atom_id") or 0
-        content = form.get("content", "").strip()
-        atom_type = form.get("atom_type", "").strip() or None
-        subject_user_id = _admin_form_int(form, "subject_user_id")
-        object_user_id = _admin_form_int(form, "object_user_id")
-        reason = form.get("reason", "").strip() or "WebUI 手动纠正"
-        new_atom_id = memory.correct_memory_atom(
-            atom_id,
-            content=content,
-            source="admin_ui",
-            actor_user_id=0,
-            reason=reason,
-            confidence=1.0,
-            atom_type=atom_type,
-            subject_user_id=subject_user_id,
-            object_user_id=object_user_id,
-        )
-        target_id = new_atom_id or atom_id
-        notice = f"已创建纠正记忆 #{new_atom_id}" if new_atom_id else "纠正失败：没有找到有效记忆或内容为空"
-        return RedirectResponse(url=_admin_memory_detail_url(target_id, notice=notice), status_code=303)
-
-    @_driver.server_app.post("/admin/memory/merge")
-    async def _http_admin_memory_merge_endpoint(request: Request):
-        if not _is_local_admin_request(request):
-            return HTMLResponse("local admin only", status_code=403)
-        form = await _admin_form_data(request)
-        source_atom_id = _admin_form_int(form, "source_atom_id") or 0
-        target_atom_id = _admin_form_int(form, "target_atom_id") or 0
-        reason = form.get("reason", "").strip() or "WebUI 合并重复记忆"
-        ok = memory.admin_merge_memory_atoms(
-            source_atom_id,
-            target_atom_id,
-            actor_user_id=0,
-            note=reason,
-        )
-        notice = f"已将 #{source_atom_id} 合并到 #{target_atom_id}" if ok else "合并失败：检查 ID、群号、状态是否有效"
-        return RedirectResponse(url=_admin_memory_detail_url(target_atom_id or source_atom_id, notice=notice), status_code=303)
-
-    @_driver.server_app.get("/admin/memory/{atom_id}")
-    async def _http_admin_memory_detail_endpoint(
-        request: Request,
-        atom_id: int,
-        notice: str = "",
-    ) -> HTMLResponse:
-        if not _is_local_admin_request(request):
-            return HTMLResponse("local admin only", status_code=403)
-        return HTMLResponse(
-            render_memory_atom_detail_page(
-                memory=memory,
-                atom_id=atom_id,
-                groups=_runtime_target_groups(),
-                notice=notice,
-            )
-        )
 
 MID_MEMORY_KEEP_SUMMARIES = 4
 MID_MEMORY_BATCH_SIZE = 60
@@ -4046,258 +3566,12 @@ def _http_trace_payload(*, trace_id: str = "", limit: int = 50) -> dict[str, obj
     return result
 
 
-async def _admin_form_data(request: Request) -> dict[str, str]:
-    body = await request.body()
-    parsed = parse_qs(body.decode("utf-8", errors="ignore"), keep_blank_values=True)
-    return {
-        key: (",".join(values) if key == "frozen_fields" else (values[-1] if values else ""))
-        for key, values in parsed.items()
-    }
-
-
-def _admin_form_int(form: dict[str, str], key: str) -> int | None:
-    value = form.get(key, "").strip()
-    if not value:
-        return None
-    try:
-        return int(value)
-    except ValueError:
-        return None
-
-
-def _admin_memory_url(
-    *,
-    group_id: int | None = None,
-    status: str = "active",
-    limit: int = 80,
-    user_id: int | None = None,
-    atom_type: str = "",
-    q: str = "",
-    notice: str = "",
-) -> str:
-    params: dict[str, object] = {"status": status or "active", "limit": limit}
-    if group_id is not None:
-        params["group_id"] = group_id
-    if user_id is not None:
-        params["user_id"] = user_id
-    if atom_type.strip():
-        params["atom_type"] = atom_type.strip()
-    if q.strip():
-        params["q"] = q.strip()
-    if notice.strip():
-        params["notice"] = notice.strip()
-    return "/admin/memory?" + urlencode(params)
-
-
-def _admin_memory_detail_url(atom_id: int, *, notice: str = "") -> str:
-    params = {"notice": notice.strip()} if notice.strip() else {}
-    return f"/admin/memory/{int(atom_id)}" + ("?" + urlencode(params) if params else "")
-
-
-def _admin_editable_files_summary() -> list[dict[str, str]]:
-    return [
-        {
-            "key": str(item.get("key", "")),
-            "label": str(item.get("label", item.get("key", ""))),
-            "description": str(item.get("description", "")),
-        }
-        for item in ADMIN_EDITABLE_FILES
-    ]
-
-
-def _admin_editable_file(key: str) -> dict[str, object]:
-    clean_key = (key or "").strip()
-    for item in ADMIN_EDITABLE_FILES:
-        if str(item.get("key")) == clean_key:
-            return item
-    return ADMIN_EDITABLE_FILES[0]
-
-
-def _admin_edit_url(key: str, *, notice: str = "") -> str:
-    params: dict[str, object] = {"file": key}
-    if notice.strip():
-        params["notice"] = notice.strip()
-    return "/admin/edit?" + urlencode(params)
-
-
-def _admin_read_editable_file(key: str) -> tuple[str, str]:
-    item = _admin_editable_file(key)
-    path = Path(item["path"])
-    try:
-        return path.read_text(encoding="utf-8"), ""
-    except OSError as exc:
-        return "", f"读取失败：{exc}"
-
-
-def _admin_save_editable_file(key: str, content: str) -> str:
-    item = _admin_editable_file(key)
-    path = Path(item["path"])
-    _ensure_admin_path_allowed(path)
-    if not path.exists():
-        raise ValueError(f"文件不存在：{path}")
-    _validate_editable_content(item, content)
-    backup_path = _backup_admin_file(path)
-    tmp_path = path.with_name(f".{path.name}.admin_tmp")
-    tmp_path.write_text(content, encoding="utf-8")
-    try:
-        tmp_path.replace(path)
-    except OSError as exc:
-        # Docker single-file bind mounts cannot be atomically replaced. Keep the
-        # backup and fall back to an in-place overwrite so WebUI config edits work.
-        if getattr(exc, "errno", None) != 16:
-            raise
-        path.write_text(content, encoding="utf-8")
-        try:
-            tmp_path.unlink()
-        except OSError:
-            pass
-    reload_mode = str(item.get("reload", ""))
-    if reload_mode == "prompt":
-        _reload_prompt_runtime()
-        return f"已保存并热重载：{item.get('label')}；备份 {backup_path.name}"
-    return f"已保存：{item.get('label')}；备份 {backup_path.name}。这个配置多数需要重启后端生效。"
-
-
-def _ensure_admin_path_allowed(path: Path) -> None:
-    root = PROJECT_ROOT.resolve()
-    resolved = path.resolve()
-    try:
-        allowed = resolved.is_relative_to(root)
-    except AttributeError:
-        allowed = str(resolved).startswith(str(root) + "/") or resolved == root
-    if not allowed:
-        raise ValueError("拒绝编辑项目目录外的文件")
-
-
-def _backup_admin_file(path: Path) -> Path:
-    ADMIN_BACKUP_DIR.mkdir(parents=True, exist_ok=True)
-    now = time.time()
-    timestamp = time.strftime("%Y%m%d_%H%M%S", time.localtime(now)) + f"_{int((now % 1) * 1000):03d}"
-    try:
-        rel = path.resolve().relative_to(PROJECT_ROOT.resolve()).as_posix()
-    except ValueError:
-        rel = path.name
-    safe_name = re.sub(r"[^A-Za-z0-9_.-]+", "__", rel)
-    backup_path = ADMIN_BACKUP_DIR / f"{timestamp}_{safe_name}"
-    suffix = 1
-    while backup_path.exists():
-        backup_path = ADMIN_BACKUP_DIR / f"{timestamp}_{suffix}_{safe_name}"
-        suffix += 1
-    backup_path.write_text(path.read_text(encoding="utf-8"), encoding="utf-8")
-    return backup_path
-
-
-def _validate_editable_content(item: dict[str, object], content: str) -> None:
-    try:
-        raw = yaml.safe_load(content)
-    except yaml.YAMLError as exc:
-        raise ValueError(f"YAML 解析失败：{exc}") from exc
-    if raw is not None and not isinstance(raw, dict):
-        raise ValueError("YAML 顶层必须是对象")
-    key = str(item.get("key", ""))
-    if key == "prompt":
-        _validate_prompt_content(content, raw or {})
-    elif key == "config":
-        _validate_config_content(content)
-
-
-def _validate_prompt_content(content: str, raw: dict[str, object]) -> None:
-    persona_raw = raw.get("persona")
-    if not isinstance(persona_raw, dict) or not str(persona_raw.get("id", "")).strip():
-        raise ValueError("Prompt 文件需要 persona.id")
-    if not str(persona_raw.get("prompt", "")).strip():
-        raise ValueError("Prompt 文件需要 persona.prompt")
-    ADMIN_BACKUP_DIR.mkdir(parents=True, exist_ok=True)
-    tmp_path = ADMIN_BACKUP_DIR / f".validate_prompt_{int(time.time() * 1000)}.yaml"
-    tmp_path.write_text(content, encoding="utf-8")
-    try:
-        registry = PromptRegistry(tmp_path)
-        required_flows = (
-            "timing_gate",
-            "decision",
-            "reply",
-            "reply_candidates",
-            "reply_direct",
-            "mid_memory",
-            "style_learning",
-            "member_profile",
-            "daily_review",
-        )
-        for flow in required_flows:
-            section = registry.flows.get(flow)
-            if not isinstance(section, dict):
-                raise ValueError(f"Prompt 文件缺少 flows.{flow}")
-            if not str(section.get("system", "")).strip() or not str(section.get("user", "")).strip():
-                raise ValueError(f"flows.{flow} 需要 system 和 user")
-    finally:
-        try:
-            tmp_path.unlink()
-        except OSError:
-            pass
-
-
-def _validate_config_content(content: str) -> None:
-    ADMIN_BACKUP_DIR.mkdir(parents=True, exist_ok=True)
-    tmp_path = ADMIN_BACKUP_DIR / f".validate_config_{int(time.time() * 1000)}.yaml"
-    tmp_path.write_text(content, encoding="utf-8")
-    try:
-        load_config(tmp_path)
-    finally:
-        try:
-            tmp_path.unlink()
-        except OSError:
-            pass
-
-
 def _reload_prompt_runtime() -> None:
     global personas
     personas = PersonaRegistry(app_config.persona_dir)
     if deepseek_client is not None:
         deepseek_client.prompts = PromptRegistry()
     logger.info("qq_social_agent admin prompt reloaded")
-
-
-def _split_admin_cues(text: str) -> list[str]:
-    return [part.strip() for part in re.split(r"[,，、;；\n]+", text or "") if part.strip()][:12]
-
-
-def _admin_summaries_url(
-    *,
-    group_id: int | None = None,
-    status: str = "active",
-    limit: int = 80,
-    q: str = "",
-    notice: str = "",
-) -> str:
-    params: dict[str, object] = {"status": status or "active", "limit": limit}
-    if group_id is not None:
-        params["group_id"] = group_id
-    if q.strip():
-        params["q"] = q.strip()
-    if notice.strip():
-        params["notice"] = notice.strip()
-    return "/admin/summaries?" + urlencode(params)
-
-
-def _admin_summary_detail_url(summary_id: int, *, notice: str = "") -> str:
-    params = {"notice": notice.strip()} if notice.strip() else {}
-    return f"/admin/summaries/{int(summary_id)}" + ("?" + urlencode(params) if params else "")
-
-
-def _admin_selected_group_id(group_id: int | None = None) -> int | None:
-    if group_id is not None:
-        return int(group_id)
-    groups = _runtime_target_groups()
-    return groups[0] if groups else None
-
-
-def _admin_tools_url(*, group_id: int | None = None, notice: str = "") -> str:
-    params: dict[str, object] = {}
-    if group_id is not None:
-        params["group_id"] = group_id
-    if notice.strip():
-        params["notice"] = notice.strip()
-    return "/admin/tools" + ("?" + urlencode(params) if params else "")
 
 
 def _admin_tools_state(group_id: int | None) -> dict[str, object]:
@@ -4613,39 +3887,10 @@ def _first_connected_onebot_bot() -> Bot | None:
 
 
 async def _http_daily_review_payload(*, mode: str) -> tuple[dict[str, object], int]:
-    bot = _first_connected_onebot_bot()
-    if bot is None:
-        return {"ok": False, "reason": "onebot_disconnected"}, 503
-    normalized_mode = (mode or "today").strip().lower()
-    sent_count, total_count = await _send_manual_daily_reviews(bot, mode=normalized_mode)
-    ok = sent_count > 0
-    return {
-        "ok": ok,
-        "mode": normalized_mode,
-        "sent_count": sent_count,
-        "target_count": total_count,
-    }, 200 if ok else 503
+    return await admin_controller.operations.daily_review_payload(mode=mode)
 
 async def _http_proactive_chat_payload(*, group_id: int | None) -> tuple[dict[str, object], int]:
-    bot = _first_connected_onebot_bot()
-    if bot is None:
-        return {"ok": False, "reason": "onebot_disconnected"}, 503
-    target_groups = (group_id,) if group_id is not None else _runtime_target_groups()
-    sent = 0
-    results: list[dict[str, object]] = []
-    for target_group_id in target_groups:
-        if not app_config.group_allowed(int(target_group_id)):
-            results.append({"group_id": int(target_group_id), "ok": False, "reason": "group_not_allowed"})
-            continue
-        ok = await _send_proactive_chat_for_group(
-            bot,
-            group_id=int(target_group_id),
-            probability=100,
-            roll=0.0,
-        )
-        sent += 1 if ok else 0
-        results.append({"group_id": int(target_group_id), "ok": bool(ok)})
-    return {"ok": sent > 0, "sent_count": sent, "target_count": len(tuple(target_groups)), "results": results}, 200 if sent > 0 else 503
+    return await admin_controller.operations.proactive_chat_payload(group_id=group_id)
 
 
 def _http_health_payload() -> dict[str, object]:
@@ -11336,3 +10581,104 @@ def _parse_minutes(value: str) -> int:
     if not match:
         return 10
     return max(1, min(24 * 60, int(match.group(1))))
+
+
+def _build_admin_controller() -> AdminController:
+    access = _is_local_admin_request
+    operations = AdminOperationsController(
+        AdminOperationsServices(
+            is_local_admin_request=access,
+            first_connected_bot=_first_connected_onebot_bot,
+            target_groups=_runtime_target_groups,
+            group_allowed=app_config.group_allowed,
+            send_manual_daily_reviews=lambda bot, mode: _send_manual_daily_reviews(bot, mode=mode),
+            send_proactive_chat_for_group=lambda bot, group_id, probability, roll: _send_proactive_chat_for_group(
+                bot,
+                group_id=group_id,
+                probability=probability,
+                roll=roll,
+            ),
+            send_group_message=_send_group_message,
+            record_group_sent_message=_record_bot_sent_message,
+            send_private_message=_send_private_message,
+            record_private_sent_message=lambda user_id, bot_id, message_text: memory.add_message(
+                _private_chat_id(user_id),
+                bot_id,
+                BOT_STATUS_CARD_BASE_NAME,
+                message_text,
+                is_bot=True,
+            ),
+            summarize_action_failed=_action_failed_summary,
+        )
+    )
+    dashboard = AdminDashboardController(
+        AdminDashboardServices(
+            is_local_admin_request=access,
+            get_memory=lambda: memory,
+            target_groups=_runtime_target_groups,
+            ready_payload=lambda: _http_ready_payload(),
+            health_payload=lambda: _http_health_payload(),
+            status_payload=lambda: _http_status_payload(),
+            model_routes=lambda: _status_model_routes(),
+            pending_approvals=lambda: list(pending_group_approvals.values()),
+            plugins_summary=lambda: local_plugin_registry.summary(),
+        )
+    )
+    tools = AdminToolsController(
+        AdminToolsServices(
+            is_local_admin_request=access,
+            target_groups=_runtime_target_groups,
+            state_for_group=_admin_tools_state,
+            apply_action=lambda form, group_id: _admin_apply_tool_action(form, group_id=group_id),
+            report=_admin_tools_report,
+        )
+    )
+    edit = AdminEditController(
+        AdminEditServices(
+            is_local_admin_request=access,
+            file_service=AdminEditableFileService(reload_prompt_runtime=_reload_prompt_runtime),
+        )
+    )
+    summaries = AdminSummariesController(
+        AdminSummariesServices(
+            is_local_admin_request=access,
+            get_memory=lambda: memory,
+            target_groups=_runtime_target_groups,
+        )
+    )
+    memory_controller = AdminMemoryController(
+        AdminMemoryServices(
+            is_local_admin_request=access,
+            get_memory=lambda: memory,
+            target_groups=_runtime_target_groups,
+        )
+    )
+    plugins = AdminPluginsController(
+        AdminPluginsServices(
+            is_local_admin_request=access,
+            reload_plugins=local_plugin_registry.reload,
+            plugins_summary=local_plugin_registry.summary,
+            plugin_errors=lambda: [error.to_summary() for error in local_plugin_registry.errors],
+        )
+    )
+    messages = AdminMessageController(
+        AdminMessageServices(
+            is_local_admin_request=access,
+            get_memory=lambda: memory,
+        )
+    )
+    return AdminController(
+        operations=operations,
+        dashboard=dashboard,
+        tools=tools,
+        edit=edit,
+        summaries=summaries,
+        memory=memory_controller,
+        plugins=plugins,
+        messages=messages,
+    )
+
+
+admin_controller = _build_admin_controller()
+if hasattr(_driver, "server_app"):
+    admin_controller.register(_driver.server_app)
