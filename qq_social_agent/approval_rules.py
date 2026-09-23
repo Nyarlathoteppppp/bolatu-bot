@@ -5,6 +5,13 @@ import re
 
 APPROVAL_REJECT_REASON_RE = re.compile(r"^不准奏(?P<index>[1-3ABCabc])?原因\s*[:：]\s*(?P<reason>.+)$", re.DOTALL)
 APPROVAL_CHOICE_RE = re.compile(r"^([1-3ABCabc])([!！])?$")
+APPROVAL_CANCEL_COMMANDS = {"取消", "取消发送", "不发", "别发", "D", "d", "X", "x"}
+APPROVAL_REVIEW_ON_COMMANDS = {"开启审查", "打开审查", "恢复审查", "启用审查", "开启审核", "打开审核"}
+APPROVAL_REVIEW_OFF_COMMANDS = {"关闭审查", "关掉审查", "暂停审查", "免审", "免审批", "关闭审核", "关掉审核"}
+APPROVAL_REVIEW_STATUS_COMMANDS = {"审查状态", "审核状态", "审批状态"}
+APPROVAL_AUTO_SEND_PERCENT_RE = re.compile(
+    r"^(?:/)?(?:审批概率|审查概率|免审概率|自动发送概率)\s*[:：]?\s*(?P<percent>\d{1,3})?%?$"
+)
 JARGON_ADD_RE = re.compile(
     r"^/黑话\s*[:：]?\s*(?P<term>.+?)\s*(?:指代|意思是|=|->|:|：)\s*[:：]?\s*(?P<meaning>.+)$"
 )

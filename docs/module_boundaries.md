@@ -6,7 +6,7 @@
 
 ## 1. 当前结论
 
-项目已经具备真实分层：消息结构化、决策、工具、上下文、记忆、RAG、审批、发送、观测、后台学习和本地插件都有独立模块。`plugin.py` 仍承担 NoneBot 入口、运行时单例装配、群聊编排、私聊阶段依赖装配、审批命令和 Web 管理路由；`private_session_service.py` 管理私聊缓冲与 followup 调度。群聊主循环已按话语解析、决策、上下文、工具执行、候选生成和审批交接分段；私聊主循环也已按轮次准备、工具执行、上下文检索和生成发送分段。
+项目已经具备真实分层：消息结构化、决策、工具、上下文、记忆、RAG、审批、发送、观测、后台学习和本地插件都有独立模块。`plugin.py` 仍承担 NoneBot 入口、运行时单例装配、群聊编排、私聊阶段依赖装配和 Web 管理路由；`private_session_service.py` 管理私聊缓冲与 followup 调度。群聊主循环已按话语解析、决策、上下文、工具执行、候选生成和审批交接分段；私聊主循环也已按轮次准备、工具执行、上下文检索和生成发送分段。
 
 策略：**保留 `plugin.py` 作为适配器和组合根，不再向其中放业务规则；新增能力优先落到所属模块，再由主文件显式注册。** 不在缺少回归测试时做一次性大拆分。
 
@@ -18,7 +18,10 @@ NapCat / OneBot Event
      -> 群聊：message_segments -> decision_gate -> group_discourse_flow
         -> group_decision_flow + conversation_tool_routing
         -> group_generation_context -> group_tool_execution + group_reply_generation
-        -> group_approval_dispatch -> delivery + social_actions + onebot_gateway
+        -> group_approval_dispatch -> approval_request_service
+        -> private command: approval_command_service
+           -> private_admin_command_service (operator tools)
+           -> approval_state_service -> approved_reply_delivery
      -> 私聊：private_session_service -> plugin.py 阶段协调
         -> private_turn_preparation -> private_tool_execution
         -> private_generation_context -> private_reply_delivery
@@ -48,6 +51,9 @@ entrypoint/plugin -> orchestration -> domain/storage/tools -> provider adapters
 | 工具 | `tool_router.py`、`conversation_tool_routing.py`、`group_tool_execution.py`、`tool_registry.py`、`tools/` | 路由、执行、缓存、限流、结构化结果 | 客服式 fallback 文案 |
 | 上下文 | `group_discourse_flow.py`、`group_generation_context.py`、`context_assembler.py`、`member_context.py`、`speaker_context.py` | 指代与记忆影响、画像、RAG、预算和输入拼装 | 数据库 schema |
 | 候选与审批交接 | `group_reply_generation.py`、`group_approval_dispatch.py` | 草稿生成、复核、审批状态转移 | QQ 实际发送 |
+| 审批命令与管理员工具 | `approval_command_service.py`、`private_admin_command_service.py`、`approval_rules.py` | 命令解析、角色权限和管理员工具命令分派 | 待审批单状态修改、群消息发送 |
+| 审批状态与请求 | `approval_state_service.py`、`approval_request_service.py`、`approval_models.py` | 待审批单集合、串行候选选择、取消反馈、stale choice 冷却、审批请求和自动发送决策 | 群消息发送与 delivery progress 写回 |
+| 审批发送 | `approved_reply_delivery.py`、`delivery.py`、`approval_models.py` | 已批准消息发送、分段进度和数据库/Trace 回写；未知结果标记后阻止盲目重试 | 审批命令解析与工具权限 |
 | LLM | `deepseek_client.py`、`embedding_client.py`、`prompts.py` | provider、JSON、模型路由、用量 | QQ 发送与审批状态 |
 | 记忆/RAG | `memory.py`、`memory_learning.py`、`rag_*.py` | 原文、画像、atoms、风格、索引 | QQ 生命周期 |
 | 发送 | `delivery.py`、`reply_splitter.py`、`social_actions.py` | 拆分、艾特、表情、节流 | 写长期事实 |
@@ -79,7 +85,7 @@ entrypoint/plugin -> orchestration -> domain/storage/tools -> provider adapters
 
 主要技术债：
 
-- `plugin.py` 仍承载生命周期、审批命令、群聊编排、私聊依赖装配和 HTTP controller。
+- `plugin.py` 仍承载生命周期、群聊编排、私聊阶段依赖装配和 HTTP controller。
 - `memory.py`、`deepseek_client.py`、`rag_store.py` 仍大，但数据契约密集，暂不宜粗暴拆分。
 - manifest 能声明能力，但实际 handler 注册仍集中在主文件。
 
@@ -87,10 +93,9 @@ entrypoint/plugin -> orchestration -> domain/storage/tools -> provider adapters
 
 群聊高频改动路径已按阶段拆出。`plugin.py` 装配当前 LLM、存储、日志和指标回调，并保留事件生命周期与阶段间早退。后续继续按功能边界迁移，保持 Trace 事件名与数据库写入不变。
 
-1. **审批服务**：拆出命令解析与权限、待审批单状态、实际发送及结果回写；保留并发选择、delivery progress 断点恢复和不确定发送保护。
-2. **定时任务**：抽 `daily_review_service.py` 与 `proactive_chat_service.py`，连接回调只保留启动/停止 task。
-3. **管理 controller**：抽 `admin_controller.py`，让 `admin_ui.py` 只做 HTML 渲染。
-4. **普通消息发送**：评估 `message_delivery_service.py`，集中普通正文与表情发送结果回写。
+1. **定时任务**：抽 `daily_review_service.py` 与 `proactive_chat_service.py`，连接回调只保留启动/停止 task。
+2. **管理 controller**：抽 `admin_controller.py`，让 `admin_ui.py` 只做 HTML 渲染。
+3. **普通消息发送**：评估 `message_delivery_service.py`，集中普通正文与表情发送结果回写。
 
 不要优先拆 `memory.py` 或 `deepseek_client.py`。先补 repository/service 边界和表级测试，再动内部结构。
 

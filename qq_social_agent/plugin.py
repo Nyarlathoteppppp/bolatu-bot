@@ -30,9 +30,13 @@ from . import onebot_gateway
 
 from .approval_rules import (
     APPROVAL_CHOICE_RE,
+    APPROVAL_AUTO_SEND_PERCENT_RE,
     APPROVAL_DETAIL_COMMANDS,
     APPROVAL_HELP_COMMANDS,
     APPROVAL_REJECT_REASON_RE,
+    APPROVAL_REVIEW_OFF_COMMANDS,
+    APPROVAL_REVIEW_ON_COMMANDS,
+    APPROVAL_REVIEW_STATUS_COMMANDS,
     APPROVAL_RULES_DETAIL_MESSAGE,
     APPROVAL_RULES_MESSAGE,
     BOT_TOOL_FULL_MESSAGE,
@@ -57,6 +61,21 @@ from .admin_ui import (
     render_private_memory_page,
 )
 from .approval_models import DeliveryProgress, PendingApprovalCandidate, PendingGroupApproval
+from .approval_command_service import (
+    PrivateApprovalCommandServices,
+    approval_choice_index as _approval_choice_index,
+    handle_private_approval_command,
+    is_approval_control_text as _is_approval_control_text,
+    is_basic_approval_control_text as _is_basic_approval_control_text,
+)
+from .approval_request_service import (
+    ApprovalRequestServices,
+    approval_side_reaction as _approval_side_reaction,
+    format_approval_candidates as _format_approval_candidates,
+    request_group_approval,
+)
+from .approval_state_service import ApprovalStateService, ApprovalStateServices
+from .approved_reply_delivery import ApprovedReplyDeliveryServices, send_approved_group_reply_inner
 from .background_learning import BackgroundLearningCoordinator
 from .config import PROJECT_ROOT, load_config
 from .context_assembler import assemble_generation_context, merge_rag_and_summary_context
@@ -179,6 +198,7 @@ from .private_generation_context import (
     build_private_generation_context,
 )
 from .private_message_types import BufferedPrivateMessage, PrivateTurn
+from .private_admin_command_service import PrivateAdminCommandServices, handle_private_admin_command
 from .private_reply_delivery import PrivateReplyServices, generate_and_send_private_reply
 from .private_session_service import (
     PrivateFollowupServices,
@@ -344,7 +364,8 @@ group_passive_decision_state: dict[int, "PassiveDecisionState"] = {}
 group_directory_tasks: dict[str, asyncio.Task[None]] = {}
 history_backfill_tasks: dict[str, asyncio.Task[None]] = {}
 notice_directory_refresh_tasks: dict[int, asyncio.Task[None]] = {}
-pending_group_approvals: dict[int, "PendingGroupApproval"] = {}
+approval_state_service = ApprovalStateService()
+pending_group_approvals = approval_state_service.pending
 recent_suppression_events: list["SuppressionEvent"] = []
 daily_review_tasks: dict[str, asyncio.Task[None]] = {}
 weekly_usage_report_tasks: dict[str, asyncio.Task[None]] = {}
@@ -355,8 +376,8 @@ daily_review_send_locks: dict[tuple[int, str], asyncio.Lock] = {}
 last_self_mute_reconcile_at: dict[int, float] = {}
 maintenance_tasks: dict[str, asyncio.Task[None]] = {}
 connected_onebot_bots: dict[str, Bot] = {}
-approval_processing_lock = asyncio.Lock()
-approval_choice_cooldowns: dict[int, float] = {}
+approval_processing_lock = approval_state_service.processing_lock
+approval_choice_cooldowns = approval_state_service.choice_cooldowns
 PROCESS_STARTED_AT = time.time()
 _data_retention_config = app_config.raw.get("data_retention", {})
 if not isinstance(_data_retention_config, dict):
@@ -1119,7 +1140,6 @@ TOKEN_USAGE_LOG_BACKFILL_FILES = (
     Path(__file__).resolve().parent.parent / "logs" / "bot-runtime.log",
     Path(__file__).resolve().parent.parent / "logs" / "bot.log",
 )
-APPROVAL_CANCEL_COMMANDS = {"取消", "取消发送", "不发", "别发", "D", "d", "X", "x"}
 BASIC_APPROVAL_DENIED_MESSAGE = "你只有基础审批权限：A/B/C/D/X/1/2/3/取消 处理审批单。"
 APPROVAL_TOOL_COMMANDS = {"bot工具", "工具", "工具单", "审批工具", "机器人工具", "bot 工具", "T", "t"}
 BOT_TOOL_COMMAND_RE = re.compile(r"^(?:bot\s*工具|工具|工具单|审批工具|机器人工具)\s*(?P<section>.*)$", re.IGNORECASE)
@@ -1182,12 +1202,6 @@ APPROVAL_REVIEW_ENABLED_KEY = "group_approval_review_enabled"
 APPROVAL_AUTO_SEND_PERCENT_KEY = "group_approval_auto_send_percent"
 AI_WORK_INTENSITY_PERCENT_KEY = "group_ai_work_intensity_percent"
 AI_WORK_INTENSITY_OVERRIDE_KEY = "group_ai_work_intensity_schedule_override"
-APPROVAL_REVIEW_ON_COMMANDS = {"开启审查", "打开审查", "恢复审查", "启用审查", "开启审核", "打开审核"}
-APPROVAL_REVIEW_OFF_COMMANDS = {"关闭审查", "关掉审查", "暂停审查", "免审", "免审批", "关闭审核", "关掉审核"}
-APPROVAL_REVIEW_STATUS_COMMANDS = {"审查状态", "审核状态", "审批状态"}
-APPROVAL_AUTO_SEND_PERCENT_RE = re.compile(
-    r"^(?:/)?(?:审批概率|审查概率|免审概率|自动发送概率)\s*[:：]?\s*(?P<percent>\d{1,3})?%?$"
-)
 AI_WORK_INTENSITY_STATUS_COMMANDS = {"工作强度", "AI强度", "ai强度", "活跃度", "触发概率"}
 AI_WORK_INTENSITY_PERCENT_RE = re.compile(
     r"^(?:/)?(?:工作强度|AI强度|ai强度|活跃度|触发概率)\s*[:：]?\s*(?P<percent>\d{1,3})?%?$"
@@ -9956,211 +9970,35 @@ async def _duplicate_group_reply_verdict(approval: PendingGroupApproval, candida
 
 
 async def _request_group_approval(bot: Bot, approval: PendingGroupApproval) -> None:
-    if not _approval_review_enabled():
-        pending_group_approvals.pop(approval.group_id, None)
-        candidate = approval.candidates[0] if approval.candidates else None
-        if candidate is None:
-            logger.info(
-                "qq_social_agent auto approval skipped: "
-                f"group={approval.group_id} reason=no_candidate"
-            )
-            return
-        duplicate_send, duplicate_reason = await _duplicate_group_reply_verdict(approval, candidate)
-        if not duplicate_send:
-            _record_metric_event(
-                "reply_suppressed",
-                group_id=approval.group_id,
-                user_id=approval.trigger_user_id,
-                stage="pre_send_duplicate",
-                action="skipped",
-                reason=duplicate_reason,
-            )
-            logger.info(
-                "qq_social_agent skipped duplicate group reply: "
-                f"group={approval.group_id} approval_id={approval.approval_id} reason={duplicate_reason}"
-            )
-            return
-        _record_metric_event(
-            "approval_auto_send",
-            group_id=approval.group_id,
-            user_id=approval.trigger_user_id,
-            stage="review_disabled",
-            action=candidate.action,
-            candidate_count=len(approval.candidates),
-        )
-        logger.info(
-            "qq_social_agent auto approval send: "
-            f"group={approval.group_id} approval_id={approval.approval_id} candidate={candidate.index}"
-        )
-        await _send_approved_group_reply(
-            bot,
-            approval,
-            candidate,
-            approver_id=None,
-            high_quality=False,
-            notify_success=False,
-        )
-        return
-    auto_send_percent = _approval_auto_send_percent()
-    if auto_send_percent > 0 and _approval_auto_send_selected(auto_send_percent):
-        pending_group_approvals.pop(approval.group_id, None)
-        candidate = approval.candidates[0] if approval.candidates else None
-        if candidate is None:
-            logger.info(
-                "qq_social_agent probabilistic auto approval skipped: "
-                f"group={approval.group_id} reason=no_candidate percent={auto_send_percent}"
-            )
-            return
-        duplicate_send, duplicate_reason = await _duplicate_group_reply_verdict(approval, candidate)
-        if not duplicate_send:
-            _record_metric_event(
-                "reply_suppressed",
-                group_id=approval.group_id,
-                user_id=approval.trigger_user_id,
-                stage="pre_send_duplicate",
-                action="skipped",
-                reason=duplicate_reason,
-            )
-            logger.info(
-                "qq_social_agent skipped duplicate group reply: "
-                f"group={approval.group_id} approval_id={approval.approval_id} reason={duplicate_reason}"
-            )
-            return
-        _record_metric_event(
-            "approval_auto_send",
-            group_id=approval.group_id,
-            user_id=approval.trigger_user_id,
-            stage="probability",
-            action=candidate.action,
-            candidate_count=len(approval.candidates),
-            auto_send_percent=auto_send_percent,
-        )
-        logger.info(
-            "qq_social_agent probabilistic auto approval send: "
-            f"group={approval.group_id} approval_id={approval.approval_id} "
-            f"candidate={candidate.index} percent={auto_send_percent}"
-        )
-        await _send_approved_group_reply(
-            bot,
-            approval,
-            candidate,
-            approver_id=None,
-            high_quality=False,
-            notify_success=False,
-        )
-        return
-    pending_group_approvals[approval.group_id] = approval
-    preview = _format_approval_candidates(approval)
-    evidence_section = (
-        f"\n\n联网依据（仅供审批核对）：\n{approval.tool_evidence}"
-        if approval.tool_evidence
-        else ""
+    await request_group_approval(
+        bot,
+        approval,
+        services=ApprovalRequestServices(
+            state=approval_state_service,
+            review_enabled=_approval_review_enabled,
+            auto_send_percent=_approval_auto_send_percent,
+            auto_send_selected=_approval_auto_send_selected,
+            duplicate_reply_verdict=_duplicate_group_reply_verdict,
+            send_approved_group_reply=_send_approved_group_reply,
+            record_metric_event=_record_metric_event,
+            approval_user_ids=_approval_user_ids,
+            send_private_message=_send_private_message,
+            member_label=_member_label,
+            action_failed_summary=_action_failed_summary,
+            logger=logger,
+        ),
     )
-    private_reply_user_id = (
-        approval.pipeline_state.private_reply_user_id
-        if approval.pipeline_state is not None
-        else 0
-    )
-    delivery_line = (
-        f"发送位置：私聊 {private_reply_user_id}（仅回复这次群内提问）\n"
-        if private_reply_user_id
-        else ""
-    )
-    side_reaction = _approval_side_reaction(approval)
-    side_reaction_line = f"附带表情：{side_reaction}\n" if side_reaction else ""
-    message = (
-        f"待发群：{approval.group_id}\n"
-        f"审批ID：{approval.approval_id}\n"
-        f"触发人：{_member_label(approval.trigger_user_id, approval.trigger_nickname)}\n"
-        f"触发消息：{approval.trigger_text}\n"
-        f"{delivery_line}{side_reaction_line}\n"
-        f"候选：\n{preview}{evidence_section}\n\n"
-        "回复：A/B/C 或 1/2/3 发送；D/X/取消 不发；T 工具单。"
-    )
-    delivered = 0
-    approval_user_ids = _approval_user_ids()
-    for approver_id in approval_user_ids:
-        try:
-            await _send_private_message(bot, user_id=approver_id, message=Message(message))
-            delivered += 1
-        except ActionFailed as exc:
-            logger.warning(
-                "qq_social_agent failed sending group approval request: "
-                f"approver={approver_id} group={approval.group_id} {_action_failed_summary(exc)}"
-            )
-    if delivered <= 0:
-        pending_group_approvals.pop(approval.group_id, None)
-        _record_metric_event(
-            "approval_request_failed",
-            group_id=approval.group_id,
-            user_id=approval.trigger_user_id,
-            stage="approval",
-            action="send_private_failed",
-            candidate_count=len(approval.candidates),
-        )
-        return
-    _record_metric_event(
-        "approval_requested",
-        group_id=approval.group_id,
-        user_id=approval.trigger_user_id,
-        stage="approval",
-        action="pending",
-        candidate_count=len(approval.candidates),
-        delivered=delivered,
-    )
-    logger.info(
-        "qq_social_agent group approval pending: "
-        f"approvers={approval_user_ids} group={approval.group_id} approval_id={approval.approval_id} "
-        f"candidates={len(approval.candidates)}"
-    )
-
-
-def _format_approval_candidates(approval: PendingGroupApproval) -> str:
-    lines: list[str] = []
-    for candidate in approval.candidates:
-        style = candidate.style.strip()
-        style_line = f"\n   style：{style}" if style else ""
-        lines.append(f"{candidate.index}. {candidate.text}{style_line}")
-    return "\n\n".join(lines).strip()
-
-
-def _approval_side_reaction(approval: PendingGroupApproval) -> str:
-    pipeline_state = approval.pipeline_state
-    if pipeline_state is None:
-        return ""
-    return str(pipeline_state.decision_side_reaction or "").strip()
 
 
 def _approval_candidate_by_index(
     approval: PendingGroupApproval,
     index: int,
 ) -> PendingApprovalCandidate | None:
-    for candidate in approval.candidates:
-        if candidate.index == index:
-            return candidate
-    return None
-
-
-def _approval_choice_index(raw: str | None, *, default: int = 1) -> int:
-    if raw is None:
-        return default
-    key = raw.strip().casefold()
-    mapping = {
-        "1": 1,
-        "a": 1,
-        "2": 2,
-        "b": 2,
-        "3": 3,
-        "c": 3,
-    }
-    return mapping.get(key, default)
+    return next((candidate for candidate in approval.candidates if candidate.index == index), None)
 
 
 def _latest_group_approval() -> PendingGroupApproval | None:
-    if not pending_group_approvals:
-        return None
-    return max(pending_group_approvals.values(), key=lambda approval: approval.created_at)
-
+    return approval_state_service.latest()
 
 
 def _status_group_card(enabled: bool) -> str:
@@ -10231,20 +10069,6 @@ async def _set_approval_review_enabled(bot: Bot, user_id: int, enabled: bool) ->
     )
 
 
-def _is_approval_control_text(text: str) -> bool:
-    return (
-        APPROVAL_CHOICE_RE.match(text) is not None
-        or text == "准奏"
-        or text in APPROVAL_CANCEL_COMMANDS
-        or APPROVAL_REJECT_REASON_RE.match(text) is not None
-    )
-
-
-def _is_basic_approval_control_text(text: str) -> bool:
-    choice_match = APPROVAL_CHOICE_RE.match(text)
-    return (choice_match is not None and not choice_match.group(2)) or text in APPROVAL_CANCEL_COMMANDS
-
-
 def _is_private_tool_text(text: str) -> bool:
     return (
         _is_jargon_command_text(text)
@@ -10280,13 +10104,6 @@ def _is_private_tool_text(text: str) -> bool:
         or AI_WORK_INTENSITY_PERCENT_RE.match(text) is not None
         or text in {"开启", "打开", "恢复", "关闭", "关掉", "暂停"}
     )
-
-
-def _cool_down_other_approval_choices(approver_id: int) -> None:
-    until = time.time() + APPROVAL_STALE_CHOICE_COOLDOWN_SECONDS
-    for user_id in _approval_user_ids():
-        if user_id != approver_id:
-            approval_choice_cooldowns[user_id] = until
 
 
 def _format_approval_user_report() -> str:
@@ -10422,282 +10239,113 @@ async def _handle_group_approval_private(bot: Bot, user_id: int, text: str) -> b
     return await _handle_group_approval_private_impl(bot, user_id, text)
 
 
-async def _handle_group_approval_private_impl(bot: Bot, user_id: int, text: str) -> bool:
-    if not _is_approval_user(user_id) and not _is_tool_admin_user(user_id):
-        return False
-    compact_text = text.strip()
-    is_admin = _is_tool_admin_user(user_id) or _is_owner_user(user_id)
-    auto_send_match = APPROVAL_AUTO_SEND_PERCENT_RE.match(compact_text)
-    can_manage_auto_send_percent = (
-        auto_send_match is not None and _can_manage_approval_auto_send_percent(user_id)
+def _private_admin_command_services() -> PrivateAdminCommandServices:
+    return PrivateAdminCommandServices(
+        send_private_text=_send_private_text,
+        basic_denied_message=BASIC_APPROVAL_DENIED_MESSAGE,
+        is_jargon_command_text=_is_jargon_command_text,
+        private_jargon_group_id=_private_jargon_group_id,
+        handle_jargon_command_text=_handle_jargon_command_text,
+        bot_tool_message=_bot_tool_message,
+        handle_approver_management_command=_handle_approver_management_command,
+        is_private_tool_text=_is_private_tool_text,
+        handle_private_whitelist_command=_handle_private_whitelist_command,
+        handle_model_route_command=_handle_model_route_command,
+        parse_memory_report_limit=_parse_memory_report_limit,
+        memory_report_command_re=MEMORY_REPORT_COMMAND_RE,
+        format_recent_memory_report=_format_recent_memory_report,
+        style_report_command_re=STYLE_REPORT_COMMAND_RE,
+        format_recent_style_report=_format_recent_style_report,
+        member_impression_report_command_re=MEMBER_IMPRESSION_REPORT_COMMAND_RE,
+        format_member_impression_report=_format_member_impression_report,
+        handle_memory_atom_command_text=_handle_memory_atom_command_text,
+        memory_atom_report_command_re=MEMORY_ATOM_REPORT_COMMAND_RE,
+        format_memory_atom_report=_format_memory_atom_report,
+        rag_admin=rag_admin,
+        parse_metric_report_command=_parse_metric_report_command,
+        format_metric_report=_format_metric_report,
+        parse_token_report_command=_parse_approval_token_report_command,
+        token_usage_report_for_window=_token_usage_report_for_window,
+        parse_suppression_report_command=_parse_approval_suppression_report_command,
+        format_suppression_report=_format_suppression_report,
+        can_manage_approval_auto_send_percent=_can_manage_approval_auto_send_percent,
+        approval_auto_send_percent_re=APPROVAL_AUTO_SEND_PERCENT_RE,
+        format_approval_review_status=_format_approval_review_status,
+        set_approval_auto_send_percent=_set_approval_auto_send_percent,
+        ai_work_intensity_percent_re=AI_WORK_INTENSITY_PERCENT_RE,
+        format_ai_work_intensity_status=_format_ai_work_intensity_status,
+        set_ai_work_intensity_percent=_set_ai_work_intensity_percent,
+        can_manage_approval_review=_can_manage_approval_review,
+        set_approval_review_enabled=_set_approval_review_enabled,
+        set_approval_group_decision_enabled=_set_approval_group_decision_enabled,
+        is_approval_control_text=_is_approval_control_text,
     )
-    can_manage_review = _can_manage_approval_review(user_id) and compact_text in (
-        APPROVAL_REVIEW_STATUS_COMMANDS | APPROVAL_REVIEW_ON_COMMANDS | APPROVAL_REVIEW_OFF_COMMANDS
-    )
-    pending_approval_control = _latest_group_approval() is not None and _is_approval_control_text(compact_text)
-    if not pending_approval_control:
-        shortcut_command = _bot_tool_shortcut_command(compact_text)
-        if shortcut_command is not None:
-            compact_text = shortcut_command
-            can_manage_review = _can_manage_approval_review(user_id) and compact_text in (
-                APPROVAL_REVIEW_STATUS_COMMANDS | APPROVAL_REVIEW_ON_COMMANDS | APPROVAL_REVIEW_OFF_COMMANDS
-            )
-    if _is_jargon_command_text(compact_text):
-        if not is_admin:
-            await _send_private_text(bot, user_id, BASIC_APPROVAL_DENIED_MESSAGE)
-            return True
-        await _send_private_text(
-            bot,
-            user_id,
-            _handle_jargon_command_text(
-                user_id=user_id,
-                group_id=_private_jargon_group_id(),
-                text=compact_text,
-            ),
-        )
-        return True
-    if not pending_approval_control and compact_text in APPROVAL_HELP_COMMANDS:
-        await _send_private_text(bot, user_id, APPROVAL_RULES_MESSAGE)
-        return True
-    if not pending_approval_control:
-        bot_tool_message = _bot_tool_message(compact_text)
-        if bot_tool_message is not None or compact_text in APPROVAL_DETAIL_COMMANDS:
-            await _send_private_text(bot, user_id, bot_tool_message or APPROVAL_RULES_DETAIL_MESSAGE)
-            return True
-    if await _handle_approver_management_command(bot, user_id, compact_text):
-        return True
-    if (
-        not pending_approval_control
-        and _is_private_tool_text(compact_text)
-        and not is_admin
-        and not can_manage_auto_send_percent
-        and not can_manage_review
-    ):
-        await _send_private_text(bot, user_id, BASIC_APPROVAL_DENIED_MESSAGE)
-        return True
-    if await _handle_private_whitelist_command(bot, user_id, compact_text):
-        return True
-    if await _handle_model_route_command(bot, user_id, compact_text):
-        return True
-    memory_report_limit = _parse_memory_report_limit(compact_text, MEMORY_REPORT_COMMAND_RE)
-    if memory_report_limit is not None:
-        await _send_private_text(
-            bot,
-            user_id,
-            _format_recent_memory_report(_private_jargon_group_id(), memory_report_limit),
-        )
-        return True
-    style_report_limit = _parse_memory_report_limit(compact_text, STYLE_REPORT_COMMAND_RE)
-    if style_report_limit is not None:
-        await _send_private_text(
-            bot,
-            user_id,
-            _format_recent_style_report(_private_jargon_group_id(), style_report_limit),
-        )
-        return True
-    member_report_limit = _parse_memory_report_limit(compact_text, MEMBER_IMPRESSION_REPORT_COMMAND_RE)
-    if member_report_limit is not None:
-        await _send_private_text(
-            bot,
-            user_id,
-            _format_member_impression_report(_private_jargon_group_id(), member_report_limit),
-        )
-        return True
-    atom_command_response = _handle_memory_atom_command_text(user_id, _private_jargon_group_id(), compact_text)
-    if atom_command_response is not None:
-        await _send_private_text(bot, user_id, atom_command_response)
-        return True
-    atom_report_limit = _parse_memory_report_limit(compact_text, MEMORY_ATOM_REPORT_COMMAND_RE)
-    if atom_report_limit is not None:
-        await _send_private_text(
-            bot,
-            user_id,
-            _format_memory_atom_report(_private_jargon_group_id(), atom_report_limit),
-        )
-        return True
-    rag_admin_result = await rag_admin.handle(
-        compact_text,
-        group_id=_private_jargon_group_id(),
-        operator_id=user_id,
-    )
-    if rag_admin_result.handled:
-        await _send_private_text(bot, user_id, rag_admin_result.text)
-        return True
-    metric_window = _parse_metric_report_command(compact_text)
-    if metric_window is not None:
-        if not is_admin:
-            await _send_private_text(bot, user_id, BASIC_APPROVAL_DENIED_MESSAGE)
-            return True
-        await _send_private_text(
-            bot,
-            user_id,
-            _format_metric_report(metric_window, group_id=_private_jargon_group_id()),
-        )
-        return True
-    token_report_window = _parse_approval_token_report_command(compact_text)
-    if token_report_window is not None:
-        if not is_admin:
-            await _send_private_text(bot, user_id, BASIC_APPROVAL_DENIED_MESSAGE)
-            return True
-        await _send_private_text(
-            bot,
-            user_id,
-            _token_usage_report_for_window(token_report_window),
-        )
-        return True
-    suppression_report_limit = _parse_approval_suppression_report_command(compact_text)
-    if suppression_report_limit is not None:
-        if not is_admin:
-            await _send_private_text(bot, user_id, BASIC_APPROVAL_DENIED_MESSAGE)
-            return True
-        await _send_private_text(bot, user_id, _format_suppression_report(suppression_report_limit))
-        return True
-    if auto_send_match is not None:
-        if not _can_manage_approval_auto_send_percent(user_id):
-            await _send_private_text(bot, user_id, BASIC_APPROVAL_DENIED_MESSAGE)
-            return True
-        raw_percent = auto_send_match.group("percent")
-        if raw_percent is None:
-            await _send_private_text(bot, user_id, _format_approval_review_status())
-            return True
-        requested_percent = int(raw_percent)
-        percent = _set_approval_auto_send_percent(requested_percent)
-        await _send_private_text(
-            bot,
-            user_id,
-            (
-                f"已设置免审自动发送概率：{percent}%。\n"
-                "审查开启时，命中概率的候选会直接发送第 1 条；未命中仍发审批单。\n"
-                "设置为 100% 时改用单条直发 prompt，不再生成三候选。"
-            ),
-        )
-        return True
-    work_intensity_match = AI_WORK_INTENSITY_PERCENT_RE.match(compact_text)
-    if work_intensity_match is not None:
-        if not is_admin:
-            await _send_private_text(bot, user_id, BASIC_APPROVAL_DENIED_MESSAGE)
-            return True
-        raw_percent = work_intensity_match.group("percent")
-        if raw_percent is None:
-            await _send_private_text(bot, user_id, _format_ai_work_intensity_status())
-            return True
-        percent = _set_ai_work_intensity_percent(int(raw_percent))
-        await _send_private_text(
-            bot,
-            user_id,
-            (
-                f"已设置 AI 工作强度：{percent}%。\n"
-                "群消息仍会写入上下文和学习素材；只有命中的触发批次会进入硬筛选、decision、搜索/行情和生成。"
-            ),
-        )
-        return True
-    if compact_text in APPROVAL_REVIEW_STATUS_COMMANDS:
-        if not _can_manage_approval_review(user_id):
-            await _send_private_text(bot, user_id, BASIC_APPROVAL_DENIED_MESSAGE)
-            return True
-        await _send_private_text(bot, user_id, _format_approval_review_status())
-        return True
-    if compact_text in APPROVAL_REVIEW_ON_COMMANDS:
-        if not _can_manage_approval_review(user_id):
-            await _send_private_text(bot, user_id, BASIC_APPROVAL_DENIED_MESSAGE)
-            return True
-        await _set_approval_review_enabled(bot, user_id, True)
-        return True
-    if compact_text in APPROVAL_REVIEW_OFF_COMMANDS:
-        if not _can_manage_approval_review(user_id):
-            await _send_private_text(bot, user_id, BASIC_APPROVAL_DENIED_MESSAGE)
-            return True
-        await _set_approval_review_enabled(bot, user_id, False)
-        return True
-    if compact_text in {"开启", "打开", "恢复"}:
-        if not is_admin:
-            await _send_private_text(bot, user_id, BASIC_APPROVAL_DENIED_MESSAGE)
-            return True
-        await _set_approval_group_decision_enabled(bot, user_id, True)
-        return True
-    if compact_text in {"关闭", "关掉", "暂停"}:
-        if not is_admin:
-            await _send_private_text(bot, user_id, BASIC_APPROVAL_DENIED_MESSAGE)
-            return True
-        await _set_approval_group_decision_enabled(bot, user_id, False)
-        return True
-    if not _is_approval_control_text(compact_text):
-        if _is_private_tool_text(compact_text) and not is_admin and not can_manage_auto_send_percent and not can_manage_review:
-            await _send_private_text(bot, user_id, BASIC_APPROVAL_DENIED_MESSAGE)
-            return True
-        return False
-    if _is_basic_approval_user(user_id) and not _is_basic_approval_control_text(compact_text):
-        await _send_private_text(bot, user_id, BASIC_APPROVAL_DENIED_MESSAGE)
-        return True
-    cooldown_until = approval_choice_cooldowns.get(user_id, 0.0)
-    if time.time() < cooldown_until and _is_approval_control_text(compact_text):
-        await _send_private_text(bot, user_id, "上一条审批刚被处理，这次审批指令已忽略，避免串到下一条。")
-        return True
 
-    async with approval_processing_lock:
-        approval = _latest_group_approval()
-        if approval is None:
-            await _send_private_text(bot, user_id, "当前没有待审批候选。")
-            return True
-        pending_group_approvals.pop(approval.group_id, None)
-        _cool_down_other_approval_choices(user_id)
-        candidate: PendingApprovalCandidate | None = None
-        high_quality = False
-        choice_match = APPROVAL_CHOICE_RE.match(compact_text)
-        if choice_match is not None:
-            candidate = _approval_candidate_by_index(approval, _approval_choice_index(choice_match.group(1)))
-            high_quality = bool(choice_match.group(2))
-            if high_quality and not is_admin:
-                await _send_private_text(bot, user_id, "你只有基础审批权限，不能标优。")
-                return True
-        elif compact_text == "准奏":
-            candidate = approval.candidates[0] if approval.candidates else None
-        if candidate is None:
-            reason_match = APPROVAL_REJECT_REASON_RE.match(compact_text)
-            if reason_match is not None and is_admin:
-                owner_reason = reason_match.group("reason").strip()
-                reject_index = _approval_choice_index(reason_match.group("index"), default=1)
-                rejected_candidate = _approval_candidate_by_index(approval, reject_index)
-                if owner_reason:
-                    _save_approval_rejection_feedback(
-                        approval,
-                        owner_reason,
-                        reason_user_id=user_id,
-                        candidate=rejected_candidate,
-                        candidate_index=reject_index,
-                    )
-                    response_text = "已取消，并记录不准奏原因。"
-                else:
-                    response_text = "已取消。不准奏原因是空的，没写入反馈。"
-            else:
-                response_text = "已取消。"
-            logger.info(
-                "qq_social_agent group approval canceled: "
-                f"approver={user_id} group={approval.group_id} approval_id={approval.approval_id} text={text!r}"
-            )
-            _record_metric_event(
-                "approval_canceled",
-                group_id=approval.group_id,
-                user_id=approval.trigger_user_id,
-                stage="approval",
-                action="reject" if candidate is None else candidate.action,
-                approver_id=user_id,
-                reason=_short_notice_text(compact_text, 120),
-                correlation_id=approval.correlation_id,
-            )
-            try:
-                await _send_private_message(bot, user_id=user_id, message=Message(response_text))
-            except ActionFailed:
-                pass
-            return True
-    await _send_approved_group_reply(
+
+async def _run_private_admin_command(
+    bot: Bot,
+    user_id: int,
+    compact_text: str,
+    *,
+    is_admin: bool,
+    pending_approval_control: bool,
+    can_manage_auto_send_percent: bool,
+    can_manage_review: bool,
+) -> bool:
+    return await handle_private_admin_command(
         bot,
-        approval,
-        candidate,
-        approver_id=user_id,
-        high_quality=high_quality,
+        user_id,
+        compact_text,
+        is_admin=is_admin,
+        pending_approval_control=pending_approval_control,
+        can_manage_auto_send_percent=can_manage_auto_send_percent,
+        can_manage_review=can_manage_review,
+        services=_private_admin_command_services(),
     )
-    return True
+
+
+def _approval_state_services() -> ApprovalStateServices:
+    return ApprovalStateServices(
+        approval_user_ids=_approval_user_ids,
+        send_private_text=_send_private_text,
+        send_private_message=_send_private_message,
+        save_rejection_feedback=_save_approval_rejection_feedback,
+        record_metric_event=_record_metric_event,
+        short_notice_text=_short_notice_text,
+        send_approved_group_reply=_send_approved_group_reply,
+        cooldown_seconds=APPROVAL_STALE_CHOICE_COOLDOWN_SECONDS,
+        logger=logger,
+    )
+
+
+async def _handle_group_approval_private_impl(bot: Bot, user_id: int, text: str) -> bool:
+    return await handle_private_approval_command(
+        bot,
+        user_id,
+        text,
+        services=PrivateApprovalCommandServices(
+            state=approval_state_service,
+            state_services=_approval_state_services(),
+            is_approval_user=_is_approval_user,
+            is_tool_admin_user=_is_tool_admin_user,
+            is_owner_user=_is_owner_user,
+            is_basic_approval_user=_is_basic_approval_user,
+            latest_approval=_latest_group_approval,
+            bot_tool_shortcut_command=_bot_tool_shortcut_command,
+            can_manage_auto_send_percent=_can_manage_approval_auto_send_percent,
+            auto_send_percent_re=APPROVAL_AUTO_SEND_PERCENT_RE,
+            can_manage_approval_review=_can_manage_approval_review,
+            review_command_texts=frozenset(
+                APPROVAL_REVIEW_ON_COMMANDS
+                | APPROVAL_REVIEW_OFF_COMMANDS
+                | APPROVAL_REVIEW_STATUS_COMMANDS
+            ),
+            handle_admin_command=_run_private_admin_command,
+            send_private_text=_send_private_text,
+            basic_denied_message=BASIC_APPROVAL_DENIED_MESSAGE,
+            cooldown_seconds=APPROVAL_STALE_CHOICE_COOLDOWN_SECONDS,
+        ),
+    )
 
 
 def _save_approval_rejection_feedback(
@@ -10887,271 +10535,46 @@ async def _send_approved_group_reply_inner(
     high_quality: bool,
     notify_success: bool = True,
 ) -> None:
-    send_started_at = time.monotonic()
-    pipeline_state = approval.pipeline_state
-    if pipeline_state is not None:
-        _pipeline_mark_sending(pipeline_state)
-    logger.info(
-        "qq_social_agent group approval accepted: "
-        f"approver={approver_id} group={approval.group_id} candidate={candidate.index} high_quality={high_quality}"
-    )
-    _record_metric_event(
-        "approval_accepted",
-        group_id=approval.group_id,
-        user_id=approval.trigger_user_id,
-        stage="approval",
-        action=candidate.action,
+    await send_approved_group_reply_inner(
+        bot,
+        approval,
+        candidate,
         approver_id=approver_id,
         high_quality=high_quality,
-        candidate_index=candidate.index,
-        approval_wait_ms=max(0, int((time.time() - approval.created_at) * 1000)),
-    )
-    private_reply_user_id = pipeline_state.private_reply_user_id if pipeline_state is not None else 0
-    if private_reply_user_id:
-        private_text = _memory_text_from_reply_part(candidate.text, approval.mention_targets)
-        try:
-            result = await _send_private_message(
-                bot,
-                user_id=private_reply_user_id,
-                message=Message(f"（回复你刚才在群里的提问）\n{private_text}"),
-            )
-            sent_message_id = _extract_message_id(result)
-            if pipeline_state is not None:
-                _pipeline_mark_sent(pipeline_state, sent_message_id)
-                _pipeline_mark_completed(
-                    pipeline_state,
-                    elapsed_ms=int((time.monotonic() - send_started_at) * 1000),
-                )
-            _record_metric_event(
-                "message_sent",
-                group_id=approval.group_id,
-                user_id=approval.trigger_user_id,
-                stage="send",
-                action=candidate.action,
-                delivery="private_group_question_redirect",
-                private_reply_user_id=private_reply_user_id,
-                message_count=1,
-                elapsed_ms=int((time.monotonic() - send_started_at) * 1000),
-                approval_id=approval.approval_id,
-                pipeline_stages=list(pipeline_state.stage_history) if pipeline_state is not None else [],
-            )
-        except ActionFailed as exc:
-            if pipeline_state is not None:
-                _pipeline_mark_failed(pipeline_state, _action_failed_summary(exc))
-            logger.warning(
-                "qq_social_agent failed redirecting group answer to private: "
-                f"group={approval.group_id} user={private_reply_user_id} {_action_failed_summary(exc)}"
-            )
-            _record_metric_event(
-                "private_redirect_failed",
-                group_id=approval.group_id,
-                user_id=private_reply_user_id,
-                stage="send",
-                action="action_failed",
-                approval_id=approval.approval_id,
-                error=_action_failed_summary(exc),
-            )
-            if approver_id is not None and approver_id != private_reply_user_id:
-                await _send_private_text(bot, approver_id, f"私聊转发失败：{_action_failed_summary(exc)}")
-            return
-        if high_quality:
-            _save_approved_reply_feedback(approval, candidate, approver_id=approver_id or 0)
-        if notify_success and approver_id is not None and approver_id != private_reply_user_id:
-            await _send_private_text(bot, approver_id, "已私聊转发。")
-        return
-    delivery_plan = build_delivery_plan(
-        reply_text=candidate.text,
-        mention_targets=approval.mention_targets,
-        trigger_user_id=approval.trigger_user_id,
-        trigger_nickname=approval.trigger_nickname,
-        trigger_sequence=approval.trigger_sequence,
-        current_sequence=group_inbound_sequences.get(
-            approval.group_id,
-            approval.trigger_sequence,
-        ),
-        max_messages=3,
-    )
-    effective_mention_targets = delivery_plan.mention_targets
-    if delivery_plan.forced_trigger_mention:
-        _record_metric_event(
-            "stale_reply_mention",
-            group_id=approval.group_id,
-            user_id=approval.trigger_user_id,
-            stage="send",
-            action="force_mention",
-            newer_message_count=delivery_plan.sequence_lag,
-        )
-    progress = approval.delivery_progress.setdefault(candidate.text, DeliveryProgress(parts=delivery_plan.parts))
-    if progress.completed:
-        if pipeline_state is not None:
-            _pipeline_mark_completed(pipeline_state)
-        return
-    if progress.uncertain_index is not None:
-        if pipeline_state is not None:
-            _pipeline_mark_failed(pipeline_state, "delivery_unknown_requires_verification")
-        _record_metric_event(
-            "group_send_failed", group_id=approval.group_id, stage="send",
-            action="unknown_no_retry", approval_id=approval.approval_id,
-            part_index=progress.uncertain_index,
-        )
-        if approver_id is not None:
-            await _send_private_text(bot, approver_id, "上一段发送结果未知，已阻止重复发送；请先核对群内是否收到。")
-        return
-    reply_parts = progress.parts
-    sent_mention_user_id: int | None = None
-    recorded_user_reply = bool(progress.sent_message_ids)
-    for index, part_text in enumerate(reply_parts):
-        if index < len(progress.sent_message_ids):
-            if sent_mention_user_id is None:
-                sent_mention_user_id = _first_allowed_mention_id(part_text, effective_mention_targets)
-            continue
-        attempted = False
-        acknowledged = False
-        try:
-            part_mention_user_id = _first_allowed_mention_id(part_text, effective_mention_targets)
-            public_text, memory_text, gag = await _prepare_group_political_send_texts(
-                part_text, context=approval.trigger_text + "\n" + candidate.text,
-            )
-            attempted = True
-            sent_message_id = await _send_group_message(
-                bot,
-                approval.group_id,
-                _message_from_reply_part(
-                    public_text,
-                    effective_mention_targets,
-                    quote_message_id=approval.source_message_id if index == 0 else "",
-                ),
-            )
-            acknowledged = True
-            progress.sent_message_ids.append(sent_message_id)
-            if pipeline_state is not None:
-                _pipeline_mark_sent(pipeline_state, sent_message_id)
-            if not recorded_user_reply:
-                _record_user_reply(approval.group_id, approval.trigger_user_id)
-                recorded_user_reply = True
-            if gag:
-                await _notify_owner_political_gag(
-                    original=part_text,
-                    public=public_text,
-                    hits=gag,
-                    group_id=approval.group_id,
-                    source=candidate.action,
-                )
-            memory_text = _memory_text_from_reply_part(memory_text, effective_mention_targets)
-            _record_bot_sent_message(
-                group_id=approval.group_id,
-                message_id=sent_message_id,
-                bot_reply=memory_text,
-                trigger_user_id=approval.trigger_user_id,
-                trigger_nickname=approval.trigger_nickname,
-                trigger_text=approval.trigger_text,
-                action=candidate.action,
-            )
-            if sent_mention_user_id is None and part_mention_user_id is not None:
-                sent_mention_user_id = part_mention_user_id
-            memory.add_message(
-                approval.group_id,
-                approval.self_id,
-                approval.persona_name,
-                memory_text,
-                is_bot=True,
-                source_message_id=sent_message_id,
-                source_kind="live",
-                correlation_id=approval.correlation_id,
-            )
-        except asyncio.CancelledError:
-            if attempted and not acknowledged:
-                progress.uncertain_index = index
-            raise
-        except Exception as exc:
-            blocked = isinstance(exc, ActionFailed) and _is_group_send_blocked_error(exc)
-            unknown = attempted and not acknowledged and (
-                not isinstance(exc, ActionFailed) or "timeout" in str(exc).lower()
-            )
-            if unknown:
-                progress.uncertain_index = index
-            if pipeline_state is not None:
-                _pipeline_mark_failed(pipeline_state, _action_failed_summary(exc))
-            logger.warning(
-                "qq_social_agent failed sending approved group reply: "
-                f"group={approval.group_id} {_action_failed_summary(exc)}"
-            )
-            _record_metric_event(
-                "group_send_failed",
-                group_id=approval.group_id,
-                user_id=approval.trigger_user_id,
-                stage="send",
-                action="unknown" if unknown else "blocked_120" if blocked else "action_failed",
-                delivered_parts=len(progress.sent_message_ids),
-                failed_part_index=index,
-                delivery_status="unknown" if unknown else "partial" if progress.sent_message_ids else "failed",
-                approval_id=approval.approval_id,
-                error=_action_failed_summary(exc),
-                candidate_index=candidate.index,
-            )
-            if blocked:
-                current_mute = float(memory.group_state(approval.group_id)["muted_until"] or 0)
-                if current_mute <= time.time():
-                    memory.mute_until(approval.group_id, time.time() + 10 * 60)
-                pending_group_approvals[approval.group_id] = approval
-                notice = (
-                    f"群 {approval.group_id} 发言失败：QQ 内核返回 result=120，"
-                    f"通常是机器人被群禁言或发送受限。已确认发送 {len(progress.sent_message_ids)} 段，剩余候选已保留。\n"
-                    f"审批ID：{approval.approval_id}\n"
-                    f"候选 {candidate.index}：{_short_notice_text(candidate.text, 180)}\n"
-                    "解除禁言后可再次回复对应候选编号发送。"
-                )
-                for target_id in _approval_user_ids():
-                    await _send_private_text(bot, target_id, notice)
-            try:
-                if approver_id is not None and not blocked:
-                    await _send_private_message(
-                        bot,
-                        user_id=approver_id,
-                        message=Message(f"发送失败：{_action_failed_summary(exc)}"),
-                    )
-            except Exception:
-                pass
-            return
-        if index < len(reply_parts) - 1:
-            await asyncio.sleep(0.9)
-    progress.completed = True
-    if sent_mention_user_id is not None:
-        last_group_mention_targets[approval.group_id] = (sent_mention_user_id, time.time())
-    else:
-        last_group_mention_targets.pop(approval.group_id, None)
-    _record_post_reply_followup_window(
-        approval.group_id,
-        trigger_user_id=approval.trigger_user_id,
-        mention_user_id=sent_mention_user_id,
-        conversation_engaged=bool(
-            approval.pipeline_state is not None and approval.pipeline_state.addressed
+        notify_success=notify_success,
+        services=ApprovedReplyDeliveryServices(
+            memory=memory,
+            pending_approvals=pending_group_approvals,
+            group_inbound_sequences=group_inbound_sequences,
+            last_group_mention_targets=last_group_mention_targets,
+            send_private_message=_send_private_message,
+            send_private_text=_send_private_text,
+            send_group_message=_send_group_message,
+            extract_message_id=_extract_message_id,
+            record_metric_event=_record_metric_event,
+            pipeline_mark_sending=_pipeline_mark_sending,
+            pipeline_mark_sent=_pipeline_mark_sent,
+            pipeline_mark_completed=_pipeline_mark_completed,
+            pipeline_mark_failed=_pipeline_mark_failed,
+            action_failed_summary=_action_failed_summary,
+            record_user_reply=_record_user_reply,
+            build_delivery_plan=build_delivery_plan,
+            message_from_reply_part=_message_from_reply_part,
+            first_allowed_mention_id=_first_allowed_mention_id,
+            prepare_group_political_send_texts=_prepare_group_political_send_texts,
+            is_group_send_blocked_error=_is_group_send_blocked_error,
+            notify_owner_political_gag=_notify_owner_political_gag,
+            memory_text_from_reply_part=_memory_text_from_reply_part,
+            record_bot_sent_message=_record_bot_sent_message,
+            approval_user_ids=_approval_user_ids,
+            short_notice_text=_short_notice_text,
+            record_post_reply_followup_window=_record_post_reply_followup_window,
+            maybe_send_group_meme=_maybe_send_group_meme,
+            execute_approved_side_reaction=_execute_approved_side_reaction,
+            save_approved_reply_feedback=_save_approved_reply_feedback,
+            logger=logger,
         ),
     )
-    await _maybe_send_group_meme(bot, approval, candidate)
-    await _execute_approved_side_reaction(bot, approval)
-    send_elapsed_ms = int((time.monotonic() - send_started_at) * 1000)
-    if pipeline_state is not None:
-        _pipeline_mark_completed(pipeline_state, elapsed_ms=send_elapsed_ms)
-    _record_metric_event(
-        "message_sent",
-        group_id=approval.group_id,
-        user_id=approval.trigger_user_id,
-        stage="send",
-        action=candidate.action,
-        message_count=len(reply_parts),
-        elapsed_ms=send_elapsed_ms,
-        approval_id=approval.approval_id,
-        pipeline_stages=list(pipeline_state.stage_history) if pipeline_state is not None else [],
-    )
-    if high_quality:
-        _save_approved_reply_feedback(approval, candidate, approver_id=approver_id or 0)
-    if not notify_success or approver_id is None:
-        return
-    try:
-        await _send_private_message(bot, user_id=approver_id, message=Message("已发。"))
-    except ActionFailed:
-        pass
 
 
 def _group_meme_context_eligible(approval: PendingGroupApproval, candidate: PendingApprovalCandidate) -> bool:
