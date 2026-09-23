@@ -2900,23 +2900,27 @@ def test_group_proactive_topic_cooldown_expires(monkeypatch, tmp_path) -> None:
 
 
 def test_recent_http_urls_prefer_current_and_nearby_messages() -> None:
+    from qq_social_agent.conversation_tool_routing import _recent_http_urls
+
     recent = [
         ChatMessage(1, 101, "A", "旧链接 https://example.com/old", False, 1.0),
         ChatMessage(1, 102, "B", "仓库在 https://github.com/Nyarlathoteppppp/bolatu-bot", False, 2.0),
         ChatMessage(1, 103, "C", "不是这个", False, 3.0),
     ]
 
-    urls = plugin._recent_http_urls("不是这个", recent, limit=4)
+    urls = _recent_http_urls("不是这个", recent, limit=4)
 
     assert urls[0] == "https://github.com/Nyarlathoteppppp/bolatu-bot"
     assert "https://example.com/old" in urls
 
 
 def test_nearby_url_tool_plan_reads_recent_github_when_addressed() -> None:
+    from qq_social_agent.conversation_tool_routing import _nearby_url_tool_plan
+
     recent = [
         ChatMessage(1, 102, "B", "https://github.com/Nyarlathoteppppp/bolatu-bot", False, 2.0),
     ]
-    plan = plugin._nearby_url_tool_plan(
+    plan = _nearby_url_tool_plan(
         text="不是这个仓库",
         recent_messages=recent,
         addressed=True,
@@ -2926,7 +2930,7 @@ def test_nearby_url_tool_plan_reads_recent_github_when_addressed() -> None:
     assert plan.first(plugin.ToolKind.DEEP_URL) is not None
     assert plan.first(plugin.ToolKind.DEEP_URL).query == "https://github.com/Nyarlathoteppppp/bolatu-bot"
 
-    skipped = plugin._nearby_url_tool_plan(
+    skipped = _nearby_url_tool_plan(
         text="哈哈",
         recent_messages=recent,
         addressed=True,
