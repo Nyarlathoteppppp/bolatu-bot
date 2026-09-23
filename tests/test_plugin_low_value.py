@@ -2523,7 +2523,7 @@ def test_changelog_notice_sent_once(monkeypatch, tmp_path) -> None:
 
     notices = [message for _, message in bot.private_messages if "后端更新记录" in message]
     assert len(notices) == len(plugin._approval_user_ids())
-    assert all("LLM 路由拆细" in message for message in notices)
+    assert all("回复模型默认改为官方" in message for message in notices)
 
 
 def test_parse_suppression_report_accepts_compact_chinese_limit() -> None:
