@@ -1,12 +1,12 @@
 # 模块边界与维护手册
 
-最后更新：2026-08-18。
+最后更新：2026-09-23。
 
 这份文档给在服务器上继续维护张风雪的开发者和 AI 使用。目标是让功能继续增长，但不再把所有事情塞进 `qq_social_agent/plugin.py`。
 
 ## 1. 当前结论
 
-项目已经具备真实分层：消息结构化、决策、工具、上下文、记忆、RAG、审批、发送、观测、后台学习和本地插件都有独立模块。问题集中在 `plugin.py`：它约 12000 行，同时承担 NoneBot 入口、运行时单例、群/私聊编排、审批命令、定时任务、Web 管理路由和发送协调。
+项目已经具备真实分层：消息结构化、决策、工具、上下文、记忆、RAG、审批、发送、观测、后台学习和本地插件都有独立模块。问题集中在 `plugin.py`：它约 14000 行，同时承担 NoneBot 入口、运行时单例、群/私聊编排、审批命令、定时任务、Web 管理路由和发送协调。群友画像与自我记忆上下文已移到 `member_context.py`，主流程仍待分段。
 
 策略：**保留 `plugin.py` 作为适配器和组合根，不再向其中放业务规则；新增能力优先落到所属模块，再由主文件显式注册。** 不在缺少回归测试时做一次性大拆分。
 
@@ -43,7 +43,7 @@ entrypoint/plugin -> orchestration -> domain/storage/tools -> provider adapters
 | 前置筛选 | `decision_gate.py`、`rate_limiter.py` | 去重、低价值、频控、buffer | 社交氛围或搜索词 |
 | 社交决策 | `timing_gate.py`、`pipeline_types.py`、`pipeline_stages.py` | channel、action、状态转移 | 最终回复正文 |
 | 工具 | `tool_router.py`、`tool_registry.py`、`tools/` | 路由、参数、缓存、限流、结构化结果 | 客服式 fallback 文案 |
-| 上下文 | `context_assembler.py`、`temporal_evidence.py`、`group_jargon.py` | 来源、时效、预算和输入拼装 | 数据库 schema |
+| 上下文 | `context_assembler.py`、`member_context.py`、`temporal_evidence.py`、`group_jargon.py` | 来源、群友画像、时效、预算和输入拼装 | 数据库 schema |
 | LLM | `deepseek_client.py`、`embedding_client.py`、`prompts.py` | provider、JSON、模型路由、用量 | QQ 发送与审批状态 |
 | 记忆/RAG | `memory.py`、`memory_learning.py`、`rag_*.py` | 原文、画像、atoms、风格、索引 | QQ 生命周期 |
 | 发送 | `delivery.py`、`reply_splitter.py`、`social_actions.py` | 拆分、艾特、表情、节流 | 写长期事实 |
@@ -97,7 +97,7 @@ entrypoint/plugin -> orchestration -> domain/storage/tools -> provider adapters
 
 生产 compose 对源码、Prompt、config、plugins 和数据均使用 bind mount：
 
-- Python、Prompt、普通 config 修改：`docker compose -p qq-social-agent -f docker-compose.server.yml restart bot`
+- Python、Prompt、普通 config 修改：`docker compose -p qq-social-agent -f docker-compose.server.yml up -d --no-deps --force-recreate bot`
 - 依赖、Dockerfile 或镜像环境修改：`docker compose -p qq-social-agent -f docker-compose.server.yml up -d --build --no-deps bot`
 - 不要为后端代码修改重启 Docker daemon、执行 `compose down` 或重启 NapCat。这些会影响 QQ 登录态。
 - 新 sidecar 如 SearXNG 只能单独 `up -d searxng`，先验证健康和网络，再切换 provider。
@@ -107,7 +107,7 @@ entrypoint/plugin -> orchestration -> domain/storage/tools -> provider adapters
 ```bash
 cd /opt/qq-social-agent
 git diff --check
-docker compose -p qq-social-agent -f docker-compose.server.yml exec -T bot python -m pytest -q <相关测试>
+PYTHONPATH=. python3 -m pytest -q <相关测试>
 curl -fsS http://127.0.0.1:8080/healthz
 git status --short
 ```
