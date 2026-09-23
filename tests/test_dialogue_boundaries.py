@@ -11,6 +11,7 @@ from qq_social_agent import plugin
 from qq_social_agent.deepseek_client import DeepSeekClient, ReplyDecision, ToolRoutingDecision
 from qq_social_agent.jev_client import JevClient, _timing_looks_like_reply_to_other
 from qq_social_agent.reference_resolver import ReferenceResolution
+from qq_social_agent.speaker_context import _format_speaker_reference_context
 from qq_social_agent.tool_router import route_tools
 from qq_social_agent.pipeline_types import ToolKind
 
@@ -45,7 +46,7 @@ def test_reply_keeps_current_request_tail_and_identity_stays_out_of_text():
     result=plugin._message_context_text(event(text,reply=reply),bot_id=1801507496)
     assert text in result
     assert "你自己" not in result
-    context=plugin._format_speaker_reference_context(current_user_id=2061999520,current_nickname="测试群友",
+    context=_format_speaker_reference_context(current_user_id=2061999520,current_nickname="测试群友",
         current_text=text,recent_messages=[],reference_resolution=ReferenceResolution(),
         mentioned=False,replied_to_bot=True,addressed_bot=True,self_id=1801507496)
     assert "风雪和张风雪都是你自己" in context
