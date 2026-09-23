@@ -2990,17 +2990,104 @@ def test_merge_rag_keeps_summary_appendix() -> None:
 
 
 def test_empty_mid_memory_skips_window_after_streak(monkeypatch, tmp_path) -> None:
-    _use_temp_plugin_memory(monkeypatch, tmp_path)
+    store = _use_temp_plugin_memory(monkeypatch, tmp_path)
     plugin.mid_memory_empty_streak.clear()
     messages = [
         ChatMessage(1, 11, "甲", f"m{index}", False, 100.0 + index, id=index + 1)
         for index in range(3)
     ]
+    for message in messages:
+        store.add_message(1, message.user_id, message.nickname, message.text, created_at=message.created_at)
+    assert plugin.mid_memory_empty_streak is plugin.memory_maintenance_service.mid_memory_empty_streak
+    assert len(store.messages_for_mid_summary(1, keep_recent=0, batch_size=10)) == 3
 
     assert plugin._note_empty_mid_memory(1, messages) == "empty_summary"
     assert plugin._note_empty_mid_memory(1, messages) == "empty_summary"
     assert plugin._note_empty_mid_memory(1, messages) == "skipped_empty_window"
     assert plugin.mid_memory_empty_streak[1] == 0
+    assert store.messages_for_mid_summary(1, keep_recent=0, batch_size=10) == []
+
+
+def test_private_memory_maintenance_skips_group_style_and_profiles(monkeypatch, tmp_path) -> None:
+    store = _use_temp_plugin_memory(monkeypatch, tmp_path)
+    chat_id = plugin.PRIVATE_CHAT_OFFSET + 1903297906
+    monkeypatch.setattr(plugin, "deepseek_client", object())
+
+    def unexpected_style_learning(*args, **kwargs):
+        raise AssertionError("private memory maintenance must not run group style learning")
+
+    async def unexpected_profile_learning(*args, **kwargs):
+        raise AssertionError("private memory maintenance must not create group member profiles")
+
+    monkeypatch.setattr(store, "messages_for_style_learning", unexpected_style_learning)
+    monkeypatch.setattr(
+        plugin.memory_maintenance_service,
+        "maintain_member_profile_summaries",
+        unexpected_profile_learning,
+    )
+
+    asyncio.run(plugin._maintain_group_learning(chat_id))
+
+
+def test_mid_memory_attempt_backoff_survives_empty_generation(monkeypatch, tmp_path) -> None:
+    store = _use_temp_plugin_memory(monkeypatch, tmp_path)
+    group_id = 1
+    now = 2_000_000.0
+    message_count = plugin.MID_MEMORY_MIN_BATCH + plugin.app_config.context_limit + 1
+    for index in range(message_count):
+        store.add_message(
+            group_id,
+            100 + index % 3,
+            f"群友{index % 3}",
+            f"有上下文的发言内容 {index}",
+            created_at=now - message_count + index,
+        )
+
+    class EmptyMemoryClient:
+        summary_calls = 0
+
+        async def summarize_mid_memory(self, **kwargs):
+            self.summary_calls += 1
+            return None
+
+        async def learn_style_rules(self, **kwargs):
+            return []
+
+    client = EmptyMemoryClient()
+    events: list[tuple[str, dict[str, object]]] = []
+    monkeypatch.setattr(plugin, "deepseek_client", client)
+    monkeypatch.setattr(plugin.time, "time", lambda: now)
+    monkeypatch.setattr(
+        plugin,
+        "_record_metric_event",
+        lambda event_type, **kwargs: events.append((event_type, kwargs)),
+    )
+    plugin.last_mid_memory_attempt.pop(group_id, None)
+    plugin.mid_memory_empty_streak.pop(group_id, None)
+    plugin.last_style_learn_attempt.pop(group_id, None)
+
+    async def no_profiles(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr(plugin.memory_maintenance_service, "maintain_member_profile_summaries", no_profiles)
+
+    asyncio.run(plugin._maintain_group_learning(group_id))
+
+    assert client.summary_calls == 1
+    assert plugin.last_mid_memory_attempt[group_id] == now
+    assert plugin.mid_memory_empty_streak[group_id] == 1
+    assert any(event == "mid_memory_learning" and payload["action"] == "empty_summary" for event, payload in events)
+    assert store.messages_for_mid_summary(
+        group_id,
+        keep_recent=plugin.app_config.context_limit,
+        batch_size=plugin.MID_MEMORY_BATCH_SIZE,
+        include_bot=False,
+    )
+
+    monkeypatch.setattr(plugin.time, "time", lambda: now + plugin.MID_MEMORY_RETRY_INTERVAL_SECONDS)
+    asyncio.run(plugin._maintain_group_learning(group_id))
+    assert client.summary_calls == 1
+    assert plugin.last_mid_memory_attempt[group_id] == now
 
 
 def test_private_followup_probability_is_lower_for_guided_user() -> None:

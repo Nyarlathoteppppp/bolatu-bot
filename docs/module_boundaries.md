@@ -6,7 +6,7 @@
 
 ## 1. 当前结论
 
-项目已经具备真实分层：消息结构化、决策、工具、上下文、记忆、RAG、审批、发送、观测、后台学习和本地插件都有独立模块。`plugin.py` 仍承担 NoneBot 入口、运行时单例装配、群聊编排、私聊阶段依赖装配和 Web 管理路由；`private_session_service.py` 管理私聊缓冲与 followup 调度；三个 scheduler service 管理 daily review、weekly usage report 和 proactive chat 的后台 task 生命周期与周期策略。群聊主循环已按话语解析、决策、上下文、工具执行、候选生成和审批交接分段；私聊主循环也已按轮次准备、工具执行、上下文检索和生成发送分段。
+项目已经具备真实分层：消息结构化、决策、工具、上下文、记忆、RAG、审批、发送、观测、后台学习和本地插件都有独立模块。`plugin.py` 仍承担 NoneBot 入口、运行时单例装配、群聊编排和私聊阶段依赖装配；`private_session_service.py` 管理私聊缓冲与 followup 调度；三个 scheduler service 管理 daily review、weekly usage report 和 proactive chat 的后台 task 生命周期与周期策略；`memory_maintenance_service.py` 管理中期记忆、群风格和成员画像的后台维护。群聊主循环已按话语解析、决策、上下文、工具执行、候选生成和审批交接分段；私聊主循环也已按轮次准备、工具执行、上下文检索和生成发送分段。
 
 策略：**保留 `plugin.py` 作为适配器和组合根，不再向其中放业务规则；新增能力优先落到所属模块，再由主文件显式注册。** 不在缺少回归测试时做一次性大拆分。
 
@@ -55,9 +55,10 @@ entrypoint/plugin -> orchestration -> domain/storage/tools -> provider adapters
 | 审批状态与请求 | `approval_state_service.py`、`approval_request_service.py`、`approval_models.py` | 待审批单集合、串行候选选择、取消反馈、stale choice 冷却、审批请求和自动发送决策 | 群消息发送与 delivery progress 写回 |
 | 审批发送 | `approved_reply_delivery.py`、`delivery.py`、`approval_models.py` | 已批准消息发送、分段进度和数据库/Trace 回写；未知结果标记后阻止盲目重试 | 审批命令解析与工具权限 |
 | LLM | `deepseek_client.py`、`embedding_client.py`、`prompts.py` | provider、JSON、模型路由、用量 | QQ 发送与审批状态 |
-| 记忆/RAG | `memory.py`、`memory_learning.py`、`rag_*.py` | 原文、画像、atoms、风格、索引 | QQ 生命周期 |
+| 记忆/RAG | `memory.py`、`memory_learning.py`、`memory_maintenance_service.py`、`rag_*.py` | 原文、画像、atoms、风格、索引；维护 service 管理异步记忆总结、风格学习和成员画像更新 | QQ 生命周期、聊天热路径 |
 | 发送 | `delivery.py`、`reply_splitter.py`、`social_actions.py` | 拆分、艾特、表情、节流 | 写长期事实 |
 | 定时任务调度 | `daily_review_scheduler_service.py`、`weekly_usage_report_scheduler_service.py`、`proactive_chat_scheduler_service.py` | 按 Bot 管理 task 去重、时间窗口/概率策略、周期 tick、异常记录和取消清理 | daily review/proactive 生成发送用例、周报格式化与发送 |
+| 后台记忆维护 | `background_learning.py`、`memory_maintenance_service.py`、`memory_learning.py` | 单 worker 协调与记忆/风格/画像维护；attempt/streak 状态归 service 所有 | OneBot 事件适配和群聊热路径 |
 | 管理 HTTP | `admin_controller.py`、`admin_tools_controller.py`、`admin_edit_controller.py`、`admin_summaries_controller.py`、`admin_memory_controller.py`、`admin_http.py` | 本地管理路由、鉴权委托、表单适配、资源操作和重定向；编辑服务保留路径白名单、内容校验、备份与原子替换 | 群聊/私聊热路径，页面 HTML 拼装 |
 | 管理页面与观测 | `admin_ui.py`、`observability.py`、`approval_rules.py` | HTML 渲染、Trace、工具单 | HTTP request parsing、管理业务规则、聊天热路径判断 |
 | 安全输出 | `political_guard.py` | 输出脱敏和明确语义拦截 | 裸匹配消息 ID/QQ/时间戳 |
@@ -97,7 +98,8 @@ entrypoint/plugin -> orchestration -> domain/storage/tools -> provider adapters
 
 1. **定时任务（第一批已完成）**：三个 scheduler service 管理 daily review、weekly usage report、proactive chat 的生命周期和 tick 策略。`plugin.py` 在 connect 时按 manifest/config 开关调用 `_ensure_*`，disconnect/shutdown 取消同一组 service task registry。daily review/proactive 的生成发送流程、周报统计格式与投递仍由 `plugin.py` 适配，后续按领域依赖再迁移；这一批不改生成和发送行为。
 2. **管理 controller（本批完成）**：26 条 `/admin` 路由由 `admin_controller.py` 聚合，并按 tools、editable files、summaries、memory/private-memory 划分资源 controller；`admin_ui.py` 只负责渲染。各 controller 通过窄依赖对象调用运行时，不反向导入 `plugin.py`。原有本地请求判定和注册顺序保留；状态与 Trace 路由仍由入口注册。编辑服务保留项目路径校验、YAML/Prompt/config 校验、保存前备份、临时文件替换及 Docker 单文件 bind mount 的原地写入处理。
-3. **普通消息发送**：评估 `message_delivery_service.py`，集中普通正文与表情发送结果回写。
+3. **后台记忆维护（本批完成）**：`memory_maintenance_service.py` 负责中期摘要、风格规则和成员画像维护；`plugin.py` 保留 task/coordinator 装配与兼容入口。attempt 时间、空摘要 streak、摘要游标推进、私聊早退、持久化和指标名沿用原逻辑；状态字典只有 service 一份，plugin 的旧名称是同对象别名。
+4. **普通消息发送**：评估 `message_delivery_service.py`，集中普通正文与表情发送结果回写。已批准群回复的分段交付主体已在 `approved_reply_delivery.py`，后续重点评估剩余发送适配与成功后副作用边界。
 
 不要优先拆 `memory.py` 或 `deepseek_client.py`。先补 repository/service 边界和表级测试，再动内部结构。
 

@@ -156,7 +156,6 @@ from .memory import (
     MemoryAtom,
     MemberImpression,
     MemberProfile,
-    MemberProfileSummary,
     MemoryStore,
     MemorySummary,
     RawCorpusExample,
@@ -183,8 +182,16 @@ from .member_context import (
 )
 from .memory_learning import (
     persist_daily_review_learning,
-    persist_mid_memory_learning,
-    persist_private_mid_memory,
+)
+from .memory_maintenance_service import (
+    MemoryMaintenancePolicy,
+    MemoryMaintenanceService,
+    _has_long_common_substring,
+    _looks_like_literal_style_rule,
+    balanced_style_learning_messages as _balanced_style_learning_messages,
+    is_useful_style_rule as _is_useful_style_rule,
+    member_profile_learning_messages as _member_profile_learning_messages,
+    member_profile_previous_text as _member_profile_previous_text,
 )
 from .observability import (
     build_trace_snapshot,
@@ -326,9 +333,6 @@ JARGON_LLM_SELECTOR_ENABLED = bool(
 )
 cue_pattern_tracker = CuePatternTracker(window_seconds=10 * 60)
 deepseek_client: DeepSeekClient | None = None
-last_mid_memory_attempt: dict[int, float] = {}
-mid_memory_empty_streak: dict[int, int] = {}
-last_style_learn_attempt: dict[int, float] = {}
 addressed_event_times: dict[tuple[int, int], list[float]] = {}
 followup_window_opened_at: dict[tuple[int, int], float] = {}
 last_group_mention_targets: dict[int, tuple[int, float]] = {}
@@ -7980,6 +7984,46 @@ def _group_processing_lock(group_id: int) -> asyncio.Lock:
     return lock
 
 
+def _memory_maintenance_policy() -> MemoryMaintenancePolicy:
+    return MemoryMaintenancePolicy(
+        group_context_limit=app_config.context_limit,
+        private_context_limit=PRIVATE_CONTEXT_LIMIT,
+        private_chat_offset=PRIVATE_CHAT_OFFSET,
+        mid_memory_batch_size=MID_MEMORY_BATCH_SIZE,
+        mid_memory_min_batch=MID_MEMORY_MIN_BATCH,
+        mid_memory_retry_interval_seconds=MID_MEMORY_RETRY_INTERVAL_SECONDS,
+        mid_memory_empty_skip_streak=MID_MEMORY_EMPTY_SKIP_STREAK,
+        style_learn_interval_seconds=STYLE_LEARN_INTERVAL_SECONDS,
+        style_learn_message_limit=STYLE_LEARN_MESSAGE_LIMIT,
+        style_learn_candidate_limit=STYLE_LEARN_CANDIDATE_LIMIT,
+        style_learn_per_user_limit=STYLE_LEARN_PER_USER_LIMIT,
+        style_learn_min_messages=STYLE_LEARN_MIN_MESSAGES,
+        member_profile_interval_seconds=MEMBER_PROFILE_SUMMARY_INTERVAL_SECONDS,
+        member_profile_lookback_seconds=MEMBER_PROFILE_SUMMARY_LOOKBACK_SECONDS,
+        member_profile_active_limit=MEMBER_PROFILE_SUMMARY_ACTIVE_LIMIT,
+        member_profile_min_messages=MEMBER_PROFILE_SUMMARY_MIN_MESSAGES,
+        member_profile_message_limit=MEMBER_PROFILE_SUMMARY_MESSAGE_LIMIT,
+        member_profile_min_chars=MEMBER_PROFILE_SUMMARY_MIN_CHARS,
+    )
+
+
+memory_maintenance_service = MemoryMaintenanceService(
+    memory_provider=lambda: memory,
+    client_provider=lambda: deepseek_client,
+    policy_provider=_memory_maintenance_policy,
+    record_metric_event=lambda *args, **kwargs: _record_metric_event(*args, **kwargs),
+    member_label=lambda user_id, nickname: _member_label(user_id, nickname),
+    useful_style_rule=lambda situation, style, source_text: _is_useful_style_rule(
+        situation,
+        style,
+        source_text,
+    ),
+)
+last_mid_memory_attempt = memory_maintenance_service.last_mid_memory_attempt
+mid_memory_empty_streak = memory_maintenance_service.mid_memory_empty_streak
+last_style_learn_attempt = memory_maintenance_service.last_style_learn_attempt
+
+
 def _schedule_group_learning(group_id: int) -> None:
     if deepseek_client is None:
         return
@@ -8026,181 +8070,11 @@ async def _run_group_learning(group_id: int) -> None:
 
 
 def _note_empty_mid_memory(group_id: int, summary_messages: list[ChatMessage]) -> str:
-    streak = mid_memory_empty_streak.get(group_id, 0) + 1
-    mid_memory_empty_streak[group_id] = streak
-    if streak < MID_MEMORY_EMPTY_SKIP_STREAK or not summary_messages:
-        return "empty_summary"
-    memory.advance_memory_summary_cursor(group_id, summary_messages[-1].id)
-    mid_memory_empty_streak[group_id] = 0
-    logger.warning(
-        "qq_social_agent mid memory skipped empty window: "
-        f"group={group_id} messages={len(summary_messages)} end_id={summary_messages[-1].id}"
-    )
-    return "skipped_empty_window"
+    return memory_maintenance_service.note_empty_mid_memory(group_id, summary_messages)
 
 
 async def _maintain_group_learning(group_id: int) -> None:
-    if deepseek_client is None:
-        return
-
-    expired_atoms = memory.expire_due_memory_atoms(group_id=group_id)
-    if expired_atoms:
-        logger.info(
-            f"qq_social_agent expired due memory atoms: group={group_id} count={expired_atoms}"
-        )
-
-    mid_messages = memory.messages_for_mid_summary(
-        group_id,
-        keep_recent=PRIVATE_CONTEXT_LIMIT if group_id >= PRIVATE_CHAT_OFFSET else app_config.context_limit,
-        batch_size=MID_MEMORY_BATCH_SIZE,
-        include_bot=False,
-    )
-    empty_streak = mid_memory_empty_streak.get(group_id, 0)
-    retry_wait = MID_MEMORY_RETRY_INTERVAL_SECONDS * (2 ** min(empty_streak, 3))
-    if (
-        len(mid_messages) >= MID_MEMORY_MIN_BATCH
-        and time.time() - last_mid_memory_attempt.get(group_id, 0.0)
-        >= retry_wait
-    ):
-        last_mid_memory_attempt[group_id] = time.time()
-        try:
-            summary_messages = [msg for msg in mid_messages if not msg.is_bot]
-            draft = None
-            if len(summary_messages) >= MID_MEMORY_MIN_BATCH:
-                draft = await deepseek_client.summarize_mid_memory(
-                    messages=summary_messages,
-                    chat_label="QQ 私聊" if group_id >= PRIVATE_CHAT_OFFSET else "QQ 群聊",
-                )
-            if draft and draft.summary:
-                memory.add_memory_summary(
-                    group_id,
-                    summary_messages,
-                    summary=draft.summary,
-                    recall_cues=list(draft.recall_cues),
-                )
-                persist_memory = (
-                    persist_private_mid_memory
-                    if group_id >= PRIVATE_CHAT_OFFSET
-                    else persist_mid_memory_learning
-                )
-                learned_atom_ids = persist_memory(
-                    memory,
-                    group_id=group_id,
-                    draft=draft,
-                    messages=summary_messages,
-                )
-                logger.info(
-                    "qq_social_agent mid memory summarized: "
-                    f"group={group_id} messages={len(mid_messages)} cues={len(draft.recall_cues)} "
-                    f"atoms={len(learned_atom_ids)}"
-                )
-                mid_memory_empty_streak[group_id] = 0
-                _record_metric_event(
-                    "mid_memory_learning",
-                    group_id=group_id,
-                    stage="memory",
-                    action="persisted",
-                    atom_count=len(learned_atom_ids),
-                    fact_count=len(draft.facts),
-                    member_delta_count=len(draft.member_deltas),
-                    jargon_count=len(draft.jargon_candidates),
-                    open_thread_count=len(draft.open_threads),
-                )
-            else:
-                skip_action = _note_empty_mid_memory(group_id, summary_messages)
-                logger.warning(
-                    "qq_social_agent mid memory returned empty summary: "
-                    f"group={group_id} messages={len(summary_messages)} action={skip_action}"
-                )
-                _record_metric_event(
-                    "mid_memory_learning",
-                    group_id=group_id,
-                    stage="memory",
-                    action=skip_action,
-                    message_count=len(summary_messages),
-                )
-        except Exception as exc:
-            logger.warning(f"qq_social_agent mid memory skipped: group={group_id} error={exc}")
-
-    if group_id >= PRIVATE_CHAT_OFFSET:
-        # Direct-chat messages retain rolling summaries and explicit memory,
-        # but never teach the shared group style or auto-create a user profile.
-        return
-
-    last_attempt = max(
-        memory.last_style_rule_at(group_id),
-        last_style_learn_attempt.get(group_id, 0.0),
-    )
-    if time.time() - last_attempt >= STYLE_LEARN_INTERVAL_SECONDS:
-        style_messages = memory.messages_for_style_learning(
-            group_id,
-            limit=STYLE_LEARN_CANDIDATE_LIMIT,
-        )
-        style_messages = _balanced_style_learning_messages(style_messages)
-        if len(style_messages) >= STYLE_LEARN_MIN_MESSAGES:
-            last_style_learn_attempt[group_id] = time.time()
-            try:
-                rules = await deepseek_client.learn_style_rules(
-                    messages=style_messages,
-                    chat_label="QQ 群聊",
-                )
-                useful_rules = [
-                    rule
-                    for rule in rules
-                    if _is_useful_style_rule(rule.situation, rule.style, rule.source_text)
-                ]
-                style_stats = memory.add_style_rules(
-                    group_id,
-                    [
-                        (
-                            rule.situation,
-                            rule.style,
-                            rule.source_text,
-                            rule.source_user_ids,
-                            rule.source_message_ids,
-                        )
-                        for rule in useful_rules
-                    ],
-                )
-                if useful_rules:
-                    logger.info(
-                        "qq_social_agent style rules learned: "
-                        f"group={group_id} rules={len(useful_rules)} "
-                        f"new={style_stats.get('new', 0)} "
-                        f"merged={style_stats.get('merged', 0)} "
-                        f"expired={style_stats.get('expired', 0)} "
-                        f"skipped={style_stats.get('skipped', 0)}"
-                    )
-            except Exception as exc:
-                logger.warning(
-                    f"qq_social_agent style learning skipped: group={group_id} error={exc}"
-                )
-
-    # Profile learning is intentionally last and capped per sweep. Reply-time
-    # work and the mid-memory backlog get priority over many sequential LLM calls.
-    await _maintain_member_profile_summaries(group_id, max_updates=1)
-
-
-def _balanced_style_learning_messages(messages: list[ChatMessage]) -> list[ChatMessage]:
-    selected: list[ChatMessage] = []
-    user_counts: dict[int, int] = {}
-    seen_texts: set[tuple[int, str]] = set()
-    for message in reversed(messages):
-        text_key = (message.user_id, re.sub(r"\s+", "", message.text).casefold())
-        if text_key in seen_texts or user_counts.get(message.user_id, 0) >= STYLE_LEARN_PER_USER_LIMIT:
-            continue
-        seen_texts.add(text_key)
-        user_counts[message.user_id] = user_counts.get(message.user_id, 0) + 1
-        selected.append(message)
-        if len(selected) >= STYLE_LEARN_MESSAGE_LIMIT:
-            break
-    balanced = sorted(selected, key=lambda item: (item.created_at, item.id))
-    logger.info(
-        "qq_social_agent style learning balanced sample: "
-        f"candidates={len(messages)} selected={len(balanced)} users={len(user_counts)} "
-        f"max_per_user={STYLE_LEARN_PER_USER_LIMIT}"
-    )
-    return balanced
+    await memory_maintenance_service.maintain_group(group_id)
 
 
 async def _maintain_member_profile_summaries(
@@ -8209,105 +8083,11 @@ async def _maintain_member_profile_summaries(
     force: bool = False,
     max_updates: int | None = None,
 ) -> None:
-    if deepseek_client is None:
-        return
-    now = time.time()
-    start_at = now - MEMBER_PROFILE_SUMMARY_LOOKBACK_SECONDS
-    active_user_ids = memory.active_member_ids_since(
+    await memory_maintenance_service.maintain_member_profile_summaries(
         group_id,
-        since_at=start_at,
-        limit=MEMBER_PROFILE_SUMMARY_ACTIVE_LIMIT,
-        min_messages=MEMBER_PROFILE_SUMMARY_MIN_MESSAGES,
+        force=force,
+        max_updates=max_updates,
     )
-    if not active_user_ids:
-        return
-    updated = 0
-    for user_id in active_user_ids:
-        previous = memory.latest_member_profile_summary(group_id, user_id)
-        last_summary_at = previous.created_at if previous is not None else 0.0
-        if not force and last_summary_at and now - last_summary_at < MEMBER_PROFILE_SUMMARY_INTERVAL_SECONDS:
-            continue
-        window_start = start_at
-        if previous is not None:
-            window_start = max(start_at, float(previous.end_at or previous.created_at))
-        messages = memory.member_messages_between(
-            group_id,
-            user_id,
-            start_at=window_start,
-            end_at=now + 1,
-            limit=MEMBER_PROFILE_SUMMARY_MESSAGE_LIMIT,
-        )
-        messages = _member_profile_learning_messages(messages)
-        if len(messages) < MEMBER_PROFILE_SUMMARY_MIN_MESSAGES:
-            continue
-        if sum(len((item.text or "").strip()) for item in messages) < MEMBER_PROFILE_SUMMARY_MIN_CHARS:
-            continue
-        label = _member_label(user_id, messages[-1].nickname)
-        previous_text = _member_profile_previous_text(previous)
-        try:
-            draft = await deepseek_client.summarize_member_profile(
-                messages=messages,
-                member_label=label,
-                chat_label="QQ 群聊",
-                previous_summary=previous_text,
-            )
-        except Exception as exc:
-            logger.warning(
-                "qq_social_agent member profile summary skipped: "
-                f"group={group_id} user={user_id} error={exc}"
-            )
-            continue
-        if not draft.summary:
-            continue
-        memory.add_member_profile_summary(
-            group_id=group_id,
-            user_id=user_id,
-            profile_summary=draft.summary,
-            interests=list(draft.interests),
-            speaking_style=draft.speaking_style,
-            representative_texts=list(draft.representative_texts),
-            start_at=messages[0].created_at,
-            end_at=messages[-1].created_at,
-            message_count=len(messages),
-        )
-        logger.info(
-            "qq_social_agent member profile summarized: "
-            f"group={group_id} user={user_id} messages={len(messages)} "
-            f"incremental={previous is not None}"
-        )
-        updated += 1
-        if max_updates is not None and updated >= max(1, max_updates):
-            break
-
-
-
-def _member_profile_learning_messages(messages: list[ChatMessage]) -> list[ChatMessage]:
-    selected: list[ChatMessage] = []
-    seen: set[str] = set()
-    for message in messages:
-        text = str(message.text or "").strip()
-        if len(text) < 8:
-            continue
-        substance = re.sub(r"[\W_]+", "", text, flags=re.UNICODE)
-        if len(substance) < 4:
-            continue
-        key = re.sub(r"\s+", "", text)
-        if key in seen:
-            continue
-        seen.add(key)
-        selected.append(message)
-    return selected
-
-
-def _member_profile_previous_text(previous: MemberProfileSummary | None) -> str:
-    if previous is None:
-        return ""
-    lines = [previous.profile_summary.strip()[:240]]
-    if previous.interests:
-        lines.append("兴趣：" + "、".join(previous.interests[:5]))
-    if previous.speaking_style.strip():
-        lines.append("说话方式：" + previous.speaking_style.strip()[:80])
-    return "\n".join(line for line in lines if line)
 
 
 def _format_memory_context(summaries: list[MemorySummary]) -> str:
@@ -10065,91 +9845,6 @@ def _decision_failure_fallback(
     )
 
 
-def _is_useful_style_rule(situation: str, style: str, source_text: str = "") -> bool:
-    text = f"{situation} {style} {source_text}".strip()
-    compact = re.sub(r"\s+", "", text)
-    if not compact:
-        return False
-    low_value_phrases = {
-        "是的",
-        "是这样的",
-        "确实",
-        "还好吧",
-        "太典了",
-        "绷不住了",
-        "闹麻了",
-        "赢麻了",
-        "差不多得了",
-        "乐死了",
-        "开宰",
-        "886",
-        "牛逼",
-        "看哭了",
-        "这么先进",
-        "算了",
-        "不赖",
-        "一般",
-        "厚米",
-        "啊",
-        "有",
-        "好",
-        "回国",
-        "倒",
-        "魔了",
-        "吓哭了",
-    }
-    if compact in low_value_phrases:
-        return False
-    if any(compact == phrase for phrase in low_value_phrases):
-        return False
-    style_compact = re.sub(r"\s+", "", style)
-    source_compact = re.sub(r"\s+", "", source_text)
-    if style_compact in low_value_phrases or source_compact in low_value_phrases:
-        return False
-    if source_compact and len(source_compact) <= 4:
-        return False
-    if source_compact.startswith("[图片") or "[图片OCR" in source_text:
-        return False
-    if source_compact.startswith("[长消息") and "摘要" in source_compact[:12]:
-        return False
-    if "原消息内容未知" in source_text:
-        return False
-    if len(style_compact) <= 3 and style_compact in {"赞同", "附和", "吐槽"}:
-        return False
-    if _looks_like_literal_style_rule(style):
-        return False
-    if source_compact and _has_long_common_substring(style_compact, source_compact, min_len=6):
-        return False
-    return True
-
-
-def _looks_like_literal_style_rule(style: str) -> bool:
-    stripped = style.strip()
-    compact = re.sub(r"\s+", "", stripped)
-    if not compact:
-        return True
-    literal_markers = (
-        "说“",
-        "说\"",
-        "用“",
-        "用\"",
-        "短句接“",
-        "直接说“",
-        "表达“",
-        "接“",
-    )
-    if any(marker in compact for marker in literal_markers):
-        return True
-    if compact.startswith(("说", "发")) and len(compact) <= 18:
-        return True
-    if compact in {"重复对方原句", "复读对方原句"}:
-        return True
-    if re.fullmatch(r"发?[^\w\u4e00-\u9fff]{1,8}", compact):
-        return True
-    quote_count = compact.count("“") + compact.count("”") + compact.count("\"")
-    return quote_count > 0 and len(compact) <= 28
-
-
 EMOJI_RE = re.compile(
     "["
     "\U0001f1e6-\U0001f1ff"
@@ -10174,20 +9869,6 @@ def _sanitize_generated_text(text: str) -> str:
     cleaned = re.sub(r"[ \t]{2,}", " ", cleaned)
     cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
     return cleaned.strip()
-
-
-def _has_long_common_substring(a: str, b: str, *, min_len: int) -> bool:
-    if len(a) < min_len or len(b) < min_len:
-        return False
-    shorter, longer = (a, b) if len(a) <= len(b) else (b, a)
-    max_size = min(len(shorter), 24)
-    for size in range(max_size, min_len - 1, -1):
-        for start in range(0, len(shorter) - size + 1):
-            if shorter[start : start + size] in longer:
-                return True
-    return False
-
-
 
 
 def _without_current_message(
