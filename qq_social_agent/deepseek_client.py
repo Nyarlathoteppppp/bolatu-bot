@@ -395,7 +395,8 @@ class DeepSeekClient:
                     "operation": what,
                     "error_type": type(exc).__name__,
                 })
-            logger.warning(f"qq_social_agent jev {what} failed, falling back: error={exc}")
+            error = f"{type(exc).__name__}: {exc}".rstrip(": ")
+            logger.warning(f"qq_social_agent jev {what} failed, falling back: error={error}")
             return None
 
     def set_route_override(self, route_name: str, route: LLMModelRoute | None) -> None:
