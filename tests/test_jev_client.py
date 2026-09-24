@@ -158,12 +158,12 @@ def test_jev_timing_gate_rolls_silent_when_random_misses_noul() -> None:
         return {
             "answers": {
                 "following_bot": {"noul": 0.10},
-                "has_concrete_content": {"noul": 0.83},
+                "has_concrete_content": {"noul": 0.80},
             }
         }
 
     client.evaluate = fake_evaluate
-    with patch("qq_social_agent.jev_client.random.random", return_value=0.83):
+    with patch("qq_social_agent.jev_client.random.random", return_value=0.80):
         timing = asyncio.run(
             client.timing_gate(
                 persona=_persona(),
@@ -175,14 +175,14 @@ def test_jev_timing_gate_rolls_silent_when_random_misses_noul() -> None:
     assert timing.channel.value == "silent"
 
 
-def test_jev_timing_gate_always_speaks_when_noul_above_0_9() -> None:
+def test_jev_timing_gate_always_speaks_when_noul_above_0_8() -> None:
     client = JevClient(api_key="test-key")
 
     async def fake_evaluate(**kwargs):
         return {
             "answers": {
                 "following_bot": {"noul": 0.11},
-                "has_concrete_content": {"noul": 0.91},
+                "has_concrete_content": {"noul": 0.81},
             }
         }
 

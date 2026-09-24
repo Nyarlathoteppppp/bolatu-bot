@@ -494,7 +494,7 @@ class JevClient:
                 confidence=speak_prob,
                 reason=f"jev_silent_{speak_prob:.2f}",
             )
-        if speak_prob <= 0.90 and random.random() >= speak_prob:
+        if speak_prob <= 0.80 and random.random() >= speak_prob:
             return TimingDecision(
                 channel=OutputChannel.SILENT,
                 intent=SocialIntent.CHAT,
