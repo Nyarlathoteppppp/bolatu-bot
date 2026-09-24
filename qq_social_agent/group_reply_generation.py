@@ -114,7 +114,7 @@ async def generate_group_reply(
                 context_packet=context_packet,
                 mention_targets=mention_targets_context,
                 priority_context=priority_context,
-                include_bot_history=tool_answer_mode,
+                include_bot_history=True,
                 context_message_limit=8 if tool_answer_mode else None,
                 candidate_count=reply_candidate_limit,
                 prompt_flow=prompt_flow,

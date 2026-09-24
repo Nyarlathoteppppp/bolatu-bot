@@ -147,6 +147,7 @@ def test_group_generation_returns_reviewed_candidate() -> None:
     assert result is not None and result.candidates == (candidate,)
     assert result.prompt_flow == "reply_candidates"
     assert calls[0]["speaker_context"] == "当前触发人是群友"
+    assert calls[0]["include_bot_history"] is True
 
 
 def test_market_report_skips_generation_and_enters_approval() -> None:
