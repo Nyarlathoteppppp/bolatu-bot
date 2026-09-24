@@ -17,12 +17,9 @@ from qq_social_agent.plugin import (
     APPROVAL_REJECT_REASON_RE,
     GROUP_BUFFER_SECONDS,
     GROUP_INFLIGHT_BUFFER_RETRY_SECONDS,
-    GROUP_PASSIVE_DECISION_EVERY_MESSAGES,
-    GROUP_PASSIVE_DECISION_GAP_SECONDS,
     JARGON_ADD_RE,
     JARGON_DELETE_RE,
     JARGON_LIST_RE,
-    group_passive_decision_state,
     group_generation_inflight,
     last_user_reply_times,
     _extract_message_id,
@@ -39,7 +36,6 @@ from qq_social_agent.plugin import (
     _is_low_value_group_text,
     _is_useful_style_rule,
     _member_label,
-    _passive_decision_allowed,
     _pre_decision_gate,
     _record_user_reply,
     _status_group_card,
@@ -151,8 +147,27 @@ def test_backend_approval_candidates_are_not_padded() -> None:
     assert not hasattr(plugin, "_pad_approval_candidates")
 
 
-def test_group_buffer_seconds_is_six() -> None:
-    assert GROUP_BUFFER_SECONDS == 6.0
+def test_group_buffer_schedules_immediate_flush(monkeypatch) -> None:
+    group_id = 1026813421
+    plugin.group_message_buffers.clear()
+    plugin.group_buffer_tasks.clear()
+    plugin.group_generation_inflight.clear()
+    plugin.group_addressed_waiters.clear()
+    plugin.group_message_buffers[group_id] = [_buffered_item(group_id, "现在接话")]
+    handled = []
+
+    async def fake_handle(*args, **kwargs) -> None:
+        handled.append(kwargs["buffered_messages"])
+
+    monkeypatch.setattr(plugin, "_handle_group_message_locked", fake_handle)
+
+    async def run() -> None:
+        plugin._schedule_group_buffer_flush(group_id)
+        await asyncio.wait_for(plugin.group_buffer_tasks[group_id], timeout=1.0)
+
+    asyncio.run(run())
+    assert len(handled) == 1
+    assert group_id not in plugin.group_buffer_tasks
 
 
 def test_status_group_card_labels() -> None:
@@ -962,88 +977,6 @@ def test_jargon_command_regexes() -> None:
     delete = JARGON_DELETE_RE.match("/删黑话：咱妈")
     assert delete is not None
     assert delete.group("term") == "咱妈"
-
-
-def test_passive_decision_gate_idle_then_every_three_messages() -> None:
-    group_passive_decision_state.clear()
-
-    allowed, reason = _passive_decision_allowed(
-        1026813421,
-        message_count=1,
-        first_message_at=1000.0,
-        last_message_at=1000.0,
-    )
-    assert allowed
-    assert reason == "first_decision"
-
-    allowed, reason = _passive_decision_allowed(
-        1026813421,
-        message_count=1,
-        first_message_at=1005.0,
-        last_message_at=1005.0,
-    )
-    assert not allowed
-    assert reason == "waiting_1/3"
-
-    allowed, reason = _passive_decision_allowed(
-        1026813421,
-        message_count=1,
-        first_message_at=1010.0,
-        last_message_at=1010.0,
-    )
-    assert not allowed
-    assert reason == "waiting_2/3"
-
-    allowed, reason = _passive_decision_allowed(
-        1026813421,
-        message_count=1,
-        first_message_at=1015.0,
-        last_message_at=1015.0,
-    )
-    assert allowed
-    assert reason == "every_three_messages"
-
-
-def test_passive_decision_gate_resets_after_idle_window() -> None:
-    group_passive_decision_state.clear()
-
-    _passive_decision_allowed(
-        1026813421,
-        message_count=1,
-        first_message_at=1000.0,
-        last_message_at=1000.0,
-    )
-    allowed, reason = _passive_decision_allowed(
-        1026813421,
-        message_count=1,
-        first_message_at=1000.0 + GROUP_PASSIVE_DECISION_GAP_SECONDS,
-        last_message_at=1000.0 + GROUP_PASSIVE_DECISION_GAP_SECONDS,
-    )
-
-    assert allowed
-    assert reason == "gap_since_decision"
-    assert GROUP_PASSIVE_DECISION_EVERY_MESSAGES == 3
-
-
-def test_passive_decision_gate_allows_after_thirty_second_gap() -> None:
-    group_passive_decision_state.clear()
-
-    _passive_decision_allowed(
-        1026813421,
-        message_count=1,
-        first_message_at=1000.0,
-        last_message_at=1000.0,
-    )
-    allowed, reason = _passive_decision_allowed(
-        1026813421,
-        message_count=1,
-        first_message_at=1031.0,
-        last_message_at=1031.0,
-    )
-
-    assert allowed
-    assert reason == "gap_since_decision"
-    assert GROUP_PASSIVE_DECISION_GAP_SECONDS == 30
 
 
 def test_daily_review_window_uses_previous_24h_at_midnight() -> None:

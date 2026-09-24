@@ -366,9 +366,6 @@ private_inbound_message_counts = private_session_service.inbound_message_counts
 private_followup_tasks = private_session_service.followup_tasks
 group_addressed_waiters: dict[int, int] = {}
 group_inbound_sequences: dict[int, int] = {}
-group_passive_retry_buffers: dict[int, list["BufferedGroupMessage"]] = {}
-group_passive_retry_tasks: dict[int, asyncio.Task[None]] = {}
-group_passive_decision_state: dict[int, "PassiveDecisionState"] = {}
 group_directory_tasks: dict[str, asyncio.Task[None]] = {}
 history_backfill_tasks: dict[str, asyncio.Task[None]] = {}
 notice_directory_refresh_tasks: dict[int, asyncio.Task[None]] = {}
@@ -478,7 +475,7 @@ FORWARD_CONTEXT_SUMMARY_THRESHOLD = 1400
 UNREADABLE_MEDIA_SEGMENT_TYPES = {"image", "mface", "face", "record", "video"}
 JARGON_CONTEXT_LOOKBACK = 4
 CUSTOM_JARGON_CONTEXT_LIMIT = 10
-GROUP_BUFFER_SECONDS = 6.0
+GROUP_BUFFER_SECONDS = 0.0
 GROUP_INFLIGHT_BUFFER_RETRY_SECONDS = 1.0
 PRIVATE_BUFFER_SECONDS = 2.5
 PRIVATE_INFLIGHT_BUFFER_RETRY_SECONDS = 0.75
@@ -603,8 +600,6 @@ BLOCKED_BACKEND_FALLBACK_TEXTS = {
     "那先看他后面怎么说。",
     "这句接一下可以，但别聊太满。",
 }
-GROUP_PASSIVE_DECISION_GAP_SECONDS = 30
-GROUP_PASSIVE_DECISION_EVERY_MESSAGES = 3
 GROUP_DIRECTORY_SYNC_INTERVAL_SECONDS = int(app_config.raw.get("group_directory", {}).get("sync_interval_seconds", 6 * 60 * 60))
 GROUP_HISTORY_BACKFILL_COUNT = int(app_config.raw.get("history_sync", {}).get("backfill_count", 80))
 GROUP_HISTORY_BACKFILL_ENABLED = bool(app_config.raw.get("history_sync", {}).get("enabled", True))
@@ -837,13 +832,6 @@ class BufferedGroupMessage:
     message_segments_json: str = ""
     raw_message_json: str = ""
     sender_json: str = ""
-
-
-@dataclass(frozen=True)
-class PassiveDecisionState:
-    last_decision_at: float
-    waiting_count: int
-    first_waiting_at: float
 
 
 @dataclass(frozen=True)
@@ -1234,7 +1222,6 @@ async def _shutdown_background_tasks() -> None:
         history_backfill_tasks,
         notice_directory_refresh_tasks,
         group_buffer_tasks,
-        group_passive_retry_tasks,
         group_learning_tasks,
         private_memory_tasks,
         maintenance_tasks,
@@ -3765,9 +3752,6 @@ def _status_approvals() -> dict[str, object]:
 def _status_buffers() -> dict[str, object]:
     return {
         "group_buffers": {str(group_id): len(items) for group_id, items in sorted(group_message_buffers.items())},
-        "passive_retry_buffers": {
-            str(group_id): len(items) for group_id, items in sorted(group_passive_retry_buffers.items())
-        },
         "generation_inflight_groups": sorted(group_generation_inflight),
         "buffer_tasks": sorted(str(group_id) for group_id, task in group_buffer_tasks.items() if not task.done()),
     }
@@ -4460,7 +4444,6 @@ async def _handle_group_message_scoped(
         )
         return
     if effective_addressed:
-        _cancel_passive_decision_retry(group_id)
         group_addressed_waiters[group_id] = group_addressed_waiters.get(group_id, 0) + 1
     try:
         async with _group_processing_lock(group_id):
@@ -4494,8 +4477,6 @@ async def _handle_group_message_locked(
     event: GroupMessageEvent,
     *,
     buffered_messages: list[BufferedGroupMessage] | None = None,
-    force_passive_decision: bool = False,
-    skip_memory_record: bool = False,
     preprocessed_text: str | None = None,
     source_message_id: str = "",
     correlation_id: str = "",
@@ -4594,14 +4575,13 @@ async def _handle_group_message_locked(
 
     if not buffered_messages and replied_to_bot and _is_low_value_reply_to_bot_event(event):
         plain_reply_text = _plain_text(event)
-        if not skip_memory_record:
-            _add_group_event_memory(
-                event,
-                bot,
-                text=plain_reply_text or text,
-                source_message_id=source_message_id or event_message_source_id(event),
-                correlation_id=correlation_id,
-            )
+        _add_group_event_memory(
+            event,
+            bot,
+            text=plain_reply_text or text,
+            source_message_id=source_message_id or event_message_source_id(event),
+            correlation_id=correlation_id,
+        )
         logger.info(
             "qq_social_agent ignored low value reply to bot: "
             f"group={group_id} user={user_id} text={plain_reply_text!r}"
@@ -4623,30 +4603,29 @@ async def _handle_group_message_locked(
             return
         text = "（只艾特了你）"
 
-    if not skip_memory_record:
-        if buffered_messages:
-            for item in buffered_messages:
-                memory.add_message(
-                    group_id,
-                    item.user_id,
-                    item.nickname,
-                    item.text,
-                    is_bot=False,
-                    source_message_id=item.source_message_id,
-                    correlation_id=item.correlation_id,
-                    session_id=item.session_id or None,
-                    message_segments_json=item.message_segments_json or None,
-                    raw_message_json=item.raw_message_json or None,
-                    sender_json=item.sender_json or None,
-                )
-        else:
-            _add_group_event_memory(
-                event,
-                bot,
-                text=text,
-                source_message_id=source_message_id or event_message_source_id(event),
-                correlation_id=correlation_id,
+    if buffered_messages:
+        for item in buffered_messages:
+            memory.add_message(
+                group_id,
+                item.user_id,
+                item.nickname,
+                item.text,
+                is_bot=False,
+                source_message_id=item.source_message_id,
+                correlation_id=item.correlation_id,
+                session_id=item.session_id or None,
+                message_segments_json=item.message_segments_json or None,
+                raw_message_json=item.raw_message_json or None,
+                sender_json=item.sender_json or None,
             )
+    else:
+        _add_group_event_memory(
+            event,
+            bot,
+            text=text,
+            source_message_id=source_message_id or event_message_source_id(event),
+            correlation_id=correlation_id,
+        )
     _record_metric_event(
         "message_buffered",
         group_id=group_id,
@@ -4732,45 +4711,6 @@ async def _handle_group_message_locked(
     )
     pipeline_state.mode = _tool_route_mode(tool_plan)
     pipeline_state.tool_requests = tool_plan.requests
-    fresh_candidate = fresh_intent is not None
-    if addressed_bot:
-        _mark_passive_decision_forced(group_id)
-    elif force_passive_decision:
-        _mark_passive_decision_forced(group_id)
-    elif not market_forced and not fresh_candidate:
-        message_count = len(buffered_messages) if buffered_messages else 1
-        first_message_at = _buffered_first_created_at(buffered_messages)
-        last_message_at = _buffered_last_created_at(buffered_messages)
-        allowed, reason = _passive_decision_allowed(
-            group_id,
-            message_count=message_count,
-            first_message_at=first_message_at,
-            last_message_at=last_message_at,
-        )
-        if not allowed:
-            logger.info(
-                "qq_social_agent skipped passive decision gate: "
-                f"group={group_id} messages={message_count} reason={reason}"
-            )
-            await _send_approval_suppression_notice(
-                bot,
-                group_id=group_id,
-                user_id=user_id,
-                nickname=nickname,
-                text=text,
-                stage="passive_frequency_gate",
-                reason=(
-                    f"被动发言频率门拦截：{reason}。30 秒内连续聊天时，每 3 条才进一次 decision；"
-                    "若 30 秒内没有新消息，会自动重试进入 decision。"
-                ),
-            )
-            if buffered_messages:
-                _schedule_passive_decision_retry(group_id, buffered_messages)
-            _schedule_group_learning(group_id)
-            return
-    else:
-        _mark_passive_decision_forced(group_id)
-
     cue_repeat_state = None
     decision_started_at = time.monotonic()
     reply_budget = GroupReplyBudget.start(decision_started_at)
@@ -7405,7 +7345,6 @@ def _buffer_group_message(
     followup_soft: bool = False,
 ) -> None:
     group_id = int(event.group_id)
-    _cancel_passive_decision_retry(group_id)
     item = BufferedGroupMessage(
         bot=bot,
         event=event,
@@ -7501,66 +7440,6 @@ async def _flush_group_buffer_after_delay(group_id: int, *, delay: float = GROUP
             _schedule_group_buffer_flush(group_id, delay=reschedule_delay)
 
 
-def _schedule_passive_decision_retry(group_id: int, items: list[BufferedGroupMessage]) -> None:
-    group_passive_retry_buffers[group_id] = list(items)
-    task = group_passive_retry_tasks.get(group_id)
-    if task is None or task.done():
-        group_passive_retry_tasks[group_id] = asyncio.create_task(_run_passive_decision_retry(group_id))
-    logger.info(
-        "qq_social_agent scheduled passive decision retry: "
-        f"group={group_id} size={len(items)} delay={GROUP_PASSIVE_DECISION_GAP_SECONDS}s"
-    )
-
-
-def _cancel_passive_decision_retry(group_id: int) -> None:
-    group_passive_retry_buffers.pop(group_id, None)
-    task = group_passive_retry_tasks.pop(group_id, None)
-    if task is not None and not task.done():
-        task.cancel()
-        logger.info(f"qq_social_agent canceled passive decision retry: group={group_id}")
-
-
-async def _run_passive_decision_retry(group_id: int) -> None:
-    should_reschedule = False
-    try:
-        await asyncio.sleep(GROUP_PASSIVE_DECISION_GAP_SECONDS)
-        async with _group_processing_lock(group_id):
-            if group_addressed_waiters.get(group_id, 0) > 0:
-                should_reschedule = True
-                return
-            items = group_passive_retry_buffers.pop(group_id, [])
-            if not items:
-                return
-            if group_message_buffers.get(group_id):
-                return
-            latest = items[-1]
-            logger.info(
-                "qq_social_agent passive decision retry flushing: "
-                f"group={group_id} size={len(items)}"
-            )
-            group_generation_inflight.add(group_id)
-            try:
-                with correlation_scope(latest.correlation_id):
-                    await _handle_group_message_locked(
-                        latest.bot,
-                        latest.event,
-                        buffered_messages=items,
-                        force_passive_decision=True,
-                        skip_memory_record=True,
-                    )
-            finally:
-                group_generation_inflight.discard(group_id)
-    finally:
-        task = asyncio.current_task()
-        if group_passive_retry_tasks.get(group_id) is task:
-            group_passive_retry_tasks.pop(group_id, None)
-        if should_reschedule and group_passive_retry_buffers.get(group_id):
-            _schedule_passive_decision_retry(
-                group_id,
-                group_passive_retry_buffers[group_id],
-            )
-
-
 def _buffered_current_text(items: list[BufferedGroupMessage] | None) -> str:
     if not items:
         return ""
@@ -7617,63 +7496,10 @@ def _buffered_current_nickname(items: list[BufferedGroupMessage] | None) -> str:
     return items[-1].nickname
 
 
-def _buffered_first_created_at(items: list[BufferedGroupMessage] | None) -> float:
-    if not items:
-        return time.time()
-    return items[0].created_at
-
-
 def _buffered_last_created_at(items: list[BufferedGroupMessage] | None) -> float:
     if not items:
         return time.time()
     return items[-1].created_at
-
-
-def _passive_decision_allowed(
-    group_id: int,
-    *,
-    message_count: int,
-    first_message_at: float,
-    last_message_at: float,
-) -> tuple[bool, str]:
-    current_count = max(1, message_count)
-    state = group_passive_decision_state.get(group_id)
-    if state is None:
-        group_passive_decision_state[group_id] = PassiveDecisionState(last_message_at, 0, 0.0)
-        return True, "first_decision"
-
-    if first_message_at - state.last_decision_at >= GROUP_PASSIVE_DECISION_GAP_SECONDS:
-        group_passive_decision_state[group_id] = PassiveDecisionState(last_message_at, 0, 0.0)
-        return True, "gap_since_decision"
-
-    first_waiting_at = state.first_waiting_at or first_message_at
-    waiting_count = state.waiting_count + current_count
-    if last_message_at - first_waiting_at >= GROUP_PASSIVE_DECISION_GAP_SECONDS:
-        group_passive_decision_state[group_id] = PassiveDecisionState(last_message_at, 0, 0.0)
-        return True, "waiting_gap_elapsed"
-
-    if waiting_count >= GROUP_PASSIVE_DECISION_EVERY_MESSAGES:
-        group_passive_decision_state[group_id] = PassiveDecisionState(
-            last_message_at,
-            waiting_count % GROUP_PASSIVE_DECISION_EVERY_MESSAGES,
-            0.0,
-        )
-        return True, "every_three_messages"
-
-    group_passive_decision_state[group_id] = PassiveDecisionState(
-        state.last_decision_at,
-        waiting_count,
-        first_waiting_at,
-    )
-    return False, f"waiting_{waiting_count}/{GROUP_PASSIVE_DECISION_EVERY_MESSAGES}"
-
-
-def _mark_passive_decision_forced(group_id: int, *, now: float | None = None) -> None:
-    group_passive_decision_state[group_id] = PassiveDecisionState(
-        time.time() if now is None else now,
-        0,
-        0.0,
-    )
 
 
 def _group_processing_lock(group_id: int) -> asyncio.Lock:

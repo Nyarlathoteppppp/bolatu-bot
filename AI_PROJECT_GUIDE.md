@@ -446,11 +446,9 @@ flowchart TD
   E -- 否 --> F{"低价值文本?"}
   F -- 是且非点名 --> Z
   F -- 否 --> G{"是否点名/回复 bot?"}
-  G -- 否 --> H["进入 6 秒 buffer"]
-  H --> I{"被动频率门"}
+  G -- 否 --> H["进入无固定延时的群消息队列"]
+  H --> J
   G -- 是 --> J["直接进入处理"]
-  I -- 不允许 --> K["30 秒后若没新消息强制重试"]
-  I -- 允许 --> J
   J --> L["写入 messages / member profile"]
   L --> M["频控 / 政治兜底 / 用户单独限频"]
   M --> N["本地 pre_decision_gate + tool_router"]
@@ -521,22 +519,19 @@ qq_social_agent/decision_gate.py
 LOW_VALUE_GROUP_TEXTS
 ```
 
-### 8.2 Buffer 和被动频率门
+### 8.2 群消息并发队列
 
 关键常量在 `plugin.py`：
 
 ```python
-GROUP_BUFFER_SECONDS = 6.0
-GROUP_PASSIVE_DECISION_GAP_SECONDS = 30
-GROUP_PASSIVE_DECISION_EVERY_MESSAGES = 3
+GROUP_BUFFER_SECONDS = 0.0
 ```
 
 含义：
 
-- 非点名群消息先攒 6 秒，避免每条都打 LLM。
-- 如果 30 秒内一直有人说话，则每 3 条普通消息才进一次 decision。
-- 如果 30 秒内没有新消息，则挂起的消息会强制进入一次 decision。
-- LLM 正在生成候选时，新消息先继续等待，不并发启动第二个生成。
+- 普通群消息进入无固定延时的队列，先后端筛选，再由 Timing Gate 判断是否发言。
+- 不再按每 3 条抽一条，也不会 30 秒后重试旧消息。
+- LLM 正在生成候选时，新消息留在队列，避免同群并发生成；这段等待取决于当前生成耗时。
 
 ### 8.3 点名和回复
 
@@ -921,13 +916,12 @@ cd /opt/qq-social-agent
 
 ### 15.2 改是否回复/插嘴频率
 
-看三层：
+看两层：
 
 1. 本地硬拦截：`decision_gate.py`
-2. buffer/被动频率门：`plugin.py` 的 `GROUP_BUFFER_SECONDS`、`GROUP_PASSIVE_DECISION_*`
-3. LLM 决策 prompt：`prompts/zhangfengxue.yaml` 的 `flows.decision`
+2. 群聊 Timing Gate：`qq_social_agent/jev_client.py` 的 `timing_gate`；JEV 不可用时回退到 `prompts/zhangfengxue.yaml` 的 `flows.timing_gate`
 
-不要只改 prompt。很多“不说话”其实是后端拦截或被动频率门。
+不要只改 prompt。后端拦截、用户触发概率和工作强度也会让消息不进入 Timing Gate。
 
 ### 15.3 改审批单/工具单
 
