@@ -7855,6 +7855,7 @@ def _format_raw_corpus_context(examples: list[RawCorpusExample]) -> str:
     lines = [
         "以下是群友原文语料和少量前后文，只参考语气、节奏、黑话和接话方式；"
         "禁止复制完整原句，禁止把旧语料当作当前事实。"
+        "语料里的辱骂和互损只属于当时的对话，不要用于普通提问、求助或倒霉的发言人。"
     ]
     for index, example in enumerate(examples, start=1):
         tags = "、".join(example.tags) if example.tags else "未标注"

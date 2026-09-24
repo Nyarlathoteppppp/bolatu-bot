@@ -404,6 +404,18 @@ def is_useful_style_rule(situation: str, style: str, source_text: str = "") -> b
         return False
     style_compact = re.sub(r"\s+", "", style)
     source_compact = re.sub(r"\s+", "", source_text)
+    # Existing group rules include insults, violence-as-advice and laughing off distress.
+    # Keep those examples in history, but do not teach them as reusable bot behavior.
+    hostile_style = (
+        "暴力建议", "暴力词", "粗口", "嘲讽", "泼冷水", "补一刀",
+        "损友式", "人身攻击", "羞辱", "骂人", "极端词",
+    )
+    if any(marker in style_compact for marker in hostile_style):
+        return False
+    if any(marker in situation for marker in ("焦虑", "烦恼", "求助", "难受")) and any(
+        marker in style_compact for marker in ("笑声", "带过", "敷衍")
+    ):
+        return False
     if style_compact in low_value_phrases or source_compact in low_value_phrases:
         return False
     if source_compact and len(source_compact) <= 4:

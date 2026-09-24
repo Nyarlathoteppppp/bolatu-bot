@@ -1558,7 +1558,11 @@ def test_style_rule_filter_rejects_literal_examples() -> None:
         "用重复关键词延续话题",
         "一只虎[#89800]回复灰機haru[#98238]消息【灰機haru[#98238]原消息内容未知，消息ID：87736905；一只虎[#89800]回复灰機haru[#98238]：玩坏了咋办】",
     )
-    assert _is_useful_style_rule("拒绝请求", "用一句损友式现实理由拒绝", "不能，你胖的不差这点")
+    assert not _is_useful_style_rule("拒绝请求", "用一句损友式现实理由拒绝", "不能，你胖的不差这点")
+    assert not _is_useful_style_rule("群友遇到人际纠纷求助时", "用夸张暴力建议反讽，制造荒诞感")
+    assert not _is_useful_style_rule("群友自嘲焦虑或烦恼时", "用简短笑声附和带过")
+    assert not _is_useful_style_rule("有人装懂或说教时", "用短句直接反驳或嘲讽，不展开")
+    assert _is_useful_style_rule("群友讨论技术问题时", "先给具体判断，再补一句轻松的观察")
 
 
 def test_specific_user_reply_cooldown() -> None:
