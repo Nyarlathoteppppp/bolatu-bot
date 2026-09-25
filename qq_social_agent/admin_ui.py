@@ -26,6 +26,15 @@ def render_admin_dashboard(
     recent_messages = memory.admin_recent_messages(group_id=group_id, limit=40)
     relation_events = memory.admin_recent_metric_events(event_types=("message_relation",), group_id=group_id, limit=25)
     decision_events = memory.admin_recent_metric_events(event_types=("decision_start", "llm_decision", "timing_gate"), group_id=group_id, limit=30)
+    group_flow_events = memory.admin_recent_metric_events(
+        event_types=(
+            "pipeline_receive", "group_gate", "group_flow_timing", "suppression",
+            "decision_result", "candidate_generated", "message_sent",
+            "approval_requested", "approval_accepted", "approval_auto_send", "approval_request_failed", "approval_canceled",
+        ),
+        group_id=group_id,
+        limit=300,
+    )
     rag_events = memory.admin_recent_metric_events(event_types=("rag_retrieval", "tool_call", "tool_route_plan"), group_id=group_id, limit=25)
     atoms = memory.admin_recent_memory_atoms(group_id=group_id, status="active", limit=16)
     styles = memory.recent_style_rules(group_id, 12) if group_id is not None else []
@@ -61,6 +70,7 @@ def render_admin_dashboard(
         {_panel('最近关系判断', _metric_table(relation_events, show_meta=True))}
         {_panel('最近决策', _metric_table(decision_events, show_meta=True))}
       </section>
+      <section class="panel wide"><h2>群聊决策链与耗时</h2>{_group_flow_table(group_flow_events)}</section>
       <section class="grid two">
         {_panel('RAG / 工具', _metric_table(rag_events, show_meta=True))}
         {_panel('24h Token / 模型调用', _usage_table(usage))}
@@ -1037,6 +1047,68 @@ def _metric_table(rows: list[Any], *, show_meta: bool) -> str:
         meta = _loads_json(_row(row, 'metadata_json'))
         summary = _metric_summary(meta) if show_meta else ''
         out.append(f'<tr><td class="small">{_fmt_time(_row(row, "created_at"))}</td><td>{_e(_row(row, "event_type"))}</td><td>{_e(_row(row, "stage"))}</td><td>{_e(_row(row, "action"))}</td><td>{summary}</td></tr>')
+    out.append('</table>')
+    return ''.join(out)
+
+
+def _group_flow_table(rows: list[Any]) -> str:
+    flows: dict[str, dict[str, Any]] = {}
+    for row in reversed(rows):
+        meta = _loads_json(_row(row, 'metadata_json'))
+        correlation_id = str(meta.get('correlation_id') or '').strip()
+        if not correlation_id:
+            continue
+        flow = flows.setdefault(correlation_id, {'created_at': 0.0, 'steps': [], 'timings': {}})
+        flow['created_at'] = max(float(flow['created_at']), float(_row(row, 'created_at') or 0))
+        event_type = str(_row(row, 'event_type') or '')
+        stage = str(_row(row, 'stage') or '')
+        action = str(_row(row, 'action') or '')
+        if event_type == 'pipeline_receive':
+            flow['steps'].append('收到')
+        elif event_type == 'group_gate':
+            label = f'{stage}:{action}'
+            if meta.get('percent') is not None:
+                label += f'({meta["percent"]}%)'
+            if stage == 'reply_decision' and meta.get('source'):
+                label += f'[{meta["source"]}]'
+            flow['steps'].append(label)
+        elif event_type == 'suppression':
+            flow['steps'].append(f'{stage}:拦截')
+        elif event_type == 'decision_result':
+            flow['steps'].append(f'决策:{action}')
+            flow['timings']['决策'] = meta.get('elapsed_ms')
+        elif event_type == 'candidate_generated':
+            flow['steps'].append('草稿完成')
+            flow['timings']['生成'] = meta.get('elapsed_ms')
+        elif event_type == 'approval_requested':
+            flow['steps'].append('待审批')
+        elif event_type == 'approval_accepted':
+            flow['steps'].append('审批通过')
+            flow['timings']['审批等待'] = meta.get('approval_wait_ms')
+        elif event_type == 'approval_auto_send':
+            flow['steps'].append('自动放行')
+        elif event_type == 'approval_request_failed':
+            flow['steps'].append('审批请求失败')
+        elif event_type == 'approval_canceled':
+            flow['steps'].append('审批取消')
+        elif event_type == 'message_sent':
+            flow['steps'].append('已发送')
+        if event_type == 'group_flow_timing':
+            flow['timings'][{'ingress': '入口', 'media': '媒体', 'buffer_wait': '缓冲', 'lock_wait': '等锁'}.get(stage, stage)] = meta.get('elapsed_ms')
+        if meta.get('receive_elapsed_ms') is not None:
+            flow['timings']['收到至此'] = meta['receive_elapsed_ms']
+    if not flows:
+        return '<p class="muted">暂无记录。</p>'
+    out = ['<table><tr><th>最近活动</th><th>消息链路</th><th>关卡与结果</th><th>耗时 ms</th></tr>']
+    for correlation_id, flow in sorted(flows.items(), key=lambda item: item[1]['created_at'], reverse=True)[:20]:
+        link = '/trace?' + urlencode({'trace_id': correlation_id})
+        steps = ' → '.join(flow['steps']) or '处理中'
+        timings = ' / '.join(f'{key} {_e(value)}' for key, value in flow['timings'].items()) or '—'
+        out.append(
+            f'<tr><td class="small">{_fmt_time(flow["created_at"])}</td>'
+            f'<td><a href="{_e(link)}">{_e(correlation_id)}</a></td>'
+            f'<td>{_e(steps)}</td><td>{timings}</td></tr>'
+        )
     out.append('</table>')
     return ''.join(out)
 

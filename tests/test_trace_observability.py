@@ -81,6 +81,19 @@ def test_trace_snapshot_uses_fixed_stage_order_and_calculates_durations() -> Non
     json.dumps(snapshot, ensure_ascii=False)
 
 
+def test_trace_shows_gate_block_and_media_timing() -> None:
+    events = [
+        _event("message_received", "group", "received", 100.0),
+        _event("group_flow_timing", "media", "completed", 100.1, elapsed_ms=120),
+        _event("group_gate", "work_intensity", "blocked", 100.2, reason="probability_miss"),
+    ]
+    trace = build_trace_snapshot(events)["traces"][0]
+    assert trace["status"] == "skipped"
+    phases = {phase["stage"]: phase for phase in trace["phases"]}
+    assert phases["ocr"]["duration_ms"] == 120
+    assert phases["decision"]["status"] == "skipped"
+
+
 def test_trace_falls_back_to_message_id_and_redacts_nested_metadata() -> None:
     metadata = {
         "source_message_id": "42",

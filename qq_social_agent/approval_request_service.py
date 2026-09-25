@@ -110,6 +110,7 @@ async def request_group_approval(
             stage="approval",
             action="send_private_failed",
             candidate_count=len(approval.candidates),
+            correlation_id=approval.pipeline_state.correlation_id if approval.pipeline_state is not None else None,
         )
         return
     services.record_metric_event(
@@ -120,6 +121,7 @@ async def request_group_approval(
         action="pending",
         candidate_count=len(approval.candidates),
         delivered=delivered,
+        correlation_id=approval.pipeline_state.correlation_id if approval.pipeline_state is not None else None,
     )
     services.logger.info(
         "qq_social_agent group approval pending: "
@@ -145,6 +147,7 @@ async def _auto_send_candidate(
             stage="pre_send_duplicate",
             action="skipped",
             reason=duplicate_reason,
+            correlation_id=approval.pipeline_state.correlation_id if approval.pipeline_state is not None else None,
         )
         services.logger.info(
             "qq_social_agent skipped duplicate group reply: "
@@ -160,6 +163,7 @@ async def _auto_send_candidate(
         stage=stage,
         action=candidate.action,
         candidate_count=len(approval.candidates),
+        correlation_id=approval.pipeline_state.correlation_id if approval.pipeline_state is not None else None,
         **fields,
     )
     description = "auto approval send" if percent is None else "probabilistic auto approval send"

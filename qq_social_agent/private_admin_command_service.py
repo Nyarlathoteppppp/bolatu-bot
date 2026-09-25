@@ -228,7 +228,8 @@ async def handle_private_admin_command(
             user_id,
             (
                 f"已设置 AI 工作强度：{percent}%。\n"
-                "群消息仍会写入上下文和学习素材；只有命中的触发批次会进入硬筛选、decision、搜索/行情和生成。"
+                "此设置持续生效，直到再次调整。群消息仍会写入上下文和学习素材；"
+                "只有命中的触发批次会进入硬筛选、decision、搜索/行情和生成。"
             ),
         )
         return True

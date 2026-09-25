@@ -1336,24 +1336,12 @@ def test_pre_decision_gate_handles_addressed_fresh_lookup_locally() -> None:
     assert result.decision.reason == "local_addressed_fresh_lookup"
 
 
-def test_ai_work_intensity_time_band_defaults_and_override(monkeypatch, tmp_path) -> None:
+def test_ai_work_intensity_manual_setting_persists_across_time(monkeypatch, tmp_path) -> None:
     store = _use_temp_plugin_memory(monkeypatch, tmp_path)
     store.app_kv_set(plugin.AI_WORK_INTENSITY_PERCENT_KEY, "80")
-    midnight = datetime(2026, 7, 14, 1, 0, tzinfo=plugin.DAILY_REVIEW_TIMEZONE)
-    morning = datetime(2026, 7, 14, 8, 0, tzinfo=plugin.DAILY_REVIEW_TIMEZONE)
-    daytime = datetime(2026, 7, 14, 15, 0, tzinfo=plugin.DAILY_REVIEW_TIMEZONE)
-
-    assert plugin._ai_work_intensity_percent(midnight) == 50
-    assert plugin._ai_work_intensity_percent(morning) == 5
-    assert plugin._ai_work_intensity_percent(daytime) == 80
-
-    band, _ = plugin._ai_work_intensity_band(midnight)
-    store.app_kv_set(
-        plugin.AI_WORK_INTENSITY_OVERRIDE_KEY,
-        json.dumps({"band": band, "percent": 37}),
-    )
-    assert plugin._ai_work_intensity_percent(midnight) == 37
-    assert plugin._ai_work_intensity_percent(morning) == 5
+    assert plugin._ai_work_intensity_percent() == 80
+    assert plugin._set_ai_work_intensity_percent(37) == 37
+    assert plugin._ai_work_intensity_percent() == 37
 
 
 def test_addressed_question_cannot_be_silenced_by_llm_ignore() -> None:
@@ -2336,12 +2324,9 @@ def test_regular_basic_approver_cannot_set_approval_auto_send_percent(monkeypatc
     assert bot.private_messages[-1] == (123456789, "你只有基础审批权限：A/B/C/D/X/1/2/3/取消 处理审批单。")
 
 
-def test_ai_work_intensity_defaults_to_configured_daytime_percent(monkeypatch, tmp_path) -> None:
+def test_ai_work_intensity_defaults_to_100_percent(monkeypatch, tmp_path) -> None:
     _use_temp_plugin_memory(monkeypatch, tmp_path)
-    daytime = datetime(2026, 7, 14, 13, 0, tzinfo=plugin.DAILY_REVIEW_TIMEZONE)
-
-    percent = plugin._ai_work_intensity_percent(daytime)
-    assert percent == 8
+    assert plugin._ai_work_intensity_percent() == 100
 
 
 def test_owner_can_set_ai_work_intensity_percent(monkeypatch, tmp_path) -> None:
@@ -2364,12 +2349,10 @@ def test_owner_can_set_ai_work_intensity_percent(monkeypatch, tmp_path) -> None:
 def test_basic_approver_cannot_set_ai_work_intensity_percent(monkeypatch, tmp_path) -> None:
     _use_temp_plugin_memory(monkeypatch, tmp_path)
     bot = FakeApprovalBot()
-    daytime = datetime(2026, 7, 14, 13, 0, tzinfo=plugin.DAILY_REVIEW_TIMEZONE)
-
     handled = asyncio.run(plugin._handle_group_approval_private(bot, 3370998238, "工作强度 30"))
 
     assert handled
-    assert plugin._ai_work_intensity_percent(daytime) == 8
+    assert plugin._ai_work_intensity_percent() == 100
     assert bot.private_messages[-1] == (3370998238, "你只有基础审批权限：A/B/C/D/X/1/2/3/取消 处理审批单。")
 
 
@@ -2426,6 +2409,24 @@ def test_policy_suppressed_message_is_still_recorded_and_learned(monkeypatch, tm
     assert learned == [1026813421]
 
 
+def test_memory_only_long_message_skips_model_summary_but_keeps_original(monkeypatch, tmp_path) -> None:
+    store = _use_temp_plugin_memory(monkeypatch, tmp_path)
+    async def forbidden_summary(*args, **kwargs):
+        raise AssertionError('non-triggering message must not call long-message summarizer')
+    monkeypatch.setattr(plugin, '_message_text_for_context', forbidden_summary)
+    text = '这是需要保存的长消息。' * 100
+    event = SimpleNamespace(
+        group_id=1026813421, user_id=2123506373, self_id=1801507496,
+        message_id=9111, time=time.time(), message=Message([MessageSegment.text(text)]),
+        sender=SimpleNamespace(card='只记忆用户', nickname='只记忆用户'),
+        reply=None, to_me=False, get_plaintext=lambda: text,
+    )
+    bot = SimpleNamespace(self_id=1801507496)
+    asyncio.run(plugin._handle_group_message_scoped(bot, event, correlation_id='group:9111'))
+    saved = store.recent_messages(1026813421, 1)
+    assert saved and saved[-1].text == text
+
+
 def test_group_question_answer_can_redirect_to_private_without_group_send(monkeypatch, tmp_path) -> None:
     store = _use_temp_plugin_memory(monkeypatch, tmp_path)
     state = plugin.PipelineState(
@@ -2457,6 +2458,10 @@ def test_group_question_answer_can_redirect_to_private_without_group_send(monkey
     ]
     assert all(not message.is_bot for message in store.recent_messages(1026813421, 5))
     assert state.stage.value == "completed"
+    sent = store.admin_recent_metric_events(event_types=("message_sent",), group_id=1026813421, limit=1)
+    sent_metadata = json.loads(sent[0]["metadata_json"])
+    assert sent_metadata["correlation_id"] == "cid-private-answer"
+    assert sent_metadata["receive_elapsed_ms"] >= 0
 
 
 def test_request_group_approval_auto_sends_by_probability(monkeypatch, tmp_path) -> None:

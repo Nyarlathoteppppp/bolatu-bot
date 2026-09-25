@@ -46,6 +46,7 @@ MAX_TRACE_METADATA_STRING = 240
 
 _EVENT_TYPE_STAGES = {
     "message_received": "receive",
+    "group_gate": "decision",
     "message_duplicate": "receive",
     "image_ocr": "ocr",
     "history_backfill": "history",
@@ -67,14 +68,18 @@ _STAGE_ALIASES = {
     "receive": "receive",
     "received": "receive",
     "inbound": "receive",
+    "ingress": "receive",
     "ocr": "ocr",
     "image_ocr": "ocr",
     "media_context": "ocr",
+    "media": "ocr",
     "history": "history",
     "history_backfill": "history",
     "reply_reference": "history",
     "buffer": "buffer",
     "buffered": "buffer",
+    "buffer_wait": "buffer",
+    "lock_wait": "buffer",
     "locked": "buffer",
     "rag": "rag",
     "rag_retrieval": "rag",
@@ -106,6 +111,7 @@ _TRACE_METADATA_KEYS = (
     "latency_ms",
     "duration_ms",
     "flow_elapsed_ms",
+    "receive_elapsed_ms",
     "approval_wait_ms",
     "error",
     "error_type",
@@ -847,7 +853,7 @@ def _trace_event_condition(event: _NormalizedTraceEvent) -> str:
         return "skipped"
     if (
         event.event_type.casefold() in {"suppression", "message_duplicate", "approval_canceled"}
-        or any(word in tokens for word in (" reject", "rejected", "canceled", "cancelled", "skipped", "ignore", "duplicate"))
+        or any(word in tokens for word in ("blocked", " reject", "rejected", "canceled", "cancelled", "skipped", "ignore", "duplicate"))
     ):
         return "skipped"
     if any(word in tokens for word in ("pending", "waiting", "queued")):

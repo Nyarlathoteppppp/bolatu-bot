@@ -1,4 +1,5 @@
 from qq_social_agent.admin_ui import (
+    _group_flow_table,
     render_admin_dashboard,
     render_admin_edit_page,
     render_admin_tools_page,
@@ -9,6 +10,30 @@ from qq_social_agent.admin_ui import (
     render_message_detail_page,
 )
 from qq_social_agent.memory import MemoryStore
+
+
+def test_group_flow_table_links_gates_and_end_to_end_timing(tmp_path) -> None:
+    memory = MemoryStore(tmp_path / "bot.sqlite3")
+    correlation_id = 'group:100:<unsafe>'
+    for event_type, stage, action, metadata, created_at in (
+        ('pipeline_receive', 'receive', 'start', {}, 100.0),
+        ('group_gate', 'work_intensity', 'passed', {'percent': 100}, 101.0),
+        ('group_flow_timing', 'lock_wait', 'completed', {'elapsed_ms': 7}, 102.0),
+        ('decision_result', 'llm', 'reply', {'elapsed_ms': 800}, 103.0),
+        ('message_sent', 'send', 'reply', {'receive_elapsed_ms': 1400}, 104.0),
+    ):
+        memory.add_metric_event(
+            event_type=event_type, group_id=100, stage=stage, action=action,
+            metadata={'correlation_id': correlation_id, **metadata}, created_at=created_at,
+        )
+    rows = memory.admin_recent_metric_events(group_id=100, limit=30)
+    rendered = _group_flow_table(rows)
+    assert 'work_intensity:passed(100%)' in rendered
+    assert '等锁 7' in rendered
+    assert '收到至此 1400' in rendered
+    assert '已发送' in rendered
+    assert '&lt;unsafe&gt;' in rendered
+    assert 'trace_id=group%3A100%3A%3Cunsafe%3E' in rendered
 
 
 def test_admin_message_detail_renders_saved_message_chain(tmp_path) -> None:

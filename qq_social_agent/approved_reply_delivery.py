@@ -75,6 +75,7 @@ async def send_approved_group_reply_inner(
         high_quality=high_quality,
         candidate_index=candidate.index,
         approval_wait_ms=max(0, int((time.time() - approval.created_at) * 1000)),
+        correlation_id=pipeline_state.correlation_id if pipeline_state is not None else None,
     )
     private_reply_user_id = pipeline_state.private_reply_user_id if pipeline_state is not None else 0
     if private_reply_user_id:
@@ -102,6 +103,11 @@ async def send_approved_group_reply_inner(
                 private_reply_user_id=private_reply_user_id,
                 message_count=1,
                 elapsed_ms=int((time.monotonic() - send_started_at) * 1000),
+                receive_elapsed_ms=(
+                    int((time.monotonic() - pipeline_state.received_monotonic) * 1000)
+                    if pipeline_state is not None else None
+                ),
+                correlation_id=pipeline_state.correlation_id if pipeline_state is not None else None,
                 approval_id=approval.approval_id,
                 pipeline_stages=list(pipeline_state.stage_history) if pipeline_state is not None else [],
             )
@@ -320,6 +326,11 @@ async def send_approved_group_reply_inner(
         action=candidate.action,
         message_count=len(reply_parts),
         elapsed_ms=send_elapsed_ms,
+        receive_elapsed_ms=(
+            int((time.monotonic() - pipeline_state.received_monotonic) * 1000)
+            if pipeline_state is not None else None
+        ),
+        correlation_id=pipeline_state.correlation_id if pipeline_state is not None else None,
         approval_id=approval.approval_id,
         pipeline_stages=list(pipeline_state.stage_history) if pipeline_state is not None else [],
     )

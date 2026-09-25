@@ -735,7 +735,6 @@ PRIVATE_FORCE_OBEY_ONCE_RE = re.compile(
 APPROVAL_REVIEW_ENABLED_KEY = "group_approval_review_enabled"
 APPROVAL_AUTO_SEND_PERCENT_KEY = "group_approval_auto_send_percent"
 AI_WORK_INTENSITY_PERCENT_KEY = "group_ai_work_intensity_percent"
-AI_WORK_INTENSITY_OVERRIDE_KEY = "group_ai_work_intensity_schedule_override"
 AI_WORK_INTENSITY_STATUS_COMMANDS = {"工作强度", "AI强度", "ai强度", "活跃度", "触发概率"}
 AI_WORK_INTENSITY_PERCENT_RE = re.compile(
     r"^(?:/)?(?:工作强度|AI强度|ai强度|活跃度|触发概率)\s*[:：]?\s*(?P<percent>\d{1,3})?%?$"
@@ -2633,50 +2632,24 @@ def _ai_work_intensity_base_percent() -> int:
     if not isinstance(rate_config, dict):
         rate_config = {}
     try:
-        configured_default = int(rate_config.get("daytime_work_intensity_percent", 8))
+        configured_default = int(rate_config.get("default_work_intensity_percent", 100))
     except (TypeError, ValueError):
-        configured_default = 8
-    configured_default = max(0, min(100, configured_default))
+        configured_default = 100
+    return max(0, min(100, configured_default))
+
+
+def _ai_work_intensity_percent() -> int:
     raw = memory.app_kv_get(AI_WORK_INTENSITY_PERCENT_KEY)
     try:
-        percent = int((raw or str(configured_default)).strip())
+        percent = int(raw.strip()) if raw is not None else _ai_work_intensity_base_percent()
     except (TypeError, ValueError):
-        percent = configured_default
+        percent = _ai_work_intensity_base_percent()
     return max(0, min(100, percent))
-
-
-def _ai_work_intensity_band(now: datetime | None = None) -> tuple[str, int | None]:
-    current = now or datetime.now(DAILY_REVIEW_TIMEZONE)
-    if current.hour < 2:
-        return f"{current.date().isoformat()}:00-02", 50
-    if current.hour < 12:
-        return f"{current.date().isoformat()}:02-12", 5
-    return f"{current.date().isoformat()}:12-24", None
-
-
-def _ai_work_intensity_percent(now: datetime | None = None) -> int:
-    band, scheduled_default = _ai_work_intensity_band(now)
-    raw_override = memory.app_kv_get(AI_WORK_INTENSITY_OVERRIDE_KEY)
-    if raw_override:
-        try:
-            override = json.loads(raw_override)
-            if str(override.get("band") or "") == band:
-                return max(0, min(100, int(override.get("percent"))))
-        except (TypeError, ValueError, json.JSONDecodeError):
-            pass
-    if scheduled_default is not None:
-        return scheduled_default
-    return _ai_work_intensity_base_percent()
 
 
 def _set_ai_work_intensity_percent(percent: int) -> int:
     cleaned = max(0, min(100, int(percent)))
     memory.app_kv_set(AI_WORK_INTENSITY_PERCENT_KEY, str(cleaned))
-    band, _ = _ai_work_intensity_band()
-    memory.app_kv_set(
-        AI_WORK_INTENSITY_OVERRIDE_KEY,
-        json.dumps({"band": band, "percent": cleaned}, ensure_ascii=False),
-    )
     return cleaned
 
 
@@ -2847,9 +2820,8 @@ def _format_ai_work_intensity_status() -> str:
     percent = _ai_work_intensity_percent()
     base_percent = _ai_work_intensity_base_percent()
     return (
-        f"AI工作强度：当前生效 {percent}%（日间常规 {base_percent}%）\n"
-        "时段默认：00:00–02:00 为 50%，02:00–12:00 为 5%，12:00–24:00 使用日间常规值；"
-        "手动设置可覆盖当前时段，到下一个时段边界重新应用默认。\n"
+        f"AI工作强度：当前生效 {percent}%（默认 {base_percent}%）。\n"
+        "手动设置会持续生效，直到再次调整。\n"
         "作用：控制群聊触发批次进入硬筛选、decision、搜索/行情和生成的概率。\n"
         "不影响：消息照常写入数据库、短期上下文、原文语料、画像素材和学习素材；艾特/回复/点名风雪不受概率影响。\n"
         "命令：工作强度 60；AI强度 30%；触发概率 100。0% 等同只记忆不主动插话。"
@@ -3309,7 +3281,6 @@ def _admin_tools_state(group_id: int | None) -> dict[str, object]:
         "work_intensity": {
             "current_percent": _ai_work_intensity_percent(),
             "base_percent": _ai_work_intensity_base_percent(),
-            "band": _ai_work_intensity_band()[0],
         },
         "private_chat": {
             "config_ids": sorted(app_config.allowed_private_users),
@@ -3358,7 +3329,7 @@ async def _admin_apply_tool_action(form: dict[str, str], *, group_id: int | None
         return f"已设置免审自动发送概率：{percent}%。"
     if action == "work_intensity":
         percent = _set_ai_work_intensity_percent(_safe_admin_percent(form.get("percent"), default=_ai_work_intensity_percent()))
-        return f"已设置当前时段 AI 工作强度：{percent}%。"
+        return f"已设置 AI 工作强度：{percent}%，持续生效直到再次调整。"
     if action == "quiet_group":
         if group_id is None:
             return "没有目标群。"
@@ -4114,6 +4085,8 @@ async def _handle_group_message_scoped(
             )
     raw_text = _message_context_text(event, bot_id=int(bot.self_id), resolved_reply=reply_reference)
     message_storage_kwargs = _event_message_storage_kwargs(event, bot=bot)
+    has_context_media = _message_has_context_media(event)
+    media_started_at = time.monotonic()
     file_context = ""
     if group_allowed:
         file_context = await file_metadata_context_for_event(bot, event)
@@ -4222,6 +4195,12 @@ async def _handle_group_message_scoped(
                 action="skipped",
                 reason="jev_not_worth_reading",
             )
+    if has_context_media:
+        _record_metric_event(
+            "group_flow_timing", group_id=group_id, user_id=int(event.user_id),
+            stage="media", action="completed",
+            elapsed_ms=int((time.monotonic() - media_started_at) * 1000),
+        )
     _record_metric_event(
         "message_received",
         group_id=group_id,
@@ -4232,7 +4211,7 @@ async def _handle_group_message_scoped(
         direct_addressed=addressed_bot,
         followup_addressed=followup_addressed,
         followup_soft=followup_soft,
-        has_media=_message_has_context_media(event),
+        has_media=has_context_media,
         has_file_context=bool(file_context),
         has_ocr=bool(ocr_context.text),
         ocr_count=ocr_context.ocr_count,
@@ -4240,6 +4219,11 @@ async def _handle_group_message_scoped(
         correlation_id=correlation_id,
     )
     text = raw_text
+    _record_metric_event(
+        "group_flow_timing", group_id=group_id, user_id=int(event.user_id),
+        stage="ingress", action="completed",
+        elapsed_ms=int((time.monotonic() - pipeline_state.received_monotonic) * 1000),
+    )
     pipeline_state.text = raw_text or plain_text
     pipeline_state.addressed = addressed_bot or followup_addressed
     pipeline_state.mentioned = mentioned_bot
@@ -4298,20 +4282,11 @@ async def _handle_group_message_scoped(
             reason="后端拦截：这条主要是图片/语音/视频或无法读取的转发记录，bot 看不到内容，不进入 buffer 和 LLM decision。",
         )
         return
-    if (
-        raw_text
-        and group_allowed
-        and plain_text
-        and not _is_low_value_group_text(plain_text)
-        and not forward_context
-        and _should_compact_group_context_message(event, raw_text=raw_text, plain_text=plain_text)
-    ):
-        text = await _message_text_for_context(
-            raw_text,
-            nickname=_nickname(event),
-            chat_label=f"QQ 群聊 {group_id}",
-        )
     if group_allowed and user_policy.memory_only:
+        _record_metric_event(
+            "group_gate", group_id=group_id, user_id=int(event.user_id),
+            stage="user_policy", action="blocked", reason="memory_only",
+        )
         _record_policy_suppressed_group_message(
             group_id=group_id,
             user_id=int(event.user_id),
@@ -4364,6 +4339,11 @@ async def _handle_group_message_scoped(
         and not contextual_search_request
     ):
         if not _ordinary_user_trigger_selected(user_policy.ordinary_trigger_percent):
+            _record_metric_event(
+                "group_gate", group_id=group_id, user_id=int(event.user_id),
+                stage="user_trigger", action="blocked",
+                reason="probability_miss", percent=user_policy.ordinary_trigger_percent,
+            )
             _record_policy_suppressed_group_message(
                 group_id=group_id,
                 user_id=int(event.user_id),
@@ -4381,6 +4361,15 @@ async def _handle_group_message_scoped(
                 f"percent={user_policy.ordinary_trigger_percent}"
             )
             return
+        _record_metric_event(
+            "group_gate", group_id=group_id, user_id=int(event.user_id),
+            stage="user_trigger", action="passed",
+            percent=user_policy.ordinary_trigger_percent,
+        )
+        text = await _maybe_compact_group_context_text(
+            event, raw_text=raw_text, plain_text=plain_text,
+            forward_context=forward_context, group_id=group_id,
+        )
         _buffer_group_message(
             bot,
             event,
@@ -4391,6 +4380,10 @@ async def _handle_group_message_scoped(
             pipeline_state=pipeline_state,
         )
         return
+    text = await _maybe_compact_group_context_text(
+        event, raw_text=raw_text, plain_text=plain_text,
+        forward_context=forward_context, group_id=group_id,
+    )
     forced_buffered_messages: list[BufferedGroupMessage] | None = None
     if contextual_search_request and group_message_buffers.get(group_id):
         task = group_buffer_tasks.pop(group_id, None)
@@ -4445,8 +4438,15 @@ async def _handle_group_message_scoped(
         return
     if effective_addressed:
         group_addressed_waiters[group_id] = group_addressed_waiters.get(group_id, 0) + 1
+    lock_requested_at = time.monotonic()
     try:
         async with _group_processing_lock(group_id):
+            _record_metric_event(
+                "group_flow_timing", group_id=group_id, user_id=int(event.user_id),
+                stage="lock_wait", action="completed",
+                elapsed_ms=int((time.monotonic() - lock_requested_at) * 1000),
+                receive_elapsed_ms=int((time.monotonic() - pipeline_state.received_monotonic) * 1000),
+            )
             await _handle_group_message_locked(
                 bot,
                 event,
@@ -4645,11 +4645,19 @@ async def _handle_group_message_locked(
     state = memory.group_state(group_id)
     enabled = bool(group_cfg.get("enabled", True)) and bool(state["enabled"])
     if not enabled:
+        _record_metric_event(
+            "group_gate", group_id=group_id, user_id=user_id,
+            stage="group_enabled", action="blocked", reason="group_disabled",
+        )
         logger.info(f"qq_social_agent ignored group={group_id}: disabled")
         return
     muted_until = float(state["muted_until"] or 0)
     muted_until = await _refresh_self_mute_state_if_stale(bot, group_id, muted_until)
     if muted_until > time.time():
+        _record_metric_event(
+            "group_gate", group_id=group_id, user_id=user_id,
+            stage="self_mute", action="blocked", reason="muted",
+        )
         logger.info(
             "qq_social_agent skipped while self muted: "
             f"group={group_id} until={muted_until} addressed={addressed_bot}"
@@ -4670,6 +4678,11 @@ async def _handle_group_message_locked(
         _ai_work_intensity_applies(addressed_bot=addressed_bot)
         and not _ai_work_intensity_selected(work_intensity_percent)
     ):
+        _record_metric_event(
+            "group_gate", group_id=group_id, user_id=user_id,
+            stage="work_intensity", action="blocked",
+            reason="probability_miss", percent=work_intensity_percent,
+        )
         logger.info(
             "qq_social_agent skipped by ai work intensity: "
             f"group={group_id} percent={work_intensity_percent} user={user_id} text={text!r}"
@@ -4689,6 +4702,11 @@ async def _handle_group_message_locked(
         )
         _schedule_group_learning(group_id)
         return
+    _record_metric_event(
+        "group_gate", group_id=group_id, user_id=user_id,
+        stage="work_intensity", action="bypassed" if addressed_bot else "passed",
+        percent=work_intensity_percent,
+    )
 
     normalized_rag_query = normalize_rag_query(text)
     tool_query_text = normalized_rag_query.current_utterance or text
@@ -4726,6 +4744,7 @@ async def _handle_group_message_locked(
         action="start",
         addressed=addressed_bot,
         text=_short_notice_text(text, 120),
+        receive_elapsed_ms=int((time.monotonic() - pipeline_state.received_monotonic) * 1000),
     )
 
     persona_id = str(state["persona"] or group_cfg.get("persona") or app_config.default_persona)
@@ -4740,6 +4759,10 @@ async def _handle_group_message_locked(
     )
     rate = rate_limiter.allow(group_id, mentioned=addressed_bot, event_at=event_at)
     if not rate.allowed:
+        _record_metric_event(
+            "group_gate", group_id=group_id, user_id=user_id,
+            stage="rate_limit", action="blocked", reason=rate.reason,
+        )
         logger.info(f"qq_social_agent suppressed by rate: group={group_id} reason={rate.reason}")
         await _send_approval_suppression_notice(
             bot,
@@ -4751,8 +4774,16 @@ async def _handle_group_message_locked(
             reason=f"发言频率限制拦截：{rate.reason}",
         )
         return
+    _record_metric_event(
+        "group_gate", group_id=group_id, user_id=user_id,
+        stage="rate_limit", action="passed",
+    )
 
     if not addressed_bot and _user_reply_cooling_down(group_id, user_id):
+        _record_metric_event(
+            "group_gate", group_id=group_id, user_id=user_id,
+            stage="user_cooldown", action="blocked", reason="cooldown",
+        )
         logger.info(
             "qq_social_agent suppressed by user cooldown: "
             f"group={group_id} user={user_id} cooldown={app_config.user_reply_cooldowns[user_id]}"
@@ -5188,6 +5219,7 @@ async def _handle_group_message_locked(
         candidate_count=len(approval_candidates),
         elapsed_ms=generation_elapsed_ms,
         flow_elapsed_ms=int((time.monotonic() - flow_started_at) * 1000),
+        receive_elapsed_ms=int((time.monotonic() - pipeline_state.received_monotonic) * 1000),
         critic_status=critic_result.status,
         critic_failed=critic_result.failed,
         critic_failures=list(critic_result.failures),
@@ -6952,6 +6984,29 @@ async def _message_text_for_context(text: str, *, nickname: str, chat_label: str
     return f"[长消息{len(clean)}字摘要] {summary}"
 
 
+async def _maybe_compact_group_context_text(
+    event: GroupMessageEvent,
+    *,
+    raw_text: str,
+    plain_text: str,
+    forward_context: str,
+    group_id: int,
+) -> str:
+    if (
+        raw_text
+        and plain_text
+        and not _is_low_value_group_text(plain_text)
+        and not forward_context
+        and _should_compact_group_context_message(event, raw_text=raw_text, plain_text=plain_text)
+    ):
+        return await _message_text_for_context(
+            raw_text,
+            nickname=_nickname(event),
+            chat_label=f"QQ 群聊 {group_id}",
+        )
+    return raw_text
+
+
 def _should_compact_group_context_message(
     event: GroupMessageEvent | PrivateMessageEvent,
     *,
@@ -7419,6 +7474,13 @@ async def _flush_group_buffer_after_delay(group_id: int, *, delay: float = GROUP
                 f"group={group_id} size={len(items)}"
             )
             latest = items[-1]
+            if latest.pipeline_state is not None:
+                _record_metric_event(
+                    "group_flow_timing", group_id=group_id, user_id=latest.user_id,
+                    stage="buffer_wait", action="completed",
+                    elapsed_ms=int((time.monotonic() - latest.pipeline_state.received_monotonic) * 1000),
+                    correlation_id=latest.correlation_id,
+                )
             group_generation_inflight.add(group_id)
             try:
                 with correlation_scope(latest.correlation_id):

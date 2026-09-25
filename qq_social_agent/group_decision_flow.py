@@ -88,6 +88,7 @@ async def resolve_group_reply_decision(
     repair_resolution = discourse_state.repair
     ambiguity_resolution = discourse_state.ambiguity_resolution
     decision = pre_decision.decision
+    decision_source = "local" if decision is not None else ""
     _pipeline_mark_gated(pipeline_state)
     _record_tool_router_shadow(
         group_id=group_id,
@@ -113,6 +114,7 @@ async def resolve_group_reply_decision(
         ],
     )
     if decision is None and any(request.required for request in tool_plan.requests):
+        decision_source = "required_tool"
         decision = _apply_tool_plan(
             ReplyDecision(
                 should_reply=True,
@@ -125,6 +127,7 @@ async def resolve_group_reply_decision(
         )
 
     if decision is None and (direct_addressed_bot or mentioned or replied_to_bot):
+        decision_source = "addressed"
         decision = ReplyDecision(
             should_reply=True,
             confidence=1.0,
@@ -137,6 +140,7 @@ async def resolve_group_reply_decision(
             f"group={group_id} user={user_id}"
         )
     if decision is None:
+        decision_source = "jev"
         try:
             timing = await client.timing_gate(
                 persona=persona,
@@ -299,6 +303,16 @@ async def resolve_group_reply_decision(
         confidence=decision.confidence,
         side_reaction=decision.side_reaction,
         elapsed_ms=int((time.monotonic() - decision_started_at) * 1000),
+    )
+    _record_metric_event(
+        "group_gate",
+        group_id=group_id,
+        user_id=user_id,
+        stage="reply_decision",
+        action="passed" if decision.should_reply else "blocked",
+        reason=decision.reason,
+        source=decision_source,
+        channel=pipeline_state.output_channel.value,
     )
     if addressed_bot and "非点名" in decision.reason:
         logger.warning(
