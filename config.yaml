@@ -164,7 +164,7 @@ image_ocr:
   deepseek_vision_timeout_seconds: 20
   deepseek_vision_max_tokens: 512
   deepseek_vision_detail: high
-  deepseek_vision_prompt: 请帮群聊机器人理解这张图：1. 用一句话说图里大概是什么；2. 转写图中能看清的文字；3. 如果像表情包/梗图，说明它大概在表达什么。简短输出。
+  deepseek_vision_prompt: 请帮张风雪理解这张图：1. 用一句话说图里大概是什么；2. 转写图中能看清的文字；3. 如果像表情包/梗图，说明它大概在表达什么。简短输出。
   siliconflow_fallback_enabled: true
   siliconflow_api_key_env: SILICONFLOW_API_KEY
   siliconflow_base_url: https://api.siliconflow.cn/v1
@@ -172,7 +172,7 @@ image_ocr:
   siliconflow_timeout_seconds: 20
   siliconflow_max_tokens: 512
   siliconflow_detail: high
-  siliconflow_prompt: 请帮群聊机器人理解这张图：1. 用一句话说图里大概是什么；2. 转写图中能看清的文字；3. 如果像表情包/梗图，说明它大概在表达什么。简短输出。
+  siliconflow_prompt: 请帮张风雪理解这张图：1. 用一句话说图里大概是什么；2. 转写图中能看清的文字；3. 如果像表情包/梗图，说明它大概在表达什么。简短输出。
 
 meme_library:
   # 图片只通过一次性人工导入进入该目录，运行时不会监听或自动收集 QQ 图片。

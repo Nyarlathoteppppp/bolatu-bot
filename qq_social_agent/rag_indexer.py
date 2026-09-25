@@ -394,7 +394,7 @@ class RAGIndexer:
                     doc_type="feedback",
                     content=(
                         f"审批负反馈场景：{row['trigger_nickname']}说“{row['trigger_text']}”。"
-                        f"机器人候选“{row['bot_reply']}”的问题：{row['owner_reason']}。"
+                        f"风雪候选回复“{row['bot_reply']}”的问题：{row['owner_reason']}。"
                         f"避免：{row['avoid_rule']}；更好方向：{row['better_direction']}"
                     ),
                     source_name="recalled_reply_feedback",

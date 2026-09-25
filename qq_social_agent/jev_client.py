@@ -1032,7 +1032,7 @@ class JevClient:
                             "NONE=没有需要解析的指代；OTHER=无法确定指代类型。"
                         ),
                         "criteria": {
-                            "PERSON": "指某个具体的人，包括机器人风雪",
+                            "PERSON": "指某个具体的人，包括风雪自己",
                             "NON_PERSON": "指事、物、消息、模型、考试或梗，不是人",
                             "NONE": "没有需要解析的指代",
                             "OTHER": "证据不足，无法确定指代类型",
@@ -1327,7 +1327,7 @@ class JevClient:
                     "PERSON=他/她是谁；ITEM=列表里第几个方案对不上；"
                     "THREAD=接哪段对话；ELLIPSIS=省略继承了什么；"
                     "TIME=时间范围；SCOPE=这些/这个范围；"
-                    "INTENT=不知道要机器人做什么；"
+                    "INTENT=不知道要风雪做什么；"
                     "MEMORY_REFERENCE=以前聊过的哪条记忆；OTHER=其他。"
                     "不要生成澄清问题。"
                 ),
@@ -1339,7 +1339,7 @@ class JevClient:
                     "ELLIPSIS": "省略继承的谓词/事件不清",
                     "TIME": "时间范围不清",
                     "SCOPE": "作用范围不清",
-                    "INTENT": "不知道要机器人做什么",
+                    "INTENT": "不知道要风雪做什么",
                     "MEMORY_REFERENCE": "不知道引用哪条旧记忆",
                     "OTHER": "其他歧义",
                 },

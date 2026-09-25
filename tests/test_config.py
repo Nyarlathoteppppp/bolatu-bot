@@ -271,6 +271,9 @@ def test_persona_registry_loads_persona_from_central_prompt_file() -> None:
     assert "北大计算机大二学生" in persona.prompt
     assert "想申请 CMU" in persona.prompt
     assert "她是 AI" not in persona.prompt
+    assert "你就是张风雪" in persona.prompt
+    assert "你自认是" not in persona.prompt
+    assert "奈亚子是创造和维护你的人" not in persona.prompt
     assert "听到他让你收敛就真的收敛" in persona.prompt
     assert "前面风雪说过的话属于同一段对话" in persona.prompt
     assert "不确定实时事实或陌生概念就搜" in persona.decision_prompt

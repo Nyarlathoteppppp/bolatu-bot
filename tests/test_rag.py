@@ -530,7 +530,7 @@ def test_conversation_hit_expands_to_surrounding_episode(tmp_path) -> None:
     assert "相邻对话扩展" in episode.reasons
     assert "你们刚才在讨论什么奖" in episode.document.content
     assert "菲尔兹奖名单" in episode.document.content
-    assert "机器人旧回复，仅供理解互动" in episode.document.content
+    assert "风雪旧回复，仅供理解互动" in episode.document.content
     assert "后面已经纠正了" in episode.document.content
     assert "很久以后的新话题" not in episode.document.content
     asyncio.run(service.close())

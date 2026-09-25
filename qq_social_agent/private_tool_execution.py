@@ -106,7 +106,7 @@ async def plan_and_execute_private_tools(
     decision = services.apply_tool_plan(decision, tool_plan)
     speaker_context = (
         f"当前是和{services.member_label(turn.user_id, turn.nickname)}的一对一私聊。"
-        "不要把普通代词误当成群友或机器人；不要艾特第三人、点群表情或假装在群里说话。"
+        "不要把普通代词误当成群友或风雪自己；不要艾特第三人、点群表情或假装在群里说话。"
     )
     private_state_context = services.private_conversation_state_context(turn.chat_id)
     decision, tool_plan = await services.apply_tool_use_router(

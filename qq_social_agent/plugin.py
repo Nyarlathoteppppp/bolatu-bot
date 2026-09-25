@@ -4291,7 +4291,7 @@ async def _handle_group_message_scoped(
             group_id=group_id,
             user_id=int(event.user_id),
             nickname=_nickname(event),
-            text=text or raw_text or plain_text or "[只艾特机器人]",
+            text=text or raw_text or plain_text or "[只艾特风雪]",
             source_message_id=source_message_id,
             correlation_id=correlation_id,
             reason="memory_only",
@@ -7760,7 +7760,7 @@ def _format_raw_corpus_context(examples: list[RawCorpusExample]) -> str:
 def _format_raw_corpus_neighbors(example: RawCorpusExample) -> str:
     items: list[str] = []
     for message in (*example.before[-2:], *example.after[:2]):
-        speaker = "机器人" if message.is_bot else _member_label(message.user_id, message.nickname)
+        speaker = "风雪" if message.is_bot else _member_label(message.user_id, message.nickname)
         items.append(f"{speaker}: {_trim_inline(message.text, 32)}")
     return " / ".join(items)
 

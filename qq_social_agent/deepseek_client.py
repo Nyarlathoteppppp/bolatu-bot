@@ -1530,27 +1530,27 @@ class DeepSeekClient:
         return _parse_style_rules(response.choices[0].message.content or "", messages)
 
 def _format_message(msg: ChatMessage) -> str:
-    speaker = "机器人" if msg.is_bot else _speaker_label(msg.user_id, msg.nickname)
+    speaker = "风雪" if msg.is_bot else _speaker_label(msg.user_id, msg.nickname)
     return f"{speaker}: {msg.text}"
 
 
 def _format_learning_source_message(msg: ChatMessage) -> str:
-    role = "bot" if msg.is_bot else "human"
+    role = "self" if msg.is_bot else "member"
     message_id = msg.id if msg.id > 0 else "unknown"
-    speaker = "机器人" if msg.is_bot else _speaker_label(msg.user_id, msg.nickname)
+    speaker = "风雪" if msg.is_bot else _speaker_label(msg.user_id, msg.nickname)
     return f"[message_id:{message_id}][role:{role}] {speaker}: {msg.text}"
 
 
 def _format_style_source_message(index: int, msg: ChatMessage) -> str:
-    role = "bot" if msg.is_bot else "human"
+    role = "self" if msg.is_bot else "member"
     message_id = msg.id if msg.id > 0 else "unknown"
-    speaker = "机器人" if msg.is_bot else _speaker_label(msg.user_id, msg.nickname)
+    speaker = "风雪" if msg.is_bot else _speaker_label(msg.user_id, msg.nickname)
     return f"[source_id:{index}][message_id:{message_id}][role:{role}] {speaker}: {msg.text}"
 
 
 def _format_decision_message(msg: ChatMessage) -> str:
     if msg.is_bot:
-        return f"机器人之前发言（只判断互动状态，禁止复用措辞）: {msg.text}"
+        return f"风雪之前发言（只判断互动状态，禁止复用措辞）: {msg.text}"
     return _format_message(msg)
 
 
@@ -1610,7 +1610,7 @@ def _append_recent_bot_duplicate_guard(context: str, recent_bot_replies: tuple[s
         return context
     lines = "\n".join(f"- {text}" for text in recent_bot_replies)
     guard = (
-        "【机器人刚刚发过的话（只用于查重，禁止复用措辞或核心答案）】\n"
+        "【风雪刚刚发过的话（只用于查重，禁止复用措辞或核心答案）】\n"
         f"{lines}\n"
         "如果不同群友连续问同一种模板问题，必须按当前这个人分别回答；"
         "不要把刚给别人的人名、结论或包袱机械再给一次。"
@@ -2593,7 +2593,7 @@ def _reply_candidates_retry_request(
     avoid_instruction = ""
     if avoid_texts:
         avoid_instruction = (
-            "另外，机器人刚才已经对别人说过以下内容，本轮禁止复用其措辞或核心答案："
+            "另外，风雪刚才已经对别人说过以下内容，本轮禁止复用其措辞或核心答案："
             + "；".join(avoid_texts)
             + "。"
         )

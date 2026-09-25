@@ -13,7 +13,7 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 DEFAULT_VISION_PROMPT = (
-    "请帮群聊机器人理解这张图：1. 用一句话说图里大概是什么；"
+    "请帮张风雪理解这张图：1. 用一句话说图里大概是什么；"
     "2. 转写图中能看清的文字；3. 如果像表情包/梗图，说明它大概在表达什么。简短输出。"
 )
 

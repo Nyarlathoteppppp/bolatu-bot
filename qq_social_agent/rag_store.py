@@ -1411,7 +1411,7 @@ def _format_episode_message(row: sqlite3.Row) -> str:
     stamp = datetime.fromtimestamp(float(row["created_at"]), RAG_TIMEZONE).strftime("%Y-%m-%d %H:%M")
     user_id = int(row["user_id"])
     nickname = str(row["nickname"] or user_id).strip()
-    role = "（机器人旧回复，仅供理解互动）" if bool(row["is_bot"]) else ""
+    role = "（风雪旧回复，仅供理解互动）" if bool(row["is_bot"]) else ""
     return f"[{stamp}] {role}{nickname}[{str(user_id)[-5:]}]：{str(row['text']).strip()}"
 
 

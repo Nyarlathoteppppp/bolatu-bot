@@ -479,7 +479,7 @@ def format_referent_jev_state(
                 lines.append(f"  - {item}")
         elif candidate.is_bot:
             lines.append("  evidence:")
-            lines.append("  - 机器人自己：风雪/张风雪")
+            lines.append("  - 风雪自己：风雪/张风雪")
     return "\n".join(lines)
 
 
@@ -489,7 +489,7 @@ def referent_choice_criteria(candidates: Iterable[ReferentCandidate]) -> dict[st
     }
     for candidate in list(candidates)[:MAX_REFERENT_CANDIDATES]:
         if candidate.is_bot:
-            criteria[candidate.key] = "指的是风雪/张风雪自己（机器人，常驻候选）"
+            criteria[candidate.key] = "指的是风雪/张风雪自己（常驻候选）"
         else:
             criteria[candidate.key] = f"指的是 {candidate.label}"
     return criteria

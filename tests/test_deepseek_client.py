@@ -866,7 +866,7 @@ def test_reply_direct_uses_direct_prompt_and_one_candidate() -> None:
     candidates = asyncio.run(
         client.reply_candidates(
             persona=persona,
-            recent_messages=[],
+            recent_messages=[ChatMessage(1, 1801507496, "张风雪", "刚才那句我说错了", True, 1000.0)],
             current_text="有人吗",
             current_nickname="A[#11111]",
             mentioned=False,
@@ -883,6 +883,8 @@ def test_reply_direct_uses_direct_prompt_and_one_candidate() -> None:
     user_prompt = captured_calls[0][2]["messages"][1]["content"]
     assert "只生成 1 条" in system_prompt
     assert "输出 1 条最终要直接发送的回复 JSON" in user_prompt
+    assert "风雪: 刚才那句我说错了" in user_prompt
+    assert "机器人: 刚才那句我说错了" not in user_prompt
 
 
 def test_search_answer_uses_fast_route_and_small_prompt_budget() -> None:
