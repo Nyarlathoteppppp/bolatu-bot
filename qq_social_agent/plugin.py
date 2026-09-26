@@ -742,10 +742,10 @@ AI_WORK_INTENSITY_PERCENT_RE = re.compile(
 MODEL_ROUTE_OVERRIDES_KEY = "llm_model_route_overrides"
 MODEL_ROUTE_STATUS_COMMANDS = {"模型状态", "模型", "model status", "/模型状态"}
 MODEL_ROUTE_RESET_COMMANDS = {"清模型覆盖", "清除模型覆盖", "重置模型", "恢复默认模型", "model reset", "/清模型覆盖"}
-MODEL_PROBE_COMMAND_RE = re.compile(r"^(?:/)?(?:测试模型|检测模型|model test)(?:\s+(?P<model>\S.+))?$", re.IGNORECASE)
+MODEL_PROBE_COMMAND_RE = re.compile(r"^(?:/)?(?:测试模型|检测模型|model test)(?:\s+(?P<model>\S+))?$", re.IGNORECASE)
 MODEL_ROUTE_COMMAND_RE = re.compile(
     r"^(?:/)?(?:切|设置|更换|改)?(?P<target>回复|reply|搜索|search|决策|decision|黑话|jargon|记忆|memory|回想|风格|style|学习|style_learning|画像|群友画像|member_profile|profile|工具|utility|utility_model)模型\s+"
-    r"(?P<model>\S.+)$",
+    r"(?P<model>\S+)$",
     re.IGNORECASE,
 )
 MEMORY_REPORT_COMMAND_RE = re.compile(r"^(?:/)?(?:记忆|近期记忆|查看记忆|回想|聊天回想|memory)\s*(?P<limit>\d{0,2})$")
@@ -2858,11 +2858,11 @@ def _format_model_route_status() -> str:
     lines.append("兼容命令：切工具模型 <模型> = 同时切黑话/记忆/风格/画像。")
     lines.append("")
     lines.append("可切换模型：")
-    for route in app_config.llm.model_catalog:
+    for index, route in enumerate(app_config.llm.model_catalog, start=1):
         provider = app_config.llm.providers[route.provider]
-        lines.append(f"- {route.label}（{_provider_key_source(provider.name)} / {provider.api_key_env}）")
+        lines.append(f"{index}. {route.label}（{_provider_key_source(provider.name)} / {provider.api_key_env}）")
     lines.append("")
-    lines.append("命令：测试模型（检测清单）；测试模型 <provider/model>（单测）；切回复模型 <provider/model>；清模型覆盖。")
+    lines.append("命令：测试模型（检测清单）；测试模型 1（单测）；切回复模型 1；清模型覆盖。编号与上方列表对应。")
     return "\n".join(lines)
 
 
@@ -8693,6 +8693,17 @@ async def _handle_private_whitelist_command(bot: Bot, user_id: int, text: str) -
     return True
 
 
+def _select_model_route(value: str):
+    if value.isdecimal():
+        index = int(value) - 1
+        if not 0 <= index < len(app_config.llm.model_catalog):
+            raise ValueError(f"模型编号无效，请输入 1-{len(app_config.llm.model_catalog)}。")
+        return app_config.llm.model_catalog[index]
+    if deepseek_client is None:
+        raise ValueError("模型客户端还没初始化。")
+    return deepseek_client.parse_model_route(value, default_provider="siliconflow")
+
+
 async def _handle_model_route_command(bot: Bot, user_id: int, text: str) -> bool:
     route_match = MODEL_ROUTE_COMMAND_RE.match(text)
     probe_match = MODEL_PROBE_COMMAND_RE.match(text)
@@ -8710,7 +8721,11 @@ async def _handle_model_route_command(bot: Bot, user_id: int, text: str) -> bool
             return True
         model_label = (probe_match.group("model") or "").strip()
         if model_label:
-            routes = (deepseek_client.parse_model_route(model_label),)
+            try:
+                routes = (_select_model_route(model_label),)
+            except ValueError as exc:
+                await _send_private_text(bot, user_id, str(exc))
+                return True
         else:
             routes = app_config.llm.model_catalog
         semaphore = asyncio.Semaphore(3)
@@ -8740,8 +8755,8 @@ async def _handle_model_route_command(bot: Bot, user_id: int, text: str) -> bool
         return True
     route_label = match.group("model").strip()
     try:
-        route = deepseek_client.parse_model_route(route_label, default_provider="siliconflow")
-    except Exception as exc:
+        route = _select_model_route(route_label)
+    except ValueError as exc:
         await _send_private_text(bot, user_id, f"模型路由解析失败：{exc}")
         return True
     target_routes = UTILITY_GROUP_ROUTE_NAMES if route_name == "utility_group" else (route_name,)

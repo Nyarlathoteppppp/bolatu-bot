@@ -2250,10 +2250,40 @@ def test_owner_can_probe_one_model_before_switching(monkeypatch, tmp_path) -> No
     monkeypatch.setattr(plugin, "deepseek_client", FakeModelClient())
     bot = FakeApprovalBot()
 
-    handled = asyncio.run(plugin._handle_group_approval_private(bot, 1535071184, "测试模型 mimo/mimo-v2.6-pro"))
+    handled = asyncio.run(plugin._handle_group_approval_private(bot, 1535071184, "测试模型 1"))
 
     assert handled
     assert bot.private_messages[-1] == (1535071184, "模型实测：\n✅ mimo/mimo-v2.6-pro：可用")
+
+
+def test_owner_can_switch_reply_model_by_catalog_number(monkeypatch, tmp_path) -> None:
+    _use_temp_plugin_memory(monkeypatch, tmp_path)
+    client = FakeModelClient()
+    monkeypatch.setattr(plugin, "deepseek_client", client)
+    bot = FakeApprovalBot()
+
+    handled = asyncio.run(plugin._handle_group_approval_private(bot, 1535071184, "切回复模型 2"))
+
+    assert handled
+    assert client.current_route("reply") == plugin.app_config.llm.model_catalog[1]
+    assert bot.private_messages[-1] == (
+        1535071184,
+        "已切回复模型：deepseek/deepseek-flash\n影响路由：reply",
+    )
+
+
+def test_owner_gets_valid_range_for_unknown_model_number(monkeypatch, tmp_path) -> None:
+    _use_temp_plugin_memory(monkeypatch, tmp_path)
+    monkeypatch.setattr(plugin, "deepseek_client", FakeModelClient())
+    bot = FakeApprovalBot()
+
+    handled = asyncio.run(plugin._handle_group_approval_private(bot, 1535071184, "切回复模型 999"))
+
+    assert handled
+    assert bot.private_messages[-1] == (
+        1535071184,
+        f"模型路由解析失败：模型编号无效，请输入 1-{len(plugin.app_config.llm.model_catalog)}。",
+    )
 
 
 def test_basic_approver_cannot_switch_model(monkeypatch, tmp_path) -> None:
