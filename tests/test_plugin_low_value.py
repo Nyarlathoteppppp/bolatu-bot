@@ -3624,6 +3624,27 @@ def test_passive_message_blocks_clarify_speaking_action(monkeypatch) -> None:
     assert "禁止反问" in seen[0]["speaker_context"]
 
 
+def test_care_timing_does_not_turn_into_teasing(monkeypatch) -> None:
+    original = ReplyDecision(True, 0.63, "jev_care_0.63", mode="chat", action="care")
+
+    async def select(**_kwargs):
+        return "tease", "jev_speak_tease"
+
+    monkeypatch.setattr(plugin, "deepseek_client", SimpleNamespace(select_speaking_action=select))
+    result = asyncio.run(plugin._maybe_apply_speaking_action(
+        original,
+        text="我害怕明天",
+        current_label="甲",
+        addressed_bot=False,
+        speaker_context="",
+        recent_messages=[],
+        group_id=1,
+        user_id=2,
+        looks_like_question=False,
+    ))
+    assert result == original
+
+
 def test_passive_approval_candidates_drop_questions() -> None:
     drafts = [
         SimpleNamespace(text="你后来怎么处理的？", action="ask_back", style=""),

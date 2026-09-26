@@ -8,7 +8,7 @@ from qq_social_agent.approval_models import PendingApprovalCandidate
 from qq_social_agent.decision_gate import PreDecisionGateResult
 from qq_social_agent.deepseek_client import ReplyDecision
 from qq_social_agent.discourse_effects import RepairResolution
-from qq_social_agent.discourse_state import DiscourseState
+from qq_social_agent.discourse_state import Binding, DiscourseState
 from qq_social_agent.ellipsis_resolver import EllipsisResolution
 from qq_social_agent.group_approval_dispatch import queue_group_reply_approval
 from qq_social_agent.group_decision_flow import GroupDecisionServices, resolve_group_reply_decision
@@ -95,6 +95,63 @@ def test_group_decision_stage_returns_routed_answer_and_updates_pipeline() -> No
     assert state.output_channel is OutputChannel.TEXT
     assert state.stage is PipelineStage.DECIDED
     assert any(event == "decision_result" for event, _ in metrics)
+
+
+def test_group_decision_skips_timing_when_addressee_is_another_member() -> None:
+    async def keep_decision(decision, **_kwargs):
+        return decision
+
+    async def keep_tool_plan(decision, *, tool_plan, **_kwargs):
+        return decision, tool_plan
+
+    async def unexpected_timing(**_kwargs):
+        raise AssertionError("timing gate should not decide a message addressed to another member")
+
+    services = GroupDecisionServices(
+        record_metric_event=lambda *_args, **_kwargs: None,
+        record_tool_router_shadow=lambda **_kwargs: None,
+        send_suppression_notice=lambda *_args, **_kwargs: None,
+        schedule_group_learning=lambda _group_id: None,
+        decision_failure_fallback=lambda **_kwargs: None,
+        looks_like_addressed_question=lambda _text: True,
+        apply_tool_use_router=keep_tool_plan,
+        enforce_addressed_reply_decision=lambda decision, **_kwargs: decision,
+        maybe_apply_speaking_action=keep_decision,
+        maybe_apply_ask_back=keep_decision,
+        logger=_logger(),
+    )
+    started = time.monotonic()
+    result = asyncio.run(resolve_group_reply_decision(
+        bot=SimpleNamespace(self_id=789),
+        client=SimpleNamespace(timing_gate=unexpected_timing),
+        pre_decision=PreDecisionGateResult(None),
+        pipeline_state=_pipeline(),
+        reply_budget=GroupReplyBudget.start(started, seconds=120),
+        tool_plan=ToolRoutePlan(),
+        persona=object(),
+        context_recent=[],
+        text="你怎么想？",
+        nickname="群友",
+        speaker_context="",
+        discourse_state=DiscourseState(addressee=Binding(status="RESOLVED", target="另一位群友", target_id=456)),
+        group_id=123,
+        user_id=111,
+        source_message_id="m2",
+        addressed_bot=False,
+        direct_addressed_bot=False,
+        synthetic_addressed_bot=False,
+        followup_addressed=False,
+        mentioned=False,
+        replied_to_bot=False,
+        market_intents=[],
+        fresh_intent=None,
+        decision_started_at=started,
+        flow_started_at=started,
+        services=services,
+    ))
+    assert result is not None
+    assert result.decision.should_reply is False
+    assert result.decision.reason == "resolved_other_addressee"
 
 
 def test_group_generation_returns_reviewed_candidate() -> None:

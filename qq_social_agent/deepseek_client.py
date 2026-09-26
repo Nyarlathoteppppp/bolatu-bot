@@ -8,7 +8,7 @@ import re
 import time
 from dataclasses import dataclass, replace
 from datetime import datetime
-from typing import Callable, Optional
+from typing import TYPE_CHECKING, Callable, Optional
 from zoneinfo import ZoneInfo
 
 from nonebot import logger
@@ -20,6 +20,9 @@ from .persona import Persona
 from .pipeline_types import ContextPacket
 from .prompts import PromptRegistry
 from .timing_gate import TimingDecision, parse_timing_decision
+
+if TYPE_CHECKING:
+    from .discourse_state import DiscourseState
 
 
 @dataclass(frozen=True)
@@ -641,6 +644,7 @@ class DeepSeekClient:
         current_nickname: str,
         chat_label: str = "QQ 群聊",
         speaker_context: str = "",
+        discourse_state: DiscourseState | None = None,
     ) -> TimingDecision:
         """Decide only whether/how to surface; tools and memory route elsewhere."""
 
@@ -671,6 +675,7 @@ class DeepSeekClient:
                 current_nickname=current_nickname,
                 speaker_context=speaker_context,
                 chat_label=chat_label,
+                discourse_state=discourse_state,
             ),
             what="timing_gate",
         )

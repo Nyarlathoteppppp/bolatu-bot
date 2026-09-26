@@ -17,6 +17,7 @@ from .member_context import member_label as _member_label
 from .memory import ChatMessage
 from .pipeline_stages import apply_decision as _pipeline_apply_decision, mark_gated as _pipeline_mark_gated
 from .pipeline_types import PipelineState
+from .resolver_result import RESOLVED
 from .speaker_context import _short_notice_text
 from .tool_router import ToolRoutePlan, apply_tool_plan as _apply_tool_plan, route_mode as _tool_route_mode
 from .tools.market_intent import MarketIntent
@@ -139,6 +140,19 @@ async def resolve_group_reply_decision(
             "qq_social_agent skipped timing_gate for addressed message: "
             f"group={group_id} user={user_id}"
         )
+    if (
+        decision is None
+        and discourse_state.addressee.status == RESOLVED
+        and discourse_state.addressee.target_id is not None
+        and discourse_state.addressee.target_id != int(bot.self_id)
+    ):
+        decision_source = "discourse"
+        decision = ReplyDecision(
+            should_reply=False,
+            confidence=discourse_state.addressee.confidence,
+            reason="resolved_other_addressee",
+            action="ignore",
+        )
     if decision is None:
         decision_source = "jev"
         try:
@@ -149,6 +163,7 @@ async def resolve_group_reply_decision(
                 current_nickname=_member_label(user_id, nickname),
                 chat_label="QQ 群聊",
                 speaker_context=speaker_context,
+                discourse_state=discourse_state,
             )
             decision = timing.to_reply_decision()
         except Exception as exc:

@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 import asyncio
-import os
 from unittest.mock import patch
+import os
 import httpx
 from qq_social_agent.jev_client import JevClient, set_jev_telemetry_recorder
 from qq_social_agent.memory import ChatMessage
@@ -19,6 +19,26 @@ def _persona() -> Persona:
         max_reply_chars=220,
         passive_reply_probability=0.95,
     )
+
+
+def _timing_answers(
+    *,
+    wants: float = 0.1,
+    care: float = 0.1,
+    other: float = 0.1,
+    silent: float = 0.8,
+    answer: float = 0.1,
+    social: float = 0.1,
+) -> dict:
+    return {"answers": {
+        "wants_answer": {"noul": wants},
+        "needs_care": {"noul": care},
+        "to_other": {"noul": other},
+        "timing_route": {"type": "choice", "choice": "silent", "probabilities": {
+            "silent": silent, "answer": answer, "care": 0.0,
+            "continue_bot": 0.0, "social_join": social, "other": 0.0,
+        }},
+    }}
 
 
 def test_jev_route_tool_returns_none_below_threshold() -> None:
@@ -95,29 +115,19 @@ def test_jev_should_reply_imports_decision_on_silent_path() -> None:
 
 
 
-def test_jev_timing_gate_silent_below_threshold() -> None:
+def test_jev_timing_gate_concrete_statement_does_not_force_reply() -> None:
     client = JevClient(api_key="test-key")
     called = {"n": 0}
 
     async def fake_evaluate(**kwargs):
         called["n"] += 1
-        return {
-            "answers": {
-                "following_bot": {"noul": 0.05},
-                "has_concrete_content": {"noul": 0.10},
-            }
-        }
+        return _timing_answers()
 
     client.evaluate = fake_evaluate
-    with patch("qq_social_agent.jev_client.random.random", return_value=0.0):
-        timing = asyncio.run(
-            client.timing_gate(
-                persona=_persona(),
-                recent_messages=[],
-                current_text="今天这课讲得好无聊啊",
-                current_nickname="A",
-            )
-        )
+    timing = asyncio.run(client.timing_gate(
+        persona=_persona(), recent_messages=[],
+        current_text="现在感觉 AI 有点特指 Transformer 了", current_nickname="A",
+    ))
     assert called["n"] == 1
     assert timing.channel.value == "silent"
 
@@ -126,130 +136,80 @@ def test_jev_timing_gate_text_answer() -> None:
     client = JevClient(api_key="test-key")
 
     async def fake_evaluate(**kwargs):
-        assert set(kwargs["questions"]) == {"following_bot", "has_concrete_content"}
-        assert "不要判断风雪要不要插话" in kwargs["questions"]["following_bot"]["instructions"]
-        assert "可回答的问题" in kwargs["questions"]["has_concrete_content"]["instructions"]
-        assert "代码预判.像提问" in kwargs["state"]
-        return {
-            "answers": {
-                "following_bot": {"noul": 0.12},
-                "has_concrete_content": {"noul": 0.8},
-            }
-        }
+        assert set(kwargs["questions"]) == {"wants_answer", "needs_care", "to_other", "timing_route"}
+        assert kwargs["state"]["current"]["text"] == "CMU 难申吗"
+        assert kwargs["state"]["bot"] == "张风雪"
+        return _timing_answers(wants=0.85, silent=0.2, answer=0.65)
 
     client.evaluate = fake_evaluate
-    with patch("qq_social_agent.jev_client.random.random", return_value=0.0):
-        timing = asyncio.run(
-            client.timing_gate(
-                persona=_persona(),
-                recent_messages=[],
-                current_text="CMU 难申吗",
-                current_nickname="A",
-            )
-        )
+    timing = asyncio.run(client.timing_gate(
+        persona=_persona(), recent_messages=[],
+        current_text="CMU 难申吗", current_nickname="A",
+    ))
     assert timing.channel.value == "text"
     assert timing.intent.value == "answer"
 
 
-def test_jev_timing_gate_rolls_silent_when_random_misses_noul() -> None:
+def test_jev_timing_gate_directed_other_is_silent() -> None:
     client = JevClient(api_key="test-key")
 
     async def fake_evaluate(**kwargs):
-        return {
-            "answers": {
-                "following_bot": {"noul": 0.10},
-                "has_concrete_content": {"noul": 0.80},
-            }
-        }
+        return _timing_answers(wants=0.92, other=0.89, silent=0.1, answer=0.8)
 
     client.evaluate = fake_evaluate
-    with patch("qq_social_agent.jev_client.random.random", return_value=0.80):
-        timing = asyncio.run(
-            client.timing_gate(
-                persona=_persona(),
-                recent_messages=[],
-                current_text="CMU 难申吗",
-                current_nickname="A",
-            )
-        )
+    timing = asyncio.run(client.timing_gate(
+        persona=_persona(), recent_messages=[],
+        current_text="[@12345] 有没有讲集体化的文章", current_nickname="A",
+    ))
     assert timing.channel.value == "silent"
+    assert timing.reason.startswith("jev_to_other")
 
 
-def test_jev_timing_gate_always_speaks_when_noul_above_0_8() -> None:
+def test_jev_timing_gate_distress_uses_care_intent() -> None:
     client = JevClient(api_key="test-key")
 
     async def fake_evaluate(**kwargs):
-        return {
-            "answers": {
-                "following_bot": {"noul": 0.11},
-                "has_concrete_content": {"noul": 0.81},
-            }
-        }
+        return _timing_answers(care=0.63, silent=0.05, answer=0.0, social=0.0)
 
     client.evaluate = fake_evaluate
-    with patch("qq_social_agent.jev_client.random.random", return_value=0.99):
-        timing = asyncio.run(
-            client.timing_gate(
-                persona=_persona(),
-                recent_messages=[],
-                current_text="CMU 难申吗",
-                current_nickname="A",
-            )
-        )
+    timing = asyncio.run(client.timing_gate(
+        persona=_persona(), recent_messages=[],
+        current_text="我害怕明天", current_nickname="A",
+    ))
     assert timing.channel.value == "text"
+    assert timing.intent.value == "care"
 
 
-def test_jev_timing_gate_keeps_unaddressed_question_when_channel_silent() -> None:
+def test_jev_timing_gate_social_opening_keeps_chat_action_available() -> None:
     client = JevClient(api_key="test-key")
 
     async def fake_evaluate(**kwargs):
-        assert "代码预判.像提问：是" in kwargs["state"]
-        return {
-            "answers": {
-                "following_bot": {"noul": 0.08},
-                "has_concrete_content": {"noul": 0.40},
-            }
-        }
+        return _timing_answers(silent=0.12, answer=0.01, social=0.82)
 
     client.evaluate = fake_evaluate
-    with patch("qq_social_agent.jev_client.random.random", return_value=0.0):
-        timing = asyncio.run(
-            client.timing_gate(
-                persona=_persona(),
-                recent_messages=[],
-                current_text="有没有懂电脑的",
-                current_nickname="A",
-            )
-        )
+    timing = asyncio.run(client.timing_gate(
+        persona=_persona(), recent_messages=[],
+        current_text="想到一个天才提示词，一脚把 agent 踩冒烟了", current_nickname="A",
+    ))
     assert timing.channel.value == "text"
+    assert timing.intent.value == "chat"
+    assert timing.to_reply_decision().action == "reply"
 
 
-def test_jev_timing_gate_keeps_followup_after_bot_when_channel_silent() -> None:
+def test_jev_timing_gate_peer_invitation_does_not_trigger_on_question_mark_alone() -> None:
     client = JevClient(api_key="test-key")
 
     async def fake_evaluate(**kwargs):
-        assert "代码预判.风雪刚说过话：是" in kwargs["state"]
-        assert "风雪: 十块钱还想赚钱" in kwargs["state"]
-        return {
-            "answers": {
-                "following_bot": {"noul": 0.38},
-                "has_concrete_content": {"noul": 0.12},
-            }
-        }
+        assert kwargs["state"]["recent"][0]["speaker"] == "风雪"
+        return _timing_answers(wants=0.7, silent=0.32, answer=0.05, social=0.62)
 
     client.evaluate = fake_evaluate
-    with patch("qq_social_agent.jev_client.random.random", return_value=0.0):
-        timing = asyncio.run(
-            client.timing_gate(
-                persona=_persona(),
-                recent_messages=[
-                    ChatMessage(1, 2, "风雪", "十块钱还想赚钱", True, 1.0),
-                ],
-                current_text="现在三个零买没意义",
-                current_nickname="A",
-            )
-        )
-    assert timing.channel.value == "text"
+    timing = asyncio.run(client.timing_gate(
+        persona=_persona(),
+        recent_messages=[ChatMessage(1, 2, "风雪", "第三次就敢玩", True, 1.0)],
+        current_text="一起吗", current_nickname="A",
+    ))
+    assert timing.channel.value == "silent"
 
 
 def test_jev_timing_gate_blocks_short_flame_even_after_bot() -> None:

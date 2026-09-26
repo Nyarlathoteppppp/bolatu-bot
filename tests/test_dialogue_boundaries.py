@@ -57,7 +57,11 @@ def test_technical_reply_words_are_not_a_reply_to_another_person(text):
     assert not _timing_looks_like_reply_to_other(text)
     client=JevClient(api_key="test")
     async def evaluate(**kwargs):
-        return {"answers":{"following_bot":{"noul":0},"has_concrete_content":{"noul":.99}}}
+        return {"answers":{
+            "wants_answer":{"noul":.99}, "needs_care":{"noul":0},
+            "to_other":{"noul":0},
+            "timing_route":{"probabilities":{"silent":.1,"answer":.8,"social_join":.1}},
+        }}
     client.evaluate=evaluate
     result=asyncio.run(client.timing_gate(persona=SimpleNamespace(decision_prompt=""),
         recent_messages=[],current_text=text,current_nickname="测试群友"))

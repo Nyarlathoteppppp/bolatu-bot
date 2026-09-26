@@ -8029,6 +8029,22 @@ async def _maybe_apply_speaking_action(
         return decision
     if choice not in SPEAKING_ACTIONS:
         return decision
+    if decision.reason.startswith("jev_care_") and choice in {
+        "tease", "warm_tease", "deflate", "amp_bit", "deadpan_echo",
+        "commit_bit", "hyperbole", "wrong_register",
+    }:
+        _record_metric_event(
+            "speaking_action",
+            group_id=group_id,
+            user_id=user_id,
+            stage="decision",
+            action="blocked",
+            previous_action=decision.action,
+            blocked_action=choice,
+            addressed=addressed_bot,
+            reason="care_timing_conflict",
+        )
+        return decision
     if not addressed_bot and choice in {"ask_back", "clarify"}:
         _record_metric_event(
             "speaking_action",

@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import os
 import math
-import random
 import re
 import time
 from typing import Any, Callable
@@ -13,6 +12,7 @@ from nonebot import logger
 from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from .deepseek_client import ReplyDecision, ToolRoutingDecision
+    from .discourse_state import DiscourseState
 from .memory import ChatMessage
 from .persona import Persona
 
@@ -20,6 +20,14 @@ from .persona import Persona
 from .jev_policy import (
     JEV_TOOL_CHOICE_CONFIDENCE_MIN,
     JEV_TOOL_NOUL_MIN,
+    JEV_TIMING_ANSWER_CHOICE_MIN,
+    JEV_TIMING_ANSWER_INTENT_MIN,
+    JEV_TIMING_ANSWER_SILENT_MAX,
+    JEV_TIMING_CARE_MIN,
+    JEV_TIMING_SEMANTIC_REQUEST_MIN,
+    JEV_TIMING_SOCIAL_CHOICE_MIN,
+    JEV_TIMING_SOCIAL_SILENT_MAX,
+    JEV_TIMING_TO_OTHER_MIN,
     OPENROUTER_JEV_MODEL,
     TYPESAFE_JEV_MODEL,
 )
@@ -93,6 +101,11 @@ _TIMING_QUESTION_HINTS = (
     "为什么",
     "为啥",
     "如何",
+    "什么",
+    "谁",
+    "会不会",
+    "是不是",
+    "还是",
 )
 _TIMING_SHORT_ACK = {
     "对",
@@ -154,10 +167,6 @@ def _timing_is_short_ack(text: str) -> bool:
     clean = _compact_timing_text(text)
     # Length alone also matches real questions (去哪/谁/为啥) and short facts.
     return clean in _TIMING_SHORT_ACK
-
-
-def _timing_bot_just_spoke(recent_messages: list[ChatMessage]) -> bool:
-    return any(bool(getattr(msg, "is_bot", False)) for msg in recent_messages[-4:])
 
 
 class JevClient:
@@ -415,19 +424,13 @@ class JevClient:
         current_nickname: str,
         speaker_context: str = "",
         chat_label: str = "QQ 群聊",
+        discourse_state: DiscourseState | None = None,
     ):
-        """Decide whether to surface now. This is the live group timing gate."""
+        """Choose a reason to join the group conversation, if there is one."""
         from .timing_gate import TimingDecision
         from .pipeline_types import OutputChannel, SocialIntent
 
-        history_lines = []
-        for msg in recent_messages[-8:]:
-            nick = "风雪" if getattr(msg, "is_bot", False) else (msg.nickname or str(msg.user_id))
-            history_lines.append(f"{nick}: {msg.text}")
-        context_str = "\n".join(history_lines) if history_lines else "（暂无近期消息）"
-        speaker = speaker_context.strip() or "无额外说话关系提示"
         like_question = _timing_looks_like_question(current_text)
-        bot_just_spoke = _timing_bot_just_spoke(recent_messages)
         reply_to_other = _timing_looks_like_reply_to_other(current_text)
         short_ack = _timing_is_short_ack(current_text)
         if short_ack or reply_to_other:
@@ -437,75 +440,96 @@ class JevClient:
                 confidence=0.0,
                 reason="code_silent_ack" if short_ack else "code_silent_reply_other",
             )
-        fact_lines = "\n".join(
-            [
-                f"代码预判.像提问：{'是' if like_question else '否'}",
-                f"代码预判.风雪刚说过话：{'是' if bot_just_spoke else '否'}",
-                f"代码预判.像回复别人：{'是' if reply_to_other else '否'}",
-                f"代码预判.短确认：{'是' if short_ack else '否'}",
-            ]
-        )
-        state = (
-            f"【角色设定】\n"
-            f"{persona.decision_prompt.strip()}\n\n"
-            f"【场景】{chat_label}\n"
-            f"【说话关系】{speaker}\n"
-            f"【代码预判】\n{fact_lines}\n\n"
-            f"【近期消息】\n"
-            f"{context_str}\n\n"
-            f"【当前发言】\n"
-            f"{current_nickname}: {current_text}\n"
-            f"这是非点名插话观察。Jev 只回答事实，不决定发不发。"
-        )
-        questions = {
-            "following_bot": {
-                "type": "noul",
-                "instructions": (
-                    "当前发言是不是在接风雪刚说的内容。"
-                    "质疑、补充、纠正、继续同一判断应为 true。"
-                    "跟别人说话、短确认、纯骂人、短感叹、纯表情应为 false。"
-                    "代码预判.风雪刚说过话 为否时，应为 false。"
-                    "不要因为语气冲、好笑或能接梗就判 true。"
-                    "不要判断风雪要不要插话。"
-                ),
+        addressee = getattr(discourse_state, "addressee", None)
+        state = {
+            "chat": chat_label,
+            "bot": getattr(persona, "name", "风雪"),
+            "recent": [
+                {
+                    "speaker": "风雪" if msg.is_bot else (msg.nickname or str(msg.user_id)),
+                    "text": msg.text[:130],
+                }
+                for msg in recent_messages[-5:]
+            ],
+            "current": {"speaker": current_nickname, "text": current_text},
+            "resolved_addressee": {
+                "status": getattr(addressee, "status", "NOT_APPLICABLE"),
+                "target": getattr(addressee, "target", ""),
             },
-            "has_concrete_content": {
+        }
+        questions = {
+            "wants_answer": {
                 "type": "noul",
-                "instructions": (
-                    "当前发言有没有可回答的问题，或可接的具体事实。"
-                    "提问、求助、给出具体判断或细节应为 true。"
-                    "只有骂人、短感叹、纯表情、没有问题也没有具体事实，应为 false。"
-                    "不要因为语气冲、好笑或能接梗就判 true。"
-                    "不要判断风雪要不要插话。"
-                ),
+                "instructions": "当前发言者是否在请求针对当前内容的答案、建议或观点？对别人发指令、单纯叙述事实、反问或感叹不算。只判断请求回应的意图，不判断风雪是否该回应。",
+            },
+            "needs_care": {
+                "type": "noul",
+                "instructions": "当前发言者是否正在表达自己的真实难受、无助或持续困扰，适合旁人给予简短关心？不要把玩笑、口头禅或转述他人的痛苦算作是。",
+            },
+            "to_other": {
+                "type": "noul",
+                "instructions": "当前发言是否主要对风雪以外某一位具体群友说话？明确@、回复、称呼或两人的连续对话都算；面向全群发问或分享不算。只判断当前发言。",
+            },
+            "timing_route": {
+                "type": "choice",
+                "instructions": "假设风雪没有被点名。在当前消息之后，她此刻最适合采取哪一种群聊参与方式？只选参与时机类别，不写回复、不选说话风格。",
+                "criteria": {
+                    "silent": "不需要风雪插话：在和别人说话、短确认、纯事实补充、风雪已说过同义内容，或插话会打断当前对话。",
+                    "answer": "当前发言是在向群里求答案、建议或观点，风雪能够接一个有用的回答。",
+                    "care": "当前发言者真实难受、无助或持续困扰，风雪现在接一句关心比保持沉默更合适。",
+                    "continue_bot": "当前发言直接接续风雪刚才的话，并期待她进一步回应。",
+                    "social_join": "当前发言向整个群抛出开放的轻松话题或梗，风雪现在加入一句会自然推进聊天。",
+                    "other": "无法从当前消息和近期上下文可靠判断。",
+                },
             },
         }
         data = await self.evaluate(state=state, questions=questions)
-        answers = data.get("answers", {})
-        following = _optional_noul(data, "following_bot")
-        has_fact = _optional_noul(data, "has_concrete_content")
-        if following is None or has_fact is None:
+        wants_answer = _optional_noul(data, "wants_answer")
+        needs_care = _optional_noul(data, "needs_care")
+        to_other = _optional_noul(data, "to_other")
+        route_answer = data.get("answers", {}).get("timing_route", {})
+        probabilities = route_answer.get("probabilities", {}) if isinstance(route_answer, dict) else {}
+        silent = _finite_probability(probabilities.get("silent")) if isinstance(probabilities, dict) else None
+        answer = _finite_probability(probabilities.get("answer")) if isinstance(probabilities, dict) else None
+        social = _finite_probability(probabilities.get("social_join")) if isinstance(probabilities, dict) else None
+        if None in (wants_answer, needs_care, to_other, silent, answer, social):
             raise ValueError("Missing or invalid Jev timing observation")
-        speak_prob = max(following, has_fact) if bot_just_spoke else has_fact
-        if speak_prob <= 0.10:
+        if to_other >= JEV_TIMING_TO_OTHER_MIN:
             return TimingDecision(
                 channel=OutputChannel.SILENT,
-                intent=SocialIntent.CHAT,
-                confidence=speak_prob,
-                reason=f"jev_silent_{speak_prob:.2f}",
+                confidence=to_other,
+                reason=f"jev_to_other_{to_other:.2f}",
             )
-        if speak_prob <= 0.80 and random.random() >= speak_prob:
+        if needs_care >= JEV_TIMING_CARE_MIN:
             return TimingDecision(
-                channel=OutputChannel.SILENT,
+                channel=OutputChannel.TEXT,
+                intent=SocialIntent.CARE,
+                confidence=needs_care,
+                reason=f"jev_care_{needs_care:.2f}",
+            )
+        if (
+            (like_question or wants_answer >= JEV_TIMING_SEMANTIC_REQUEST_MIN)
+            and wants_answer >= JEV_TIMING_ANSWER_INTENT_MIN
+            and answer >= JEV_TIMING_ANSWER_CHOICE_MIN
+            and silent < JEV_TIMING_ANSWER_SILENT_MAX
+        ):
+            return TimingDecision(
+                channel=OutputChannel.TEXT,
+                intent=SocialIntent.ANSWER,
+                confidence=min(wants_answer, answer),
+                reason=f"jev_answer_{wants_answer:.2f}",
+            )
+        if social >= JEV_TIMING_SOCIAL_CHOICE_MIN and silent < JEV_TIMING_SOCIAL_SILENT_MAX:
+            return TimingDecision(
+                channel=OutputChannel.TEXT,
                 intent=SocialIntent.CHAT,
-                confidence=speak_prob,
-                reason=f"jev_silent_{speak_prob:.2f}",
+                confidence=social,
+                reason=f"jev_social_{social:.2f}",
             )
         return TimingDecision(
-            channel=OutputChannel.TEXT,
-            intent=SocialIntent.ANSWER if like_question else SocialIntent.CHAT,
-            confidence=speak_prob,
-            reason=f"jev_text_{speak_prob:.2f}",
+            channel=OutputChannel.SILENT,
+            confidence=silent,
+            reason=f"jev_silent_{silent:.2f}",
         )
 
     async def audit_proactive_reply(
