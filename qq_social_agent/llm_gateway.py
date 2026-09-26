@@ -309,8 +309,6 @@ def _log_llm_usage(task: str, response: object, *, model: str) -> None:
 
 
 def _extra_body_for_route(provider: LLMProviderConfig, route: LLMModelRoute) -> dict[str, object]:
-    if provider.name == "openrouter" and provider.reasoning_effort:
-        return {"reasoning": {"effort": provider.reasoning_effort}}
     if provider.thinking not in {"enabled", "disabled"}:
         return {}
     model = route.model.casefold()

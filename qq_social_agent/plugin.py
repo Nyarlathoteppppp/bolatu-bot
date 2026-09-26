@@ -8729,11 +8729,14 @@ async def _handle_model_route_command(bot: Bot, user_id: int, text: str) -> bool
         else:
             routes = app_config.llm.model_catalog
         semaphore = asyncio.Semaphore(3)
+        catalog_numbers = {route.label: index for index, route in enumerate(app_config.llm.model_catalog, start=1)}
 
         async def _probe_one(route):
             async with semaphore:
                 available, reason = await deepseek_client.probe_model(route)
-                return f"{'✅' if available else '❌'} {route.label}：{reason}"
+                number = catalog_numbers.get(route.label)
+                prefix = f"{number}. " if number is not None else ""
+                return f"{prefix}{'✅' if available else '❌'} {route.label}：{reason}"
 
         results = await asyncio.gather(*(_probe_one(route) for route in routes))
         await _send_private_text(bot, user_id, "模型实测：\n" + "\n".join(results))

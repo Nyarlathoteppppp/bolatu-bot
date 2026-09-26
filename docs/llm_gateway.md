@@ -8,14 +8,14 @@
 
 当前回复顺序为 `mimo/mimo-v2.6-pro` → `deepseek/deepseek-flash` → `siliconflow/deepseek-ai/DeepSeek-V4-Flash`。MiMo 返回余额不足时，本次请求立即回退，进程内后续请求跳过 MiMo；重启后会重新尝试。工作日高峰时，原有 DeepSeek/SiliconFlow 价差路由仍适用于两个回退模型。其他任务仍使用原来的路由。
 
-OpenRouter 的 `openai/gpt-6-luna` 已加入模型清单，provider 的推理强度配置为 `high`，没有成为默认路由。2026-09-27 从生产服务器实测返回 HTTP 403，表示该服务器出口地区暂不能使用它。
+文本模型清单只列 MiMo 2.6 Pro、DeepSeek Flash 和 SiliconFlow DS Flash。JEV 使用独立的 Decisions API，不在聊天模型清单内。
 
 ## QQ 私聊命令
 
 仅主人号可用：
 
 - `模型状态`：查看当前任务路由、回退顺序和候选模型。
-- `测试模型`：逐个请求候选模型，显示可用、HTTP 状态、超时或缺少密钥。每次测试会调用模型并消耗少量额度。
+- `测试模型`：逐个请求候选模型，按与 `模型状态` 相同的编号显示可用、HTTP 状态、超时或缺少密钥。每次测试会调用模型并消耗少量额度。
 - `测试模型 1`：按 `模型状态` 中的编号只测一个模型，失败不会被备用模型掩盖。也接受完整的 `provider/model` 名称。
 - `切回复模型 1`：按相同编号覆盖回复路由；其他任务类似。也接受完整模型名称。覆盖保存到应用 KV，重启后仍生效。
 - `清模型覆盖`：恢复 `config.yaml` 中的默认路由。

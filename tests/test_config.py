@@ -256,7 +256,12 @@ def test_production_config_uses_official_deepseek_flash_for_reply() -> None:
     assert config.llm.routes["reply"].label == "mimo/mimo-v2.6-pro"
     assert config.llm.fallback_routes["reply"].label == "deepseek/deepseek-flash"
     assert config.llm.additional_fallback_routes["reply"][0].label == "siliconflow/deepseek-ai/DeepSeek-V4-Flash"
-    assert "mimo/mimo-v2.6-pro" in {route.label for route in config.llm.model_catalog}
+    assert tuple(route.label for route in config.llm.model_catalog) == (
+        "mimo/mimo-v2.6-pro",
+        "deepseek/deepseek-flash",
+        "siliconflow/deepseek-ai/DeepSeek-V4-Flash",
+    )
+    assert set(config.llm.providers) == {"deepseek", "siliconflow", "mimo"}
     assert config.llm is config.deepseek
     assert config.raw["image_ocr"]["deepseek_vision_enabled"] is True
     assert config.raw["image_ocr"]["deepseek_vision_model"] == "deepseek-flash"

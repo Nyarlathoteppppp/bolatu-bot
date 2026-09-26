@@ -2253,7 +2253,24 @@ def test_owner_can_probe_one_model_before_switching(monkeypatch, tmp_path) -> No
     handled = asyncio.run(plugin._handle_group_approval_private(bot, 1535071184, "测试模型 1"))
 
     assert handled
-    assert bot.private_messages[-1] == (1535071184, "模型实测：\n✅ mimo/mimo-v2.6-pro：可用")
+    assert bot.private_messages[-1] == (1535071184, "模型实测：\n1. ✅ mimo/mimo-v2.6-pro：可用")
+
+
+def test_owner_probe_list_uses_switch_numbers(monkeypatch, tmp_path) -> None:
+    _use_temp_plugin_memory(monkeypatch, tmp_path)
+    monkeypatch.setattr(plugin, "deepseek_client", FakeModelClient())
+    bot = FakeApprovalBot()
+
+    handled = asyncio.run(plugin._handle_group_approval_private(bot, 1535071184, "测试模型"))
+
+    assert handled
+    result = bot.private_messages[-1][1]
+    assert result.splitlines() == [
+        "模型实测：",
+        "1. ✅ mimo/mimo-v2.6-pro：可用",
+        "2. ❌ deepseek/deepseek-flash：HTTP 403",
+        "3. ❌ siliconflow/deepseek-ai/DeepSeek-V4-Flash：HTTP 403",
+    ]
 
 
 def test_owner_can_switch_reply_model_by_catalog_number(monkeypatch, tmp_path) -> None:

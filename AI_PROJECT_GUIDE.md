@@ -355,12 +355,20 @@ llm:
       base_url: https://api.siliconflow.cn/v1
       api_key_env: SILICONFLOW_API_KEY
       thinking: disabled
-  decision_model: siliconflow/Qwen/Qwen3.5-35B-A3B
-  reply_model: siliconflow/MiniMaxAI/MiniMax-M2.5
-  jargon_model: siliconflow/Qwen/Qwen3.5-35B-A3B
-  memory_model: siliconflow/Qwen/Qwen3.5-35B-A3B
-  style_model: siliconflow/MiniMaxAI/MiniMax-M2.5
-  member_profile_model: siliconflow/MiniMaxAI/MiniMax-M2.5
+    mimo:
+      base_url: https://api.xiaomimimo.com/v1
+      api_key_env: MIMO_API_KEY
+      thinking: disabled
+  decision_model: siliconflow/deepseek-ai/DeepSeek-V4-Flash
+  reply_model: mimo/mimo-v2.6-pro
+  jargon_model: siliconflow/deepseek-ai/DeepSeek-V4-Flash
+  memory_model: siliconflow/deepseek-ai/DeepSeek-V4-Flash
+  style_model: siliconflow/deepseek-ai/DeepSeek-V4-Flash
+  member_profile_model: siliconflow/deepseek-ai/DeepSeek-V4-Flash
+  model_catalog:
+    - mimo/mimo-v2.6-pro
+    - deepseek/deepseek-flash
+    - siliconflow/deepseek-ai/DeepSeek-V4-Flash
 ```
 
 路由含义：
@@ -376,7 +384,7 @@ llm:
 
 运行时也能通过 QQ 私聊工具单切模型，覆盖值存在 SQLite 的 `app_kv`，重启后仍生效。清除覆盖命令：`清模型覆盖`。
 
-`deepseek_client.py` 会按主路由调用；主 provider 失败时尝试 `fallback_models`。
+`llm_gateway.py` 会按主路由调用；主 provider 失败时尝试 `fallback_models`。
 
 ## 7. Prompt 管理
 
@@ -881,7 +889,8 @@ H1              审批人列表
 统计 7天
 统计 2026-07-11
 模型状态
-切回复模型 siliconflow/MiniMaxAI/MiniMax-M2.5
+测试模型
+切回复模型 1
 清模型覆盖
 /黑话：咱妈 指代：中国
 /删黑话：咱妈

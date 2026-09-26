@@ -16,7 +16,6 @@ class LLMProviderConfig:
     base_url: str
     api_key_env: str
     thinking: str
-    reasoning_effort: str | None = None
 
 
 @dataclass(frozen=True)
@@ -332,7 +331,6 @@ def _llm_providers(deepseek: dict[str, Any]) -> dict[str, LLMProviderConfig]:
                 base_url=str(raw.get("base_url", providers.get(provider_name, providers["deepseek"]).base_url)),
                 api_key_env=str(raw.get("api_key_env", f"{provider_name.upper()}_API_KEY")),
                 thinking=str(raw.get("thinking", "disabled")).lower(),
-                reasoning_effort=str(raw["reasoning_effort"]).lower() if raw.get("reasoning_effort") else None,
             )
     return providers
 
