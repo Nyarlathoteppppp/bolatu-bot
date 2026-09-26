@@ -19,7 +19,7 @@ group_user_policies:
     ordinary_trigger_percent: 10
     addressed_question_private_reply: true
 
-deepseek:
+llm:
   base_url: https://api.deepseek.com
   providers:
     deepseek:
@@ -34,9 +34,14 @@ deepseek:
       base_url: https://openrouter.ai/api/v1
       api_key_env: OPENROUTER_API_KEY
       thinking: disabled
+      reasoning_effort: high
+    mimo:
+      base_url: https://api.xiaomimimo.com/v1
+      api_key_env: MIMO_API_KEY
+      thinking: disabled
   model: siliconflow/deepseek-ai/DeepSeek-V4-Flash
   decision_model: siliconflow/deepseek-ai/DeepSeek-V4-Flash
-  reply_model: deepseek/deepseek-flash
+  reply_model: mimo/mimo-v2.6-pro
   reply_peak_routing:
     enabled: true
     timezone: Asia/Shanghai
@@ -53,6 +58,7 @@ deepseek:
   style_model: siliconflow/deepseek-ai/DeepSeek-V4-Flash
   member_profile_model: siliconflow/deepseek-ai/DeepSeek-V4-Flash
   model_catalog:
+    - mimo/mimo-v2.6-pro
     - deepseek/deepseek-flash
     - siliconflow/deepseek-ai/DeepSeek-V4-Flash
     - siliconflow/deepseek-ai/DeepSeek-V4-Pro
@@ -62,9 +68,12 @@ deepseek:
     - siliconflow/MiniMaxAI/MiniMax-M2.5
     - siliconflow/Pro/moonshotai/Kimi-K2.6
     - openrouter/typesafe/jev-1.13
+    - openrouter/openai/gpt-6-luna
   fallback_models:
     decision: deepseek/deepseek-v4-flash
-    reply: siliconflow/deepseek-ai/DeepSeek-V4-Flash
+    reply:
+      - deepseek/deepseek-flash
+      - siliconflow/deepseek-ai/DeepSeek-V4-Flash
     search: deepseek/deepseek-v4-flash
     utility: deepseek/deepseek-v4-flash
     jargon: deepseek/deepseek-v4-flash

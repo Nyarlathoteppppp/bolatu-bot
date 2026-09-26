@@ -94,12 +94,12 @@ from .decision_gate import (
     pre_decision_gate as _pre_decision_gate,
 )
 from .deepseek_client import (
-    DeepSeekClient,
+    LLMTaskClient,
     MemberProfileDraft,
     ReplyDecision,
     ToolSymbol,
-    set_usage_recorder,
 )
+from .llm_gateway import set_usage_recorder
 from .jev_client import set_jev_telemetry_recorder
 from .delivery import build_delivery_plan
 from .daily_review_scheduler_service import DailyReviewSchedulerService
@@ -345,7 +345,7 @@ JARGON_LLM_SELECTOR_ENABLED = bool(
     else False
 )
 cue_pattern_tracker = CuePatternTracker(window_seconds=10 * 60)
-deepseek_client: DeepSeekClient | None = None
+deepseek_client: LLMTaskClient | None = None
 addressed_event_times: dict[tuple[int, int], list[float]] = {}
 followup_window_opened_at: dict[tuple[int, int], float] = {}
 last_group_mention_targets: dict[int, tuple[int, float]] = {}
@@ -742,6 +742,7 @@ AI_WORK_INTENSITY_PERCENT_RE = re.compile(
 MODEL_ROUTE_OVERRIDES_KEY = "llm_model_route_overrides"
 MODEL_ROUTE_STATUS_COMMANDS = {"模型状态", "模型", "model status", "/模型状态"}
 MODEL_ROUTE_RESET_COMMANDS = {"清模型覆盖", "清除模型覆盖", "重置模型", "恢复默认模型", "model reset", "/清模型覆盖"}
+MODEL_PROBE_COMMAND_RE = re.compile(r"^(?:/)?(?:测试模型|检测模型|model test)(?:\s+(?P<model>\S.+))?$", re.IGNORECASE)
 MODEL_ROUTE_COMMAND_RE = re.compile(
     r"^(?:/)?(?:切|设置|更换|改)?(?P<target>回复|reply|搜索|search|决策|decision|黑话|jargon|记忆|memory|回想|风格|style|学习|style_learning|画像|群友画像|member_profile|profile|工具|utility|utility_model)模型\s+"
     r"(?P<model>\S.+)$",
@@ -854,9 +855,9 @@ class SuppressionEvent:
 @get_driver().on_startup
 async def _init_client() -> None:
     global deepseek_client, learning_coordinator, jev_probability_tool
-    set_usage_recorder(_record_llm_usage if app_config.deepseek.usage_tracking_enabled else None)
+    set_usage_recorder(_record_llm_usage if app_config.llm.usage_tracking_enabled else None)
     set_jev_telemetry_recorder(_record_jev_telemetry)
-    deepseek_client = DeepSeekClient(app_config.deepseek)
+    deepseek_client = LLMTaskClient(app_config.llm)
     jev_probability_tool = JevProbabilityTool(
         deepseek_client.jev_client,
         deepseek_client,
@@ -1229,8 +1230,7 @@ async def _shutdown_background_tasks() -> None:
     if learning_coordinator is not None:
         closers.append(learning_coordinator.close())
     if deepseek_client is not None:
-        closers.extend(client.close() for client in deepseek_client.clients.values())
-        closers.append(deepseek_client.jev_client.aclose())
+        closers.append(deepseek_client.aclose())
     closers.append(image_ocr_service.aclose())
     closers.append(content_ingestion_service.aclose())
     closers.append(deep_content_tool.aclose())
@@ -2842,8 +2842,8 @@ def _format_model_route_status() -> str:
     overrides = _model_route_overrides()
     lines = ["模型状态：", "可切换部分："]
     for route_name, title, flow in MODEL_ROUTE_INFOS:
-        configured = app_config.deepseek.routes[route_name].label
-        fallback = app_config.deepseek.fallback_routes[route_name].label
+        configured = app_config.llm.routes[route_name].label
+        fallback = app_config.llm.fallback_routes[route_name].label
         if deepseek_client is not None:
             active = deepseek_client.current_route(route_name).label
         else:
@@ -2852,15 +2852,17 @@ def _format_model_route_status() -> str:
         lines.append(f"- {title}模型（{route_name}）：{flow}")
         lines.append(f"  当前：{active} {suffix}")
         lines.append(f"  config：{configured}")
-        lines.append(f"  fallback：{fallback}")
+        more_fallbacks = app_config.llm.additional_fallback_routes.get(route_name, ())
+        fallback_chain = " → ".join((fallback, *(route.label for route in more_fallbacks)))
+        lines.append(f"  fallback：{fallback_chain}")
     lines.append("兼容命令：切工具模型 <模型> = 同时切黑话/记忆/风格/画像。")
     lines.append("")
     lines.append("可切换模型：")
-    for route in app_config.deepseek.model_catalog:
-        provider = app_config.deepseek.providers[route.provider]
+    for route in app_config.llm.model_catalog:
+        provider = app_config.llm.providers[route.provider]
         lines.append(f"- {route.label}（{_provider_key_source(provider.name)} / {provider.api_key_env}）")
     lines.append("")
-    lines.append("命令示例：切回复模型 deepseek/deepseek-flash；切搜索模型 siliconflow/deepseek-ai/DeepSeek-V4-Flash；切决策模型 siliconflow/deepseek-ai/DeepSeek-V4-Flash；清模型覆盖。")
+    lines.append("命令：测试模型（检测清单）；测试模型 <provider/model>（单测）；切回复模型 <provider/model>；清模型覆盖。")
     return "\n".join(lines)
 
 
@@ -3148,13 +3150,13 @@ def _http_status_payload() -> dict[str, object]:
             "ready": deepseek_ready,
             "routes": _status_model_routes(),
             "latency_policy": {
-                "decision_attempt_seconds": app_config.deepseek.decision_timeout_seconds,
-                "decision_total_seconds": app_config.deepseek.decision_total_timeout_seconds,
-                "reply_attempt_seconds": app_config.deepseek.reply_timeout_seconds,
-                "reply_total_seconds": app_config.deepseek.reply_total_timeout_seconds,
-                "utility_attempt_seconds": app_config.deepseek.utility_timeout_seconds,
-                "utility_total_seconds": app_config.deepseek.utility_total_timeout_seconds,
-                "sdk_max_retries": app_config.deepseek.max_retries,
+                "decision_attempt_seconds": app_config.llm.decision_timeout_seconds,
+                "decision_total_seconds": app_config.llm.decision_total_timeout_seconds,
+                "reply_attempt_seconds": app_config.llm.reply_timeout_seconds,
+                "reply_total_seconds": app_config.llm.reply_total_timeout_seconds,
+                "utility_attempt_seconds": app_config.llm.utility_timeout_seconds,
+                "utility_total_seconds": app_config.llm.utility_total_timeout_seconds,
+                "sdk_max_retries": app_config.llm.max_retries,
             },
         },
         "search": fresh_context_tool.status_snapshot(),
@@ -3241,8 +3243,8 @@ def _admin_tools_state(group_id: int | None) -> dict[str, object]:
     overrides = _model_route_overrides()
     model_rows: list[dict[str, object]] = []
     for route_name, title, flow in MODEL_ROUTE_INFOS:
-        configured = app_config.deepseek.routes[route_name].label
-        fallback = app_config.deepseek.fallback_routes[route_name].label
+        configured = app_config.llm.routes[route_name].label
+        fallback = app_config.llm.fallback_routes[route_name].label
         active = deepseek_client.current_route(route_name).label if deepseek_client is not None else overrides.get(route_name, configured)
         model_rows.append(
             {
@@ -3295,9 +3297,9 @@ def _admin_tools_state(group_id: int | None) -> dict[str, object]:
         "model_catalog": [
             {
                 "label": route.label,
-                "source": f"{_provider_key_source(route.provider)} / {app_config.deepseek.providers[route.provider].api_key_env}",
+                "source": f"{_provider_key_source(route.provider)} / {app_config.llm.providers[route.provider].api_key_env}",
             }
-            for route in app_config.deepseek.model_catalog
+            for route in app_config.llm.model_catalog
         ],
         "jargon_entries": jargon_entries,
         "tool_docs": {
@@ -3614,10 +3616,10 @@ def _status_model_routes() -> dict[str, str]:
             route = (
                 deepseek_client.current_route(route_name)
                 if deepseek_client is not None
-                else app_config.deepseek.routes.get(route_name)
+                else app_config.llm.routes.get(route_name)
             )
         except Exception:
-            route = app_config.deepseek.routes.get(route_name)
+            route = app_config.llm.routes.get(route_name)
         if route is not None:
             routes[route_name] = route.label
     return routes
@@ -5610,17 +5612,17 @@ async def handle_bot_command(bot: Bot, event: Event, matcher: Matcher, args: Mes
         decision_model = (
             deepseek_client.current_route("decision").label
             if deepseek_client is not None
-            else app_config.deepseek.routes["decision"].label
+            else app_config.llm.routes["decision"].label
         )
         reply_model = (
             deepseek_client.current_route("reply").label
             if deepseek_client is not None
-            else app_config.deepseek.routes["reply"].label
+            else app_config.llm.routes["reply"].label
         )
         utility_model = (
             deepseek_client.current_route("utility").label
             if deepseek_client is not None
-            else app_config.deepseek.routes["utility"].label
+            else app_config.llm.routes["utility"].label
         )
         await matcher.finish(
             f"enabled={enabled} persona={persona_id} muted_left={muted_left}s "
@@ -5790,7 +5792,7 @@ def _format_metric_metadata(metadata: dict[str, object]) -> str:
 
 
 def _token_usage_report_for_window(window: TokenReportWindow) -> str:
-    if not app_config.deepseek.usage_tracking_enabled:
+    if not app_config.llm.usage_tracking_enabled:
         return (
             "Token 用量统计：已关闭。\n"
             "原因：当前接入多个模型，暂时不做统一 token/费用计算。\n"
@@ -8692,8 +8694,34 @@ async def _handle_private_whitelist_command(bot: Bot, user_id: int, text: str) -
 
 
 async def _handle_model_route_command(bot: Bot, user_id: int, text: str) -> bool:
+    route_match = MODEL_ROUTE_COMMAND_RE.match(text)
+    probe_match = MODEL_PROBE_COMMAND_RE.match(text)
+    if text not in MODEL_ROUTE_STATUS_COMMANDS | MODEL_ROUTE_RESET_COMMANDS and route_match is None and probe_match is None:
+        return False
+    if not _is_owner_user(user_id):
+        await _send_private_text(bot, user_id, "只有主人能查询、测试和切换模型。")
+        return True
     if text in MODEL_ROUTE_STATUS_COMMANDS:
         await _send_private_text(bot, user_id, _format_model_route_status())
+        return True
+    if probe_match is not None:
+        if deepseek_client is None:
+            await _send_private_text(bot, user_id, "模型客户端还没初始化，稍后再测。")
+            return True
+        model_label = (probe_match.group("model") or "").strip()
+        if model_label:
+            routes = (deepseek_client.parse_model_route(model_label),)
+        else:
+            routes = app_config.llm.model_catalog
+        semaphore = asyncio.Semaphore(3)
+
+        async def _probe_one(route):
+            async with semaphore:
+                available, reason = await deepseek_client.probe_model(route)
+                return f"{'✅' if available else '❌'} {route.label}：{reason}"
+
+        results = await asyncio.gather(*(_probe_one(route) for route in routes))
+        await _send_private_text(bot, user_id, "模型实测：\n" + "\n".join(results))
         return True
     if text in MODEL_ROUTE_RESET_COMMANDS:
         _save_model_route_overrides({})
@@ -8702,9 +8730,7 @@ async def _handle_model_route_command(bot: Bot, user_id: int, text: str) -> bool
                 deepseek_client.set_route_override(route_name, None)
         await _send_private_text(bot, user_id, "已清除模型覆盖，恢复 config.yaml 默认模型。")
         return True
-    match = MODEL_ROUTE_COMMAND_RE.match(text)
-    if match is None:
-        return False
+    match = route_match
     if deepseek_client is None:
         await _send_private_text(bot, user_id, "模型客户端还没初始化，稍后再切。")
         return True

@@ -16,6 +16,7 @@ class LLMProviderConfig:
     base_url: str
     api_key_env: str
     thinking: str
+    reasoning_effort: str | None = None
 
 
 @dataclass(frozen=True)
@@ -37,7 +38,7 @@ class ReplyPeakRouting:
 
 
 @dataclass(frozen=True)
-class DeepSeekConfig:
+class LLMConfig:
     base_url: str
     model: str
     decision_model: str
@@ -65,9 +66,14 @@ class DeepSeekConfig:
     providers: dict[str, LLMProviderConfig]
     routes: dict[str, LLMModelRoute]
     fallback_routes: dict[str, LLMModelRoute]
+    additional_fallback_routes: dict[str, tuple[LLMModelRoute, ...]]
     model_catalog: tuple[LLMModelRoute, ...]
     usage_tracking_enabled: bool
     reply_peak_routing: ReplyPeakRouting
+
+
+# Existing callers still use the old name while task code migrates to LLMConfig.
+DeepSeekConfig = LLMConfig
 
 
 @dataclass(frozen=True)
@@ -93,7 +99,10 @@ class AppConfig:
     def __init__(self, raw: dict[str, Any]):
         self.raw = raw
         bot = raw.get("bot", {})
-        deepseek = raw.get("deepseek", {})
+        llm = raw.get("llm", raw.get("deepseek", {}))
+        if not isinstance(llm, dict):
+            raise ValueError("llm must be a mapping")
+        deepseek = llm
         rate = raw.get("rate_control", {})
         quiet = rate.get("quiet_hours", {})
 
@@ -126,6 +135,10 @@ class AppConfig:
         fallback_models = deepseek.get("fallback_models", {})
         if not isinstance(fallback_models, dict):
             fallback_models = {}
+        first_fallback_models = {
+            name: values[0] if isinstance(values, list) and values else values
+            for name, values in fallback_models.items()
+        }
         routes = {
             "base": parse_llm_model_route(base_model, providers, default_provider="deepseek"),
             "decision": parse_llm_model_route(decision_model, providers, default_provider="deepseek"),
@@ -139,48 +152,56 @@ class AppConfig:
         }
         fallback_routes = {
             "decision": _parse_model_route(
-                str(fallback_models.get("decision", "deepseek-v4-flash")),
+                str(first_fallback_models.get("decision", "deepseek-v4-flash")),
                 providers,
                 default_provider="deepseek",
             ),
             "reply": _parse_model_route(
-                str(fallback_models.get("reply", reply_model)),
+                str(first_fallback_models.get("reply", reply_model)),
                 providers,
                 default_provider="deepseek",
             ),
             "search": _parse_model_route(
-                str(fallback_models.get("search", fallback_models.get("reply", reply_model))),
+                str(first_fallback_models.get("search", first_fallback_models.get("reply", reply_model))),
                 providers,
                 default_provider="deepseek",
             ),
             "utility": _parse_model_route(
-                str(fallback_models.get("utility", "deepseek-v4-flash")),
+                str(first_fallback_models.get("utility", "deepseek-v4-flash")),
                 providers,
                 default_provider="deepseek",
             ),
             "jargon": _parse_model_route(
-                str(fallback_models.get("jargon", fallback_models.get("utility", "deepseek-v4-flash"))),
+                str(first_fallback_models.get("jargon", first_fallback_models.get("utility", "deepseek-v4-flash"))),
                 providers,
                 default_provider="deepseek",
             ),
             "memory": _parse_model_route(
-                str(fallback_models.get("memory", fallback_models.get("utility", "deepseek-v4-flash"))),
+                str(first_fallback_models.get("memory", first_fallback_models.get("utility", "deepseek-v4-flash"))),
                 providers,
                 default_provider="deepseek",
             ),
             "style": _parse_model_route(
-                str(fallback_models.get("style", fallback_models.get("utility", "deepseek-v4-flash"))),
+                str(first_fallback_models.get("style", first_fallback_models.get("utility", "deepseek-v4-flash"))),
                 providers,
                 default_provider="deepseek",
             ),
             "member_profile": _parse_model_route(
-                str(fallback_models.get("member_profile", fallback_models.get("utility", "deepseek-v4-flash"))),
+                str(first_fallback_models.get("member_profile", first_fallback_models.get("utility", "deepseek-v4-flash"))),
                 providers,
                 default_provider="deepseek",
             ),
         }
+        additional_fallback_routes = {
+            name: tuple(
+                parse_llm_model_route(str(value), providers, default_provider="deepseek")
+                for value in values[1:]
+            )
+            for name, values in fallback_models.items()
+            if name in routes and isinstance(values, list) and len(values) > 1
+        }
         reply_peak_routing = _reply_peak_routing(deepseek)
-        self.deepseek = DeepSeekConfig(
+        self.llm = LLMConfig(
             base_url=str(deepseek.get("base_url", "https://api.deepseek.com")),
             model=base_model,
             decision_model=decision_model,
@@ -208,10 +229,12 @@ class AppConfig:
             providers=providers,
             routes=routes,
             fallback_routes=fallback_routes,
+            additional_fallback_routes=additional_fallback_routes,
             model_catalog=_model_catalog(deepseek, routes, fallback_routes, providers),
             usage_tracking_enabled=bool(deepseek.get("usage_tracking_enabled", True)),
             reply_peak_routing=reply_peak_routing,
         )
+        self.deepseek = self.llm
         self.rate = RateConfig(
             min_interval_seconds=int(rate.get("min_interval_seconds", 60)),
             hard_mention_interval_seconds=int(rate.get("hard_mention_interval_seconds", 8)),
@@ -309,6 +332,7 @@ def _llm_providers(deepseek: dict[str, Any]) -> dict[str, LLMProviderConfig]:
                 base_url=str(raw.get("base_url", providers.get(provider_name, providers["deepseek"]).base_url)),
                 api_key_env=str(raw.get("api_key_env", f"{provider_name.upper()}_API_KEY")),
                 thinking=str(raw.get("thinking", "disabled")).lower(),
+                reasoning_effort=str(raw["reasoning_effort"]).lower() if raw.get("reasoning_effort") else None,
             )
     return providers
 

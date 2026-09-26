@@ -342,10 +342,10 @@ SUPERUSERS=["..."]
 
 ## 6. 模型路由
 
-模型路由在 `config.yaml`：
+模型路由在 `config.yaml` 的 `llm` 节；完整的扩展方式和 QQ 测试/切换命令见 `docs/llm_gateway.md`。密钥只写服务器 `.env`，不要写入仓库。
 
 ```yaml
-deepseek:
+llm:
   providers:
     deepseek:
       base_url: https://api.deepseek.com

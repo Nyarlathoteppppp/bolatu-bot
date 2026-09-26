@@ -54,7 +54,8 @@ entrypoint/plugin -> orchestration -> domain/storage/tools -> provider adapters
 | 审批命令与管理员工具 | `approval_command_service.py`、`private_admin_command_service.py`、`approval_rules.py` | 命令解析、角色权限和管理员工具命令分派 | 待审批单状态修改、群消息发送 |
 | 审批状态与请求 | `approval_state_service.py`、`approval_request_service.py`、`approval_models.py` | 待审批单集合、串行候选选择、取消反馈、stale choice 冷却、审批请求和自动发送决策 | 群消息发送与 delivery progress 写回 |
 | 审批发送 | `approved_reply_delivery.py`、`delivery.py`、`approval_models.py` | 已批准消息发送、分段进度和数据库/Trace 回写；未知结果标记后阻止盲目重试 | 审批命令解析与工具权限 |
-| LLM | `deepseek_client.py`、`embedding_client.py`、`prompts.py` | provider、JSON、模型路由、用量 | QQ 发送与审批状态 |
+| 文本模型 | `llm_gateway.py`、`deepseek_client.py`、`prompts.py` | gateway 统一 provider、任务路由、超时、回退和用量；task client 负责提示词与结果解析 | QQ 发送与审批状态 |
+| 专用模型接口 | `jev_client.py`、`embedding_client.py`、`siliconflow_ocr.py`、语音客户端 | 各自协议和模态的请求 | 文本聊天路由 |
 | 记忆/RAG | `memory.py`、`memory_learning.py`、`memory_maintenance_service.py`、`rag_*.py` | 原文、画像、atoms、风格、索引；维护 service 管理异步记忆总结、风格学习和成员画像更新 | QQ 生命周期、聊天热路径 |
 | 发送 | `delivery.py`、`reply_splitter.py`、`social_actions.py` | 拆分、艾特、表情、节流 | 写长期事实 |
 | 定时任务调度 | `daily_review_scheduler_service.py`、`weekly_usage_report_scheduler_service.py`、`proactive_chat_scheduler_service.py` | 按 Bot 管理 task 去重、时间窗口/概率策略、周期 tick、异常记录和取消清理 | 群消息生成、周报格式化与投递 |

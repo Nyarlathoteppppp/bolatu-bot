@@ -95,6 +95,9 @@ class FakeModelClient:
     def current_route(self, route_name: str):
         return self.route_overrides.get(route_name, self.config.routes[route_name])
 
+    async def probe_model(self, route):
+        return (route.provider == "mimo", "可用" if route.provider == "mimo" else "HTTP 403")
+
 
 def _use_temp_plugin_memory(monkeypatch, tmp_path) -> MemoryStore:
     store = MemoryStore(tmp_path / "bot.sqlite3")
@@ -2240,6 +2243,17 @@ def test_owner_can_clear_model_overrides(monkeypatch, tmp_path) -> None:
     assert client.current_route("reply").label == plugin.app_config.deepseek.routes["reply"].label
     assert store.app_kv_get(plugin.MODEL_ROUTE_OVERRIDES_KEY) == "{}"
     assert bot.private_messages[-1] == (1535071184, "已清除模型覆盖，恢复 config.yaml 默认模型。")
+
+
+def test_owner_can_probe_one_model_before_switching(monkeypatch, tmp_path) -> None:
+    _use_temp_plugin_memory(monkeypatch, tmp_path)
+    monkeypatch.setattr(plugin, "deepseek_client", FakeModelClient())
+    bot = FakeApprovalBot()
+
+    handled = asyncio.run(plugin._handle_group_approval_private(bot, 1535071184, "测试模型 mimo/mimo-v2.6-pro"))
+
+    assert handled
+    assert bot.private_messages[-1] == (1535071184, "模型实测：\n✅ mimo/mimo-v2.6-pro：可用")
 
 
 def test_basic_approver_cannot_switch_model(monkeypatch, tmp_path) -> None:
