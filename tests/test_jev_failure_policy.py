@@ -166,7 +166,7 @@ def test_short_questions_are_not_hard_silenced(text):
         return {"answers": {
             "wants_answer": {"noul": 0.95}, "needs_care": {"noul": 0.0},
             "to_other": {"noul": 0.0},
-            "timing_route": {"probabilities": {"silent": 0.1, "answer": 0.8, "social_join": 0.1}},
+            "timing_route": {"probabilities": {"silent": 0.1, "answer": 0.8, "continue_bot": 0.0, "social_join": 0.1}},
         }}
 
     client.evaluate = evaluate

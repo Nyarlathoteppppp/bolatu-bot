@@ -20,14 +20,6 @@ from .persona import Persona
 from .jev_policy import (
     JEV_TOOL_CHOICE_CONFIDENCE_MIN,
     JEV_TOOL_NOUL_MIN,
-    JEV_TIMING_ANSWER_CHOICE_MIN,
-    JEV_TIMING_ANSWER_INTENT_MIN,
-    JEV_TIMING_ANSWER_SILENT_MAX,
-    JEV_TIMING_CARE_MIN,
-    JEV_TIMING_SEMANTIC_REQUEST_MIN,
-    JEV_TIMING_SOCIAL_CHOICE_MIN,
-    JEV_TIMING_SOCIAL_SILENT_MAX,
-    JEV_TIMING_TO_OTHER_MIN,
     OPENROUTER_JEV_MODEL,
     TYPESAFE_JEV_MODEL,
 )
@@ -425,9 +417,10 @@ class JevClient:
         speaker_context: str = "",
         chat_label: str = "QQ 群聊",
         discourse_state: DiscourseState | None = None,
+        followup_addressed: bool = False,
     ):
         """Choose a reason to join the group conversation, if there is one."""
-        from .timing_gate import TimingDecision
+        from .timing_gate import TimingDecision, choose_jev_group_timing
         from .pipeline_types import OutputChannel, SocialIntent
 
         like_question = _timing_looks_like_question(current_text)
@@ -491,45 +484,20 @@ class JevClient:
         probabilities = route_answer.get("probabilities", {}) if isinstance(route_answer, dict) else {}
         silent = _finite_probability(probabilities.get("silent")) if isinstance(probabilities, dict) else None
         answer = _finite_probability(probabilities.get("answer")) if isinstance(probabilities, dict) else None
+        continue_bot = _finite_probability(probabilities.get("continue_bot")) if isinstance(probabilities, dict) else None
         social = _finite_probability(probabilities.get("social_join")) if isinstance(probabilities, dict) else None
-        if None in (wants_answer, needs_care, to_other, silent, answer, social):
+        if None in (wants_answer, needs_care, to_other, silent, answer, continue_bot, social):
             raise ValueError("Missing or invalid Jev timing observation")
-        if to_other >= JEV_TIMING_TO_OTHER_MIN:
-            return TimingDecision(
-                channel=OutputChannel.SILENT,
-                confidence=to_other,
-                reason=f"jev_to_other_{to_other:.2f}",
-            )
-        if needs_care >= JEV_TIMING_CARE_MIN:
-            return TimingDecision(
-                channel=OutputChannel.TEXT,
-                intent=SocialIntent.CARE,
-                confidence=needs_care,
-                reason=f"jev_care_{needs_care:.2f}",
-            )
-        if (
-            (like_question or wants_answer >= JEV_TIMING_SEMANTIC_REQUEST_MIN)
-            and wants_answer >= JEV_TIMING_ANSWER_INTENT_MIN
-            and answer >= JEV_TIMING_ANSWER_CHOICE_MIN
-            and silent < JEV_TIMING_ANSWER_SILENT_MAX
-        ):
-            return TimingDecision(
-                channel=OutputChannel.TEXT,
-                intent=SocialIntent.ANSWER,
-                confidence=min(wants_answer, answer),
-                reason=f"jev_answer_{wants_answer:.2f}",
-            )
-        if social >= JEV_TIMING_SOCIAL_CHOICE_MIN and silent < JEV_TIMING_SOCIAL_SILENT_MAX:
-            return TimingDecision(
-                channel=OutputChannel.TEXT,
-                intent=SocialIntent.CHAT,
-                confidence=social,
-                reason=f"jev_social_{social:.2f}",
-            )
-        return TimingDecision(
-            channel=OutputChannel.SILENT,
-            confidence=silent,
-            reason=f"jev_silent_{silent:.2f}",
+        return choose_jev_group_timing(
+            looks_like_question=like_question,
+            followup_addressed=followup_addressed,
+            wants_answer=wants_answer,
+            needs_care=needs_care,
+            to_other=to_other,
+            silent=silent,
+            answer=answer,
+            continue_bot=continue_bot,
+            social=social,
         )
 
     async def audit_proactive_reply(

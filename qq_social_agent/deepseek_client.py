@@ -645,6 +645,7 @@ class DeepSeekClient:
         chat_label: str = "QQ 群聊",
         speaker_context: str = "",
         discourse_state: DiscourseState | None = None,
+        followup_addressed: bool = False,
     ) -> TimingDecision:
         """Decide only whether/how to surface; tools and memory route elsewhere."""
 
@@ -676,6 +677,7 @@ class DeepSeekClient:
                 speaker_context=speaker_context,
                 chat_label=chat_label,
                 discourse_state=discourse_state,
+                followup_addressed=followup_addressed,
             ),
             what="timing_gate",
         )

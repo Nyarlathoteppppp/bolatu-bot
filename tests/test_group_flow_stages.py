@@ -102,7 +102,7 @@ def test_group_decision_skips_timing_when_addressee_is_another_member() -> None:
         return decision
 
     async def keep_tool_plan(decision, *, tool_plan, **_kwargs):
-        return decision, tool_plan
+        raise AssertionError("tool router should not run for another member's message")
 
     async def unexpected_timing(**_kwargs):
         raise AssertionError("timing gate should not decide a message addressed to another member")
@@ -120,38 +120,49 @@ def test_group_decision_skips_timing_when_addressee_is_another_member() -> None:
         maybe_apply_ask_back=keep_decision,
         logger=_logger(),
     )
-    started = time.monotonic()
-    result = asyncio.run(resolve_group_reply_decision(
-        bot=SimpleNamespace(self_id=789),
-        client=SimpleNamespace(timing_gate=unexpected_timing),
-        pre_decision=PreDecisionGateResult(None),
-        pipeline_state=_pipeline(),
-        reply_budget=GroupReplyBudget.start(started, seconds=120),
-        tool_plan=ToolRoutePlan(),
-        persona=object(),
-        context_recent=[],
-        text="你怎么想？",
-        nickname="群友",
-        speaker_context="",
-        discourse_state=DiscourseState(addressee=Binding(status="RESOLVED", target="另一位群友", target_id=456)),
-        group_id=123,
-        user_id=111,
-        source_message_id="m2",
-        addressed_bot=False,
-        direct_addressed_bot=False,
-        synthetic_addressed_bot=False,
-        followup_addressed=False,
-        mentioned=False,
-        replied_to_bot=False,
-        market_intents=[],
-        fresh_intent=None,
-        decision_started_at=started,
-        flow_started_at=started,
-        services=services,
-    ))
-    assert result is not None
-    assert result.decision.should_reply is False
-    assert result.decision.reason == "resolved_other_addressee"
+    cases = (
+        (PreDecisionGateResult(None), ToolRoutePlan(), False),
+        (PreDecisionGateResult(ReplyDecision(True, 0.95, "local_explicit_market_lookup", action="market_check")), ToolRoutePlan(), False),
+        (PreDecisionGateResult(None), ToolRoutePlan((ToolRequest(ToolKind.FRESH_SEARCH, query="最新行情", required=True),)), False),
+        (PreDecisionGateResult(None), ToolRoutePlan(), True),
+    )
+    for pre_decision, tool_plan, synthetic_addressed_bot in cases:
+        started = time.monotonic()
+        pipeline_state = _pipeline()
+        pipeline_state.tool_requests = tool_plan.requests
+        result = asyncio.run(resolve_group_reply_decision(
+            bot=SimpleNamespace(self_id=789),
+            client=SimpleNamespace(timing_gate=unexpected_timing),
+            pre_decision=pre_decision,
+            pipeline_state=pipeline_state,
+            reply_budget=GroupReplyBudget.start(started, seconds=120),
+            tool_plan=tool_plan,
+            persona=object(),
+            context_recent=[],
+            text="你怎么想？",
+            nickname="群友",
+            speaker_context="",
+            discourse_state=DiscourseState(addressee=Binding(status="RESOLVED", target="另一位群友", target_id=456)),
+            group_id=123,
+            user_id=111,
+            source_message_id="m2",
+            addressed_bot=synthetic_addressed_bot,
+            direct_addressed_bot=False,
+            synthetic_addressed_bot=synthetic_addressed_bot,
+            followup_addressed=False,
+            mentioned=False,
+            replied_to_bot=False,
+            market_intents=[],
+            fresh_intent=None,
+            decision_started_at=started,
+            flow_started_at=started,
+            services=services,
+        ))
+        assert result is not None
+        assert result.decision.should_reply is False
+        assert result.decision.reason == "resolved_other_addressee"
+        assert result.tool_plan.requests == ()
+        assert pipeline_state.tool_requests == ()
 
 
 def test_group_generation_returns_reviewed_candidate() -> None:

@@ -11,6 +11,7 @@ nonebot.init()
 from nonebot.adapters.onebot.v11 import Message
 
 from qq_social_agent import plugin
+from qq_social_agent.memory import ChatMessage
 from qq_social_agent.private_session_service import PrivateFollowupServices, PrivateSessionService
 from qq_social_agent.private_message_types import BufferedPrivateMessage
 
@@ -180,3 +181,71 @@ def test_followup_probability_gate_records_skip_without_generating(monkeypatch):
     assert metrics[0][1]["action"] == "skipped"
     assert metrics[0][1]["probability"] == 0.2
     assert generated == []
+
+
+def test_followup_drops_stale_reply_and_stays_inflight_through_send(monkeypatch):
+    monkeypatch.setattr("qq_social_agent.private_session_service.random.random", lambda: 0.0)
+    user_id = 1
+    chat_id = 10_001
+
+    for new_message_during_generation in (True, False):
+        service = PrivateSessionService()
+        service.inbound_message_counts[user_id] = 2
+        sent = []
+        recent = [
+            ChatMessage(chat_id, user_id, "甲", "刚才的话", False, 1.0),
+            ChatMessage(chat_id, 789, "风雪", "嗯", True, 2.0),
+        ]
+
+        async def reply(**_kwargs):
+            if new_message_during_generation:
+                service.message_buffers[user_id] = ["新消息"]
+            return "接着说一句"
+
+        async def send(_bot, *, user_id, message):
+            assert user_id in service.generation_inflight
+            sent.append(str(message))
+
+        client = SimpleNamespace(
+            should_continue_private_chat=lambda **_kwargs: asyncio.sleep(0, result=(True, "ok")),
+            reply=reply,
+            audit_proactive_reply=lambda **_kwargs: asyncio.sleep(0, result=(True, "ok")),
+        )
+        memory = SimpleNamespace(
+            group_state=lambda _chat_id: {"enabled": True, "persona": "default"},
+            recent_messages=lambda *_args: recent,
+            relevant_memory_summaries=lambda *_args, **_kwargs: [],
+            add_message=lambda *_args, **_kwargs: None,
+        )
+        services = PrivateFollowupServices(
+            memory=memory,
+            get_deepseek_client=lambda: client,
+            private_user_can_chat=lambda _user_id: True,
+            private_chat_id=lambda _user_id: chat_id,
+            rate_limiter=SimpleNamespace(allow=lambda *_args, **_kwargs: SimpleNamespace(allowed=True)),
+            personas=SimpleNamespace(get=lambda _name: SimpleNamespace(name="风雪")),
+            default_persona="default",
+            format_memory_context=lambda _values: "",
+            private_priority_context=lambda _user_id: "",
+            member_label=lambda _user_id, nickname: nickname,
+            first_connected_onebot_bot=lambda: SimpleNamespace(self_id=789),
+            send_private_message=send,
+            record_metric_event=lambda *_args, **_kwargs: None,
+            short_notice_text=lambda value, limit: value[:limit],
+            sanitize_generated_text=lambda value: value,
+            blocked_backend_fallback_texts=frozenset(),
+            probability_by_user={},
+            default_probability=1.0,
+            private_context_limit=40,
+            mid_memory_keep_summaries=4,
+            logger=plugin.logger,
+        )
+
+        asyncio.run(service.run_followup_after_delay(
+            user_id,
+            expected_message_count=2,
+            delay=0,
+            services=services,
+        ))
+        assert sent == ([] if new_message_during_generation else ["接着说一句"])
+        assert user_id not in service.generation_inflight

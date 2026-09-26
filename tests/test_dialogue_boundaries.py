@@ -60,7 +60,7 @@ def test_technical_reply_words_are_not_a_reply_to_another_person(text):
         return {"answers":{
             "wants_answer":{"noul":.99}, "needs_care":{"noul":0},
             "to_other":{"noul":0},
-            "timing_route":{"probabilities":{"silent":.1,"answer":.8,"social_join":.1}},
+            "timing_route":{"probabilities":{"silent":.1,"answer":.8,"continue_bot":.0,"social_join":.1}},
         }}
     client.evaluate=evaluate
     result=asyncio.run(client.timing_gate(persona=SimpleNamespace(decision_prompt=""),

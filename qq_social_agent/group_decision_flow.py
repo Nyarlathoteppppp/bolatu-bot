@@ -90,6 +90,22 @@ async def resolve_group_reply_decision(
     ambiguity_resolution = discourse_state.ambiguity_resolution
     decision = pre_decision.decision
     decision_source = "local" if decision is not None else ""
+    addressed_other = (
+        not (direct_addressed_bot or mentioned or replied_to_bot)
+        and discourse_state.addressee.status == RESOLVED
+        and discourse_state.addressee.target_id is not None
+        and discourse_state.addressee.target_id != int(bot.self_id)
+    )
+    if addressed_other:
+        decision_source = "discourse"
+        decision = ReplyDecision(
+            should_reply=False,
+            confidence=discourse_state.addressee.confidence,
+            reason="resolved_other_addressee",
+            action="ignore",
+        )
+        tool_plan = ToolRoutePlan()
+        pipeline_state.tool_requests = tool_plan.requests
     _pipeline_mark_gated(pipeline_state)
     _record_tool_router_shadow(
         group_id=group_id,
@@ -140,19 +156,6 @@ async def resolve_group_reply_decision(
             "qq_social_agent skipped timing_gate for addressed message: "
             f"group={group_id} user={user_id}"
         )
-    if (
-        decision is None
-        and discourse_state.addressee.status == RESOLVED
-        and discourse_state.addressee.target_id is not None
-        and discourse_state.addressee.target_id != int(bot.self_id)
-    ):
-        decision_source = "discourse"
-        decision = ReplyDecision(
-            should_reply=False,
-            confidence=discourse_state.addressee.confidence,
-            reason="resolved_other_addressee",
-            action="ignore",
-        )
     if decision is None:
         decision_source = "jev"
         try:
@@ -164,6 +167,7 @@ async def resolve_group_reply_decision(
                 chat_label="QQ 群聊",
                 speaker_context=speaker_context,
                 discourse_state=discourse_state,
+                followup_addressed=followup_addressed,
             )
             decision = timing.to_reply_decision()
         except Exception as exc:
@@ -226,21 +230,22 @@ async def resolve_group_reply_decision(
         fresh_intent=fresh_intent,
     )
     decision = _apply_tool_plan(decision, tool_plan)
-    decision, tool_plan = await _apply_tool_use_router(
-        decision,
-        tool_plan=tool_plan,
-        persona=persona,
-        context_recent=context_recent,
-        text=text,
-        nickname=nickname,
-        addressed_bot=addressed_bot,
-        fresh_intent=fresh_intent,
-        market_intents=market_intents,
-        speaker_context=speaker_context,
-        group_id=group_id,
-        user_id=user_id,
-        source_message_id=source_message_id,
-    )
+    if not addressed_other:
+        decision, tool_plan = await _apply_tool_use_router(
+            decision,
+            tool_plan=tool_plan,
+            persona=persona,
+            context_recent=context_recent,
+            text=text,
+            nickname=nickname,
+            addressed_bot=addressed_bot,
+            fresh_intent=fresh_intent,
+            market_intents=market_intents,
+            speaker_context=speaker_context,
+            group_id=group_id,
+            user_id=user_id,
+            source_message_id=source_message_id,
+        )
     pipeline_state.mode = _tool_route_mode(tool_plan)
     pipeline_state.tool_requests = tool_plan.requests
     _record_metric_event(
@@ -262,9 +267,11 @@ async def resolve_group_reply_decision(
     )
     decision = _enforce_addressed_reply_decision(
         decision,
-        addressed_bot=direct_addressed_bot
-        or synthetic_addressed_bot
-        or (followup_addressed and _looks_like_addressed_question(text)),
+        addressed_bot=not addressed_other and (
+            direct_addressed_bot
+            or synthetic_addressed_bot
+            or (followup_addressed and _looks_like_addressed_question(text))
+        ),
         text=text,
     )
     if reply_budget.skip("speaking_action", time.monotonic()):

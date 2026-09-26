@@ -4894,17 +4894,6 @@ async def _handle_group_message_locked(
                 "qq_social_agent inferred follow-up search: "
                 f"group={group_id} query={fresh_intent.query!r} kind={fresh_intent.kind}"
             )
-    market_context_task: asyncio.Task[ToolResult] | None = None
-    # External fresh-context lookup is intentionally delayed until after the
-    # reply decision is confirmed. The pre-decision path may use LLM routing
-    # hints, but it must not spend Tavily/search calls for messages we will not
-    # answer.
-    prefetched_market_request = tool_plan.first(ToolKind.MARKET)
-    if prefetched_market_request is not None and prefetched_market_request.required:
-        market_context_task = asyncio.create_task(
-            tool_registry.execute(prefetched_market_request)
-        )
-
     pre_decision = _pre_decision_gate(
         text=text,
         recent_messages=context_recent,
@@ -4917,8 +4906,6 @@ async def _handle_group_message_locked(
         fresh_intent=fresh_intent,
     )
     if pre_decision.skip_reason:
-        if market_context_task is not None and not market_context_task.done():
-            market_context_task.cancel()
         logger.info(
             "qq_social_agent skipped by local pre-decision gate: "
             f"group={group_id} reason={pre_decision.skip_reason}"
@@ -4979,8 +4966,6 @@ async def _handle_group_message_locked(
     decision = resolved_decision.decision
     tool_plan = resolved_decision.tool_plan
     if pipeline_state.output_channel is OutputChannel.SILENT:
-        if market_context_task is not None and not market_context_task.done():
-            market_context_task.cancel()
         await _send_approval_suppression_notice(
             bot,
             group_id=group_id,
@@ -5057,6 +5042,15 @@ async def _handle_group_message_locked(
         )
         _pipeline_mark_completed(pipeline_state)
         return
+
+    # Start external market work only for a confirmed text reply, using the
+    # final routed request. Context assembly can run while the lookup runs.
+    market_context_task: asyncio.Task[ToolResult] | None = None
+    prefetched_market_request = tool_plan.first(ToolKind.MARKET)
+    if prefetched_market_request is not None and prefetched_market_request.required:
+        market_context_task = asyncio.create_task(
+            tool_registry.execute(prefetched_market_request)
+        )
 
     context_packet = await build_group_generation_context(
         group_id=group_id,

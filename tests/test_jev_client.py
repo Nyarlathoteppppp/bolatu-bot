@@ -28,6 +28,7 @@ def _timing_answers(
     other: float = 0.1,
     silent: float = 0.8,
     answer: float = 0.1,
+    continues: float = 0.0,
     social: float = 0.1,
 ) -> dict:
     return {"answers": {
@@ -36,7 +37,7 @@ def _timing_answers(
         "to_other": {"noul": other},
         "timing_route": {"type": "choice", "choice": "silent", "probabilities": {
             "silent": silent, "answer": answer, "care": 0.0,
-            "continue_bot": 0.0, "social_join": social, "other": 0.0,
+            "continue_bot": continues, "social_join": social, "other": 0.0,
         }},
     }}
 
@@ -210,6 +211,26 @@ def test_jev_timing_gate_peer_invitation_does_not_trigger_on_question_mark_alone
         current_text="一起吗", current_nickname="A",
     ))
     assert timing.channel.value == "silent"
+
+
+def test_jev_timing_gate_nonquestion_correction_needs_followup_binding() -> None:
+    client = JevClient(api_key="test-key")
+
+    async def fake_evaluate(**_kwargs):
+        return _timing_answers(silent=0.07, answer=0.02, continues=0.91, social=0.0)
+
+    client.evaluate = fake_evaluate
+    for followup_addressed, expected_channel in ((False, "silent"), (True, "text")):
+        timing = asyncio.run(client.timing_gate(
+            persona=_persona(),
+            recent_messages=[ChatMessage(1, 789, "风雪", "这个结论应该没问题", True, 1.0)],
+            current_text="你刚才说错了，前面那个结论不对",
+            current_nickname="甲",
+            followup_addressed=followup_addressed,
+        ))
+        assert timing.channel.value == expected_channel
+        if followup_addressed:
+            assert timing.reason.startswith("jev_continue")
 
 
 def test_jev_timing_gate_blocks_short_flame_even_after_bot() -> None:

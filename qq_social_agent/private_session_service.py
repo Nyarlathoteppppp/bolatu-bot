@@ -180,6 +180,7 @@ class PrivateSessionService:
         delay: float,
         services: PrivateFollowupServices,
     ) -> None:
+        followup_inflight = False
         try:
             await asyncio.sleep(delay)
             if self.inbound_message_counts.get(user_id, 0) != expected_message_count:
@@ -220,56 +221,56 @@ class PrivateSessionService:
             if len(recent) < 2:
                 return
             self.generation_inflight.add(user_id)
-            try:
-                should_continue, continue_reason = await deepseek_client.should_continue_private_chat(
-                    persona=persona,
-                    recent_messages=recent,
+            followup_inflight = True
+            should_continue, continue_reason = await deepseek_client.should_continue_private_chat(
+                persona=persona,
+                recent_messages=recent,
+            )
+            if not should_continue:
+                services.record_metric_event(
+                    "private_followup",
+                    group_id=chat_id,
+                    user_id=user_id,
+                    stage="precheck",
+                    action="skipped",
+                    probability=probability,
+                    roll=round(roll, 3),
+                    reason=services.short_notice_text(continue_reason, 80),
                 )
-                if not should_continue:
-                    services.record_metric_event(
-                        "private_followup",
-                        group_id=chat_id,
-                        user_id=user_id,
-                        stage="precheck",
-                        action="skipped",
-                        probability=probability,
-                        roll=round(roll, 3),
-                        reason=services.short_notice_text(continue_reason, 80),
+                return
+            reply = await deepseek_client.reply(
+                persona=persona,
+                recent_messages=recent,
+                current_text=(
+                    "对方刚连续和你聊了几句，现在停了十秒。"
+                    "如果能自然延续刚才的话题、补一个有用观点或轻轻开个新话题，就主动发一句；"
+                    "如果没有自然的话，不要回复。"
+                ),
+                current_nickname=services.member_label(
+                    user_id,
+                    private_nickname_from_recent(recent, user_id),
+                ),
+                mentioned=False,
+                action="reply",
+                chat_label="QQ 私聊",
+                memory_context=services.format_memory_context(
+                    services.memory.relevant_memory_summaries(
+                        chat_id,
+                        " ".join(msg.text for msg in recent[-4:]),
+                        limit=services.mid_memory_keep_summaries,
                     )
-                    return
-                reply = await deepseek_client.reply(
-                    persona=persona,
-                    recent_messages=recent,
-                    current_text=(
-                        "对方刚连续和你聊了几句，现在停了十秒。"
-                        "如果能自然延续刚才的话题、补一个有用观点或轻轻开个新话题，就主动发一句；"
-                        "如果没有自然的话，不要回复。"
-                    ),
-                    current_nickname=services.member_label(
-                        user_id,
-                        private_nickname_from_recent(recent, user_id),
-                    ),
-                    mentioned=False,
-                    action="reply",
-                    chat_label="QQ 私聊",
-                    memory_context=services.format_memory_context(
-                        services.memory.relevant_memory_summaries(
-                            chat_id,
-                            " ".join(msg.text for msg in recent[-4:]),
-                            limit=services.mid_memory_keep_summaries,
-                        )
-                    ),
-                    priority_context=services.private_priority_context(user_id),
-                    speaker_context="当前是一对一私聊。只能自然续聊，不要提群聊、审批或工具流程。",
-                )
-                audit_send, audit_reason = await deepseek_client.audit_proactive_reply(
-                    persona=persona,
-                    recent_messages=recent,
-                    candidate=reply,
-                    chat_label="QQ 私聊",
-                )
-            finally:
-                self.generation_inflight.discard(user_id)
+                ),
+                priority_context=services.private_priority_context(user_id),
+                speaker_context="当前是一对一私聊。只能自然续聊，不要提群聊、审批或工具流程。",
+            )
+            audit_send, audit_reason = await deepseek_client.audit_proactive_reply(
+                persona=persona,
+                recent_messages=recent,
+                candidate=reply,
+                chat_label="QQ 私聊",
+            )
+            if self.message_buffers.get(user_id) or self.inbound_message_counts.get(user_id, 0) != expected_message_count:
+                return
             if not audit_send:
                 services.record_metric_event(
                     "private_followup",
@@ -306,6 +307,8 @@ class PrivateSessionService:
         except Exception as exc:
             services.logger.warning(f"qq_social_agent private follow-up failed: user={user_id} error={exc}")
         finally:
+            if followup_inflight:
+                self.generation_inflight.discard(user_id)
             task = asyncio.current_task()
             if self.followup_tasks.get(user_id) is task:
                 self.followup_tasks.pop(user_id, None)

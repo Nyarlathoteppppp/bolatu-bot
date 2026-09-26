@@ -3,6 +3,17 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
+from .jev_policy import (
+    JEV_TIMING_ANSWER_CHOICE_MIN,
+    JEV_TIMING_ANSWER_INTENT_MIN,
+    JEV_TIMING_ANSWER_SILENT_MAX,
+    JEV_TIMING_CARE_MIN,
+    JEV_TIMING_CONTINUE_CHOICE_MIN,
+    JEV_TIMING_SEMANTIC_REQUEST_MIN,
+    JEV_TIMING_SOCIAL_CHOICE_MIN,
+    JEV_TIMING_SOCIAL_SILENT_MAX,
+    JEV_TIMING_TO_OTHER_MIN,
+)
 from .pipeline_types import OutputChannel, SocialIntent
 
 if TYPE_CHECKING:
@@ -51,6 +62,65 @@ class TimingDecision:
             action=INTENT_TO_ACTION.get(self.intent, "reply"),
             side_reaction=self.side_reaction,
         )
+
+
+def choose_jev_group_timing(
+    *,
+    looks_like_question: bool,
+    followup_addressed: bool,
+    wants_answer: float,
+    needs_care: float,
+    to_other: float,
+    silent: float,
+    answer: float,
+    continue_bot: float,
+    social: float,
+) -> TimingDecision:
+    """Apply group speaking policy to provider observations."""
+    if to_other >= JEV_TIMING_TO_OTHER_MIN:
+        return TimingDecision(
+            channel=OutputChannel.SILENT,
+            confidence=to_other,
+            reason=f"jev_to_other_{to_other:.2f}",
+        )
+    if needs_care >= JEV_TIMING_CARE_MIN:
+        return TimingDecision(
+            channel=OutputChannel.TEXT,
+            intent=SocialIntent.CARE,
+            confidence=needs_care,
+            reason=f"jev_care_{needs_care:.2f}",
+        )
+    if (
+        (looks_like_question or wants_answer >= JEV_TIMING_SEMANTIC_REQUEST_MIN)
+        and wants_answer >= JEV_TIMING_ANSWER_INTENT_MIN
+        and answer >= JEV_TIMING_ANSWER_CHOICE_MIN
+        and silent < JEV_TIMING_ANSWER_SILENT_MAX
+    ):
+        return TimingDecision(
+            channel=OutputChannel.TEXT,
+            intent=SocialIntent.ANSWER,
+            confidence=min(wants_answer, answer),
+            reason=f"jev_answer_{wants_answer:.2f}",
+        )
+    if followup_addressed and continue_bot >= JEV_TIMING_CONTINUE_CHOICE_MIN and continue_bot > silent:
+        return TimingDecision(
+            channel=OutputChannel.TEXT,
+            intent=SocialIntent.CHAT,
+            confidence=continue_bot,
+            reason=f"jev_continue_{continue_bot:.2f}",
+        )
+    if social >= JEV_TIMING_SOCIAL_CHOICE_MIN and silent < JEV_TIMING_SOCIAL_SILENT_MAX:
+        return TimingDecision(
+            channel=OutputChannel.TEXT,
+            intent=SocialIntent.CHAT,
+            confidence=social,
+            reason=f"jev_social_{social:.2f}",
+        )
+    return TimingDecision(
+        channel=OutputChannel.SILENT,
+        confidence=silent,
+        reason=f"jev_silent_{silent:.2f}",
+    )
 
 
 def parse_timing_decision(raw: object) -> TimingDecision:
