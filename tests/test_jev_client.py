@@ -494,7 +494,7 @@ def test_jev_speaking_action_none_keeps_baseline() -> None:
         assert "protect" in criteria
         assert "mirror_style" in criteria
         assert "act_cute" in criteria
-        assert len(criteria) == 27
+        assert len(criteria) == 26
         return {"answers": {"speaking_action": {"choice": "none"}}}
 
     client.evaluate = fake_evaluate
@@ -533,6 +533,7 @@ def test_jev_speaking_action_can_choose_act_cute() -> None:
 
     async def fake_evaluate(**kwargs):
         assert "act_cute" in kwargs["questions"]["speaking_action"]["criteria"]
+        assert "care" not in kwargs["questions"]["speaking_action"]["criteria"]
         return {"answers": {"speaking_action": {"choice": "act_cute"}}}
 
     client.evaluate = fake_evaluate

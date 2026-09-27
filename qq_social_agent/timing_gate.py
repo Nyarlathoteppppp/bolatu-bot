@@ -123,14 +123,12 @@ def parse_timing_decision(raw: object) -> TimingDecision:
         intent = SocialIntent(str(data.get("intent", "chat")).strip().lower())
     except ValueError:
         intent = SocialIntent.CHAT
-    if intent is SocialIntent.CARE:
-        intent = SocialIntent.CHAT
     try:
         confidence = max(0.0, min(1.0, float(data.get("confidence", 0.0))))
     except (TypeError, ValueError):
         confidence = 0.0
     reaction = str(data.get("reaction", "") or "").strip().lower()
-    if reaction not in {"agree", "care", "laugh", "tease", "surprise", "question", "applause", "heart"}:
+    if reaction not in {"agree", "laugh", "tease", "surprise", "question", "applause", "heart"}:
         reaction = ""
     side_reaction = str(
         data.get("side_reaction", "")
@@ -138,7 +136,7 @@ def parse_timing_decision(raw: object) -> TimingDecision:
         or data.get("emoji_reaction", "")
         or ""
     ).strip().lower()
-    if side_reaction not in {"agree", "care", "laugh", "tease", "surprise", "question", "applause", "heart"}:
+    if side_reaction not in {"agree", "laugh", "tease", "surprise", "question", "applause", "heart"}:
         side_reaction = ""
     if channel == OutputChannel.REACT:
         if not reaction and side_reaction:

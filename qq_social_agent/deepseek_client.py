@@ -134,7 +134,6 @@ SPEAKING_ACTIONS = {
     "reply",
     "answer",
     "agree",
-    "care",
     "act_cute",
     "tease",
     "ask_back",
@@ -167,7 +166,7 @@ SOCIAL_ACTIONS = SPEAKING_ACTIONS | {
     "poke",
 }
 
-ADDRESSED_QUESTION_ACTIONS = {"answer", "ask_back", "clarify", "care"}
+ADDRESSED_QUESTION_ACTIONS = {"answer", "ask_back", "clarify"}
 
 
 class LLMTaskClient(LLMGateway):
@@ -1768,12 +1767,6 @@ def _normalize_action(value: str, *, should_reply: bool) -> str:
         "approve": "agree",
         "认可": "agree",
         "同意": "agree",
-        "care": "care",
-        "comfort": "care",
-        "empathy": "care",
-        "关心": "care",
-        "安慰": "care",
-        "承接": "care",
         "act_cute": "act_cute",
         "卖萌": "act_cute",
         "装乖": "act_cute",
@@ -1863,9 +1856,6 @@ def _normalize_reaction_name(value: str) -> str:
         "thumbs_up": "agree",
         "like": "agree",
         "赞": "agree",
-        "hug": "care",
-        "抱抱": "care",
-        "comfort": "care",
         "哈哈": "laugh",
         "笑": "laugh",
         "laughing": "laugh",
@@ -1881,7 +1871,6 @@ def _normalize_reaction_name(value: str) -> str:
     normalized = aliases.get(key, key)
     return normalized if normalized in {
         "agree",
-        "care",
         "laugh",
         "tease",
         "surprise",

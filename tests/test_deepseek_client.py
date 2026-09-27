@@ -303,22 +303,22 @@ def test_parse_reply_decision_action_agree() -> None:
     assert decision.action == "agree"
 
 
-def test_parse_reply_decision_action_care() -> None:
+def test_parse_reply_decision_removed_care_action_becomes_reply() -> None:
     decision = _parse_reply_decision(
         '{"should_reply": true, "confidence": 0.81, "action": "care", "reason": "压力很大"}'
     )
 
     assert decision.should_reply
-    assert decision.action == "care"
+    assert decision.action == "reply"
 
 
-def test_parse_reply_decision_action_care_chinese_alias() -> None:
+def test_parse_reply_decision_removed_care_alias_becomes_reply() -> None:
     decision = _parse_reply_decision(
         '{"should_reply": true, "confidence": 0.81, "action": "关心", "reason": "明显低落"}'
     )
 
     assert decision.should_reply
-    assert decision.action == "care"
+    assert decision.action == "reply"
 
 
 def test_parse_reply_decision_action_answer() -> None:
@@ -791,9 +791,9 @@ def test_reply_candidates_includes_priority_context() -> None:
                     message=SimpleNamespace(
                         content=(
                             '{"candidates":['
-                            '{"text":"小鸟别急呀，风雪陪你慢慢看","style":"温柔可爱","action":"care"},'
-                            '{"text":"这事先别慌，风雪觉得可以一点点拆","style":"顺毛安慰","action":"care"},'
-                            '{"text":"小鸟这句有点委屈欸，先抱一下再说","style":"亲近承接","action":"care"}'
+                            '{"text":"小鸟别急呀，风雪陪你慢慢看","style":"温柔可爱","action":"reply"},'
+                            '{"text":"这事先别慌，风雪觉得可以一点点拆","style":"顺毛安慰","action":"reply"},'
+                            '{"text":"小鸟这句有点委屈欸，先抱一下再说","style":"亲近承接","action":"reply"}'
                             ']}'
                         )
                     ),
@@ -819,7 +819,7 @@ def test_reply_candidates_includes_priority_context() -> None:
             current_text="我有点难受",
             current_nickname="小鸟[#89072]",
             mentioned=True,
-            action="care",
+            action="reply",
             priority_context="当前触发人是小鸟 / 184589072。最高优先级：回复小鸟时必须超级温柔、可爱。",
         )
     )

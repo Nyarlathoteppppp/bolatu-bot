@@ -127,7 +127,7 @@ class FreshContextTool:
         provider: str | None = None,
         tavily_api_key: str | None = None,
         searxng_base_url: str | None = None,
-        timeout_seconds: float = 10.0,
+        timeout_seconds: float = 15.0,
         max_results: int = 5,
         cache_max_entries: int = 256,
         query_max_chars: int = 120,
@@ -162,6 +162,7 @@ class FreshContextTool:
         self._stats: dict[str, int] = {
             "requests": 0,
             "external_requests": 0,
+            "provider_queries": 0,
             "cache_hits": 0,
             "successes": 0,
             "no_results": 0,
@@ -209,7 +210,7 @@ class FreshContextTool:
                 or cfg.get("searxng_base_url")
                 or ""
             ),
-            timeout_seconds=_config_float(cfg, "timeout_seconds", default=10.0),
+            timeout_seconds=_config_float(cfg, "timeout_seconds", default=15.0),
             max_results=_config_int(cfg, "max_results", default=5),
             cache_max_entries=_config_int(cfg, "cache_max_entries", default=256),
             query_max_chars=_config_int(cfg, "query_max_chars", default=120),
@@ -357,6 +358,7 @@ class FreshContextTool:
         items: tuple[FreshItem, ...] = ()
         used_provider = candidate_providers[-1] if candidate_providers else initial_provider
         deadline = time.monotonic() + max(0.2, float(self.timeout_seconds))
+        provider_failures = 0
         for index, provider_name in enumerate(candidate_providers):
             remaining = deadline - time.monotonic()
             if remaining <= 0:
@@ -371,56 +373,31 @@ class FreshContextTool:
                 provider_timeout = min(provider_timeout, 1.5)
             attempted.append(provider_name)
             used_provider = provider_name
-            try:
-                answer, items = await asyncio.wait_for(
-                    self._lookup_provider(
-                        provider_name,
-                        normalized_query,
-                        kind=normalized_kind,
-                        timeout_seconds=provider_timeout,
-                    ),
-                    timeout=max(0.1, provider_timeout),
+            provider_queries = research_queries if index == 0 else research_queries[:1]
+            outcomes = await asyncio.gather(*(
+                self._lookup_provider_outcome(
+                    provider_name,
+                    search_query,
+                    kind=normalized_kind,
+                    timeout_seconds=provider_timeout,
                 )
-            except asyncio.TimeoutError:
-                errors.append(f"{provider_name}:total_timeout")
-                answer, items = "", ()
-            except SearchProviderError as exc:
-                errors.append(f"{provider_name}:{exc.code}")
-                answer, items = "", ()
-            except Exception as exc:
-                errors.append(f"{provider_name}:{type(exc).__name__}")
-                answer, items = "", ()
+                for search_query in provider_queries
+            ))
+            if all(error for _, _, error in outcomes):
+                provider_failures += 1
+            for found_answer, found_items, error in outcomes:
+                if error:
+                    errors.append(f"{provider_name}:{error}")
+                if found_answer and not answer:
+                    answer = found_answer
+                if found_items:
+                    items = _merge_fresh_items(items, found_items)
             if answer or items:
                 break
 
-        extra_queries = [query for query in research_queries[1:] if query and query != normalized_query]
-        remaining = deadline - time.monotonic()
-        if (answer or items) and extra_queries and remaining > 0.4:
-            extra_timeout = min(2.0, remaining)
-            extra_results = await asyncio.gather(
-                *[
-                    self._lookup_provider_quiet(
-                        used_provider,
-                        extra_query,
-                        kind=normalized_kind,
-                        timeout_seconds=extra_timeout,
-                    )
-                    for extra_query in extra_queries
-                ],
-                return_exceptions=True,
-            )
-            for extra in extra_results:
-                if isinstance(extra, Exception):
-                    continue
-                extra_answer, extra_items = extra
-                if extra_answer and not answer:
-                    answer = extra_answer
-                if extra_items:
-                    items = _merge_fresh_items(items, extra_items)
-
         if answer or items:
             status = "ok"
-        elif errors and len(errors) >= len(attempted):
+        elif attempted and provider_failures == len(attempted):
             status = "failed"
         else:
             status = "no_result"
@@ -671,6 +648,28 @@ class FreshContextTool:
             research_rounds=lookup.research_rounds,
         )
 
+    async def _lookup_provider_outcome(
+        self,
+        provider: str,
+        query: str,
+        *,
+        kind: str,
+        timeout_seconds: float,
+    ) -> tuple[str, tuple[FreshItem, ...], str]:
+        self._stats["provider_queries"] += 1
+        try:
+            answer, items = await asyncio.wait_for(
+                self._lookup_provider(provider, query, kind=kind, timeout_seconds=timeout_seconds),
+                timeout=max(0.1, timeout_seconds),
+            )
+            return answer, items, ""
+        except asyncio.TimeoutError:
+            return "", (), "total_timeout"
+        except SearchProviderError as exc:
+            return "", (), exc.code
+        except Exception as exc:
+            return "", (), type(exc).__name__
+
     async def _lookup_provider_quiet(
         self,
         provider: str,
@@ -679,6 +678,7 @@ class FreshContextTool:
         kind: str,
         timeout_seconds: float | None = None,
     ) -> tuple[str, tuple[FreshItem, ...]]:
+        self._stats["provider_queries"] += 1
         try:
             return await asyncio.wait_for(
                 self._lookup_provider(
@@ -1691,20 +1691,27 @@ def _planned_research_queries(
         if str(item or "").strip()
     )
     planned_queries = tuple(item for item in planned_queries if item)
-    if planned_queries:
-        primary = _compact_search_query(query) or _normalize_query(query)
-        merged = [primary] if primary else []
-        seen = {re.sub(r"\s+", "", primary.casefold())} if primary else set()
-        for item in planned_queries:
+    primary = _compact_search_query(query) or _normalize_query(query)
+    merged = [primary] if primary else []
+    seen = {re.sub(r"\s+", "", primary.casefold())} if primary else set()
+    for item in planned_queries:
+        key = re.sub(r"\s+", "", item.casefold())
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        merged.append(item)
+        if len(merged) >= 4:
+            return tuple(merged)
+    if len(merged) < 3:
+        for item in _research_queries(query, kind=kind):
             key = re.sub(r"\s+", "", item.casefold())
             if not key or key in seen:
                 continue
             seen.add(key)
             merged.append(item)
-            if len(merged) >= 4:
+            if len(merged) >= 3:
                 break
-        return tuple(merged)
-    return _research_queries(query, kind=kind)
+    return tuple(merged)
 
 
 def _research_queries(query: str, *, kind: str) -> tuple[str, ...]:
@@ -1716,17 +1723,16 @@ def _research_queries(query: str, *, kind: str) -> tuple[str, ...]:
     if kind in {"news", "sports"}:
         if "最新" not in compact:
             variants.append(f"{base} 最新")
-        variants.append(f"{base} 最新进展")
+        variants.extend((f"{base} 官方 通报", f"{base} 英文 报道"))
     else:
+        if any(marker in compact for marker in ("github", "api", "sdk", "插件", "文档", "模型", "论文", "cad", "dwg")):
+            variants.append(f"{base} 官方 文档")
         if not any(marker in compact for marker in ("是什么", "什么是", "定义", "简介", "wiki", "维基")):
             variants.append(f"{base} 是什么")
         if not any(marker in compact for marker in ("wiki", "维基", "wikipedia")):
             variants.append(f"{base} 维基百科")
-        if any(marker in compact for marker in ("github", "api", "sdk", "插件", "文档", "模型", "论文", "cad", "dwg")):
-            variants.append(f"{base} 官方 文档")
-        elif "最新" not in compact:
-            variants.append(f"{base} 最新")
-    return tuple(_dedupe_strings(variants)[:4])
+        variants.append(f"{base} 英文")
+    return tuple(_dedupe_strings(variants)[:3])
 
 
 def _claim_retry_query(query: str, *, kind: str) -> str:

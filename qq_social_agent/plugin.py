@@ -9369,7 +9369,7 @@ async def _send_approved_group_reply_inner(
 
 
 def _group_meme_context_eligible(approval: PendingGroupApproval, candidate: PendingApprovalCandidate) -> bool:
-    if candidate.action in {"care", "market_check", "fresh_context"}:
+    if candidate.action in {"market_check", "fresh_context"}:
         return False
     if approval.tool_evidence.strip():
         return False
@@ -9989,7 +9989,7 @@ def _private_meme_context_eligible(
 ) -> bool:
     """Keep curated images an accent for playful private chat, never an answer substitute."""
 
-    if decision.action in {"care", "market_check", "fresh_context"}:
+    if decision.action in {"market_check", "fresh_context"}:
         return False
     if decision.need_tool or decision.need_fresh_context or market_context.strip() or fresh_context.strip():
         return False

@@ -44,7 +44,6 @@ def apply_decision(
         state.output_channel = OutputChannel.TEXT
     state.social_intent = {
         "answer": SocialIntent.ANSWER,
-        "care": SocialIntent.CARE,
         "tease": SocialIntent.PLAY,
         "agree": SocialIntent.AGREE,
     }.get(action, SocialIntent.CHAT)

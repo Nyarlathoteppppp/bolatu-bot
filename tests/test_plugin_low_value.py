@@ -3759,7 +3759,7 @@ def test_passive_message_blocks_clarify_speaking_action(monkeypatch) -> None:
     assert "禁止反问" in seen[0]["speaker_context"]
 
 
-def test_care_is_chosen_after_timing_gate(monkeypatch) -> None:
+def test_removed_care_action_is_not_selected_after_timing_gate(monkeypatch) -> None:
     original = ReplyDecision(True, 0.63, "jev_social_0.63", mode="chat", action="reply")
 
     async def select(**_kwargs):
@@ -3777,7 +3777,7 @@ def test_care_is_chosen_after_timing_gate(monkeypatch) -> None:
         user_id=2,
         looks_like_question=False,
     ))
-    assert result.action == "care"
+    assert result.action == "reply"
 
 
 def test_act_cute_speaking_action_reaches_generation(monkeypatch) -> None:

@@ -11,8 +11,6 @@ from . import onebot_gateway
 DEFAULT_REACTION_EMOJI_IDS = {
     "agree": ("76",),
     "like": ("76",),
-    "care": ("49",),
-    "hug": ("49",),
     "laugh": ("182",),
     "tease": ("101",),
     "surprise": ("32",),
@@ -302,7 +300,6 @@ def reaction_from_action(action: str, requested_reaction: str = "") -> str:
         return normalized
     mapping = {
         "agree": "agree",
-        "care": "care",
         "tease": "tease",
         "echo_mood": "laugh",
         "observe": "like",
@@ -321,9 +318,6 @@ def normalize_reaction(value: str) -> str:
         "赞": "agree",
         "like": "agree",
         "ok": "agree",
-        "hug": "care",
-        "comfort": "care",
-        "抱抱": "care",
         "heart": "heart",
         "爱心": "heart",
         "哈哈": "laugh",

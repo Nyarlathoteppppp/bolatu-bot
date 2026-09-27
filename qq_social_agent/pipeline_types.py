@@ -36,7 +36,6 @@ class PipelineStage(str, Enum):
 
 class SocialIntent(str, Enum):
     ANSWER = "answer"
-    CARE = "care"
     PLAY = "play"
     AGREE = "agree"
     CHAT = "chat"

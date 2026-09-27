@@ -993,6 +993,38 @@ async def test_lookup_runs_parallel_angle_queries_without_polluting_attempted_pr
     assert len(seen) >= 2
     assert "OpenFOAM 是开源 CFD 工具包" in lookup.answer
 
+
+@pytest.mark.anyio
+async def test_lookup_defaults_to_three_parallel_queries_even_when_primary_is_empty(monkeypatch) -> None:
+    seen: list[str] = []
+    all_started = asyncio.Event()
+
+    async def fake_tavily(query: str, *, kind: str, api_key: str):
+        seen.append(query)
+        if len(seen) == 3:
+            all_started.set()
+        await all_started.wait()
+        if query == "OpenFOAM 简介":
+            return "", ()
+        return "", (FreshItem(query, "openfoam.org", "", url="https://openfoam.org"),)
+
+    monkeypatch.setattr(fresh_context, "_fetch_tavily_lookup", fake_tavily)
+    tool = FreshContextTool(
+        provider="tavily",
+        tavily_api_key="test-key",
+        followup_page_max_tries=0,
+        followup_search_hops=1,
+    )
+    lookup = await asyncio.wait_for(
+        tool.lookup("OpenFOAM 简介", kind="web", queries=("OpenFOAM 简介",)),
+        timeout=1.0,
+    )
+    assert lookup.status == "ok"
+    assert len(lookup.research_queries) == 3
+    assert set(seen) == set(lookup.research_queries)
+    assert lookup.provider == "tavily"
+    assert tool.status_snapshot()["counters"]["provider_queries"] == 3
+
 def test_should_run_second_research_round_only_when_evidence_is_thin() -> None:
     covered = (
         FreshItem("OpenFOAM 简介", "openfoam.org", "", url="https://openfoam.org/docs"),

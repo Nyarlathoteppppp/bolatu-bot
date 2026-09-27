@@ -128,10 +128,13 @@ def test_timing_gate_converts_text_reaction_to_side_reaction() -> None:
     assert decision.side_reaction == "laugh"
 
 
-def test_timing_gate_cannot_select_care_before_speaking_action() -> None:
-    timing = parse_timing_decision({"channel": "text", "intent": "care", "confidence": 0.8})
+def test_timing_gate_drops_removed_care_intent_and_reaction() -> None:
+    timing = parse_timing_decision({
+        "channel": "text", "intent": "care", "reaction": "care", "confidence": 0.8,
+    })
 
     assert timing.to_reply_decision().action == "reply"
+    assert timing.side_reaction == ""
 
 
 def test_tool_router_searches_academic_concept_without_asking_timing_model() -> None:
