@@ -283,6 +283,7 @@ from .tools.fresh_context import (
     FreshContextTool,
     _compact_search_query,
     detect_fresh_intent,
+    fresh_lookup_status,
 )
 from .tools.deep_content import DeepContentTool
 from .tools.market import MarketTool
@@ -6663,14 +6664,13 @@ async def _execute_registered_fresh_search(request: ToolRequest) -> ToolResult:
     kind = str(request.arguments.get("kind", "web"))
     raw_queries = request.arguments.get("queries", ())
     queries = tuple(str(item).strip() for item in (raw_queries or ()) if str(item or "").strip())
-    context = await fresh_context_tool.context_for(
+    context, lookup = await fresh_context_tool.context_and_lookup(
         request.query,
         kind=kind,
         force_refresh=bool(request.arguments.get("force_refresh", False)),
         queries=queries,
     )
-    status = fresh_context_tool.status_snapshot().get("last_request", {})
-    status = status if isinstance(status, dict) else {}
+    status = fresh_lookup_status(lookup)
     raw_status = str(status.get("status", "") or "unknown")
     return ToolResult(
         ToolKind.FRESH_SEARCH,

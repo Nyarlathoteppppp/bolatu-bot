@@ -48,8 +48,26 @@ from qq_social_agent.cue_patterns import CueRepeatState
 from qq_social_agent.config import parse_llm_model_route
 from qq_social_agent.deepseek_client import ReplyDecision
 from qq_social_agent.memory import ChatMessage, MemoryStore, MemorySummary, MemberImpression, MemberProfile, RawCorpusExample, RecalledReplyFeedback
-from qq_social_agent.tools.fresh_context import FreshIntent
+from qq_social_agent.tools.fresh_context import FreshIntent, FreshLookup
+from qq_social_agent.pipeline_types import ToolKind, ToolRequest
 from qq_social_agent.tools.market_intent import MarketIntent
+
+
+def test_registered_search_uses_its_own_lookup_status(monkeypatch) -> None:
+    class FakeFreshTool:
+        async def context_and_lookup(self, query, **_kwargs):
+            await asyncio.sleep(0)
+            return "搜索结果", FreshLookup(query, "web", (), "no_result", provider="tavily")
+
+        def status_snapshot(self):
+            raise AssertionError("execution must not read global last_request")
+
+    monkeypatch.setattr(plugin, "fresh_context_tool", FakeFreshTool())
+    result = asyncio.run(plugin._execute_registered_fresh_search(
+        ToolRequest(ToolKind.FRESH_SEARCH, query="并发查询", arguments={"kind": "web"})
+    ))
+    assert result.status == "no_result"
+    assert result.metadata["provider"] == "tavily"
 
 
 class FakeApprovalBot:

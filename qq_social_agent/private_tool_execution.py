@@ -198,14 +198,24 @@ async def plan_and_execute_private_tools(
     if decision.need_fresh_context:
         raw_query = decision.fresh_query.strip() or context_query
         query = services.compact_search_query(raw_query) or raw_query
-        fresh_result = await services.execute_fresh_tool_request(
-            ToolRequest(
+        planned_search = tool_plan.first(ToolKind.FRESH_SEARCH)
+        search_request = (
+            replace(
+                planned_search,
+                query=query,
+                arguments={**dict(planned_search.arguments), "kind": decision.fresh_kind},
+            )
+            if planned_search is not None
+            else ToolRequest(
                 ToolKind.FRESH_SEARCH,
                 query=query,
                 reason="private_reply_requires_fresh_context",
                 required=True,
                 arguments={"kind": decision.fresh_kind},
-            ),
+            )
+        )
+        fresh_result = await services.execute_fresh_tool_request(
+            search_request,
             metric_stage="private_fresh_context",
             group_id=turn.chat_id,
             user_id=turn.user_id,

@@ -60,6 +60,29 @@ class FreshLookup:
     research_rounds: int = 1
 
 
+def fresh_lookup_status(lookup: FreshLookup, *, started: float | None = None) -> dict[str, object]:
+    preview = lookup.query[:36]
+    if len(lookup.query) > 36:
+        preview += "…"
+    latency_ms = lookup.latency_ms
+    if not latency_ms and started is not None:
+        latency_ms = int((time.monotonic() - started) * 1000)
+    return {
+        "at": time.time(),
+        "query_preview": preview,
+        "kind": lookup.kind,
+        "status": lookup.status,
+        "provider": lookup.provider,
+        "attempted_providers": list(lookup.attempted_providers),
+        "result_count": len(lookup.items),
+        "cached": lookup.cached,
+        "latency_ms": latency_ms,
+        "error": lookup.error[:120],
+        "page_status": lookup.page_status,
+        "page_url": lookup.page_url[:180],
+    }
+
+
 @dataclass(frozen=True)
 class FreshFactPack:
     topic: str
@@ -209,13 +232,29 @@ class FreshContextTool:
         force_refresh: bool = False,
         queries: tuple[str, ...] | list[str] | None = None,
     ) -> str:
+        context, _lookup = await self.context_and_lookup(
+            query,
+            kind=kind,
+            force_refresh=force_refresh,
+            queries=queries,
+        )
+        return context
+
+    async def context_and_lookup(
+        self,
+        query: str,
+        *,
+        kind: str = "news",
+        force_refresh: bool = False,
+        queries: tuple[str, ...] | list[str] | None = None,
+    ) -> tuple[str, FreshLookup]:
         lookup = await self.lookup(
             query,
             kind=kind,
             force_refresh=force_refresh,
             queries=queries,
         )
-        return _prompt_context_from_fact_pack(fact_pack_from_lookup(lookup))
+        return _prompt_context_from_fact_pack(fact_pack_from_lookup(lookup)), lookup
 
     async def lookup(
         self,
@@ -754,23 +793,7 @@ class FreshContextTool:
             self._stats["rate_limited"] += 1
         elif lookup.status not in {"empty_query", "disabled"}:
             self._stats["failures"] += 1
-        preview = lookup.query[:36]
-        if len(lookup.query) > 36:
-            preview += "…"
-        self._last_request = {
-            "at": time.time(),
-            "query_preview": preview,
-            "kind": lookup.kind,
-            "status": lookup.status,
-            "provider": lookup.provider,
-            "attempted_providers": list(lookup.attempted_providers),
-            "result_count": len(lookup.items),
-            "cached": lookup.cached,
-            "latency_ms": lookup.latency_ms or int((time.monotonic() - started) * 1000),
-            "error": lookup.error[:120],
-            "page_status": lookup.page_status,
-            "page_url": lookup.page_url[:180],
-        }
+        self._last_request = fresh_lookup_status(lookup, started=started)
 
     async def _read_followup_pages(
         self,

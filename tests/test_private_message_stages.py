@@ -17,7 +17,7 @@ from qq_social_agent.private_message_types import PrivateGenerationContext, Priv
 from qq_social_agent.private_reply_delivery import PrivateReplyServices, generate_and_send_private_reply
 from qq_social_agent.private_tool_execution import PrivateToolServices, plan_and_execute_private_tools
 from qq_social_agent.private_turn_preparation import PrivateTurnServices, prepare_private_turn
-from qq_social_agent.pipeline_types import ToolKind
+from qq_social_agent.pipeline_types import ToolKind, ToolRequest
 from qq_social_agent.tool_router import ToolRoutePlan, apply_tool_plan, infer_followup_fresh_intent, route_tools
 from qq_social_agent.tools.fresh_context import detect_fresh_intent
 
@@ -329,6 +329,25 @@ def test_private_tool_stage_uses_the_shared_router_and_preserves_private_scope(m
         followup = await search_turn("搜一下", current_at=1_800_000_002)
         assert "GLM 5.3 Flash" in observed["search_request"].query
         assert followup.fresh_context == "[搜索结果] 找到了最新资料"
+
+        async def multi_query_route(decision, tool_plan, **_kwargs):
+            planned = tool_plan.first(ToolKind.FRESH_SEARCH)
+            assert planned is not None
+            return decision, ToolRoutePlan((ToolRequest(
+                ToolKind.FRESH_SEARCH,
+                query=planned.query,
+                required=True,
+                arguments={"kind": "web", "queries": ("GLM 官方公告", "GLM 更新日志")},
+            ),))
+
+        multi_services = replace(search_services, apply_tool_use_router=multi_query_route)
+        memory.add_message(chat_id, turn.user_id, turn.nickname, "帮我搜索 GLM 5.3 Flash", created_at=1_800_000_003)
+        multi_stage = await plan_and_execute_private_tools(
+            replace(turn, text="帮我搜索 GLM 5.3 Flash"), services=multi_services,
+        )
+        assert multi_stage is not None
+        await multi_stage.rag_task
+        assert observed["search_request"].arguments["queries"] == ("GLM 官方公告", "GLM 更新日志")
 
     asyncio.run(search_checks())
 

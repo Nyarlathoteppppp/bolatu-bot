@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Awaitable, Callable
 
 from .approval_models import PendingApprovalCandidate
@@ -112,14 +112,24 @@ async def execute_group_tools(
         query = _compact_search_query(decision.fresh_query.strip() or text.strip()) or (
             decision.fresh_query.strip() or text.strip()
         )
-        fresh_result = await execute_fresh_tool_request(
-            ToolRequest(
+        planned_search = tool_plan.first(ToolKind.FRESH_SEARCH)
+        search_request = (
+            replace(
+                planned_search,
+                query=query,
+                arguments={**dict(planned_search.arguments), "kind": decision.fresh_kind},
+            )
+            if planned_search is not None
+            else ToolRequest(
                 ToolKind.FRESH_SEARCH,
                 query=query,
                 reason="reply_requires_fresh_context",
                 required=True,
                 arguments={"kind": decision.fresh_kind},
-            ),
+            )
+        )
+        fresh_result = await execute_fresh_tool_request(
+            search_request,
             metric_stage="fresh_context",
             group_id=group_id,
             user_id=user_id,

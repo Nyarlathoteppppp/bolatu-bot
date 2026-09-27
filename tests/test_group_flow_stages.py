@@ -280,6 +280,43 @@ def test_market_report_skips_generation_and_enters_approval() -> None:
     assert approvals[0].candidates == result.direct_candidates
 
 
+def test_group_search_keeps_router_research_queries() -> None:
+    request = ToolRequest(
+        ToolKind.FRESH_SEARCH,
+        query="GLM 最新消息",
+        required=True,
+        arguments={"kind": "web", "queries": ("GLM 官方公告", "GLM 更新日志")},
+    )
+    captured = []
+
+    async def search(tool_request, **_kwargs):
+        captured.append(tool_request)
+        return ToolResult(ToolKind.FRESH_SEARCH, "ok", context="搜索结果")
+
+    result = asyncio.run(execute_group_tools(
+        decision=ReplyDecision(True, 1.0, "search", action="answer", need_fresh_context=True,
+                               fresh_query="GLM 最新消息", fresh_kind="web"),
+        tool_plan=ToolRoutePlan((request,)),
+        pipeline_state=_pipeline(),
+        group_id=123,
+        user_id=456,
+        text="搜一下 GLM",
+        market_intents=[],
+        market_context_task=None,
+        prefetched_market_request=None,
+        tool_registry=SimpleNamespace(execute=lambda _request: None),
+        market_intents_from_decision=lambda *_args, **_kwargs: [],
+        execute_fresh_tool_request=search,
+        fresh_tool_failure_context=lambda *_args, **_kwargs: "",
+        combine_text_sections=lambda *parts: "\n".join(parts),
+        record_metric_event=lambda *_args, **_kwargs: None,
+        logger=_logger(),
+    ))
+
+    assert result.fresh_context == "搜索结果"
+    assert captured[0].arguments["queries"] == ("GLM 官方公告", "GLM 更新日志")
+
+
 def test_group_context_builder_returns_memory_packet_without_rag_lookup() -> None:
     calls = []
 
