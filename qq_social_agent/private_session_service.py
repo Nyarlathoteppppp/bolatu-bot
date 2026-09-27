@@ -10,6 +10,7 @@ from nonebot.adapters.onebot.v11 import Bot, Message, PrivateMessageEvent
 
 from .history_sync import event_message_source_id
 from .memory import ChatMessage, MemoryStore
+from .private_context_window import current_private_session_messages
 from .private_message_types import BufferedPrivateMessage
 from .persona import PersonaRegistry
 from .rate_limiter import RateLimiter
@@ -39,6 +40,7 @@ class PrivateFollowupServices:
     private_context_limit: int
     mid_memory_keep_summaries: int
     logger: Any
+    private_conversation_state_context: Callable[[int], str] = lambda _chat_id: ""
 
 
 class PrivateSessionService:
@@ -217,7 +219,9 @@ class PrivateSessionService:
             persona = services.personas.get(str(state["persona"] or services.default_persona))
             if persona is None:
                 return
-            recent = services.memory.recent_messages(chat_id, services.private_context_limit)
+            recent = current_private_session_messages(
+                services.memory.recent_messages(chat_id, services.private_context_limit)
+            )
             if len(recent) < 2:
                 return
             self.generation_inflight.add(user_id)
@@ -260,7 +264,12 @@ class PrivateSessionService:
                         limit=services.mid_memory_keep_summaries,
                     )
                 ),
-                priority_context=services.private_priority_context(user_id),
+                priority_context="\n".join(
+                    section for section in (
+                        services.private_priority_context(user_id),
+                        services.private_conversation_state_context(chat_id),
+                    ) if section
+                ),
                 speaker_context="当前是一对一私聊。只能自然续聊，不要提群聊、审批或工具流程。",
             )
             audit_send, audit_reason = await deepseek_client.audit_proactive_reply(

@@ -85,22 +85,9 @@ async def build_private_generation_context(
             speaker_user_id=turn.user_id,
         )
     )
-    raw_corpus_context = services.format_raw_corpus_context(
-        services.memory.relevant_raw_corpus_examples(
-            turn.chat_id,
-            stage.context_query,
-            limit=services.raw_corpus_context_limit,
-            candidate_limit=services.raw_corpus_candidate_limit,
-            context_radius=services.raw_corpus_context_radius,
-            exclude_user_id=turn.user_id,
-            exclude_text=turn.text,
-            preferred_user_id=turn.user_id,
-            preferred_limit=2,
-            preferred_score_multiplier=1.1,
-            preferred_score_bonus=0.5,
-            per_user_limit=1,
-        )
-    )
+    # Raw corpus examples are group style samples. In a one-to-one chat they
+    # replay old jokes and even nearby bot lines as if they were the current tone.
+    raw_corpus_context = ""
     jargon_context = await services.selected_group_jargon_context(
         turn.chat_id,
         list(stage.context_recent),

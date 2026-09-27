@@ -12,6 +12,7 @@ from .rate_limiter import RateLimiter
 from .tool_registry import ToolRegistry
 from .tool_router import ToolRoutePlan
 from .private_message_types import PrivateToolStage, PrivateTurn
+from .private_context_window import current_private_session_messages
 
 
 @dataclass(frozen=True)
@@ -36,6 +37,7 @@ class PrivateToolServices:
     normalize_rag_query: Callable[[str], Any]
     detect_market_intents: Callable[..., Any]
     detect_fresh_intent: Callable[[str], Any]
+    infer_followup_fresh_intent: Callable[..., Any]
     without_current_message: Callable[..., list[ChatMessage]]
     combine_text_sections: Callable[..., str]
     private_conversation_state_context: Callable[[int], str]
@@ -59,7 +61,9 @@ async def plan_and_execute_private_tools(
 
     persona_id = str(state["persona"] or services.app_config.default_persona)
     persona = services.personas.get(persona_id)
-    recent = services.memory.recent_messages(turn.chat_id, services.private_context_limit)
+    recent = current_private_session_messages(
+        services.memory.recent_messages(turn.chat_id, services.private_context_limit)
+    )
     context_recent = services.without_current_message(recent, user_id=turn.user_id, text=turn.text)
     normalized_rag_query = services.normalize_rag_query(turn.text)
     context_query = normalized_rag_query.current_utterance or turn.text
@@ -78,6 +82,14 @@ async def plan_and_execute_private_tools(
 
     market_intents = services.detect_market_intents(context_query, limit=2)
     fresh_intent = services.detect_fresh_intent(context_query)
+    if fresh_intent is None:
+        fresh_intent = services.infer_followup_fresh_intent(
+            context_query,
+            context_recent,
+            addressed=True,
+            current_user_id=turn.user_id,
+            current_at=recent[-1].created_at if recent else None,
+        )
     tool_plan = services.tool_plan_with_runtime_context(
         services.route_tools(
             context_query,

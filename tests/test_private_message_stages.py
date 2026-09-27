@@ -1,6 +1,7 @@
 """Behavioral checks for the staged private-message pipeline."""
 
 import asyncio
+from dataclasses import replace
 from types import SimpleNamespace
 
 import nonebot
@@ -16,7 +17,9 @@ from qq_social_agent.private_message_types import PrivateGenerationContext, Priv
 from qq_social_agent.private_reply_delivery import PrivateReplyServices, generate_and_send_private_reply
 from qq_social_agent.private_tool_execution import PrivateToolServices, plan_and_execute_private_tools
 from qq_social_agent.private_turn_preparation import PrivateTurnServices, prepare_private_turn
-from qq_social_agent.tool_router import ToolRoutePlan
+from qq_social_agent.pipeline_types import ToolKind
+from qq_social_agent.tool_router import ToolRoutePlan, apply_tool_plan, infer_followup_fresh_intent, route_tools
+from qq_social_agent.tools.fresh_context import detect_fresh_intent
 
 
 class FakeContentIngestion:
@@ -271,6 +274,7 @@ def test_private_tool_stage_uses_the_shared_router_and_preserves_private_scope(m
         normalize_rag_query=lambda text: SimpleNamespace(current_utterance=text),
         detect_market_intents=lambda *args, **kwargs: [],
         detect_fresh_intent=lambda text: None,
+        infer_followup_fresh_intent=lambda *args, **kwargs: None,
         without_current_message=lambda messages, **kwargs: messages,
         combine_text_sections=lambda *sections: "\n".join(item for item in sections if item),
         private_conversation_state_context=lambda chat_id: "",
@@ -292,6 +296,41 @@ def test_private_tool_stage_uses_the_shared_router_and_preserves_private_scope(m
     assert observed["speaker_context"].startswith("当前是和奈亚子的一对一私聊")
     assert observed["router_text"] == turn.text
     assert observed["rag_chat_id"] == chat_id
+
+    async def fresh_search(request, **kwargs):
+        observed["search_request"] = request
+        observed["search_scope"] = kwargs
+        return SimpleNamespace(context="[搜索结果] 找到了最新资料", status="ok", error="")
+
+    search_services = replace(
+        services,
+        route_tools=route_tools,
+        apply_tool_plan=apply_tool_plan,
+        execute_fresh_tool_request=fresh_search,
+        detect_fresh_intent=detect_fresh_intent,
+        infer_followup_fresh_intent=infer_followup_fresh_intent,
+    )
+
+    async def search_turn(text, *, current_at):
+        memory.add_message(chat_id, turn.user_id, turn.nickname, text, created_at=current_at)
+        stage = await plan_and_execute_private_tools(replace(turn, text=text), services=search_services)
+        assert stage is not None
+        await stage.rag_task
+        return stage
+
+    async def search_checks():
+        explicit = await search_turn("帮我搜索 GLM 5.3 Flash 最新进展", current_at=1_800_000_000)
+        assert "GLM 5.3 Flash" in observed["search_request"].query
+        assert explicit.fresh_context == "[搜索结果] 找到了最新资料"
+        assert observed["search_scope"]["group_id"] == chat_id
+        assert observed["search_request"].kind == ToolKind.FRESH_SEARCH
+
+        memory.add_message(chat_id, turn.self_id, "风雪", "我看一下", is_bot=True, created_at=1_800_000_001)
+        followup = await search_turn("搜一下", current_at=1_800_000_002)
+        assert "GLM 5.3 Flash" in observed["search_request"].query
+        assert followup.fresh_context == "[搜索结果] 找到了最新资料"
+
+    asyncio.run(search_checks())
 
 
 def test_private_segment_send_failure_keeps_successful_prefix_only(monkeypatch, tmp_path):
