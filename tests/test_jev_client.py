@@ -24,7 +24,6 @@ def _persona() -> Persona:
 def _timing_answers(
     *,
     wants: float = 0.1,
-    care: float = 0.1,
     other: float = 0.1,
     silent: float = 0.8,
     answer: float = 0.1,
@@ -33,10 +32,9 @@ def _timing_answers(
 ) -> dict:
     return {"answers": {
         "wants_answer": {"noul": wants},
-        "needs_care": {"noul": care},
         "to_other": {"noul": other},
         "timing_route": {"type": "choice", "choice": "silent", "probabilities": {
-            "silent": silent, "answer": answer, "care": 0.0,
+            "silent": silent, "answer": answer,
             "continue_bot": continues, "social_join": social, "other": 0.0,
         }},
     }}
@@ -137,7 +135,8 @@ def test_jev_timing_gate_text_answer() -> None:
     client = JevClient(api_key="test-key")
 
     async def fake_evaluate(**kwargs):
-        assert set(kwargs["questions"]) == {"wants_answer", "needs_care", "to_other", "timing_route"}
+        assert set(kwargs["questions"]) == {"wants_answer", "to_other", "timing_route"}
+        assert "care" not in kwargs["questions"]["timing_route"]["criteria"]
         assert kwargs["state"]["current"]["text"] == "CMU 难申吗"
         assert kwargs["state"]["bot"] == "张风雪"
         return _timing_answers(wants=0.85, silent=0.2, answer=0.65)
@@ -166,19 +165,18 @@ def test_jev_timing_gate_directed_other_is_silent() -> None:
     assert timing.reason.startswith("jev_to_other")
 
 
-def test_jev_timing_gate_distress_uses_care_intent() -> None:
+def test_jev_timing_gate_does_not_force_care_reply() -> None:
     client = JevClient(api_key="test-key")
 
     async def fake_evaluate(**kwargs):
-        return _timing_answers(care=0.63, silent=0.05, answer=0.0, social=0.0)
+        return _timing_answers(silent=0.7, answer=0.0, social=0.0)
 
     client.evaluate = fake_evaluate
     timing = asyncio.run(client.timing_gate(
         persona=_persona(), recent_messages=[],
         current_text="我害怕明天", current_nickname="A",
     ))
-    assert timing.channel.value == "text"
-    assert timing.intent.value == "care"
+    assert timing.channel.value == "silent"
 
 
 def test_jev_timing_gate_social_opening_keeps_chat_action_available() -> None:
@@ -495,7 +493,8 @@ def test_jev_speaking_action_none_keeps_baseline() -> None:
         assert "none" in criteria
         assert "protect" in criteria
         assert "mirror_style" in criteria
-        assert len(criteria) == 26
+        assert "act_cute" in criteria
+        assert len(criteria) == 27
         return {"answers": {"speaking_action": {"choice": "none"}}}
 
     client.evaluate = fake_evaluate
@@ -527,6 +526,20 @@ def test_jev_speaking_action_unknown_falls_to_none() -> None:
         )
     )
     assert choice == "none"
+
+
+def test_jev_speaking_action_can_choose_act_cute() -> None:
+    client = JevClient(api_key="test-key")
+
+    async def fake_evaluate(**kwargs):
+        assert "act_cute" in kwargs["questions"]["speaking_action"]["criteria"]
+        return {"answers": {"speaking_action": {"choice": "act_cute"}}}
+
+    client.evaluate = fake_evaluate
+    choice, _reason = asyncio.run(client.select_speaking_action(
+        current_text="你又装无辜", current_label="甲", addressed=False, baseline_action="reply",
+    ))
+    assert choice == "act_cute"
 
 
 def test_jev_resolve_ellipsis_same_predicate() -> None:

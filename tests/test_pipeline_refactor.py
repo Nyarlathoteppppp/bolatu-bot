@@ -128,6 +128,12 @@ def test_timing_gate_converts_text_reaction_to_side_reaction() -> None:
     assert decision.side_reaction == "laugh"
 
 
+def test_timing_gate_cannot_select_care_before_speaking_action() -> None:
+    timing = parse_timing_decision({"channel": "text", "intent": "care", "confidence": 0.8})
+
+    assert timing.to_reply_decision().action == "reply"
+
+
 def test_tool_router_searches_academic_concept_without_asking_timing_model() -> None:
     plan = route_tools(
         "三维挂谷猜想是什么，有什么最新进展",

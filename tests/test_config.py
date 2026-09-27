@@ -210,7 +210,8 @@ def test_prompt_registry_loads_central_prompt_file() -> None:
     assert "群聊免审直发单条生成" in prompts.raw["flows"]["reply_direct"]["flow"]
     assert "自然接话" in prompts.action_guide("reply")
     assert "语气由当前氛围决定" in prompts.action_guide("reply")
-    assert "关心/承接" in prompts.action_guide("care")
+    assert "不用硬给建议" in prompts.action_guide("care")
+    assert "卖萌" in prompts.action_guide("act_cute")
     persona_prompt = prompts.raw["persona"]["prompt"]
     assert "先接住对方这句的意思" in persona_prompt
     assert "有人说你老怼人、要求温柔时" in persona_prompt

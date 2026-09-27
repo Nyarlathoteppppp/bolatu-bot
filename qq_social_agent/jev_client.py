@@ -28,6 +28,36 @@ OPENROUTER_DECISIONS_URL = "https://openrouter.ai/api/alpha/decisions"
 TYPESAFE_SYSTEM_ONE_URL = "https://api.typesafe.ai/v1/systemone"
 DRAFT_REVIEW_TIMEOUT_SECONDS = 4.0
 
+SPEAKING_ACTION_CRITERIA = {
+    "none": "不确定就不要加花活，维持普通接话/答题，不选其他动作",
+    "reply": "自然顺手接一句，没有更合适的细动作",
+    "answer": "先认真回答实际问题或给出判断，不要用玩梗代替答案",
+    "agree": "对方说到点子上，先认可再补一句自己的",
+    "care": "对方确实在难受，回应眼前的事；别套安慰模板，也不用每次都给建议",
+    "act_cute": "熟人轻松互动时小小装乖、耍赖或讨饶，顺着话题接；不靠固定口癖，也不拿卖萌代替回答或关心",
+    "tease": "只接对方主动抛出的梗或互损；针对事情和观点，不拿普通求助或陌生人开涮",
+    "ask_back": "已经能短答或表态，再只追问一个真正有用或有趣的问题",
+    "at_someone": "必须把话甩给某个在场的人，并给他回复空间",
+    "observe": "轻轻冒泡，不是正式回答",
+    "echo_mood": "只接氛围（惊/无奈/高兴），不处理具体问题",
+    "shift_topic": "当前话题将死或没意思，轻轻转到更好聊的方向",
+    "self_comment": "被评价你自己，或需要自评/自嘲",
+    "relationship_reply": "必须用上和这个人的旧梗、称呼或长期关系",
+    "clarify": "还没听懂对象/问题，先对齐再答，不要装懂",
+    "warm_tease": "熟人之间更短更亲的损，撒娇式互损；生人不要",
+    "deflate": "对方明确自夸或挑衅时，简短回应观点；不要主动找人吵架",
+    "take_side": "两造对比或吵架，明确站一边，不要和稀泥",
+    "share_self": "带一句自己的课/代码/申校/夜猫子日常来推进聊天，不是答题",
+    "comfort_joke": "倒霉、社死、小崩溃，先接住事情再轻松回应；真撑不住才用 care",
+    "mirror_style": "学当前这个人的句长、脏口密度、标点，内容仍是风雪的，禁止复读原句",
+    "amp_bit": "把群友刚抛的包袱/设定加一档当共谋，不复读同一句",
+    "deadpan_echo": "极短冷接，像草/好死，几乎不解释",
+    "commit_bit": "群友已在离谱设定里，认真演完这一下就出戏，不把玩笑当事实",
+    "hyperbole": "烦躁/倒霉用夸张狠话，抽象成修辞，不点名真人去死",
+    "wrong_register": "对离谱事突然一本正经或学术腔，错位才好笑",
+    "protect": "有人被围/被踩时挡一句，不是安慰也不是站队抬杠",
+}
+
 JevTelemetryRecorder = Callable[[dict[str, Any]], None]
 _telemetry_recorder: JevTelemetryRecorder | None = None
 
@@ -318,7 +348,6 @@ class JevClient:
                 "instructions": "如果回复，选择最适合的动作类型：",
                 "criteria": {
                     "tease": "回应对方主动抛出的梗或互损，笑点针对事情和观点，不针对求助者",
-                    "care": "关心、安慰压力、倾听难过",
                     "answer": "认真回答实际问题、专业建议或给出判断",
                     "agree": "认可对方观点后补充自己的想法",
                     "reply": "自然顺手接话、评价氛围或延续闲聊",
@@ -335,7 +364,7 @@ class JevClient:
             raise ValueError("Missing or invalid Jev should_reply observation")
         action_data = answers.get("action", {})
         action_choice = str(action_data.get("choice", "")).strip().lower()
-        if action_choice not in {"tease", "care", "answer", "agree", "reply", "ignore"}:
+        if action_choice not in {"tease", "answer", "agree", "reply", "ignore"}:
             raise ValueError("Missing or invalid Jev action observation")
 
         if addressed:
@@ -353,7 +382,7 @@ class JevClient:
                 reason=f"jev_silent_noul_{noul_score:.2f}",
             )
 
-        action = action_choice if action_choice in {"tease", "care", "answer", "agree", "reply"} else "reply"
+        action = action_choice if action_choice in {"tease", "answer", "agree", "reply"} else "reply"
         mode = "addressed" if addressed else "chat"
         return ReplyDecision(
             should_reply=True,
@@ -455,10 +484,6 @@ class JevClient:
                 "type": "noul",
                 "instructions": "当前发言者是否在请求针对当前内容的答案、建议或观点？对别人发指令、单纯叙述事实、反问或感叹不算。只判断请求回应的意图，不判断风雪是否该回应。",
             },
-            "needs_care": {
-                "type": "noul",
-                "instructions": "当前发言者是否正在表达自己的真实难受、无助或持续困扰，适合旁人给予简短关心？不要把玩笑、口头禅或转述他人的痛苦算作是。",
-            },
             "to_other": {
                 "type": "noul",
                 "instructions": "当前发言是否主要对风雪以外某一位具体群友说话？明确@、回复、称呼或两人的连续对话都算；面向全群发问或分享不算。只判断当前发言。",
@@ -469,16 +494,14 @@ class JevClient:
                 "criteria": {
                     "silent": "不需要风雪插话：在和别人说话、短确认、纯事实补充、风雪已说过同义内容，或插话会打断当前对话。",
                     "answer": "当前发言是在向群里求答案、建议或观点，风雪能够接一个有用的回答。",
-                    "care": "当前发言者真实难受、无助或持续困扰，风雪现在接一句关心比保持沉默更合适。",
                     "continue_bot": "当前发言直接接续风雪刚才的话，并期待她进一步回应。",
-                    "social_join": "当前发言向整个群抛出开放的轻松话题或梗，风雪现在加入一句会自然推进聊天。",
+                    "social_join": "当前发言向群里抛出开放话题、梗，或明确希望有人接话；风雪加入一句会自然推进聊天。这里只判断是否适合加入，不判断该如何关心。",
                     "other": "无法从当前消息和近期上下文可靠判断。",
                 },
             },
         }
         data = await self.evaluate(state=state, questions=questions)
         wants_answer = _optional_noul(data, "wants_answer")
-        needs_care = _optional_noul(data, "needs_care")
         to_other = _optional_noul(data, "to_other")
         route_answer = data.get("answers", {}).get("timing_route", {})
         probabilities = route_answer.get("probabilities", {}) if isinstance(route_answer, dict) else {}
@@ -486,13 +509,12 @@ class JevClient:
         answer = _finite_probability(probabilities.get("answer")) if isinstance(probabilities, dict) else None
         continue_bot = _finite_probability(probabilities.get("continue_bot")) if isinstance(probabilities, dict) else None
         social = _finite_probability(probabilities.get("social_join")) if isinstance(probabilities, dict) else None
-        if None in (wants_answer, needs_care, to_other, silent, answer, continue_bot, social):
+        if None in (wants_answer, to_other, silent, answer, continue_bot, social):
             raise ValueError("Missing or invalid Jev timing observation")
         return choose_jev_group_timing(
             looks_like_question=like_question,
             followup_addressed=followup_addressed,
             wants_answer=wants_answer,
-            needs_care=needs_care,
             to_other=to_other,
             silent=silent,
             answer=answer,
@@ -1690,14 +1712,14 @@ class JevClient:
                     "没有把握、或只是普通接话，选 none，不要硬加花活。"
                     "学群友只学语气和加码，禁止复读原句。"
                 ),
-                "criteria": {'none': '不确定就不要加花活，维持普通接话/答题，不选其他动作', 'reply': '自然顺手接一句，没有更合适的细动作', 'answer': '先认真回答实际问题或给出判断，不要用玩梗代替答案', 'agree': '对方说到点子上，先认可再补一句自己的', 'care': '对方明显真难受、高压、撑不住，先接住再给可行的一句', 'tease': '只接对方主动抛出的梗或互损；针对事情和观点，不拿普通求助或陌生人开涮', 'ask_back': '已经能短答或表态，再只追问一个真正有用或有趣的问题', 'at_someone': '必须把话甩给某个在场的人，并给他回复空间', 'observe': '轻轻冒泡，不是正式回答', 'echo_mood': '只接氛围（惊/无奈/高兴），不处理具体问题', 'shift_topic': '当前话题将死或没意思，轻轻转到更好聊的方向', 'self_comment': '被评价你自己，或需要自评/自嘲', 'relationship_reply': '必须用上和这个人的旧梗、称呼或长期关系', 'clarify': '还没听懂对象/问题，先对齐再答，不要装懂', 'warm_tease': '熟人之间更短更亲的损，撒娇式互损；生人不要', 'deflate': '对方明确自夸或挑衅时，简短回应观点；不要主动找人吵架', 'take_side': '两造对比或吵架，明确站一边，不要和稀泥', 'share_self': '带一句自己的课/代码/申校/夜猫子日常来推进聊天，不是答题', 'comfort_joke': '倒霉、社死、小崩溃，先接住事情再轻松回应；真撑不住才用 care', 'mirror_style': '学当前这个人的句长、脏口密度、标点，内容仍是风雪的，禁止复读原句', 'amp_bit': '把群友刚抛的包袱/设定加一档当共谋，不复读同一句', 'deadpan_echo': '极短冷接，像草/好死，几乎不解释', 'commit_bit': '群友已在离谱设定里，认真演完这一下就出戏，不把玩笑当事实', 'hyperbole': '烦躁/倒霉用夸张狠话，抽象成修辞，不点名真人去死', 'wrong_register': '对离谱事突然一本正经或学术腔，错位才好笑', 'protect': '有人被围/被踩时挡一句，不是安慰也不是站队抬杠'},
+                "criteria": SPEAKING_ACTION_CRITERIA,
             }
         }
         data = await self.evaluate(state=state, questions=questions)
         choice = str(
             data.get("answers", {}).get("speaking_action", {}).get("choice", "none")
         ).strip()
-        if choice not in {'none': '不确定就不要加花活，维持普通接话/答题，不选其他动作', 'reply': '自然顺手接一句，没有更合适的细动作', 'answer': '先认真回答实际问题或给出判断，不要用玩梗代替答案', 'agree': '对方说到点子上，先认可再补一句自己的', 'care': '对方明显真难受、高压、撑不住，先接住再给可行的一句', 'tease': '只接对方主动抛出的梗或互损；针对事情和观点，不拿普通求助或陌生人开涮', 'ask_back': '已经能短答或表态，再只追问一个真正有用或有趣的问题', 'at_someone': '必须把话甩给某个在场的人，并给他回复空间', 'observe': '轻轻冒泡，不是正式回答', 'echo_mood': '只接氛围（惊/无奈/高兴），不处理具体问题', 'shift_topic': '当前话题将死或没意思，轻轻转到更好聊的方向', 'self_comment': '被评价你自己，或需要自评/自嘲', 'relationship_reply': '必须用上和这个人的旧梗、称呼或长期关系', 'clarify': '还没听懂对象/问题，先对齐再答，不要装懂', 'warm_tease': '熟人之间更短更亲的损，撒娇式互损；生人不要', 'deflate': '对方明确自夸或挑衅时，简短回应观点；不要主动找人吵架', 'take_side': '两造对比或吵架，明确站一边，不要和稀泥', 'share_self': '带一句自己的课/代码/申校/夜猫子日常来推进聊天，不是答题', 'comfort_joke': '倒霉、社死、小崩溃，先接住事情再轻松回应；真撑不住才用 care', 'mirror_style': '学当前这个人的句长、脏口密度、标点，内容仍是风雪的，禁止复读原句', 'amp_bit': '把群友刚抛的包袱/设定加一档当共谋，不复读同一句', 'deadpan_echo': '极短冷接，像草/好死，几乎不解释', 'commit_bit': '群友已在离谱设定里，认真演完这一下就出戏，不把玩笑当事实', 'hyperbole': '烦躁/倒霉用夸张狠话，抽象成修辞，不点名真人去死', 'wrong_register': '对离谱事突然一本正经或学术腔，错位才好笑', 'protect': '有人被围/被踩时挡一句，不是安慰也不是站队抬杠'}:
+        if choice not in SPEAKING_ACTION_CRITERIA:
             choice = "none"
         return choice, f"jev_speak_{choice}"
 

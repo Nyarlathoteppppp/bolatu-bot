@@ -7,7 +7,6 @@ from .jev_policy import (
     JEV_TIMING_ANSWER_CHOICE_MIN,
     JEV_TIMING_ANSWER_INTENT_MIN,
     JEV_TIMING_ANSWER_SILENT_MAX,
-    JEV_TIMING_CARE_MIN,
     JEV_TIMING_CONTINUE_CHOICE_MIN,
     JEV_TIMING_SEMANTIC_REQUEST_MIN,
     JEV_TIMING_SOCIAL_CHOICE_MIN,
@@ -22,7 +21,6 @@ if TYPE_CHECKING:
 
 INTENT_TO_ACTION = {
     SocialIntent.ANSWER: "answer",
-    SocialIntent.CARE: "care",
     SocialIntent.PLAY: "tease",
     SocialIntent.AGREE: "agree",
     SocialIntent.CHAT: "reply",
@@ -69,7 +67,6 @@ def choose_jev_group_timing(
     looks_like_question: bool,
     followup_addressed: bool,
     wants_answer: float,
-    needs_care: float,
     to_other: float,
     silent: float,
     answer: float,
@@ -82,13 +79,6 @@ def choose_jev_group_timing(
             channel=OutputChannel.SILENT,
             confidence=to_other,
             reason=f"jev_to_other_{to_other:.2f}",
-        )
-    if needs_care >= JEV_TIMING_CARE_MIN:
-        return TimingDecision(
-            channel=OutputChannel.TEXT,
-            intent=SocialIntent.CARE,
-            confidence=needs_care,
-            reason=f"jev_care_{needs_care:.2f}",
         )
     if (
         (looks_like_question or wants_answer >= JEV_TIMING_SEMANTIC_REQUEST_MIN)
@@ -132,6 +122,8 @@ def parse_timing_decision(raw: object) -> TimingDecision:
     try:
         intent = SocialIntent(str(data.get("intent", "chat")).strip().lower())
     except ValueError:
+        intent = SocialIntent.CHAT
+    if intent is SocialIntent.CARE:
         intent = SocialIntent.CHAT
     try:
         confidence = max(0.0, min(1.0, float(data.get("confidence", 0.0))))

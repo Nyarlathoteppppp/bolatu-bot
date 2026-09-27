@@ -3741,11 +3741,11 @@ def test_passive_message_blocks_clarify_speaking_action(monkeypatch) -> None:
     assert "禁止反问" in seen[0]["speaker_context"]
 
 
-def test_care_timing_does_not_turn_into_teasing(monkeypatch) -> None:
-    original = ReplyDecision(True, 0.63, "jev_care_0.63", mode="chat", action="care")
+def test_care_is_chosen_after_timing_gate(monkeypatch) -> None:
+    original = ReplyDecision(True, 0.63, "jev_social_0.63", mode="chat", action="reply")
 
     async def select(**_kwargs):
-        return "tease", "jev_speak_tease"
+        return "care", "jev_speak_care"
 
     monkeypatch.setattr(plugin, "deepseek_client", SimpleNamespace(select_speaking_action=select))
     result = asyncio.run(plugin._maybe_apply_speaking_action(
@@ -3759,7 +3759,28 @@ def test_care_timing_does_not_turn_into_teasing(monkeypatch) -> None:
         user_id=2,
         looks_like_question=False,
     ))
-    assert result == original
+    assert result.action == "care"
+
+
+def test_act_cute_speaking_action_reaches_generation(monkeypatch) -> None:
+    original = ReplyDecision(True, 0.72, "jev_social_0.72", mode="chat", action="reply")
+
+    async def select(**_kwargs):
+        return "act_cute", "jev_speak_act_cute"
+
+    monkeypatch.setattr(plugin, "deepseek_client", SimpleNamespace(select_speaking_action=select))
+    result = asyncio.run(plugin._maybe_apply_speaking_action(
+        original,
+        text="你又装无辜",
+        current_label="甲",
+        addressed_bot=False,
+        speaker_context="",
+        recent_messages=[],
+        group_id=1,
+        user_id=2,
+        looks_like_question=False,
+    ))
+    assert result.action == "act_cute"
 
 
 def test_passive_approval_candidates_drop_questions() -> None:
