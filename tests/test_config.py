@@ -260,8 +260,11 @@ def test_production_config_uses_official_deepseek_flash_for_reply() -> None:
         "mimo/mimo-v2.6-pro",
         "deepseek/deepseek-flash",
         "siliconflow/deepseek-ai/DeepSeek-V4-Flash",
+        "openrouter/z-ai/glm-5.3-flash",
     )
-    assert set(config.llm.providers) == {"deepseek", "siliconflow", "mimo"}
+    assert set(config.llm.providers) == {"deepseek", "siliconflow", "mimo", "openrouter"}
+    assert config.raw["background_models"]["memory"] == "openrouter/z-ai/glm-5.3-flash:batch"
+    assert config.raw["background_models"]["review"] == "openrouter/z-ai/glm-5.3-flash:batch"
     assert config.llm is config.deepseek
     assert config.raw["image_ocr"]["deepseek_vision_enabled"] is True
     assert config.raw["image_ocr"]["deepseek_vision_model"] == "deepseek-flash"

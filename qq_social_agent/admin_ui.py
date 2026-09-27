@@ -715,6 +715,9 @@ def _tools_send_forms(state: dict[str, Any]) -> str:
 def _tools_model_forms(state: dict[str, Any]) -> str:
     routes = state.get('models') if isinstance(state.get('models'), list) else []
     catalog = state.get('model_catalog') if isinstance(state.get('model_catalog'), list) else []
+    background_routes = state.get('background_models') if isinstance(state.get('background_models'), list) else []
+    background_catalog = state.get('background_model_catalog') if isinstance(state.get('background_model_catalog'), list) else []
+    background_status = state.get('background_batch_status') if isinstance(state.get('background_batch_status'), dict) else {}
     route_options = ''.join(f'<option value="{_e(row.get("route"))}">{_e(row.get("title"))} ({_e(row.get("route"))})</option>' for row in routes if isinstance(row, dict))
     model_options = ''.join(f'<option value="{_e(row.get("label"))}">{_e(row.get("label"))} - {_e(row.get("source"))}</option>' for row in catalog if isinstance(row, dict))
     form = (
@@ -732,7 +735,31 @@ def _tools_model_forms(state: dict[str, Any]) -> str:
         suffix = ' <span class="badge">覆盖</span>' if row.get('overridden') else ''
         table.append(f'<tr><td>{_e(row.get("title"))}<br><span class="muted small">{_e(row.get("flow"))}</span></td><td>{_e(row.get("active"))}{suffix}</td><td>{_e(row.get("configured"))}</td><td>{_e(row.get("fallback"))}</td></tr>')
     table.append('</table>')
-    return form + ''.join(table)
+    background_route_options = ''.join(
+        f'<option value="{_e(row.get("group"))}">{_e(row.get("title"))}</option>'
+        for row in background_routes if isinstance(row, dict)
+    )
+    background_model_options = ''.join(
+        f'<option value="{_e(label)}">{_e(label)}</option>' for label in background_catalog
+    )
+    background_form = (
+        '<h3>后台模型</h3>'
+        '<form class="inline" method="post" action="/admin/tools/action">'
+        '<input type="hidden" name="action" value="background_model_route">'
+        f'<div class="field"><label>任务组</label><select name="route">{background_route_options}</select></div>'
+        f'<div class="field"><label>模型</label><select name="model">{background_model_options}</select></div>'
+        '<button type="submit">切换</button></form>'
+        '<form class="inline" method="post" action="/admin/tools/action">'
+        '<input type="hidden" name="action" value="background_model_reset">'
+        '<button type="submit">清后台模型覆盖</button></form>'
+    )
+    background_table = ['<table><tr><th>任务组</th><th>当前模型</th></tr>']
+    for row in background_routes:
+        if isinstance(row, dict):
+            background_table.append(f'<tr><td>{_e(row.get("title"))}</td><td>{_e(row.get("active"))}</td></tr>')
+    background_table.append('</table>')
+    batch_counts = '、'.join(f'{_e(key)} {_e(value)}' for key, value in background_status.items()) or '暂无任务'
+    return form + ''.join(table) + background_form + ''.join(background_table) + f'<p class="muted">批任务：{batch_counts}</p>'
 
 
 def _tools_jargon_forms(state: dict[str, Any], selected_group_id: int | None) -> str:

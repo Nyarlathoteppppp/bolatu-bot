@@ -34,6 +34,10 @@ llm:
       base_url: https://api.xiaomimimo.com/v1
       api_key_env: MIMO_API_KEY
       thinking: disabled
+    openrouter:
+      base_url: https://openrouter.ai/api/v1
+      api_key_env: OPENROUTER_API_KEY
+      thinking: disabled
   model: siliconflow/deepseek-ai/DeepSeek-V4-Flash
   decision_model: siliconflow/deepseek-ai/DeepSeek-V4-Flash
   reply_model: mimo/mimo-v2.6-pro
@@ -56,6 +60,7 @@ llm:
     - mimo/mimo-v2.6-pro
     - deepseek/deepseek-flash
     - siliconflow/deepseek-ai/DeepSeek-V4-Flash
+    - openrouter/z-ai/glm-5.3-flash
   fallback_models:
     decision: deepseek/deepseek-v4-flash
     reply:
@@ -82,6 +87,14 @@ llm:
   utility_timeout_seconds: 8
   utility_total_timeout_seconds: 12
   max_retries: 0
+
+background_models:
+  memory: openrouter/z-ai/glm-5.3-flash:batch
+  review: openrouter/z-ai/glm-5.3-flash:batch
+  catalog:
+    - openrouter/z-ai/glm-5.3-flash:batch
+    - siliconflow/deepseek-ai/DeepSeek-V4-Flash
+    - deepseek/deepseek-flash
 
 rate_control:
   default_work_intensity_percent: 100

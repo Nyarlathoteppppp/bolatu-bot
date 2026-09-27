@@ -1228,6 +1228,29 @@ class LLMTaskClient(LLMGateway):
         feedback_context: str = "",
     ) -> DailyReviewDraft:
         context_messages = messages[-140:]
+        request = self.build_daily_review_request(
+            persona=persona,
+            messages=messages,
+            chat_label=chat_label,
+            today_label=today_label,
+            max_chars=max_chars,
+            feedback_context=feedback_context,
+        )
+        response = await self._chat_completion(task="daily_review", route_name="reply", request=request)
+        content = response.choices[0].message.content or ""
+        return self.parse_daily_review_response(content, messages=context_messages, max_chars=max_chars)
+
+    def build_daily_review_request(
+        self,
+        *,
+        persona: Persona,
+        messages: list[ChatMessage],
+        chat_label: str,
+        today_label: str,
+        max_chars: int = 520,
+        feedback_context: str = "",
+    ) -> dict[str, object]:
+        context_messages = messages[-140:]
         context = "\n".join(
             _format_learning_source_message(msg)
             for msg in context_messages
@@ -1261,9 +1284,12 @@ class LLMTaskClient(LLMGateway):
         else:
             request["temperature"] = min(0.85, max(0.5, self.config.temperature))
 
-        response = await self._chat_completion(task="daily_review", route_name="reply", request=request)
-        content = response.choices[0].message.content or ""
-        return _parse_daily_review(content, messages=context_messages, max_chars=max_chars)
+        return request
+
+    def parse_daily_review_response(
+        self, content: str, *, messages: list[ChatMessage], max_chars: int = 520
+    ) -> DailyReviewDraft:
+        return _parse_daily_review(content, messages=messages[-140:], max_chars=max_chars)
 
     async def summarize_mid_memory(
         self,
@@ -1271,6 +1297,13 @@ class LLMTaskClient(LLMGateway):
         messages: list[ChatMessage],
         chat_label: str = "QQ 群聊",
     ) -> MidMemoryDraft:
+        request = self.build_mid_memory_request(messages=messages, chat_label=chat_label)
+        response = await self._chat_completion(task="mid_memory", route_name="memory", request=request)
+        return self.parse_mid_memory_response(response.choices[0].message.content or "", messages=messages)
+
+    def build_mid_memory_request(
+        self, *, messages: list[ChatMessage], chat_label: str = "QQ 群聊"
+    ) -> dict[str, object]:
         context = "\n".join(
             _format_learning_source_message(msg)
             for msg in messages
@@ -1282,10 +1315,7 @@ class LLMTaskClient(LLMGateway):
             chat_label=chat_label,
             context=context,
         )
-        response = await self._chat_completion(
-            task="mid_memory",
-            route_name="memory",
-            request={
+        return {
                 "temperature": 0.2,
                 "max_tokens": 900,
                 "response_format": {"type": "json_object"},
@@ -1293,9 +1323,10 @@ class LLMTaskClient(LLMGateway):
                     {"role": "system", "content": system},
                     {"role": "user", "content": user},
                 ],
-            },
-        )
-        return _parse_mid_memory(response.choices[0].message.content or "", messages=messages)
+            }
+
+    def parse_mid_memory_response(self, content: str, *, messages: list[ChatMessage]) -> MidMemoryDraft:
+        return _parse_mid_memory(content, messages=messages)
 
     async def learn_style_rules(
         self,

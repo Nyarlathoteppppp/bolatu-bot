@@ -45,6 +45,7 @@ class LLMGateway:
         self._provider_failures: dict[str, list[float]] = {}
         self._provider_circuit_until: dict[str, float] = {}
         self._provider_exhausted: set[str] = set()
+        self._reply_peak_combo_enabled = False
 
     async def aclose(self) -> None:
         await asyncio.gather(*(client.close() for client in self.clients.values()), return_exceptions=True)
@@ -58,7 +59,7 @@ class LLMGateway:
         request: dict[str, object] = {
             "model": route.model,
             "messages": [{"role": "user", "content": "Reply with OK."}],
-            "max_tokens": 64,
+            "max_tokens": 260 if route.provider == "openrouter" else 64,
         }
         extra_body = _extra_body_for_route(provider, route)
         if extra_body:
@@ -80,6 +81,8 @@ class LLMGateway:
             return False, type(exc).__name__
         if not getattr(response, "choices", None):
             return False, "空响应"
+        if not str(getattr(response.choices[0].message, "content", "") or "").strip():
+            return False, "空回复"
         self._provider_exhausted.discard(route.provider)
         return True, "可用"
 
@@ -89,8 +92,9 @@ class LLMGateway:
         task: str,
         route_name: str,
         request: dict[str, object],
+        routes_override: tuple[LLMModelRoute, ...] | None = None,
     ) -> object:
-        routes = self._candidate_routes(route_name)
+        routes = routes_override if routes_override is not None else self._candidate_routes(route_name)
         last_error: Exception | None = None
         attempt_timeout, total_timeout = self._task_timeouts(task=task, route_name=route_name)
         deadline = time.monotonic() + total_timeout
@@ -143,6 +147,17 @@ class LLMGateway:
             raise last_error
         raise RuntimeError(f"No available LLM provider for route={route_name}")
 
+    async def complete_on_model(
+        self, *, task: str, route: LLMModelRoute, request: dict[str, object]
+    ) -> object:
+        """Use a background selection without mutating the live reply route."""
+        return await self._chat_completion(
+            task=task,
+            route_name="memory" if task == "mid_memory" else "reply",
+            request=request,
+            routes_override=(route,),
+        )
+
     def _task_timeouts(self, *, task: str, route_name: str) -> tuple[float, float]:
         if route_name == "decision" or task == "decision":
             attempt = self.config.decision_timeout_seconds
@@ -175,12 +190,16 @@ class LLMGateway:
         return attempt, total
 
     def _candidate_routes(self, route_name: str) -> tuple[LLMModelRoute, ...]:
-        primary = self.route_overrides.get(route_name, self.config.routes[route_name])
-        fallback = self.config.fallback_routes.get(route_name)
-        routes = [primary]
-        if fallback is not None:
-            routes.append(fallback)
-        routes.extend(getattr(self.config, "additional_fallback_routes", {}).get(route_name, ()))
+        if route_name == "reply" and getattr(self, "_reply_peak_combo_enabled", False):
+            routes = [self.config.fallback_routes["reply"]]
+            routes.extend(self.config.additional_fallback_routes["reply"])
+        else:
+            primary = self.route_overrides.get(route_name, self.config.routes[route_name])
+            fallback = self.config.fallback_routes.get(route_name)
+            routes = [primary]
+            if fallback is not None:
+                routes.append(fallback)
+            routes.extend(getattr(self.config, "additional_fallback_routes", {}).get(route_name, ()))
         if route_name == "reply" and route_name not in self.route_overrides:
             # Keep the existing DeepSeek/SiliconFlow peak policy when they are
             # first and second choice, or the two fallbacks after MiMo.
@@ -273,12 +292,21 @@ class LLMGateway:
     def set_route_override(self, route_name: str, route: LLMModelRoute | None) -> None:
         if route_name not in self.config.routes:
             raise ValueError(f"unknown route: {route_name}")
+        if route_name == "reply":
+            self._reply_peak_combo_enabled = False
         if route is None:
             self.route_overrides.pop(route_name, None)
             return
         self.route_overrides[route_name] = route
 
+    def set_reply_peak_combo(self) -> None:
+        self.route_overrides.pop("reply", None)
+        self._reply_peak_combo_enabled = True
+
     def current_route(self, route_name: str) -> LLMModelRoute:
+        if route_name == "reply" and getattr(self, "_reply_peak_combo_enabled", False):
+            routes = self._candidate_routes("reply")
+            return routes[0] if routes else self.config.fallback_routes["reply"]
         return self.route_overrides.get(route_name, self.config.routes[route_name])
 
 

@@ -83,3 +83,26 @@ def test_model_probe_checks_requested_provider_without_fallback() -> None:
     assert reason == "RuntimeError"
     assert mimo.calls == 1
     assert deepseek.calls == 0
+
+
+def test_reply_peak_combo_skips_mimo_and_selects_configured_pair() -> None:
+    gateway = _gateway()
+    gateway._is_reply_peak_now = lambda: False
+    gateway.set_reply_peak_combo()
+    assert [route.provider for route in gateway._candidate_routes("reply")] == ["deepseek", "siliconflow"]
+    gateway._is_reply_peak_now = lambda: True
+    assert [route.provider for route in gateway._candidate_routes("reply")] == ["siliconflow", "deepseek"]
+    gateway.set_route_override("reply", gateway.config.routes["reply"])
+    assert gateway.current_route("reply").provider == "mimo"
+
+
+def test_selected_background_model_does_not_change_reply_route() -> None:
+    gateway = _gateway()
+    gateway.clients = {"deepseek": FakeChatClient(), "mimo": FakeChatClient()}
+    selected = gateway.config.fallback_routes["reply"]
+
+    result = asyncio.run(gateway.complete_on_model(task="daily_review", route=selected, request={"messages": []}))
+
+    assert result.model == selected.model
+    assert gateway.current_route("reply").provider == "mimo"
+    assert gateway.clients["mimo"].calls == 0

@@ -92,6 +92,9 @@ class FakeModelClient:
         else:
             self.route_overrides[route_name] = route
 
+    def set_reply_peak_combo(self) -> None:
+        self.route_overrides.pop("reply", None)
+
     def current_route(self, route_name: str):
         return self.route_overrides.get(route_name, self.config.routes[route_name])
 
@@ -2270,6 +2273,8 @@ def test_owner_probe_list_uses_switch_numbers(monkeypatch, tmp_path) -> None:
         "1. ✅ mimo/mimo-v2.6-pro：可用",
         "2. ❌ deepseek/deepseek-flash：HTTP 403",
         "3. ❌ siliconflow/deepseek-ai/DeepSeek-V4-Flash：HTTP 403",
+        "4. ❌ openrouter/z-ai/glm-5.3-flash：HTTP 403",
+        "5. 高峰 DeepSeek/SiliconFlow 组合：deepseek ❌HTTP 403 / siliconflow ❌HTTP 403",
     ]
 
 
@@ -2289,6 +2294,50 @@ def test_owner_can_switch_reply_model_by_catalog_number(monkeypatch, tmp_path) -
     )
 
 
+def test_background_model_groups_switch_independently(monkeypatch, tmp_path) -> None:
+    store = _use_temp_plugin_memory(monkeypatch, tmp_path)
+    bot = FakeApprovalBot()
+
+    assert asyncio.run(plugin._handle_group_approval_private(bot, 1535071184, "切后台记忆模型 2"))
+    assert plugin._background_model_selection("memory") == "siliconflow/deepseek-ai/DeepSeek-V4-Flash"
+    assert plugin._background_model_selection("review") == "openrouter/z-ai/glm-5.3-flash:batch"
+    assert not plugin._background_batch_enabled("memory")
+    assert plugin._background_batch_enabled("review")
+    assert "memory" in store.app_kv_get(plugin.BACKGROUND_MODEL_OVERRIDES_KEY)
+
+    assert asyncio.run(plugin._handle_group_approval_private(bot, 1535071184, "后台模型状态"))
+    assert "1. openrouter/z-ai/glm-5.3-flash:batch" in bot.private_messages[-1][1]
+    assert "2. siliconflow/deepseek-ai/DeepSeek-V4-Flash" in bot.private_messages[-1][1]
+
+
+def test_private_memory_batch_poll_resumes_without_new_message(monkeypatch, tmp_path) -> None:
+    store = _use_temp_plugin_memory(monkeypatch, tmp_path)
+    chat_id = plugin.PRIVATE_CHAT_OFFSET + 12345
+    store.app_kv_set(f"mid_memory_batch_pending:{chat_id}", '{"key":"pending"}')
+    resumed: list[int] = []
+    monkeypatch.setattr(plugin, "_schedule_private_memory_maintenance", resumed.append)
+
+    async def stop_after_tick(_seconds: float) -> None:
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(plugin.asyncio, "sleep", stop_after_tick)
+    try:
+        asyncio.run(plugin._run_private_memory_batch_poll_loop())
+    except asyncio.CancelledError:
+        pass
+
+    assert resumed == [chat_id]
+
+
+def test_batch_model_rejected_for_realtime_reply(monkeypatch, tmp_path) -> None:
+    _use_temp_plugin_memory(monkeypatch, tmp_path)
+    monkeypatch.setattr(plugin, "deepseek_client", FakeModelClient())
+    bot = FakeApprovalBot()
+
+    assert asyncio.run(plugin._handle_group_approval_private(bot, 1535071184, "切回复模型 openrouter/z-ai/glm-5.3-flash:batch"))
+    assert "批处理模型只能用于后台" in bot.private_messages[-1][1]
+
+
 def test_owner_gets_valid_range_for_unknown_model_number(monkeypatch, tmp_path) -> None:
     _use_temp_plugin_memory(monkeypatch, tmp_path)
     monkeypatch.setattr(plugin, "deepseek_client", FakeModelClient())
@@ -2299,7 +2348,7 @@ def test_owner_gets_valid_range_for_unknown_model_number(monkeypatch, tmp_path) 
     assert handled
     assert bot.private_messages[-1] == (
         1535071184,
-        f"模型路由解析失败：模型编号无效，请输入 1-{len(plugin.app_config.llm.model_catalog)}。",
+        f"模型路由解析失败：模型编号无效，请输入 1-{len(plugin._model_options())}。",
     )
 
 
@@ -3246,6 +3295,13 @@ def test_private_memory_maintenance_skips_group_style_and_profiles(monkeypatch, 
 
 def test_mid_memory_attempt_backoff_survives_empty_generation(monkeypatch, tmp_path) -> None:
     store = _use_temp_plugin_memory(monkeypatch, tmp_path)
+    # This regression covers the synchronous empty-result backoff. Batch-mode
+    # submission and restart recovery are covered by test_memory_maintenance_batch.
+    monkeypatch.setattr(
+        plugin.memory_maintenance_service,
+        "batch_mode_for_task",
+        lambda _task: False,
+    )
     group_id = 1
     now = 2_000_000.0
     message_count = plugin.MID_MEMORY_MIN_BATCH + plugin.app_config.context_limit + 1

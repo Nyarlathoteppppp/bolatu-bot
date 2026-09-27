@@ -359,6 +359,10 @@ llm:
       base_url: https://api.xiaomimimo.com/v1
       api_key_env: MIMO_API_KEY
       thinking: disabled
+    openrouter:
+      base_url: https://openrouter.ai/api/v1
+      api_key_env: OPENROUTER_API_KEY
+      thinking: disabled
   decision_model: siliconflow/deepseek-ai/DeepSeek-V4-Flash
   reply_model: mimo/mimo-v2.6-pro
   jargon_model: siliconflow/deepseek-ai/DeepSeek-V4-Flash
@@ -369,6 +373,10 @@ llm:
     - mimo/mimo-v2.6-pro
     - deepseek/deepseek-flash
     - siliconflow/deepseek-ai/DeepSeek-V4-Flash
+    - openrouter/z-ai/glm-5.3-flash
+background_models:
+  memory: openrouter/z-ai/glm-5.3-flash:batch
+  review: openrouter/z-ai/glm-5.3-flash:batch
 ```
 
 路由含义：
@@ -376,13 +384,13 @@ llm:
 | route | 用途 |
 | --- | --- |
 | `decision` | 群聊是否插嘴、action、是否需要最新背景 |
-| `reply` | 私聊单条回复、群聊三候选、每日复盘 |
+| `reply` | 私聊单条回复、群聊三候选；每日复盘的实时备用路径 |
 | `jargon` | 黑话词典注入选择 |
 | `memory` | 中期记忆压缩、长消息摘要 |
 | `style` | 群聊表达风格学习 |
 | `member_profile` | 群友画像总结 |
 
-运行时也能通过 QQ 私聊工具单切模型，覆盖值存在 SQLite 的 `app_kv`，重启后仍生效。清除覆盖命令：`清模型覆盖`。
+运行时也能通过 QQ 私聊工具单切模型，覆盖值存在 SQLite 的 `app_kv`，重启后仍生效。清除覆盖命令：`清模型覆盖`。后台记忆和定时复盘各有独立模型组，命令为 `后台模型状态`、`切后台记忆模型 1`、`切后台复盘模型 1`、`清后台模型覆盖`。`:batch` 通过异步 Batch API 提交，待完成任务持久化并在重启后恢复轮询。
 
 `llm_gateway.py` 会按主路由调用；主 provider 失败时尝试 `fallback_models`。
 

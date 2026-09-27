@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 import time
 from dataclasses import dataclass
@@ -47,6 +48,10 @@ class MemoryMaintenanceService:
         record_metric_event: Callable[..., None],
         member_label: Callable[[int, str], str],
         useful_style_rule: Callable[[str, str, str], bool],
+        batch_service: Any | None = None,
+        batch_mode_for_task: Callable[[str], bool] | None = None,
+        memory_batch_enabled: Callable[[], bool] | None = None,
+        memory_sync_model: Callable[[], Any | None] | None = None,
     ) -> None:
         self.memory_provider = memory_provider
         self.client_provider = client_provider
@@ -54,12 +59,164 @@ class MemoryMaintenanceService:
         self.record_metric_event = record_metric_event
         self.member_label = member_label
         self.useful_style_rule = useful_style_rule
+        self.batch_service = batch_service
+        self.batch_mode_for_task = batch_mode_for_task or (
+            lambda task: bool(memory_batch_enabled())
+            if task == "memory" and memory_batch_enabled is not None
+            else False
+        )
+        self.memory_sync_model = memory_sync_model or (lambda: None)
 
         # These maps are the single source of truth. plugin.py exposes aliases
         # for compatibility with existing diagnostics and tests.
         self.last_mid_memory_attempt: dict[int, float] = {}
         self.mid_memory_empty_streak: dict[int, int] = {}
         self.last_style_learn_attempt: dict[int, float] = {}
+
+    @staticmethod
+    def _mid_memory_batch_pointer_key(group_id: int) -> str:
+        return f"mid_memory_batch_pending:{int(group_id)}"
+
+    @staticmethod
+    def _mid_memory_batch_messages(messages: list[ChatMessage]) -> list[dict[str, Any]]:
+        # Keep the evidence fields needed by summary/atom persistence. The prompt
+        # itself is stored with the pending job so a restart can resubmit the
+        # exact request if the transport did not record its submission yet.
+        return [
+            {
+                "id": int(message.id),
+                "group_id": int(message.group_id),
+                "user_id": int(message.user_id),
+                "nickname": message.nickname,
+                "text": message.text,
+                "is_bot": bool(message.is_bot),
+                "created_at": float(message.created_at),
+                "source_message_id": message.source_message_id,
+            }
+            for message in messages
+        ]
+
+    @staticmethod
+    def _restore_mid_memory_batch_messages(payload: list[dict[str, Any]]) -> list[ChatMessage]:
+        return [ChatMessage(**item) for item in payload]
+
+    def _clear_mid_memory_batch(
+        self,
+        memory: MemoryStore,
+        group_id: int,
+        job_key: str,
+        *,
+        acknowledge: bool = False,
+    ) -> None:
+        memory.app_kv_set(self._mid_memory_batch_pointer_key(group_id), "")
+        if acknowledge:
+            acknowledge_result = getattr(self.batch_service, "acknowledge", None)
+            if callable(acknowledge_result):
+                acknowledge_result(job_key)
+
+    async def _mid_memory_batch_draft(
+        self,
+        *,
+        memory: MemoryStore,
+        client: Any,
+        group_id: int,
+        summary_messages: list[ChatMessage],
+        chat_label: str,
+    ) -> tuple[Any | None, bool, list[ChatMessage], str | None]:
+        """Submit/poll one persisted batch job; return draft, pending, evidence, key."""
+
+        if self.batch_service is None:
+            raise RuntimeError("background memory batch service is unavailable")
+
+        pointer_key = self._mid_memory_batch_pointer_key(group_id)
+        raw_job = memory.app_kv_get(pointer_key)
+        if raw_job:
+            try:
+                job = json.loads(raw_job)
+                job_key = str(job["key"])
+                job_messages = self._restore_mid_memory_batch_messages(job["messages"])
+                request_body = job["body"]
+            except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+                logger.warning(
+                    "qq_social_agent mid memory batch state is unreadable: "
+                    f"group={group_id} error={exc}"
+                )
+                # Do not submit a second job while an unreadable pointer may still
+                # represent a remote request.
+                return None, True, summary_messages, None
+
+            try:
+                result = await self.batch_service.poll(job_key)
+            except KeyError:
+                # The pointer is written before the POST. If the process stopped
+                # in that gap, re-submit with the same idempotency key and payload.
+                await self.batch_service.submit(
+                    job_key,
+                    request_body,
+                    task="mid_memory",
+                    metadata={"group_id": group_id, "messages": job["messages"]},
+                )
+                return None, True, job_messages, None
+
+            status = str(getattr(result, "status", ""))
+            if status in {"queued", "in_progress", "submission_uncertain"}:
+                return None, True, job_messages, None
+            if status != "completed":
+                error = str(getattr(result, "error", "") or status or "unknown status")
+                self._clear_mid_memory_batch(memory, group_id, job_key)
+                self.last_mid_memory_attempt[group_id] = time.time()
+                logger.warning(
+                    "qq_social_agent mid memory batch failed: "
+                    f"group={group_id} status={status} error={error}"
+                )
+                return None, True, job_messages, None
+
+            content = str(getattr(result, "content", "") or "")
+            try:
+                draft = client.parse_mid_memory_response(content, messages=job_messages)
+            except Exception:
+                self._clear_mid_memory_batch(
+                    memory,
+                    group_id,
+                    job_key,
+                    acknowledge=True,
+                )
+                raise
+            return draft, False, job_messages, job_key
+
+        if len(summary_messages) == 0:
+            return None, False, summary_messages, None
+
+        now_ms = int(time.time() * 1000)
+        job_key = (
+            f"mid-memory:{group_id}:{summary_messages[0].id}:"
+            f"{summary_messages[-1].id}:{now_ms}"
+        )
+        request_body = client.build_mid_memory_request(
+            messages=summary_messages,
+            chat_label=chat_label,
+        )
+        message_payload = self._mid_memory_batch_messages(summary_messages)
+        job = {
+            "key": job_key,
+            "messages": message_payload,
+            "chat_label": chat_label,
+            "body": request_body,
+        }
+        # Persist before submission. This allows the next sweep to retry a
+        # request with the same key if the process stops during the POST.
+        memory.app_kv_set(
+            pointer_key,
+            json.dumps(job, ensure_ascii=False, separators=(",", ":")),
+        )
+        self.last_mid_memory_attempt[group_id] = time.time()
+        await self.batch_service.submit(
+            job_key,
+            request_body,
+            task="mid_memory",
+            metadata={"group_id": group_id, "messages": message_payload},
+        )
+        return None, True, summary_messages, None
 
     def note_empty_mid_memory(self, group_id: int, summary_messages: list[ChatMessage]) -> str:
         policy = self.policy_provider()
@@ -101,21 +258,66 @@ class MemoryMaintenanceService:
         )
         empty_streak = self.mid_memory_empty_streak.get(group_id, 0)
         retry_wait = policy.mid_memory_retry_interval_seconds * (2 ** min(empty_streak, 3))
-        if (
+        has_pending_batch = bool(
+            memory.app_kv_get(self._mid_memory_batch_pointer_key(group_id))
+        )
+        should_attempt_mid_memory = (
             len(mid_messages) >= policy.mid_memory_min_batch
             and time.time() - self.last_mid_memory_attempt.get(group_id, 0.0)
             >= retry_wait
-        ):
+        )
+        if has_pending_batch or should_attempt_mid_memory:
             self.last_mid_memory_attempt[group_id] = time.time()
             try:
                 summary_messages = [msg for msg in mid_messages if not msg.is_bot]
                 draft = None
-                if len(summary_messages) >= policy.mid_memory_min_batch:
-                    draft = await client.summarize_mid_memory(
-                        messages=summary_messages,
-                        chat_label="QQ 私聊" if group_id >= policy.private_chat_offset else "QQ 群聊",
+                batch_job_to_ack: str | None = None
+                if has_pending_batch or len(summary_messages) >= policy.mid_memory_min_batch:
+                    chat_label = (
+                        "QQ 私聊"
+                        if group_id >= policy.private_chat_offset
+                        else "QQ 群聊"
                     )
-                if draft and draft.summary:
+                    if has_pending_batch or self.batch_mode_for_task("memory"):
+                        draft, batch_pending, summary_messages, batch_job_to_ack = await self._mid_memory_batch_draft(
+                            memory=memory,
+                            client=client,
+                            group_id=group_id,
+                            summary_messages=summary_messages,
+                            chat_label=chat_label,
+                        )
+                    else:
+                        batch_pending = False
+                        selected_model = self.memory_sync_model()
+                        if selected_model is None:
+                            draft = await client.summarize_mid_memory(
+                                messages=summary_messages,
+                                chat_label=chat_label,
+                            )
+                        else:
+                            request = client.build_mid_memory_request(
+                                messages=summary_messages,
+                                chat_label=chat_label,
+                            )
+                            response = await client.complete_on_model(
+                                task="mid_memory",
+                                route=selected_model,
+                                request=request,
+                            )
+                            content = response.choices[0].message.content or ""
+                            draft = client.parse_mid_memory_response(
+                                content,
+                                messages=summary_messages,
+                            )
+                else:
+                    batch_pending = False
+
+                if batch_pending:
+                    logger.info(
+                        "qq_social_agent mid memory batch deferred: "
+                        f"group={group_id} messages={len(summary_messages)}"
+                    )
+                elif draft and draft.summary:
                     memory.add_memory_summary(
                         group_id,
                         summary_messages,
@@ -150,6 +352,13 @@ class MemoryMaintenanceService:
                         jargon_count=len(draft.jargon_candidates),
                         open_thread_count=len(draft.open_threads),
                     )
+                    if batch_job_to_ack:
+                        self._clear_mid_memory_batch(
+                            memory,
+                            group_id,
+                            batch_job_to_ack,
+                            acknowledge=True,
+                        )
                 else:
                     skip_action = self.note_empty_mid_memory(group_id, summary_messages)
                     logger.warning(
@@ -163,6 +372,13 @@ class MemoryMaintenanceService:
                         action=skip_action,
                         message_count=len(summary_messages),
                     )
+                    if batch_job_to_ack:
+                        self._clear_mid_memory_batch(
+                            memory,
+                            group_id,
+                            batch_job_to_ack,
+                            acknowledge=True,
+                        )
             except Exception as exc:
                 logger.warning(f"qq_social_agent mid memory skipped: group={group_id} error={exc}")
 

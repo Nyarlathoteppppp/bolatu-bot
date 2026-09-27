@@ -23,6 +23,7 @@ class DailyReviewSchedulerService:
         record_metric_event: Callable[..., None],
         logger: Any,
         summarize_error: Callable[[str, int], str],
+        poll_pending_reviews: Callable[[object, float], Awaitable[bool]] | None = None,
     ) -> None:
         self.timezone = timezone
         self.hour = hour
@@ -31,6 +32,7 @@ class DailyReviewSchedulerService:
         self.retry_seconds = retry_seconds
         self.poll_seconds = poll_seconds
         self.send_due_reviews = send_due_reviews
+        self.poll_pending_reviews = poll_pending_reviews
         self.record_metric_event = record_metric_event
         self.logger = logger
         self.summarize_error = summarize_error
@@ -69,9 +71,13 @@ class DailyReviewSchedulerService:
                 try:
                     now = time.time()
                     within_catch_up = self.within_catch_up_window(now)
-                    has_pending = False
+                    has_pending = (
+                        await self.poll_pending_reviews(bot, now)
+                        if self.poll_pending_reviews is not None
+                        else False
+                    )
                     if within_catch_up:
-                        has_pending = await self.send_due_reviews(bot, now)
+                        has_pending = await self.send_due_reviews(bot, now) or has_pending
                     delay = (
                         self.retry_seconds
                         if within_catch_up and has_pending
