@@ -955,6 +955,13 @@ def test_research_queries_split_web_topic_into_angles() -> None:
     assert any("维基百科" in item or "是什么" in item for item in queries)
 
 
+def test_research_queries_do_not_repeat_requested_document_type() -> None:
+    queries = fresh_context._planned_research_queries(
+        "OpenFOAM 官方文档", kind="web", planned=("OpenFOAM 官方文档",),
+    )
+    assert queries == ("OpenFOAM 官方文档", "OpenFOAM GitHub", "OpenFOAM 使用指南")
+
+
 def test_detect_fresh_intent_drops_weak_search_object() -> None:
     assert detect_fresh_intent("搜一下然后开始想个思路") is None
     intent = detect_fresh_intent("搜一下 OpenFOAM 简介")

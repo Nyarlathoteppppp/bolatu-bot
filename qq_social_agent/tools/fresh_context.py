@@ -1718,20 +1718,36 @@ def _research_queries(query: str, *, kind: str) -> tuple[str, ...]:
     base = _compact_search_query(query) or _normalize_query(query)
     if not base:
         return ()
+    topic = re.sub(
+        r"(?:\s*官方)?(?:\s*文档|\s*教程|\s*简介|\s*最新消息|\s*最新进展|\s*是什么|\s*什么是)$",
+        "",
+        base,
+        flags=re.IGNORECASE,
+    ).strip() or base
     variants = [base]
     compact = re.sub(r"\s+", "", base.casefold())
-    if kind in {"news", "sports"}:
+    if kind == "sports":
+        variants.extend((f"{topic} 官方 赛程 赛果", f"{topic} 英文 比赛结果"))
+    elif kind == "news":
         if "最新" not in compact:
-            variants.append(f"{base} 最新")
-        variants.extend((f"{base} 官方 通报", f"{base} 英文 报道"))
+            variants.append(f"{topic} 最新")
+        if "官方" not in compact:
+            variants.append(f"{topic} 官方 通报")
+        variants.append(f"{topic} 英文 报道")
     else:
-        if any(marker in compact for marker in ("github", "api", "sdk", "插件", "文档", "模型", "论文", "cad", "dwg")):
-            variants.append(f"{base} 官方 文档")
-        if not any(marker in compact for marker in ("是什么", "什么是", "定义", "简介", "wiki", "维基")):
-            variants.append(f"{base} 是什么")
-        if not any(marker in compact for marker in ("wiki", "维基", "wikipedia")):
-            variants.append(f"{base} 维基百科")
-        variants.append(f"{base} 英文")
+        technical = any(marker in compact for marker in ("github", "api", "sdk", "插件", "文档", "模型", "论文", "cad", "dwg"))
+        if technical:
+            if "官方" not in compact and "文档" not in compact:
+                variants.append(f"{topic} 官方 文档")
+            if "github" not in compact:
+                variants.append(f"{topic} GitHub")
+            variants.extend((f"{topic} 使用指南", f"{topic} 英文文档"))
+        else:
+            if not any(marker in compact for marker in ("是什么", "什么是", "定义", "简介", "wiki", "维基")):
+                variants.append(f"{topic} 是什么")
+            if not any(marker in compact for marker in ("wiki", "维基", "wikipedia")):
+                variants.append(f"{topic} 维基百科")
+            variants.append(f"{topic} 英文")
     return tuple(_dedupe_strings(variants)[:3])
 
 
