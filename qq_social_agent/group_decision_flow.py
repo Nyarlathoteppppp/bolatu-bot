@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import time
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable
@@ -21,6 +22,26 @@ from .resolver_result import RESOLVED
 from .speaker_context import _short_notice_text
 from .tool_router import ToolRoutePlan, apply_tool_plan as _apply_tool_plan, route_mode as _tool_route_mode
 from .tools.market_intent import MarketIntent
+
+
+_OPEN_KNOWLEDGE_PING_RE = re.compile(
+    r"^(?:有没有人知道|有人知道|有谁知道|谁知道|有人有消息吗|有消息吗|有没有消息)"
+    r"[吗么呢呀啊？?!！。~～]*$"
+)
+_PERSON_STATUS_QUESTION_RE = re.compile(
+    r"(?:活了|还活着|还健在|失联|联系上|找到了|平安吗|安全么)"
+    r".{0,4}[吗么呢？?]|(?:有|有没有)(?:他|她|ta|那人|这个人)?(?:的)?(?:新)?消息[吗么呢？?]",
+    re.IGNORECASE,
+)
+
+
+def _is_open_knowledge_ping(text: str) -> bool:
+    """A bare question to the room carries no answerable claim of its own."""
+    return bool(_OPEN_KNOWLEDGE_PING_RE.fullmatch(re.sub(r"\s+", "", text or "")))
+
+
+def _is_unverified_status_question(text: str) -> bool:
+    return bool(_PERSON_STATUS_QUESTION_RE.search(re.sub(r"\s+", "", text or "")))
 
 
 @dataclass(frozen=True)
@@ -274,6 +295,26 @@ async def resolve_group_reply_decision(
         ),
         text=text,
     )
+    if (
+        decision.should_reply
+        and not addressed_bot
+        and not tool_plan.requests
+        and (_is_open_knowledge_ping(text) or _is_unverified_status_question(text))
+    ):
+        _record_metric_event(
+            "group_gate",
+            group_id=group_id,
+            user_id=user_id,
+            stage="unanswerable_open_question",
+            action="blocked",
+            text=_short_notice_text(text, 80),
+        )
+        decision = ReplyDecision(
+            should_reply=False,
+            confidence=decision.confidence,
+            reason="unanswerable_open_question",
+            action="ignore",
+        )
     if reply_budget.skip("speaking_action", time.monotonic()):
         _record_metric_event(
             "reply_budget",

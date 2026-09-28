@@ -11,18 +11,19 @@ from qq_social_agent.discourse_effects import RepairResolution
 from qq_social_agent.discourse_state import Binding, DiscourseState
 from qq_social_agent.ellipsis_resolver import EllipsisResolution
 from qq_social_agent.group_approval_dispatch import queue_group_reply_approval
-from qq_social_agent.group_decision_flow import GroupDecisionServices, resolve_group_reply_decision
+from qq_social_agent.group_decision_flow import GroupDecisionServices, _is_open_knowledge_ping, _is_unverified_status_question, resolve_group_reply_decision
 from qq_social_agent.group_discourse_flow import resolve_group_discourse_context
 from qq_social_agent.group_generation_context import GroupContextLimits, build_group_generation_context
 from qq_social_agent.group_reply_generation import generate_group_reply
 from qq_social_agent.group_tool_execution import execute_group_tools
 from qq_social_agent.jev_policy import GroupReplyBudget
-from qq_social_agent.pipeline_types import ContextPacket, OutputChannel, PipelineMode, PipelineStage, PipelineState, ToolKind, ToolRequest, ToolResult
+from qq_social_agent.pipeline_types import ContextPacket, OutputChannel, PipelineMode, PipelineStage, PipelineState, SocialIntent, ToolKind, ToolRequest, ToolResult
 from qq_social_agent.rag_retriever import RAGRetrievalResult
 from qq_social_agent.rag_router import RAGQueryPlan
 from qq_social_agent.reference_resolver import ReferenceResolution
 from qq_social_agent.reference_resolver import ReplyHint
 from qq_social_agent.tool_router import ToolRoutePlan
+from qq_social_agent.timing_gate import TimingDecision
 
 
 def _pipeline() -> PipelineState:
@@ -95,6 +96,81 @@ def test_group_decision_stage_returns_routed_answer_and_updates_pipeline() -> No
     assert state.output_channel is OutputChannel.TEXT
     assert state.stage is PipelineStage.DECIDED
     assert any(event == "decision_result" for event, _ in metrics)
+
+
+def test_open_knowledge_ping_without_evidence_stays_silent() -> None:
+    assert _is_open_knowledge_ping("有没有人知道")
+    assert not _is_open_knowledge_ping("有人知道 OpenFOAM 官方文档吗")
+    assert _is_unverified_status_question("所以 gs 活了吗")
+    assert _is_unverified_status_question("他联系上了吗？")
+    assert not _is_unverified_status_question("OpenFOAM 官方文档在哪")
+
+    metrics = []
+
+    async def keep_decision(decision, **_kwargs):
+        return decision
+
+    async def keep_tool_plan(decision, *, tool_plan, **_kwargs):
+        return decision, tool_plan
+
+    async def jev_misclassifies_as_answer(**_kwargs):
+        return TimingDecision(OutputChannel.TEXT, SocialIntent.ANSWER, 0.89, "jev_answer_0.89")
+
+    async def unused_notice(*_args, **_kwargs):
+        raise AssertionError("open question should be handled by the decision gate")
+
+    services = GroupDecisionServices(
+        record_metric_event=lambda event, **kwargs: metrics.append((event, kwargs)),
+        record_tool_router_shadow=lambda **_: None,
+        send_suppression_notice=unused_notice,
+        schedule_group_learning=lambda _group_id: None,
+        decision_failure_fallback=lambda **_: None,
+        looks_like_addressed_question=lambda _text: True,
+        apply_tool_use_router=keep_tool_plan,
+        enforce_addressed_reply_decision=lambda decision, **_: decision,
+        maybe_apply_speaking_action=keep_decision,
+        maybe_apply_ask_back=keep_decision,
+        logger=_logger(),
+    )
+    started = time.monotonic()
+    for text in ("所以 gs 活了吗", "有没有人知道"):
+        state = _pipeline()
+        result = asyncio.run(resolve_group_reply_decision(
+            bot=object(),
+            client=SimpleNamespace(timing_gate=jev_misclassifies_as_answer),
+            pre_decision=PreDecisionGateResult(None),
+            pipeline_state=state,
+            reply_budget=GroupReplyBudget.start(started, seconds=120),
+            tool_plan=ToolRoutePlan(),
+            persona=object(),
+            context_recent=[],
+            text=text,
+            nickname="群友",
+            speaker_context="当前触发人是群友",
+            discourse_state=DiscourseState(),
+            group_id=123,
+            user_id=456,
+            source_message_id="m1",
+            addressed_bot=False,
+            direct_addressed_bot=False,
+            synthetic_addressed_bot=False,
+            followup_addressed=False,
+            mentioned=False,
+            replied_to_bot=False,
+            market_intents=[],
+            fresh_intent=None,
+            decision_started_at=started,
+            flow_started_at=started,
+            services=services,
+        ))
+        assert result is not None
+        assert not result.decision.should_reply
+        assert result.decision.reason == "unanswerable_open_question"
+        assert state.output_channel is OutputChannel.SILENT
+    assert sum(
+        event == "group_gate" and data.get("stage") == "unanswerable_open_question"
+        for event, data in metrics
+    ) == 2
 
 
 def test_group_decision_skips_timing_when_addressee_is_another_member() -> None:
