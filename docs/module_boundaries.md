@@ -138,4 +138,4 @@ git status --short
 
 ## 短期互动与角色卡组织（2026-09-30）
 
-消息依据、分支边界、发送回执和生命周期见 [interaction_state.md](interaction_state.md)。角色正文与运行规则的加载方式见 [persona_prompt_organization.md](persona_prompt_organization.md)。有效人格文本与 flow prompt 保持原文；短期状态以结构化数据进入现有说话关系上下文。
+消息依据、分支边界、发送回执和生命周期见 [interaction_state.md](interaction_state.md)。角色正文与运行规则的加载方式见 [persona_prompt_organization.md](persona_prompt_organization.md)。角色 PList 保持原文，事实、能力和输出句子迁入运行规则；按用户偏好允许简短括号表情、心理反应或玩笑动作，critic 同步区分表达与现实事实。flow prompt 保持原文；短期状态以结构化数据进入现有说话关系上下文。

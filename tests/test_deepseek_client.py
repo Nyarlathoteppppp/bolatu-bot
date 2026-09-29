@@ -1,4 +1,5 @@
 import asyncio
+import json
 from datetime import datetime
 from types import SimpleNamespace
 from zoneinfo import ZoneInfo
@@ -1231,3 +1232,19 @@ def test_select_relevant_context_always_pins_last_six() -> None:
     texts = [msg.text for msg in selected]
     assert texts[-6:] == [f"old-{index}" for index in range(14, 20)]
     assert len(texts) == 8
+
+
+def test_parenthetical_expression_survives_candidate_and_delivery():
+    from qq_social_agent.delivery import build_delivery_plan
+    samples = [
+        '这还用挑日子，现在立刻马上，你请客我就去（伸手）',
+        '才没有，我是在给你表现机会（心虚）',
+        '行啦，刚才是我说话太冲了（收起叉腰）',
+    ]
+    for text in samples:
+        draft = json.dumps({'candidates': [{'style': '接话', 'action': 'reply', 'text': text}]}, ensure_ascii=False)
+        candidates = _parse_reply_candidates(draft, max_chars=120, fallback_action='reply', limit=1)
+        assert candidates[0].text == text
+        plan = build_delivery_plan(reply_text=candidates[0].text, mention_targets={}, trigger_user_id=1,
+                                   trigger_nickname='奈亚子', trigger_sequence=1, current_sequence=1)
+        assert plan.parts == (text,)
