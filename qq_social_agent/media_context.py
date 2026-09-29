@@ -165,7 +165,7 @@ class ImageOcrService:
             if text:
                 self._store_cache(image_key, text)
                 return ImageOcrResult(image_key=image_key, text=text)
-        if file_id and file_id not in seen_targets:
+        if file_id:
             try:
                 image_info = await onebot_gateway.get_image(
                     bot,

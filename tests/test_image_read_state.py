@@ -382,3 +382,23 @@ def test_followup_retries_unread_image_without_rereading_successful_one(tmp_path
         assert calls.count('https://example.com/cat.png') == 2
         assert calls.count('https://example.com/dog.png') == 1
     asyncio.run(run())
+
+
+def test_failed_direct_target_still_resolves_file_location():
+    calls = []
+
+    class Bot:
+        async def call_api(self, api, **kwargs):
+            assert api == 'get_image'
+            calls.append(api)
+            return {'url': 'https://example.com/resolved.png'}
+
+    class Vision:
+        async def recognize(self, target):
+            calls.append(target)
+            return '猫' if target == 'https://example.com/resolved.png' else ''
+
+    service = ImageOcrService(napcat_ocr_enabled=False, primary_ocr=Vision())
+    result = asyncio.run(service.ocr_image_segment(Bot(), {'file': 'file:///image/cat.png'}))
+    assert result.text == '猫'
+    assert calls == ['file:///image/cat.png', 'get_image', 'https://example.com/resolved.png']
