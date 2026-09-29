@@ -62,9 +62,12 @@ async def plan_and_execute_private_tools(
     persona_id = str(state["persona"] or services.app_config.default_persona)
     persona = services.personas.get(persona_id)
     recent = current_private_session_messages(
-        services.memory.recent_messages(turn.chat_id, services.private_context_limit)
+        services.memory.images.enrich(services.memory.recent_messages(turn.chat_id, services.private_context_limit))
     )
-    context_recent = services.without_current_message(recent, user_id=turn.user_id, text=turn.text)
+    context_recent = services.without_current_message(
+        [message for message in recent if not turn.source_message_id or message.source_message_id != turn.source_message_id],
+        user_id=turn.user_id, text=turn.text,
+    )
     normalized_rag_query = services.normalize_rag_query(turn.text)
     context_query = normalized_rag_query.current_utterance or turn.text
     market_intents = services.detect_market_intents(context_query, limit=2)

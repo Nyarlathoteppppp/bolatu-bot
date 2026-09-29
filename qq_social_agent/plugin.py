@@ -268,6 +268,7 @@ from .discourse_effects import (
     memory_can_commit,
 )
 from .discourse_state import segments_have_real_media
+from .image_read_state import resolved_image_message, stored_image_segments
 from .jev_policy import GroupReplyBudget
 from .pre_send_critic import (
     CriticResult,
@@ -1247,6 +1248,7 @@ async def _shutdown_background_tasks() -> None:
         maintenance_tasks,
     )
     closers: list[object] = []
+    await memory.images.aclose()
     if learning_coordinator is not None:
         closers.append(learning_coordinator.close())
     if deepseek_client is not None:
@@ -2800,6 +2802,7 @@ def _add_group_event_memory(
         _nickname(event),
         text,
         is_bot=False,
+        created_at=float(getattr(event, "time", 0) or time.time()),
         source_message_id=source_message_id,
         correlation_id=correlation_id,
         **_event_message_storage_kwargs(event, bot=bot),
@@ -4138,6 +4141,13 @@ async def _handle_group_message_scoped(
     inbound_sequence = group_inbound_sequences.get(group_id, 0) + 1
     group_inbound_sequences[group_id] = inbound_sequence
     pipeline_state.trigger_sequence = inbound_sequence
+    # Publish image arrival before any network enrichment. A following turn
+    # must be able to refer to the real image even while vision is running.
+    if collect_ocr_image_segments(getattr(event, "message", None)):
+        _add_group_event_memory(
+            event, bot, text=_message_context_text(event, bot_id=int(bot.self_id)),
+            source_message_id=source_message_id, correlation_id=correlation_id,
+        )
     history_started_at = time.monotonic()
     reply_reference = await _resolve_reply_reference_for_event(bot, event, group_allowed=group_allowed)
     _record_metric_event(
@@ -4278,7 +4288,9 @@ async def _handle_group_message_scoped(
         )
     ocr_context = ImageOcrContext("", 0, 0)
     if group_allowed:
-        image_segments = collect_ocr_image_segments(getattr(event, "message", []) or [])
+        related_images = await _ocr_related_image_segments(bot, event)
+        pipeline_state.reply_image_present = bool(related_images)
+        image_segments = collect_ocr_image_segments(getattr(event, "message", []) or []) + related_images
         if image_segments and await _media_worth_reading(
             kind="ocr",
             caption=plain_text,
@@ -4294,11 +4306,15 @@ async def _handle_group_message_scoped(
                 group_id=group_id,
                 user_id=int(event.user_id),
                 correlation_id=correlation_id,
+                extra_image_segments=related_images,
             )
             if ocr_context.text:
                 raw_text = _join_context_parts(raw_text, _format_image_ocr_context(ocr_context))
         elif image_segments:
             ocr_context = ImageOcrContext("", len(image_segments), 0, "jev_skip")
+            image_row = memory.admin_message_by_source(group_id, source_message_id)
+            if image_row is not None:
+                memory.images.skipped(int(image_row["id"]), "jev_skip")
             _record_metric_event(
                 "image_ocr",
                 group_id=group_id,
@@ -4330,6 +4346,10 @@ async def _handle_group_message_scoped(
                 action="skipped",
                 reason="jev_not_worth_reading",
             )
+    if collect_ocr_image_segments(getattr(event, "message", None)):
+        image_row = memory.admin_message_by_source(group_id, source_message_id)
+        if image_row is not None:
+            memory.update_message_context(int(image_row["id"]), raw_text)
     if has_context_media:
         _record_metric_event(
             "group_flow_timing", group_id=group_id, user_id=int(event.user_id),
@@ -4886,13 +4906,14 @@ async def _handle_group_message_locked(
     persona = personas.get(persona_id)
 
     pipeline_state.interaction_context_at = time.time()
-    recent = memory.recent_messages(group_id, app_config.context_limit)
+    recent = memory.images.enrich(memory.recent_messages(group_id, app_config.context_limit))
     context_recent = _without_current_message(
         recent,
         user_id=user_id,
         text=text,
         buffered_messages=buffered_messages,
     )
+    context_recent = [message for message in context_recent if not source_message_id or message.source_message_id != source_message_id]
     rate = rate_limiter.allow(group_id, mentioned=addressed_bot, event_at=event_at)
     if not rate.allowed:
         _record_metric_event(
@@ -4960,10 +4981,13 @@ async def _handle_group_message_locked(
     at_user_ids = _at_user_ids_from_event(event, bot)
     current_has_media = segments_have_real_media(getattr(event, "message", None), text=text)
     reply_event = getattr(event, "reply", None)
-    reply_has_media = bool(reply_hint.exists) and segments_have_real_media(
+    reply_has_media = pipeline_state.reply_image_present or (bool(reply_hint.exists) and segments_have_real_media(
         getattr(reply_event, "message", None) if reply_event is not None else None,
         text=reply_hint.text,
-    )
+    ))
+    quoted_row = memory.admin_message_by_source(group_id, reply_hint.message_id)
+    if quoted_row is not None and stored_image_segments(quoted_row["message_segments_json"]):
+        reply_has_media = True
     discourse_context = await resolve_group_discourse_context(
         group_id=group_id,
         user_id=user_id,
@@ -4990,6 +5014,13 @@ async def _handle_group_message_locked(
     )
     discourse_state = discourse_context.state
     speaker_context = discourse_context.speaker_context
+    image_context = await _resolved_image_context(bot, discourse_state, context_recent, group_id=group_id)
+    if image_context:
+        speaker_context = _combine_text_sections(speaker_context, image_context)
+        # Keep the same history snapshot and identities, replacing only the
+        # image observations that became ready during resolution.
+        recent = memory.images.enrich(recent)
+        context_recent = memory.images.enrich(context_recent)
     interaction_state = memory.interactions.bind_discourse(
         group_id=group_id,
         source_message_id=source_message_id,
@@ -5579,6 +5610,7 @@ async def _handle_private_message_scoped(
             file_metadata_context=file_metadata_context_for_event,
             media_worth_reading=_media_worth_reading,
             image_ocr_context_for_event=_image_ocr_context_for_event,
+            related_image_segments=_ocr_related_image_segments,
             format_image_ocr_context=_format_image_ocr_context,
             message_has_forward_context=_message_has_forward_context,
             forward_context_text=_forward_context_text,
@@ -6207,15 +6239,45 @@ async def _image_ocr_context_for_event(
     group_id: int,
     user_id: int,
     correlation_id: str,
+    extra_image_segments: list[dict[str, object]] | None = None,
 ) -> ImageOcrContext:
     if not group_allowed:
         return ImageOcrContext("", 0, 0, "group_not_allowed")
     started_at = time.monotonic()
-    extra_image_segments = await _ocr_related_image_segments(bot, event)
-    context = await image_ocr_service.context_for_event(
-        bot,
-        event,
-        extra_image_segments=extra_image_segments,
+    if extra_image_segments is None:
+        extra_image_segments = await _ocr_related_image_segments(bot, event)
+    results = []
+    direct_images = collect_ocr_image_segments(getattr(event, "message", None))
+    if direct_images:
+        row = memory.admin_message_by_source(group_id, event_message_source_id(event))
+        if row is None and not getattr(event, "group_id", None):
+            memory.add_message(
+                group_id, int(event.user_id), _private_nickname(event),
+                _message_context_text(event, bot_id=int(bot.self_id)),
+                created_at=float(getattr(event, "time", 0) or time.time()),
+                source_message_id=event_message_source_id(event), correlation_id=correlation_id,
+                **_event_message_storage_kwargs(event, bot=bot),
+            )
+            row = memory.admin_message_by_source(group_id, event_message_source_id(event))
+        if row is not None and stored_image_segments(row["message_segments_json"]):
+            results.append(await memory.images.read(bot, image_ocr_service, row))
+        else:
+            results.append(await image_ocr_service.context_for_event(bot, event))
+    if extra_image_segments:
+        quoted_id = str(reply_message_id(event) or "")
+        row = memory.admin_message_by_source(group_id, quoted_id)
+        if row is not None and stored_image_segments(row["message_segments_json"]):
+            quoted = await memory.images.read(bot, image_ocr_service, row)
+        else:
+            quoted = await image_ocr_service.context_for_event(
+                bot, None, extra_image_segments=extra_image_segments,
+            )
+        results.append(replace(quoted, text=f"引用消息 {quoted_id} 的图片：{quoted.text}" if quoted.text else ""))
+    context = ImageOcrContext(
+        "；".join(result.text for result in results if result.text),
+        sum(result.image_count for result in results),
+        sum(result.ocr_count for result in results),
+        next((result.skipped_reason for result in results if result.skipped_reason), ""),
     )
     if context.image_count:
         _record_metric_event(
@@ -6238,6 +6300,20 @@ async def _image_ocr_context_for_event(
     return context
 
 
+async def _resolved_image_context(bot, discourse, recent_messages, *, group_id: int) -> str:
+    source = resolved_image_message(discourse.ellipsis, recent_messages)
+    if source is None:
+        return ""
+    row = memory.admin_message_by_source(group_id, source.source_message_id)
+    if row is None:
+        return ""
+    await memory.images.read(bot, image_ocr_service, row)
+    # Read the outcome, including unavailable, instead of pretending the image
+    # was absent. This is the exact source chosen by DiscourseState.
+    refreshed = memory.images.enrich([replace(source, text=str(row["text"]))])[0]
+    return refreshed.text
+
+
 def _format_image_ocr_context(context: ImageOcrContext) -> str:
     text = _short_notice_text(context.text, 800)
     return f"{IMAGE_OCR_CONTEXT_PREFIX} {text}]" if text else ""
@@ -6248,6 +6324,14 @@ async def _ocr_related_image_segments(
     event: GroupMessageEvent | PrivateMessageEvent,
 ) -> list[dict[str, object]]:
     extra: list[dict[str, object]] = []
+    chat_id = getattr(event, "group_id", None)
+    if chat_id is None and getattr(event, "user_id", None) is not None:
+        chat_id = _private_chat_id(int(event.user_id))
+    row = memory.admin_message_by_source(int(chat_id), reply_message_id(event)) if chat_id is not None else None
+    if row is not None:
+        images = stored_image_segments(row["message_segments_json"])
+        if images:
+            return images
     reply_images = _reply_ocr_image_segments(event)
     extra.extend(reply_images)
     if not reply_images and _event_has_reply_context(event):
@@ -8293,12 +8377,12 @@ def _reply_hint_for_reference(
     self_id: int,
 ) -> ReplyHint:
     reply = getattr(event, "reply", None)
-    message_id = ""
+    message_id = str(reply_message_id(event) or "")
     user_id = None
     nickname = ""
     text = ""
     if reply is not None:
-        message_id = str(getattr(reply, "message_id", "") or "")
+        message_id = str(getattr(reply, "message_id", "") or message_id)
         user_id = getattr(reply, "user_id", None) or getattr(reply, "sender_id", None)
         sender = getattr(reply, "sender", None)
         if user_id is None and sender is not None:
@@ -8309,7 +8393,15 @@ def _reply_hint_for_reference(
         if raw_message is not None:
             text = message_text_from_payload(raw_message, language="zh")
     relation = _extract_reply_relation(current_text)
-    if not reply and relation is None:
+    chat_id = getattr(event, "group_id", None)
+    if chat_id is None and getattr(event, "user_id", None) is not None:
+        chat_id = _private_chat_id(int(event.user_id))
+    stored = memory.admin_message_by_source(int(chat_id), message_id) if chat_id is not None else None
+    if stored is not None:
+        user_id = int(stored["user_id"])
+        nickname = str(stored["nickname"])
+        text = str(stored["text"])
+    if not reply and relation is None and stored is None:
         return ReplyHint()
     if user_id is None and relation is not None and not text:
         text = current_text

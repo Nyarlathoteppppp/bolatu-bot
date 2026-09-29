@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import json
 import time
 from dataclasses import dataclass
 from typing import Any
 
 from . import onebot_gateway
 from .media_context import coerce_int, message_text_from_payload, sender_nickname
+from .message_segments import message_segments_from_payload
 from .memory import MemoryStore
 
 
@@ -17,6 +19,7 @@ class HistoricalMessage:
     nickname: str
     text: str
     created_at: float
+    message_segments_json: str = ""
 
 
 @dataclass(frozen=True)
@@ -52,8 +55,13 @@ async def backfill_group_history(
             source_message_id=item.message_id,
             source_kind="history",
             correlation_id=f"history:{item.group_id}:{item.message_id}",
+            message_segments_json=item.message_segments_json or None,
         ):
             inserted += 1
+        elif item.message_segments_json:
+            existing = memory.admin_message_by_source(item.group_id, item.message_id)
+            if existing is not None:
+                memory.fill_message_segments(int(existing["id"]), item.message_segments_json)
     return inserted
 
 
@@ -80,6 +88,7 @@ def normalize_message_payload(payload: dict[str, Any], *, fallback_group_id: int
     nickname = sender_nickname(sender, fallback_user_id=user_id)
     text = message_text_from_payload(payload, language="zh")
     created_at = float(coerce_int(payload.get("time") or payload.get("timestamp"), 0) or time.time())
+    message_segments = message_segments_from_payload(payload)
     return HistoricalMessage(
         group_id=group_id,
         message_id=message_id,
@@ -87,6 +96,11 @@ def normalize_message_payload(payload: dict[str, Any], *, fallback_group_id: int
         nickname=nickname or str(user_id),
         text=text,
         created_at=created_at,
+        message_segments_json=(
+            json.dumps(message_segments, ensure_ascii=False, separators=(",", ":"))
+            if message_segments
+            else ""
+        ),
     )
 
 

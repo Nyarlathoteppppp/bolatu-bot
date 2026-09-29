@@ -51,6 +51,7 @@ from .resolver_result import (
 
 
 from .jev_policy import JEV_ADDRESSEE_CONFIDENCE_MIN, JEV_AUDIT_CONFIDENCE_MIN
+from .image_read_state import resolved_image_message
 
 MAX_DEIXIS_CANDIDATES = 8
 MAX_LOGICAL_GAP_SECONDS = 90.0
@@ -1411,6 +1412,9 @@ async def resolve_group_discourse(
                 reason="non_blocking_resolved_deixis",
             )
 
+    media_present = bool(current_has_media or reply_has_media or resolved_image_message(
+        ellipsis, messages
+    ))
     state = assemble_discourse_state(
         speaker_id=current_user_id,
         speaker_label=speaker_label,
@@ -1496,6 +1500,9 @@ async def resolve_group_discourse(
             fallback=reference,
         )
         recomputed = list(recomputed) + ["referent"]
+    media_present = bool(current_has_media or reply_has_media or resolved_image_message(
+        ellipsis, messages
+    ))
     return assemble_discourse_state(
         speaker_id=current_user_id,
         speaker_label=speaker_label,

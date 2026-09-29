@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .interaction_state import InteractionStateStore
+from .image_read_state import ImageReadStateStore
 
 
 MEMORY_ATOM_EVIDENCE_TYPES = frozenset({"message", "event", "manual"})
@@ -369,6 +370,7 @@ class MemoryStore:
         self._configure_connection()
         self._init_schema()
         self.interactions = InteractionStateStore(self.conn)
+        self.images = ImageReadStateStore(self.conn)
 
     def _configure_connection(self) -> None:
         self.conn.execute("pragma busy_timeout = 5000")
@@ -1183,6 +1185,8 @@ class MemoryStore:
         if cursor.rowcount <= 0:
             self.conn.commit()
             return False
+        if not is_bot and message_segments_json:
+            self.images.observe(int(cursor.lastrowid), message_segments_json)
         if not is_bot:
             self._upsert_member_profile(group_id, user_id, nickname, last_seen_at=created)
             self._update_member_impression(
@@ -1227,6 +1231,21 @@ class MemoryStore:
             """,
             (int(message_id),),
         ).fetchone()
+
+    def update_message_context(self, message_id: int, text: str) -> None:
+        """Enrich an existing message without moving its arrival time."""
+        self.conn.execute("update messages set text = ? where id = ?", (text, int(message_id)))
+        self.conn.commit()
+
+    def fill_message_segments(self, message_id: int, segments: str) -> None:
+        """Restore media data omitted by older history imports, in place."""
+        cursor = self.conn.execute("""
+            update messages set message_segments_json = ?
+            where id = ? and (message_segments_json is null or message_segments_json = '')
+        """, (segments, int(message_id)))
+        if cursor.rowcount:
+            self.images.observe(int(message_id), segments)
+        self.conn.commit()
 
     def admin_message_by_source(self, group_id: int, source_message_id: int | str | None) -> sqlite3.Row | None:
         source_key = _source_message_key(source_message_id)
@@ -4176,6 +4195,7 @@ class MemoryStore:
         self.conn.commit()
 
     def reset_group_messages(self, group_id: int) -> None:
+        self.images.clear_group(group_id)
         self.conn.execute("delete from interaction_events where group_id = ?", (group_id,))
         self.conn.execute("delete from messages where group_id = ?", (group_id,))
         self.conn.execute("delete from inbound_message_events where group_id = ?", (group_id,))

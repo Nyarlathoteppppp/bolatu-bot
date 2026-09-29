@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass
-from typing import Awaitable, Callable
+from dataclasses import dataclass, replace
+from typing import Any, Awaitable, Callable
 
 from nonebot.adapters.onebot.v11 import Bot, Message, PrivateMessageEvent
 
@@ -27,6 +27,7 @@ class PrivateTurnServices:
     file_metadata_context: Callable[..., Awaitable[str]]
     media_worth_reading: Callable[..., Awaitable[bool]]
     image_ocr_context_for_event: Callable[..., Awaitable[ImageOcrContext]]
+    related_image_segments: Callable[..., Awaitable[list[dict[str, Any]]]]
     format_image_ocr_context: Callable[[ImageOcrContext], str]
     message_has_forward_context: Callable[[PrivateMessageEvent], bool]
     forward_context_text: Callable[..., Awaitable[str]]
@@ -151,7 +152,30 @@ async def prepare_private_turn(
             file_status=content_context.file_status,
             voice_status=content_context.voice_status,
         )
-    image_segments = collect_ocr_image_segments(getattr(event, "message", []) or [])
+    # A private burst can be an image followed by "这个图什么意思". Process
+    # the earlier image too; selecting only the last event loses it entirely.
+    for index, item in enumerate(accepted_items[:-1]):
+        earlier_images = collect_ocr_image_segments(getattr(item.event, "message", None))
+        if not earlier_images:
+            continue
+        services.memory.add_message(
+            chat_id, user_id, item.nickname, item.text, is_bot=False,
+            created_at=item.created_at, source_message_id=item.source_message_id,
+            correlation_id=item.correlation_id,
+            **services.event_message_storage_kwargs(item.event, bot=item.bot),
+        )
+        if await services.media_worth_reading(
+            kind="ocr", caption=_join_context_parts(item.text, text), addressed=True,
+            item_count=len(earlier_images), group_id=chat_id, user_id=user_id,
+        ):
+            earlier_ocr = await services.image_ocr_context_for_event(
+                item.bot, item.event, group_allowed=True, group_id=chat_id,
+                user_id=user_id, correlation_id=item.correlation_id,
+            )
+            if earlier_ocr.text:
+                accepted_items[index] = replace(item, text=_join_context_parts(item.text, services.format_image_ocr_context(earlier_ocr)))
+    related_images = await services.related_image_segments(bot, event)
+    image_segments = collect_ocr_image_segments(getattr(event, "message", []) or []) + related_images
     if image_segments and await services.media_worth_reading(
         kind="ocr",
         caption=text,
@@ -226,7 +250,7 @@ async def prepare_private_turn(
             prompt_text = "[对方连续发了多条私聊]\n" + "\n".join(earlier + [text])
     services.logger.info(f"qq_social_agent private start: user={user_id} text={text!r}")
     for item in accepted_items[:-1]:
-        services.memory.add_message(
+        inserted = services.memory.add_message(
             chat_id,
             user_id,
             item.nickname,
@@ -236,7 +260,11 @@ async def prepare_private_turn(
             correlation_id=item.correlation_id,
             **services.event_message_storage_kwargs(item.event, bot=item.bot),
         )
-    services.memory.add_message(
+        if not inserted and collect_ocr_image_segments(getattr(item.event, "message", None)):
+            row = services.memory.admin_message_by_source(chat_id, item.source_message_id)
+            if row is not None:
+                services.memory.update_message_context(int(row["id"]), item.text)
+    inserted = services.memory.add_message(
         chat_id,
         user_id,
         nickname,
@@ -246,6 +274,10 @@ async def prepare_private_turn(
         correlation_id=correlation_id,
         **services.event_message_storage_kwargs(event, bot=bot),
     )
+    if not inserted and collect_ocr_image_segments(getattr(event, "message", None)):
+        row = services.memory.admin_message_by_source(chat_id, source_message_id)
+        if row is not None:
+            services.memory.update_message_context(int(row["id"]), text)
     private_state = services.memory.private_conversation_state(chat_id)
     if private_state is None or "display_name" not in private_state.frozen_fields:
         services.memory.update_private_conversation_state(chat_id=chat_id, user_id=user_id, display_name=nickname)

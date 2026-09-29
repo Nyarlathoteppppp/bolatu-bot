@@ -46,6 +46,7 @@ entrypoint/plugin -> orchestration -> domain/storage/tools -> provider adapters
 | 私聊工具与上下文 | `private_tool_execution.py`、`private_generation_context.py`、`conversation_tool_routing.py`、`tool_registry.py` | 共享工具路由、工具执行、并行 RAG 与记忆上下文，使用有类型的阶段结果交接 | 原始 OneBot 事件适配、审批状态 |
 | 私聊生成与发送 | `private_reply_delivery.py`、`reply_splitter.py`、`meme_library.py` | 私聊模型调用、表情包选择、分段回复、首段引用及成功后的机器人消息入库 | 入口注册、会话 buffer 调度 |
 | MessageChain | `message_segments.py`、`reference_resolver.py`、`media_context.py` | 原始 segment、引用/艾特/媒体事实 | 凭文本猜人物关系 |
+| 图片识别状态 | `image_read_state.py`、`media_context.py` | 原消息接收事实、识图状态持久化、共享任务与原消息结果关联；只消费统一指代绑定 | 重新猜图片来源、插入迟到的用户消息、学习临时识别状态 |
 | 前置筛选 | `decision_gate.py`、`rate_limiter.py` | 去重、低价值、频控、buffer | 社交氛围或搜索词 |
 | 社交决策 | `decision_gate.py`、`group_decision_flow.py`、`timing_gate.py`、`pipeline_types.py`、`pipeline_stages.py` | channel、action、状态转移；`timing_gate.py` 根据 Jev 观察执行开口策略 | 最终回复正文 |
 | 工具 | `tool_router.py`、`conversation_tool_routing.py`、`group_tool_execution.py`、`tool_registry.py`、`tools/` | 路由、执行、缓存、限流、结构化结果 | 客服式 fallback 文案 |

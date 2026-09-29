@@ -84,6 +84,9 @@ def _preparation_services(memory, *, rag=None, content=None, **overrides):
     async def no_forward(*args, **kwargs):
         return ""
 
+    async def no_related_images(*args, **kwargs):
+        return []
+
     async def identity_text(text, **kwargs):
         return text
 
@@ -105,6 +108,7 @@ def _preparation_services(memory, *, rag=None, content=None, **overrides):
         file_metadata_context=empty_text,
         media_worth_reading=no_media,
         image_ocr_context_for_event=no_ocr,
+        related_image_segments=no_related_images,
         format_image_ocr_context=lambda result: f"[图片OCR: {result.text}]",
         message_has_forward_context=lambda event: False,
         forward_context_text=no_forward,
@@ -420,3 +424,72 @@ def test_private_segment_send_failure_keeps_successful_prefix_only(monkeypatch, 
     assert len(sent) == 2
     stored = memory.recent_messages(turn.chat_id, 10)
     assert [(message.text, message.is_bot) for message in stored] == [("第一段", True)]
+
+
+def test_private_burst_reads_image_before_text_question(monkeypatch, tmp_path):
+    from qq_social_agent.media_context import ImageOcrService
+    from qq_social_agent.private_message_types import BufferedPrivateMessage
+
+    memory = MemoryStore(tmp_path / 'bot.sqlite3')
+    monkeypatch.setattr(plugin, 'memory', memory)
+    calls = []
+
+    class Vision:
+        async def recognize(self, target):
+            calls.append(target)
+            return '一只猫在伸手'
+
+    async def worth(*args, **kwargs):
+        return True
+
+    monkeypatch.setattr(plugin, 'image_ocr_service', ImageOcrService(napcat_ocr_enabled=False, primary_ocr=Vision()))
+    image = _event('image-before-question', '[图片]', message=Message(MessageSegment.image('https://example.com/cat.png')))
+    question = _event('image-question', '这个图什么意思')
+    bot = SimpleNamespace(self_id=1801507496)
+    items = [BufferedPrivateMessage(bot, event, text, event.user_id, '奈亚子', 1000 + index,
+                                   event.message_id, 'image-test')
+             for index, (event, text) in enumerate(((image, '[图片]'), (question, '这个图什么意思')))]
+    services = _preparation_services(
+        memory, media_worth_reading=worth,
+        image_ocr_context_for_event=plugin._image_ocr_context_for_event,
+        related_image_segments=plugin._ocr_related_image_segments,
+        event_message_storage_kwargs=plugin._event_message_storage_kwargs,
+    )
+    turn = asyncio.run(prepare_private_turn(bot, question, correlation_id='image-test', received_text='这个图什么意思',
+                                           buffered_messages=items, services=services))
+    assert turn and '一只猫' in turn.text
+    history = memory.recent_messages(turn.chat_id, 10)
+    assert len(history) == 2
+    assert '一只猫' in history[0].text
+    assert '尚无识别结果' not in history[0].text
+    assert history[1].source_message_id == question.message_id
+    assert calls == ['https://example.com/cat.png']
+
+
+def test_private_text_only_reply_reads_quoted_picture(monkeypatch, tmp_path):
+    from qq_social_agent.media_context import ImageOcrService
+
+    memory = MemoryStore(tmp_path / 'bot.sqlite3')
+    monkeypatch.setattr(plugin, 'memory', memory)
+
+    class Vision:
+        async def recognize(self, target):
+            return '图片中的猫正在伸手'
+
+    async def worth(*args, **kwargs):
+        return True
+
+    monkeypatch.setattr(plugin, 'image_ocr_service', ImageOcrService(napcat_ocr_enabled=False, primary_ocr=Vision()))
+    event = _event('quoted-picture-question', '什么意思', message=MessageSegment.reply(42) + Message('什么意思'))
+    chat_id = plugin._private_chat_id(event.user_id)
+    memory.add_message(chat_id, event.user_id, '奈亚子', '[图片]', source_message_id='42',
+                       **plugin._event_message_storage_kwargs(_event(42, '[图片]', message=Message(MessageSegment.image('https://example.com/cat.png'))), bot=SimpleNamespace(self_id=1801507496)))
+    services = _preparation_services(
+        memory, media_worth_reading=worth,
+        image_ocr_context_for_event=plugin._image_ocr_context_for_event,
+        related_image_segments=plugin._ocr_related_image_segments,
+    )
+    turn = asyncio.run(prepare_private_turn(SimpleNamespace(self_id=1801507496), event,
+        correlation_id='quoted-image', received_text='什么意思', buffered_messages=None, services=services))
+    assert turn and '猫正在伸手' in turn.text
+    assert '引用消息 42 的图片' in turn.text

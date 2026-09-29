@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import time
 from collections import deque
 from dataclasses import dataclass
@@ -70,6 +71,7 @@ class ImageOcrService:
         self.fallback_ocr = fallback_ocr
         self.cache_empty_results = bool(cache_empty_results)
         self._cache: dict[str, _OcrCacheEntry] = {}
+        self._inflight: dict[str, asyncio.Task[ImageOcrResult | None]] = {}
         self._call_times: deque[float] = deque()
         self._burst_times: deque[float] = deque()
 
@@ -106,16 +108,16 @@ class ImageOcrService:
             return ImageOcrContext("", 0, 0)
         if self.max_images_per_message <= 0:
             return ImageOcrContext("", len(image_segments), 0, "message_limit")
-        results: list[ImageOcrResult] = []
-        for data in image_segments[: self.max_images_per_message]:
+        results: list[tuple[int, ImageOcrResult]] = []
+        for index, data in enumerate(image_segments[: self.max_images_per_message], start=1):
             result = await self.ocr_image_segment(bot, data)
             if result is not None and result.text:
-                results.append(result)
+                results.append((index, result))
         if not results:
             return ImageOcrContext("", len(image_segments), 0, "empty_ocr")
         lines = [
             f"第{index}张图：{_compact_ocr_text(result.text, self.max_text_chars_per_image)}"
-            for index, result in enumerate(results, start=1)
+            for index, result in results
         ]
         return ImageOcrContext(
             text="；".join(lines),
@@ -134,11 +136,36 @@ class ImageOcrService:
         cached = self._cached_text(image_key)
         if cached is not None:
             return ImageOcrResult(image_key=image_key, text=cached, from_cache=True)
+        task = self._inflight.get(image_key)
+        if task is None:
+            task = asyncio.create_task(self._recognize_image(bot, data, image_key))
+            self._inflight[image_key] = task
+        return await asyncio.shield(task)
+
+    async def _recognize_image(self, bot, data, image_key) -> ImageOcrResult | None:
+        try:
+            return await self._recognize_image_once(bot, data, image_key)
+        finally:
+            self._inflight.pop(image_key, None)
+
+    async def _recognize_image_once(self, bot, data, image_key) -> ImageOcrResult | None:
         if not self._rate_limit_available(time.time()):
             return None
         targets = list(image_ocr_targets(data))
         file_id = str(data.get("file", "") or "").strip()
-        if file_id:
+        # QQ image events commonly already contain a usable URL. Calling
+        # get_image first adds an unrelated API round trip (up to 8 seconds).
+        seen_targets: set[str] = set()
+        direct_targets = [target for target in targets if target != file_id or target.startswith(("http://", "https://", "file://"))]
+        for target in direct_targets:
+            if target in seen_targets:
+                continue
+            seen_targets.add(target)
+            text = await self._ocr_target(bot, target)
+            if text:
+                self._store_cache(image_key, text)
+                return ImageOcrResult(image_key=image_key, text=text)
+        if file_id and file_id not in seen_targets:
             try:
                 image_info = await onebot_gateway.get_image(
                     bot,
@@ -148,7 +175,6 @@ class ImageOcrService:
             except Exception:
                 image_info = {}
             targets.extend(image_ocr_targets(image_info))
-        seen_targets: set[str] = set()
         for target in targets:
             if target in seen_targets:
                 continue
@@ -231,6 +257,11 @@ class ImageOcrService:
         self._burst_times.append(now)
 
     async def aclose(self) -> None:
+        tasks = list(self._inflight.values())
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        self._inflight.clear()
         for client in (self.primary_ocr, self.fallback_ocr):
             closer = getattr(client, "aclose", None)
             if closer is not None:
