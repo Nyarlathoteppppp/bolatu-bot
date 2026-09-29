@@ -9,6 +9,8 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
 
+from .interaction_state import InteractionStateStore
+
 
 MEMORY_ATOM_EVIDENCE_TYPES = frozenset({"message", "event", "manual"})
 MEMORY_ATOM_STATUSES = frozenset({"active", "superseded", "disputed", "expired"})
@@ -366,6 +368,7 @@ class MemoryStore:
         self.conn.row_factory = sqlite3.Row
         self._configure_connection()
         self._init_schema()
+        self.interactions = InteractionStateStore(self.conn)
 
     def _configure_connection(self) -> None:
         self.conn.execute("pragma busy_timeout = 5000")
@@ -4173,6 +4176,7 @@ class MemoryStore:
         self.conn.commit()
 
     def reset_group_messages(self, group_id: int) -> None:
+        self.conn.execute("delete from interaction_events where group_id = ?", (group_id,))
         self.conn.execute("delete from messages where group_id = ?", (group_id,))
         self.conn.execute("delete from inbound_message_events where group_id = ?", (group_id,))
         self.conn.commit()

@@ -275,3 +275,86 @@ def test_cancelled_send_requires_verification_before_retry(monkeypatch, delivery
     asyncio.run(run())
     assert len(calls) == 1
     assert approval.delivery_progress[candidate.text].uncertain_index == 0
+
+
+def _seed_interaction_trigger(approval):
+    from dataclasses import replace
+    plugin.memory.add_message(100, 200, 'A', '怎么做？', source_message_id='trigger',
+                              message_segments_json='[{"type":"text","data":{"text":"怎么做？"}}]')
+    plugin.memory.interactions.observe_inbound(group_id=100, source_message_id='trigger', addressed_bot=True)
+    approval.pipeline_state.interaction_context_at = 1.0
+    return replace(approval, source_message_id='trigger')
+
+
+def test_partial_delivery_records_only_acknowledged_interaction(monkeypatch, delivery):
+    approval, candidate = delivery
+    approval = _seed_interaction_trigger(approval)
+    attempts = []
+
+    async def send(*args):
+        attempts.append(1)
+        if len(attempts) == 2:
+            raise plugin.ActionFailed(status='failed', retcode=120, message='blocked')
+        return 800
+
+    monkeypatch.setattr(plugin, '_send_group_message', send)
+    asyncio.run(plugin._send_approved_group_reply_scoped(
+        object(), approval, candidate, approver_id=None, high_quality=False, notify_success=False))
+    events = plugin.memory.conn.execute("select * from interaction_events where kind='sent'").fetchall()
+    assert len(events) == 1
+    assert events[0]['context_at'] == 1.0
+    assert plugin.memory.conn.execute('select text from messages where is_bot=1').fetchone()[0] == '第一段'
+
+
+def test_send_failure_does_not_change_interaction(monkeypatch, delivery):
+    approval, candidate = delivery
+    approval = _seed_interaction_trigger(approval)
+
+    async def fail(*args):
+        raise ConnectionResetError()
+
+    monkeypatch.setattr(plugin, '_send_group_message', fail)
+    asyncio.run(plugin._send_approved_group_reply_scoped(
+        object(), approval, candidate, approver_id=None, high_quality=False, notify_success=False))
+    assert plugin.memory.conn.execute("select count(*) from interaction_events where kind='sent'").fetchone()[0] == 0
+
+
+def test_gag_notification_failure_keeps_acknowledged_message(monkeypatch, delivery):
+    approval, candidate = delivery
+    approval = _seed_interaction_trigger(approval)
+
+    async def prepare(text, **kw):
+        return text, text, ('word',)
+
+    async def send(*args):
+        return 801
+
+    async def fail(**kw):
+        raise ConnectionResetError()
+
+    monkeypatch.setattr(plugin, '_prepare_group_political_send_texts', prepare)
+    monkeypatch.setattr(plugin, '_send_group_message', send)
+    monkeypatch.setattr(plugin, '_notify_owner_political_gag', fail)
+    asyncio.run(plugin._send_approved_group_reply_scoped(
+        object(), approval, candidate, approver_id=None, high_quality=False, notify_success=False))
+    assert plugin.memory.conn.execute("select count(*) from interaction_events where kind='sent'").fetchone()[0] == 1
+    assert plugin.memory.conn.execute("select text from messages where source_message_id='801'").fetchone()[0] == '第一段'
+
+
+def test_live_inbound_records_qq_edge_and_original_segments(monkeypatch, tmp_path):
+    from nonebot.adapters.onebot.v11 import Message, MessageSegment
+    store = MemoryStore(tmp_path / 'inbound.sqlite3')
+    monkeypatch.setattr(plugin, 'memory', store)
+    store.add_message(100, 123, '风雪', '原回答', is_bot=True, source_message_id='parent')
+    message = Message([MessageSegment.reply('parent'), MessageSegment.text('你说错了')])
+    event = SimpleNamespace(group_id=100, user_id=200, self_id=123, message_id=900,
+                            sender=SimpleNamespace(card='', nickname='A'), message=message,
+                            reply=SimpleNamespace(message_id='parent', user_id=123),
+                            get_plaintext=lambda: '你说错了')
+    assert plugin._add_group_event_memory(event, SimpleNamespace(self_id='123'),
+                                          text='[回复风雪：原回答]你说错了',
+                                          source_message_id='900', correlation_id='test')
+    snapshot = store.interactions.for_source(100, '900', context_message_ids=[1, 2])
+    assert snapshot.feedback[0].text == '你说错了'
+    assert snapshot.feedback[0].parent_message_id == 1
+    assert snapshot.feedback[0].edge_source == 'qq_reply'

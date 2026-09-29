@@ -122,6 +122,7 @@ from .group_approval_dispatch import queue_group_reply_approval
 from .group_decision_flow import GroupDecisionServices, resolve_group_reply_decision
 from .group_discourse_flow import resolve_group_discourse_context
 from .group_generation_context import GroupContextLimits, build_group_generation_context
+from .interaction_state import format_interaction_state
 from .group_reply_generation import generate_group_reply
 from .group_tool_execution import execute_group_tools
 from .group_jargon import (
@@ -2793,7 +2794,7 @@ def _add_group_event_memory(
     source_message_id: str,
     correlation_id: str,
 ) -> bool:
-    return memory.add_message(
+    inserted = memory.add_message(
         int(event.group_id),
         int(event.user_id),
         _nickname(event),
@@ -2803,6 +2804,13 @@ def _add_group_event_memory(
         correlation_id=correlation_id,
         **_event_message_storage_kwargs(event, bot=bot),
     )
+    memory.interactions.observe_inbound(
+        group_id=int(event.group_id),
+        source_message_id=source_message_id,
+        reply_source_id=str(reply_message_id(event) or ""),
+        addressed_bot=_mentioned_bot(event, bot) or _replied_to_bot(event, bot),
+    )
+    return inserted
 
 
 def _record_policy_suppressed_group_message(
@@ -4877,6 +4885,7 @@ async def _handle_group_message_locked(
     persona_id = str(state["persona"] or group_cfg.get("persona") or app_config.default_persona)
     persona = personas.get(persona_id)
 
+    pipeline_state.interaction_context_at = time.time()
     recent = memory.recent_messages(group_id, app_config.context_limit)
     context_recent = _without_current_message(
         recent,
@@ -4981,6 +4990,14 @@ async def _handle_group_message_locked(
     )
     discourse_state = discourse_context.state
     speaker_context = discourse_context.speaker_context
+    interaction_state = memory.interactions.bind_discourse(
+        group_id=group_id,
+        source_message_id=source_message_id,
+        discourse=discourse_state,
+        self_id=int(event.self_id),
+        context_message_ids=(message.id for message in recent),
+    )
+    speaker_context = _combine_text_sections(speaker_context, format_interaction_state(interaction_state))
     memory_effect_resolution = discourse_context.memory_effect
     memory_candidate = discourse_context.memory_candidate
     invalidated_layers = discourse_context.invalidated_layers
@@ -9460,6 +9477,14 @@ async def _maybe_send_group_meme(
         source_kind="live",
         correlation_id=approval.correlation_id,
     )
+    if message_id is not None:
+        memory.interactions.observe_sent(
+            group_id=approval.group_id,
+            source_message_id=str(message_id),
+            trigger_source_id=approval.source_message_id,
+            action="meme",
+            context_at=approval.pipeline_state.interaction_context_at if approval.pipeline_state is not None else None,
+        )
     _record_metric_event(
         "group_meme_selector",
         group_id=approval.group_id,

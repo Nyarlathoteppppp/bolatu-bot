@@ -142,6 +142,7 @@ class PipelineState:
     stage_history: list[str] = field(default_factory=lambda: [PipelineStage.RECEIVED.value])
     timings_ms: dict[str, int] = field(default_factory=dict)
     received_monotonic: float = field(default_factory=time.monotonic)
+    interaction_context_at: float | None = None
 
     def add_tool_result(self, result: ToolResult) -> None:
         self.tool_results = (*self.tool_results, result)

@@ -1,6 +1,6 @@
 # 模块边界与维护手册
 
-最后更新：2026-09-24。
+最后更新：2026-09-30。
 
 这份文档给在服务器上继续维护张风雪的开发者和 AI 使用。目标是让功能继续增长，但不再把所有事情塞进 `qq_social_agent/plugin.py`。
 
@@ -56,6 +56,7 @@ entrypoint/plugin -> orchestration -> domain/storage/tools -> provider adapters
 | 审批发送 | `approved_reply_delivery.py`、`delivery.py`、`approval_models.py` | 已批准消息发送、分段进度和数据库/Trace 回写；未知结果标记后阻止盲目重试 | 审批命令解析与工具权限 |
 | 文本模型 | `llm_gateway.py`、`deepseek_client.py`、`prompts.py` | gateway 统一 provider、任务路由、超时、回退和用量；task client 负责提示词与结果解析 | QQ 发送与审批状态 |
 | 专用模型接口 | `jev_client.py`、`embedding_client.py`、`siliconflow_ocr.py`、语音客户端 | 各自协议和模态的请求 | 文本聊天路由 |
+| 短期互动 | `interaction_state.py` | 引用原消息与真实发送回执；消费唯一话语状态，按当前窗口整理回复链、字面反馈与结束标记 | 再次判断说话人；推测情绪、亲密度或校园经历；生成角色卡措辞 |
 | 记忆/RAG | `memory.py`、`memory_learning.py`、`memory_maintenance_service.py`、`rag_*.py` | 原文、画像、atoms、风格、索引；维护 service 管理异步记忆总结、风格学习和成员画像更新 | QQ 生命周期、聊天热路径 |
 | 发送 | `delivery.py`、`reply_splitter.py`、`social_actions.py` | 拆分、艾特、表情、节流 | 写长期事实 |
 | 定时任务调度 | `daily_review_scheduler_service.py`、`weekly_usage_report_scheduler_service.py`、`proactive_chat_scheduler_service.py` | 按 Bot 管理 task 去重、时间窗口/概率策略、周期 tick、异常记录和取消清理 | 群消息生成、周报格式化与投递 |
@@ -134,3 +135,7 @@ git status --short
 - SearXNG 是 MVP。镜像或服务未健康时保留 Tavily/RSS fallback，不要强制切主 provider。
 - 政治保护只能检查可见正文、引用和明确语义；消息 ID、QQ 号、时间戳必须剥离。
 - 新功能先归属领域模块，`plugin.py` 仅负责装配和入口编排。
+
+## 短期互动与角色卡组织（2026-09-30）
+
+消息依据、分支边界、发送回执和生命周期见 [interaction_state.md](interaction_state.md)。角色正文与运行规则的加载方式见 [persona_prompt_organization.md](persona_prompt_organization.md)。有效人格文本与 flow prompt 保持原文；短期状态以结构化数据进入现有说话关系上下文。

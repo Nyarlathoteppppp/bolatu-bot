@@ -215,14 +215,6 @@ async def send_approved_group_reply_inner(
             if not recorded_user_reply:
                 services.record_user_reply(approval.group_id, approval.trigger_user_id)
                 recorded_user_reply = True
-            if gag:
-                await services.notify_owner_political_gag(
-                    original=part_text,
-                    public=public_text,
-                    hits=gag,
-                    group_id=approval.group_id,
-                    source=candidate.action,
-                )
             memory_text = services.memory_text_from_reply_part(memory_text, effective_mention_targets)
             services.record_bot_sent_message(
                 group_id=approval.group_id,
@@ -245,6 +237,22 @@ async def send_approved_group_reply_inner(
                 source_kind="live",
                 correlation_id=approval.correlation_id,
             )
+            if sent_message_id is not None:
+                services.memory.interactions.observe_sent(
+                    group_id=approval.group_id,
+                    source_message_id=str(sent_message_id),
+                    trigger_source_id=approval.source_message_id,
+                    action=candidate.action,
+                    context_at=pipeline_state.interaction_context_at if pipeline_state is not None else None,
+                )
+            if gag:
+                await services.notify_owner_political_gag(
+                    original=part_text,
+                    public=public_text,
+                    hits=gag,
+                    group_id=approval.group_id,
+                    source=candidate.action,
+                )
         except asyncio.CancelledError:
             if attempted and not acknowledged:
                 progress.uncertain_index = index

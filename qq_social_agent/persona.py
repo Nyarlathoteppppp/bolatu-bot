@@ -18,6 +18,15 @@ class Persona:
     passive_reply_probability: float
 
 
+def compose_persona_prompt(prompt: str, runtime_rules: str = "") -> str:
+    """Append runtime rules after core text. Does not rewrite either side."""
+    if not runtime_rules.strip():
+        return prompt
+    if not prompt.strip():
+        return runtime_rules
+    return f"{prompt.rstrip()}\n{runtime_rules.strip()}\n"
+
+
 _MISSING = object()
 
 
@@ -35,12 +44,15 @@ class PersonaRegistry:
             if "id" not in raw:
                 continue
             style = raw.get("style", {})
+            core_prompt = str(raw.get("prompt", ""))
+            runtime_rules = str(raw.get("runtime_rules", "") or "")
+            effective_prompt = compose_persona_prompt(core_prompt, runtime_rules)
             persona = Persona(
                 id=str(raw["id"]),
                 name=str(raw.get("name", raw["id"])),
                 description=str(raw.get("description", "")),
-                prompt=str(raw.get("prompt", "")),
-                decision_prompt=str(raw.get("decision_prompt", raw.get("prompt", ""))),
+                prompt=effective_prompt,
+                decision_prompt=str(raw.get("decision_prompt", effective_prompt)),
                 max_reply_chars=int(style.get("max_reply_chars", 180)),
                 passive_reply_probability=float(style.get("passive_reply_probability", 0.18)),
             )
