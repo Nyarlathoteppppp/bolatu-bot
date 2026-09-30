@@ -3,8 +3,23 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable
 
-from .memory import MemoryStore
-from .private_message_types import PrivateGenerationContext, PrivateToolStage
+from .memory import ChatMessage, MemoryStore
+from .private_context_window import PRIVATE_SESSION_GAP_SECONDS
+from .private_message_types import PrivateGenerationContext, PrivateToolStage, PrivateTurn
+
+
+def load_private_generation_messages(
+    memory: MemoryStore,
+    turn: PrivateTurn,
+    context_recent: tuple[ChatMessage, ...],
+) -> tuple[ChatMessage, ...]:
+    if not turn.source_message_id:
+        return context_recent
+    current_source_ids = set(turn.current_source_message_ids or (turn.source_message_id,))
+    session = memory.current_session_messages(turn.chat_id, gap_seconds=PRIVATE_SESSION_GAP_SECONDS)
+    return tuple(memory.images.enrich([
+        message for message in session if message.source_message_id not in current_source_ids
+    ]))
 
 
 @dataclass(frozen=True)
@@ -118,7 +133,7 @@ async def build_private_generation_context(
     )
     return PrivateGenerationContext(
         persona=stage.persona,
-        recent_messages=stage.context_recent,
+        recent_messages=load_private_generation_messages(services.memory, turn, stage.context_recent),
         current_text=turn.text,
         current_nickname=turn.nickname,
         decision=stage.decision,

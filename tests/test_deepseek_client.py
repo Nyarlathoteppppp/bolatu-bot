@@ -10,7 +10,6 @@ from qq_social_agent.deepseek_client import (
     DeepSeekClient,
     _log_llm_usage,
     _format_context_with_local_focus,
-    select_relevant_context_messages,
     _filter_recent_bot_duplicate_candidates,
     _parse_jargon_terms,
     _parse_daily_review,
@@ -1179,59 +1178,6 @@ def test_parse_tool_routing_decision_probability() -> None:
     assert decision.tool == "probability"
     assert "CMU" in decision.query
 
-
-
-def test_select_relevant_context_keeps_recent_and_top_older_in_time_order() -> None:
-    messages = [
-        ChatMessage(1, 1, "A", f"old-{index}", False, float(index))
-        for index in range(20)
-    ]
-    scores = [0.1] * 14
-    scores[2] = 0.9
-    scores[10] = 0.8
-    selected = select_relevant_context_messages(
-        messages,
-        scores,
-        keep_recent=6,
-        target_total=8,
-    )
-    texts = [msg.text for msg in selected]
-    assert texts[-6:] == [f"old-{index}" for index in range(14, 20)]
-    assert "old-2" in texts
-    assert "old-10" in texts
-    assert texts == sorted(texts, key=lambda item: int(item.split("-")[1]))
-
-
-def test_select_relevant_context_falls_back_when_scores_are_weak() -> None:
-    messages = [
-        ChatMessage(1, 1, "A", f"old-{index}", False, float(index))
-        for index in range(20)
-    ]
-    selected = select_relevant_context_messages(
-        messages,
-        [0.05] * 14,
-        keep_recent=6,
-        target_total=12,
-    )
-    assert [msg.text for msg in selected] == [f"old-{index}" for index in range(8, 20)]
-
-
-
-def test_select_relevant_context_always_pins_last_six() -> None:
-    messages = [
-        ChatMessage(1, 1, "A", f"old-{index}", False, float(index))
-        for index in range(20)
-    ]
-    scores = [0.9] * 14
-    selected = select_relevant_context_messages(
-        messages,
-        scores,
-        keep_recent=3,
-        target_total=8,
-    )
-    texts = [msg.text for msg in selected]
-    assert texts[-6:] == [f"old-{index}" for index in range(14, 20)]
-    assert len(texts) == 8
 
 
 def test_parenthetical_expression_survives_candidate_and_delivery():

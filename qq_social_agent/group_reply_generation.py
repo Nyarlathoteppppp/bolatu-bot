@@ -72,6 +72,8 @@ async def generate_group_reply(
     combine_text_sections: Callable[..., str],
     record_metric_event: Callable[..., None],
     logger: Any,
+    pinned_source_ids: set[str] | None = None,
+    pinned_db_ids: set[int] | None = None,
 ) -> GeneratedGroupReply | None:
     tool_answer_mode = mode in {
         PipelineMode.SEARCH,
@@ -102,6 +104,8 @@ async def generate_group_reply(
             reply_candidates = await client.reply_candidates(
                 persona=persona,
                 recent_messages=recent_messages,
+                pinned_source_ids=pinned_source_ids or set(),
+                pinned_db_ids=pinned_db_ids or set(),
                 current_text=text,
                 current_nickname=current_label,
                 mentioned=addressed_bot,

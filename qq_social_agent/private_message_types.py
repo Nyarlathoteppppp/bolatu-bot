@@ -38,6 +38,7 @@ class PrivateTurn:
     text: str
     forced_once_context: str
     received_message_count: int
+    current_source_message_ids: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)

@@ -1683,6 +1683,54 @@ class MemoryStore:
         rows = _dedupe_recent_message_rows(rows, safe_limit)
         return [_message_from_row(row) for row in reversed(rows)]
 
+    def messages_since(self, group_id: int, *, since_at: float) -> list[ChatMessage]:
+        """Read the short window excluded from RAG, without a message-count cutoff."""
+        rows = self.conn.execute(
+            """
+            select id, group_id, user_id, nickname, text, is_bot, created_at, source_message_id, session_id, message_segments_json, raw_message_json, sender_json
+            from messages
+            where group_id = ? and created_at >= ?
+            order by created_at desc, id desc
+            """,
+            (int(group_id), float(since_at)),
+        ).fetchall()
+        rows = _dedupe_recent_message_rows(rows, len(rows))
+        return [_message_from_row(row) for row in reversed(rows)]
+
+    def current_session_messages(self, group_id: int, *, gap_seconds: float) -> list[ChatMessage]:
+        """Read back to the last private-chat gap instead of a fixed message count."""
+        cursor = self.conn.execute(
+            """
+            select id, group_id, user_id, nickname, text, is_bot, created_at, source_message_id, session_id, message_segments_json, raw_message_json, sender_json
+            from messages where group_id = ? order by created_at desc, id desc
+            """,
+            (int(group_id),),
+        )
+        rows: list[sqlite3.Row] = []
+        newer_at: float | None = None
+        for row in cursor:
+            created_at = float(row["created_at"])
+            if newer_at is not None and newer_at - created_at >= gap_seconds:
+                break
+            rows.append(row)
+            newer_at = created_at
+        rows = _dedupe_recent_message_rows(rows, len(rows))
+        return [_message_from_row(row) for row in reversed(rows)]
+
+    def message_by_source(self, group_id: int, source_message_id: int | str | None) -> ChatMessage | None:
+        row = self.admin_message_by_source(group_id, source_message_id)
+        return _message_from_row(row) if row is not None else None
+
+    def message_by_id(self, group_id: int, message_id: int) -> ChatMessage | None:
+        row = self.conn.execute(
+            """
+            select id, group_id, user_id, nickname, text, is_bot, created_at, source_message_id, session_id, message_segments_json, raw_message_json, sender_json
+            from messages where group_id = ? and id = ?
+            """,
+            (int(group_id), int(message_id)),
+        ).fetchone()
+        return _message_from_row(row) if row is not None else None
+
     def messages_between(
         self,
         group_id: int,

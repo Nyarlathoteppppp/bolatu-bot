@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Callable
 from nonebot import logger
 
 from .config import LLMConfig
+from .generation_message_context import select_generation_messages, shortlist_older_messages
 from .jev_client import JevClient
 from .llm_gateway import LLMGateway, _log_llm_usage, _usage_value, set_usage_recorder
 from .memory import ChatMessage
@@ -719,11 +720,19 @@ class LLMTaskClient(LLMGateway):
         current_nickname: str,
         keep_recent: int = 6,
         target_total: int = 12,
+        pinned_source_ids: set[str] | None = None,
+        pinned_db_ids: set[int] | None = None,
     ) -> list[ChatMessage]:
         if len(messages) <= target_total:
             return list(messages)
-        keep_recent = 6
-        older = list(messages[:-keep_recent])
+        source_ids = pinned_source_ids or set()
+        db_ids = pinned_db_ids or set()
+        older = shortlist_older_messages(
+            messages[:-keep_recent],
+            current_text=current_text,
+            pinned_source_ids=source_ids,
+            pinned_db_ids=db_ids,
+        )
         scores = await self._try_jev(
             lambda: self.jev_client.rank_context_messages(
                 current_nickname=current_nickname,
@@ -733,11 +742,14 @@ class LLMTaskClient(LLMGateway):
             what="context_rank",
             timeout=4.0,
         )
-        return select_relevant_context_messages(
+        return select_generation_messages(
             messages,
-            scores if isinstance(scores, list) else None,
+            candidates=older,
+            scores=scores if isinstance(scores, list) else None,
+            pinned_source_ids=source_ids,
+            pinned_db_ids=db_ids,
             keep_recent=keep_recent,
-            target_total=target_total,
+            max_total=target_total,
         )
 
     async def select_jargon_terms(
@@ -822,6 +834,7 @@ class LLMTaskClient(LLMGateway):
         context_messages = _reply_context_messages(
             recent_messages,
             include_bot_history=include_bot_history,
+            limit=len(recent_messages),
         )
         context_messages = await self._select_relevant_generation_context(
             context_messages,
@@ -1040,6 +1053,8 @@ class LLMTaskClient(LLMGateway):
         priority_context: str = "",
         include_bot_history: bool = True,
         context_message_limit: int | None = None,
+        pinned_source_ids: set[str] | None = None,
+        pinned_db_ids: set[int] | None = None,
         candidate_count: int = 3,
         prompt_flow: str = "reply_candidates",
         task_name: str = "reply_candidates",
@@ -1056,20 +1071,27 @@ class LLMTaskClient(LLMGateway):
             recall_feedback_context = context_packet.get("recall_feedback")
             positive_feedback_context = context_packet.get("positive_feedback")
             social_action_context = context_packet.get("social_actions")
+        pinned_sources = pinned_source_ids or set()
+        pinned_ids = pinned_db_ids or set()
+        has_pinned_evidence = bool(pinned_sources or pinned_ids)
         selected_recent = (
             recent_messages[-max(1, context_message_limit) :]
-            if context_message_limit is not None
+            if context_message_limit is not None and not has_pinned_evidence
             else recent_messages
         )
         context_messages = _reply_context_messages(
             selected_recent,
             include_bot_history=include_bot_history,
+            limit=len(selected_recent),
         )
-        if context_message_limit is None or int(context_message_limit) >= 20:
+        if context_message_limit is None or int(context_message_limit) >= 20 or has_pinned_evidence:
             context_messages = await self._select_relevant_generation_context(
                 context_messages,
                 current_text=current_text,
                 current_nickname=current_nickname,
+                target_total=context_message_limit or 12,
+                pinned_source_ids=pinned_sources,
+                pinned_db_ids=pinned_ids,
             )
         context = _format_context_with_local_focus(context_messages, formatter=_format_message)
         search_reply = prompt_flow == "search_answer" and candidate_count == 1
@@ -1383,38 +1405,6 @@ def _format_decision_message(msg: ChatMessage) -> str:
     if msg.is_bot:
         return f"风雪之前发言（只判断互动状态，禁止复用措辞）: {msg.text}"
     return _format_message(msg)
-
-
-def select_relevant_context_messages(
-    messages: list[ChatMessage],
-    scores_for_older: list[float] | None,
-    *,
-    keep_recent: int = 6,
-    target_total: int = 12,
-) -> list[ChatMessage]:
-    """Pin the newest 6 lines; only older lines may be dropped or ranked."""
-    if not messages:
-        return []
-    keep_recent = 6 if len(messages) >= 6 else len(messages)
-    target_total = max(keep_recent, int(target_total))
-    if len(messages) <= target_total:
-        return list(messages)
-    recent = list(messages[-keep_recent:])
-    older = list(messages[:-keep_recent])
-    slots = max(0, target_total - len(recent))
-    if not older or slots <= 0:
-        return recent
-    if scores_for_older is None or len(scores_for_older) != len(older):
-        return list(messages[-target_total:])
-    ranked = sorted(
-        range(len(older)),
-        key=lambda index: (-float(scores_for_older[index]), -index),
-    )
-    chosen = {index for index in ranked[:slots] if float(scores_for_older[index]) >= 0.28}
-    if len(chosen) < min(2, slots):
-        return list(messages[-target_total:])
-    selected = [msg for index, msg in enumerate(older) if index in chosen] + recent
-    return selected
 
 
 def _reply_context_messages(

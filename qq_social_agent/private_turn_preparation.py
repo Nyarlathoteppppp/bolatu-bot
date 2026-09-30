@@ -294,4 +294,5 @@ async def prepare_private_turn(
         text=prompt_text,
         forced_once_context=forced_once_context,
         received_message_count=len(accepted_items),
+        current_source_message_ids=tuple(item.source_message_id for item in accepted_items if item.source_message_id),
     )

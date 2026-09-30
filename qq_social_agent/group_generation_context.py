@@ -14,6 +14,9 @@ from .memory import ChatMessage, MemoryStore
 from .pipeline_types import ContextPacket, PipelineMode
 from .rag_retriever import RAGRetrievalResult, RAGService
 from .reference_resolver import ReferenceResolution
+from .reference_resolver import ReplyHint
+from .discourse_state import DiscourseState
+from .resolver_result import RESOLVED
 from .social_actions import SocialActionService
 from .jev_policy import GroupReplyBudget
 
@@ -30,6 +33,57 @@ class GroupContextLimits:
     raw_corpus_radius: int
     recall_feedback: int
     positive_feedback: int
+
+
+def load_group_generation_messages(
+    *,
+    memory: MemoryStore,
+    group_id: int,
+    recent_messages: list[ChatMessage],
+    discourse: DiscourseState,
+    reply_hint: ReplyHint,
+    excluded_source_ids: set[str],
+    lookback_seconds: int,
+    now: float | None = None,
+) -> tuple[list[ChatMessage], set[str], set[int]]:
+    """Add the raw turns RAG intentionally excludes, only for reply generation."""
+    selected: dict[int, ChatMessage] = {message.id: message for message in recent_messages}
+    if lookback_seconds > 0:
+        cutoff = (time.time() if now is None else now) - lookback_seconds
+        for message in memory.messages_since(group_id, since_at=cutoff):
+            if message.source_message_id not in excluded_source_ids:
+                selected[message.id] = message
+
+    pinned_sources: set[str] = set()
+    pinned_ids: set[int] = set()
+    source_ids: list[str] = []
+    if reply_hint.exists and reply_hint.message_id:
+        source_ids.append(str(reply_hint.message_id))
+    ellipsis = discourse.ellipsis
+    if ellipsis.status == RESOLVED and ellipsis.source_message_id:
+        source_ids.append(str(ellipsis.source_message_id))
+    for source_id in source_ids:
+        message = memory.message_by_source(group_id, source_id)
+        if message is not None and message.source_message_id not in excluded_source_ids:
+            selected[message.id] = message
+            pinned_ids.add(message.id)
+            if message.source_message_id:
+                pinned_sources.add(message.source_message_id)
+    if ellipsis.status == RESOLVED and ellipsis.source_key.startswith("m"):
+        db_id = ellipsis.source_key[1:]
+        if db_id.isdecimal():
+            message = memory.message_by_id(group_id, int(db_id))
+            if message is not None and message.source_message_id not in excluded_source_ids:
+                selected[message.id] = message
+                pinned_ids.add(message.id)
+                if message.source_message_id:
+                    pinned_sources.add(message.source_message_id)
+
+    return (
+        sorted(selected.values(), key=lambda message: (message.created_at, message.id)),
+        pinned_sources,
+        pinned_ids,
+    )
 
 
 async def build_group_generation_context(

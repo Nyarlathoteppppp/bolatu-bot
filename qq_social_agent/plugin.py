@@ -121,7 +121,7 @@ from .conversation_tool_routing import (
 from .group_approval_dispatch import queue_group_reply_approval
 from .group_decision_flow import GroupDecisionServices, resolve_group_reply_decision
 from .group_discourse_flow import resolve_group_discourse_context
-from .group_generation_context import GroupContextLimits, build_group_generation_context
+from .group_generation_context import GroupContextLimits, build_group_generation_context, load_group_generation_messages
 from .interaction_state import format_interaction_state
 from .group_reply_generation import generate_group_reply
 from .group_tool_execution import execute_group_tools
@@ -5317,11 +5317,28 @@ async def _handle_group_message_locked(
         suppress_user_id=suppress_mention_user_id,
     )
     direct_single_reply = _approval_direct_single_reply_enabled()
+    generation_messages, pinned_source_ids, pinned_db_ids = load_group_generation_messages(
+        memory=memory,
+        group_id=group_id,
+        recent_messages=context_recent,
+        discourse=discourse_state,
+        reply_hint=reply_hint,
+        excluded_source_ids={
+            source_id for source_id in (
+                source_message_id,
+                *(item.source_message_id for item in buffered_messages),
+            ) if source_id
+        },
+        lookback_seconds=rag_service.config.exclude_recent_seconds,
+    )
+    generation_messages = memory.images.enrich(generation_messages)
     generated_reply = await generate_group_reply(
         client=deepseek_client,
         decision=decision,
         persona=persona,
-        recent_messages=context_recent,
+        recent_messages=generation_messages,
+        pinned_source_ids=pinned_source_ids,
+        pinned_db_ids=pinned_db_ids,
         text=text,
         nickname=nickname,
         current_label=_member_label(user_id, nickname),
