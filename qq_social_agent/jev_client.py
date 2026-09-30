@@ -220,6 +220,8 @@ class JevClient:
             self.provider = "openrouter"
             self.api_key = openrouter_key
         self.model = model or (TYPESAFE_JEV_MODEL if self.provider == "typesafe" else OPENROUTER_JEV_MODEL)
+        self._openrouter_fallback_key = openrouter_key if self.provider == "typesafe" else ""
+        self._official_credits_exhausted = False
         self.timeout = timeout
         self._http_client: httpx.AsyncClient | None = None
 
@@ -238,58 +240,75 @@ class JevClient:
         if not self.available:
             raise RuntimeError("Neither TYPESAFE_API_KEY nor OPENROUTER_API_KEY is configured.")
 
-        payload = {
-            "model": model or self.model,
-            "state": state,
-            "questions": questions,
-        }
-        headers = {
-            "Authorization": f"Bearer {self.api_key}",
-            "Content-Type": "application/json",
-        }
-        if self.provider == "openrouter":
-            headers.update({
-                "HTTP-Referer": "https://qq-social-agent.local",
-                "X-Title": "QQ Social Agent",
-            })
         timeout_val = self.timeout if timeout is None else timeout
         if self._http_client is None or self._http_client.is_closed:
             self._http_client = httpx.AsyncClient()
-        started = time.perf_counter()
-        try:
-            resp = await self._http_client.post(
-                self.base_url,
-                json=payload,
-                headers=headers,
-                timeout=timeout_val,
-            )
-            resp.raise_for_status()
-            data = resp.json()
-        except Exception as exc:
+        use_fallback = self._official_credits_exhausted
+        while True:
+            provider = "openrouter" if use_fallback else self.provider
+            base_url = OPENROUTER_DECISIONS_URL if use_fallback else self.base_url
+            api_key = self._openrouter_fallback_key if use_fallback else self.api_key
+            payload = {
+                "model": OPENROUTER_JEV_MODEL if use_fallback else (model or self.model),
+                "state": state,
+                "questions": questions,
+            }
+            headers = {
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            }
+            if provider == "openrouter":
+                headers.update({
+                    "HTTP-Referer": "https://qq-social-agent.local",
+                    "X-Title": "QQ Social Agent",
+                })
+            started = time.perf_counter()
+            try:
+                resp = await self._http_client.post(
+                    base_url,
+                    json=payload,
+                    headers=headers,
+                    timeout=timeout_val,
+                )
+                resp.raise_for_status()
+                data = resp.json()
+            except Exception as exc:
+                self.record_telemetry({
+                    "provider": provider,
+                    "model": payload["model"],
+                    "latency_ms": round((time.perf_counter() - started) * 1000, 2),
+                    "status": "error",
+                    "error_type": type(exc).__name__,
+                    "http_status": exc.response.status_code if isinstance(exc, httpx.HTTPStatusError) else None,
+                    "question_ids": list(questions),
+                })
+                if (
+                    provider == "typesafe"
+                    and self._openrouter_fallback_key
+                    and isinstance(exc, httpx.HTTPStatusError)
+                    and exc.response.status_code in {402, 429}
+                ):
+                    if exc.response.status_code == 402:
+                        self._official_credits_exhausted = True
+                        logger.warning("qq_social_agent official Jev credits exhausted; switching to OpenRouter")
+                    use_fallback = True
+                    continue
+                raise
+            answers = data.get("answers") if isinstance(data, dict) else None
+            usage = data.get("usage") if isinstance(data, dict) else None
             self.record_telemetry({
-                "provider": self.provider,
-                "model": payload["model"],
+                "provider": provider,
+                "model": data.get("model", payload["model"]) if isinstance(data, dict) else payload["model"],
                 "latency_ms": round((time.perf_counter() - started) * 1000, 2),
-                "status": "error",
-                "error_type": type(exc).__name__,
+                "status": "ok",
                 "question_ids": list(questions),
+                "answers": {
+                    str(key): _answer_telemetry(value)
+                    for key, value in answers.items()
+                } if isinstance(answers, dict) else {},
+                "usage": usage if isinstance(usage, dict) else {},
             })
-            raise
-        answers = data.get("answers") if isinstance(data, dict) else None
-        usage = data.get("usage") if isinstance(data, dict) else None
-        self.record_telemetry({
-            "provider": self.provider,
-            "model": data.get("model", payload["model"]) if isinstance(data, dict) else payload["model"],
-            "latency_ms": round((time.perf_counter() - started) * 1000, 2),
-            "status": "ok",
-            "question_ids": list(questions),
-            "answers": {
-                str(key): _answer_telemetry(value)
-                for key, value in answers.items()
-            } if isinstance(answers, dict) else {},
-            "usage": usage if isinstance(usage, dict) else {},
-        })
-        return data
+            return data
 
     def record_telemetry(self, event: dict[str, Any]) -> None:
         if _telemetry_recorder is None:

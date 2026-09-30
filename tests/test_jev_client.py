@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from unittest.mock import patch
 import os
 import httpx
@@ -724,6 +725,59 @@ def test_jev_prefers_official_api_when_typesafe_key_exists() -> None:
     assert client.base_url == "https://api.typesafe.ai/v1/systemone"
     assert client.model == "jev-1.13.0"
     assert client.api_key == "direct"
+
+
+def test_jev_switches_to_openrouter_after_official_credits_exhausted() -> None:
+    requests: list[tuple[str, str, str]] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests.append((str(request.url), request.headers["authorization"], request.read().decode()))
+        if request.url.host == "api.typesafe.ai":
+            return httpx.Response(402, json={"error": "insufficient_credits"})
+        return httpx.Response(200, json={"model": "typesafe/jev-1.13", "answers": {"ok": {"type": "noul", "noul": 0.9}}})
+
+    async def run() -> None:
+        with patch.dict(os.environ, {"TYPESAFE_API_KEY": "direct", "OPENROUTER_API_KEY": "router"}):
+            client = JevClient()
+        client._http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        try:
+            for _ in range(2):
+                result = await client.evaluate(state="hello", questions={"ok": {"type": "noul", "instructions": "yes?"}})
+                assert result["answers"]["ok"]["noul"] == 0.9
+        finally:
+            await client.aclose()
+
+    asyncio.run(run())
+    assert [url for url, _, _ in requests] == [
+        "https://api.typesafe.ai/v1/systemone",
+        "https://openrouter.ai/api/alpha/decisions",
+        "https://openrouter.ai/api/alpha/decisions",
+    ]
+    assert [auth for _, auth, _ in requests] == ["Bearer direct", "Bearer router", "Bearer router"]
+    assert json.loads(requests[1][2])["model"] == "typesafe/jev-1.13"
+
+
+def test_jev_uses_openrouter_once_on_official_rate_limit() -> None:
+    hosts: list[str] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        hosts.append(request.url.host)
+        if request.url.host == "api.typesafe.ai" and hosts.count("api.typesafe.ai") == 1:
+            return httpx.Response(429, json={"error": "rate_limit"})
+        return httpx.Response(200, json={"answers": {"ok": {"type": "noul", "noul": 0.9}}})
+
+    async def run() -> None:
+        with patch.dict(os.environ, {"TYPESAFE_API_KEY": "direct", "OPENROUTER_API_KEY": "router"}):
+            client = JevClient()
+        client._http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        try:
+            for _ in range(2):
+                await client.evaluate(state="hello", questions={"ok": {"type": "noul", "instructions": "yes?"}})
+        finally:
+            await client.aclose()
+
+    asyncio.run(run())
+    assert hosts == ["api.typesafe.ai", "openrouter.ai", "api.typesafe.ai"]
 
 
 def test_jev_telemetry_records_full_choice_distribution() -> None:
