@@ -5326,7 +5326,7 @@ async def _handle_group_message_locked(
         excluded_source_ids={
             source_id for source_id in (
                 source_message_id,
-                *(item.source_message_id for item in buffered_messages),
+                *(item.source_message_id for item in buffered_messages or ()),
             ) if source_id
         },
         lookback_seconds=rag_service.config.exclude_recent_seconds,
