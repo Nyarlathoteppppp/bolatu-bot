@@ -4,6 +4,8 @@ import asyncio
 import time
 from types import SimpleNamespace
 
+import pytest
+
 from qq_social_agent.approval_models import PendingApprovalCandidate
 from qq_social_agent.decision_gate import PreDecisionGateResult
 from qq_social_agent.deepseek_client import ReplyDecision
@@ -241,7 +243,8 @@ def test_group_decision_skips_timing_when_addressee_is_another_member() -> None:
         assert pipeline_state.tool_requests == ()
 
 
-def test_group_generation_returns_reviewed_candidate() -> None:
+@pytest.mark.parametrize("mode", [PipelineMode.CHAT, PipelineMode.SEARCH])
+def test_group_generation_returns_reviewed_candidate(mode) -> None:
     candidate = PendingApprovalCandidate(1, "你好", "answer", "自然")
     calls = []
 
@@ -267,10 +270,11 @@ def test_group_generation_returns_reviewed_candidate() -> None:
             market_context="",
             fresh_context="",
             context_packet=ContextPacket(),
-            mode=PipelineMode.CHAT,
+            mode=mode,
             mention_targets_context="",
             priority_context="",
             speaker_context="当前触发人是群友",
+            self_interaction_context="<self_interaction_context>实际发过的观点</self_interaction_context>",
             memory_context="",
             reference_resolution=ReferenceResolution(),
             ellipsis_resolution=EllipsisResolution(),
@@ -289,8 +293,9 @@ def test_group_generation_returns_reviewed_candidate() -> None:
     )
 
     assert result is not None and result.candidates == (candidate,)
-    assert result.prompt_flow == "reply_candidates"
-    assert calls[0]["speaker_context"] == "当前触发人是群友"
+    assert result.prompt_flow == ("search_answer" if mode is PipelineMode.SEARCH else "reply_candidates")
+    assert calls[0]["speaker_context"].startswith("当前触发人是群友")
+    assert ("<self_interaction_context>" in calls[0]["speaker_context"]) is (mode is PipelineMode.CHAT)
     assert calls[0]["include_bot_history"] is True
 
 

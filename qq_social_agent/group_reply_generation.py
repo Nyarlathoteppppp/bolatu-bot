@@ -74,6 +74,7 @@ async def generate_group_reply(
     logger: Any,
     pinned_source_ids: set[str] | None = None,
     pinned_db_ids: set[int] | None = None,
+    self_interaction_context: str = "",
 ) -> GeneratedGroupReply | None:
     tool_answer_mode = mode in {
         PipelineMode.SEARCH,
@@ -96,8 +97,10 @@ async def generate_group_reply(
     approval_candidates: list[PendingApprovalCandidate] = []
     for attempt in range(2):
         effective_speaker_context = speaker_context
+        if self_interaction_context and not tool_answer_mode:
+            effective_speaker_context = combine_text_sections(effective_speaker_context, self_interaction_context)
         if critic_feedback:
-            effective_speaker_context = combine_text_sections(speaker_context, critic_feedback)
+            effective_speaker_context = combine_text_sections(effective_speaker_context, critic_feedback)
             if critic_prefers_clarify(critic_result) and attempt > 0:
                 decision = replace(decision, action="clarify")
         try:

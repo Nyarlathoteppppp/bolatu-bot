@@ -845,7 +845,7 @@ class LLMTaskClient(LLMGateway):
         if not context:
             context = "（暂无更多上下文）"
         mode = (
-            "你被直接点名或回复，必须先回应当前实际问题；即使对方重复问，也不能只吐槽、拒答或反问。"
+            "你被直接点名或回复，要回应当前这句话。认真提问先回答；玩笑或离谱设定按聊天来接，不必给建议。"
             if mentioned
             else "你是自然插话，只能在合适时短句接话。"
         )
@@ -1103,7 +1103,7 @@ class LLMTaskClient(LLMGateway):
         if not context:
             context = "（暂无更多上下文）"
         mode = (
-            "你被直接点名或回复，必须先回应当前实际问题；即使对方重复问，也不能只吐槽、拒答或反问。"
+            "你被直接点名或回复，要回应当前这句话。认真提问先回答；玩笑或离谱设定按聊天来接，不必给建议。"
             if mentioned
             else "你是自然插话，只能在合适时短句接话。"
         )

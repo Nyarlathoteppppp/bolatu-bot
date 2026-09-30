@@ -23,10 +23,10 @@ def incoming(store, source, text, *, user=1, group=100, reply='', addressed=True
     return store.conn.execute('select id from messages where group_id=? and source_message_id=?', (group, source)).fetchone()[0]
 
 
-def sent(store, source, trigger, *, at=10, context_at=2):
-    store.add_message(100, 9, '风雪', '回了', is_bot=True, source_message_id=source, created_at=at)
+def sent(store, source, trigger, *, at=10, context_at=2, text='回了', action='reply'):
+    store.add_message(100, 9, '风雪', text, is_bot=True, source_message_id=source, created_at=at)
     store.interactions.observe_sent(group_id=100, source_message_id=source, trigger_source_id=trigger,
-                                   action='reply', context_at=context_at)
+                                   action=action, context_at=context_at)
 
 
 def state(store, source, ids=None):
@@ -179,3 +179,77 @@ def test_qq_parent_can_have_larger_db_id_after_backfill(store):
     incoming(store, 'parent', '怎么做？', at=1)
     store.interactions.observe_inbound(group_id=100, source_message_id='child', reply_source_id='parent', addressed_bot=True)
     assert [e.source_message_id for e in state(store, 'child').events] == ['parent', 'child']
+
+
+def own(store, source, ids=None):
+    if ids is None:
+        ids = [row[0] for row in store.conn.execute('select id from messages where group_id=100')]
+    return store.interactions.own_contributions(state(store, source, ids),
+        source_message_id=source, context_message_ids=ids)
+
+
+def test_own_reply_to_ancestor_is_generation_evidence_without_changing_decision_state(store):
+    incoming(store, 'q', '列宁给我托梦了', at=1)
+    sent(store, 's', 'q', at=2, text='梦里他说啥了？', action='ask_back')
+    incoming(store, 'next', '他说你们不行', reply='q', at=3)
+    assert [e.source_message_id for e in state(store, 'next').events] == ['q', 'next']
+    contributions = own(store, 'next')
+    assert [item['qq_message_id'] for item in contributions] == ['s']
+    assert contributions[0]['said'] == '梦里他说啥了？'
+    assert contributions[0]['trigger_said'] == '列宁给我托梦了'
+    assert contributions[0]['expression_action'] == 'ask_back'
+    assert contributions[0]['trigger_user_id'] == 1
+    assert contributions[0]['question_like']
+    assert contributions[0]['direct_reply_message_ids'] == []
+
+
+def test_own_questions_record_direct_reply_without_claiming_resolution(store):
+    incoming(store, 'q', '我想换电脑', at=1)
+    sent(store, 's', 'q', at=2, text='你预算多少？')
+    current_id = incoming(store, 'next', '八千', reply='s', at=3)
+    contribution = own(store, 'next')[0]
+    assert contribution['direct_reply_message_ids'] == [current_id]
+    assert 'solved' not in contribution and 'emotion' not in contribution
+
+
+def test_own_context_excludes_other_threads_future_sends_drafts_and_memes(store):
+    incoming(store, 'q', '玩这个梗', at=1)
+    sent(store, 'valid', 'q', at=2, text='我可不答应', action='take_side')
+    incoming(store, 'other', '你怎么看代码？', at=2)
+    sent(store, 'unrelated', 'other', at=2.5, text='代码有错误')
+    sent(store, 'meme', 'q', at=2.6, text='[图片]', action='meme')
+    store.add_message(100, 9, '风雪', '未确认草稿', is_bot=True, source_message_id='draft', created_at=2.7)
+    incoming(store, 'next', '那你怎么想', reply='q', at=3)
+    sent(store, 'future', 'q', at=4, text='之后才发的')
+    assert [item['qq_message_id'] for item in own(store, 'next')] == ['valid']
+    assert own(store, 'other') == []
+
+
+def test_own_context_obeys_snapshot_and_explicit_topic_closure(store):
+    incoming(store, 'q', '我说这个', at=1)
+    sent(store, 's', 'q', at=2, text='我不同意')
+    next_id = incoming(store, 'next', '接着说', reply='q', at=3)
+    assert own(store, 'next', [next_id]) == []
+    incoming(store, 'close', '换个话题', reply='s', at=4)
+    assert own(store, 'close') == []
+    incoming(store, 'new', '聊聊代码', reply='close', at=5)
+    assert own(store, 'new') == []
+
+
+def test_own_context_carries_observed_feedback_and_closure_but_not_future_feedback(store):
+    incoming(store, 'q', '你怎么看？', at=1)
+    sent(store, 's', 'q', at=2, text='我的看法是这样')
+    incoming(store, 'correction', '你说错了', reply='s', user=2, at=3)
+    incoming(store, 'close', '换个话题', reply='s', at=4)
+    incoming(store, 'next', '我有个新信息', reply='q', at=5)
+    incoming(store, 'future', '你说错了', reply='s', at=6)
+    contribution = own(store, 'next')[0]
+    assert [(item['kind'], item['user_id'], item['said']) for item in contribution['subsequent_feedback']] == [
+        ('correction', 2, '你说错了'), ('closed', 1, '换个话题')]
+
+
+def test_exact_quote_to_own_sent_message_survives_snapshot_cutoff(store):
+    incoming(store, 'q', '你更喜欢哪个？', at=1)
+    sent(store, 's', 'q', at=2, text='我选这个')
+    current = incoming(store, 'next', '你刚才为什么选这个', reply='s', at=300)
+    assert [item['said'] for item in own(store, 'next', [current])] == ['我选这个']

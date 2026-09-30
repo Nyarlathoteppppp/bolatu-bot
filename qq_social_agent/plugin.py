@@ -123,6 +123,7 @@ from .group_decision_flow import GroupDecisionServices, resolve_group_reply_deci
 from .group_discourse_flow import resolve_group_discourse_context
 from .group_generation_context import GroupContextLimits, build_group_generation_context, load_group_generation_messages
 from .interaction_state import format_interaction_state
+from .self_interaction_context import format_self_interaction_context
 from .group_reply_generation import generate_group_reply
 from .group_tool_execution import execute_group_tools
 from .group_jargon import (
@@ -5332,6 +5333,11 @@ async def _handle_group_message_locked(
         lookback_seconds=rag_service.config.exclude_recent_seconds,
     )
     generation_messages = memory.images.enrich(generation_messages)
+    self_interaction_context = format_self_interaction_context(memory.interactions.own_contributions(
+        interaction_state,
+        source_message_id=source_message_id,
+        context_message_ids=(message.id for message in recent),
+    ))
     generated_reply = await generate_group_reply(
         client=deepseek_client,
         decision=decision,
@@ -5339,6 +5345,7 @@ async def _handle_group_message_locked(
         recent_messages=generation_messages,
         pinned_source_ids=pinned_source_ids,
         pinned_db_ids=pinned_db_ids,
+        self_interaction_context=self_interaction_context,
         text=text,
         nickname=nickname,
         current_label=_member_label(user_id, nickname),

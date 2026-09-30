@@ -58,6 +58,7 @@ entrypoint/plugin -> orchestration -> domain/storage/tools -> provider adapters
 | 文本模型 | `llm_gateway.py`、`deepseek_client.py`、`prompts.py` | gateway 统一 provider、任务路由、超时、回退和用量；task client 负责提示词与结果解析 | QQ 发送与审批状态 |
 | 专用模型接口 | `jev_client.py`、`embedding_client.py`、`siliconflow_ocr.py`、语音客户端 | 各自协议和模态的请求 | 文本聊天路由 |
 | 短期互动 | `interaction_state.py` | 引用原消息与真实发送回执；消费唯一话语状态，按当前窗口整理回复链、字面反馈与结束标记 | 再次判断说话人；推测情绪、亲密度或校园经历；生成角色卡措辞 |
+| 自身互动连续性 | `interaction_state.py` 的 `own_contributions()`、`self_interaction_context.py` | 从当前分支和原有窗口读取已确认发送的原话、表达动作、触发人、直接回应与后续明确反馈；仅喂普通聊天生成阶段 | 写入推测的内心或情绪；影响发言时机；用旧观点覆盖联网事实 |
 | 记忆/RAG | `memory.py`、`memory_learning.py`、`memory_maintenance_service.py`、`rag_*.py` | 原文、画像、atoms、风格、索引；维护 service 管理异步记忆总结、风格学习和成员画像更新 | QQ 生命周期、聊天热路径 |
 | 发送 | `delivery.py`、`reply_splitter.py`、`social_actions.py` | 拆分、艾特、表情、节流 | 写长期事实 |
 | 定时任务调度 | `daily_review_scheduler_service.py`、`weekly_usage_report_scheduler_service.py`、`proactive_chat_scheduler_service.py` | 按 Bot 管理 task 去重、时间窗口/概率策略、周期 tick、异常记录和取消清理 | 群消息生成、周报格式化与投递 |
@@ -139,4 +140,4 @@ git status --short
 
 ## 短期互动与角色卡组织（2026-09-30）
 
-消息依据、分支边界、发送回执和生命周期见 [interaction_state.md](interaction_state.md)。角色正文与运行规则的加载方式见 [persona_prompt_organization.md](persona_prompt_organization.md)。角色 PList 保持原文，事实、能力和输出句子迁入运行规则；按用户偏好允许简短括号表情、心理反应或玩笑动作，critic 同步区分表达与现实事实。flow prompt 保持原文；短期状态以结构化数据进入现有说话关系上下文。
+消息依据、分支边界、发送回执和生命周期见 [interaction_state.md](interaction_state.md)。角色正文与运行规则的加载方式见 [persona_prompt_organization.md](persona_prompt_organization.md)。角色 PList 保持原文，事实、能力和输出句子迁入运行规则；按用户偏好允许简短括号表情、心理反应或玩笑动作，critic 同步区分表达与现实事实。普通聊天生成 flow 将社交 action 作为表达建议，认真问题仍先答；自身互动证据在决策完成后注入，不加入工具答案的上下文。

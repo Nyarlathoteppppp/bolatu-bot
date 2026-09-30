@@ -227,6 +227,87 @@ class InteractionStateStore:
                 item["created_at"], provenance, item["edge_source"] or "", item["action"] or "", item["context_at"]))
         return InteractionState(group_id, root, tuple(evidence))
 
+    def own_contributions(self, state: InteractionState | None, *, source_message_id: str,
+                          context_message_ids: Iterable[int]) -> list[dict[str, object]]:
+        """Generation-only view of acknowledged replies on the current ancestor branch."""
+        if state is None:
+            return []
+        by_id = {event.message_id: event for event in state.events}
+        current = next((event for event in state.events if event.source_message_id == source_message_id), None)
+        if current is None or current.kind == "closed":
+            return []
+        ancestors: set[int] = set()
+        event = current
+        while event.message_id not in ancestors:
+            if event.kind == "closed":
+                break
+            ancestors.add(event.message_id)
+            if event.parent_message_id not in by_id:
+                break
+            event = by_id[event.parent_message_id]
+        ids = set(context_message_ids) | {
+            event.message_id for event in state.events
+            if event.kind == "sent" and event.message_id in ancestors
+        }
+        if not ids:
+            return []
+        id_slots = ",".join("?" for _ in ids)
+        ancestor_slots = ",".join("?" for _ in ancestors)
+        rows = self.conn.execute(f"""
+            select m.*, e.action, e.parent_message_id,
+                   trigger.source_message_id as trigger_source_id,
+                   trigger.user_id as trigger_user_id, trigger.nickname as trigger_speaker,
+                   trigger.message_segments_json as trigger_segments
+            from messages m join interaction_events e on e.message_id = m.id
+            join messages trigger on trigger.id = e.parent_message_id and trigger.group_id = m.group_id
+            where m.group_id = ? and m.id in ({id_slots}) and m.is_bot = 1
+              and e.kind = 'sent' and e.action != 'meme' and m.created_at <= ?
+              and (m.id in ({ancestor_slots}) or e.parent_message_id in ({ancestor_slots}))
+            order by m.created_at, m.id
+        """, (state.group_id, *ids, current.created_at, *ancestors, *ancestors)).fetchall()
+        observed = self.conn.execute(f"""
+            select m.*, e.kind, e.parent_message_id from messages m
+            join interaction_events e on e.message_id = m.id
+            where m.group_id = ? and m.id in ({id_slots}) and m.is_bot = 0
+              and m.created_at <= ? order by m.created_at, m.id
+        """, (state.group_id, *ids, current.created_at)).fetchall()
+        parents = {event.message_id: event.parent_message_id for event in state.events}
+        parents.update({item["id"]: item["parent_message_id"] for item in observed})
+
+        def follows(item: sqlite3.Row, target: int) -> bool:
+            parent = item["parent_message_id"]
+            visited: set[int] = set()
+            while parent is not None and parent not in visited:
+                if parent == target:
+                    return True
+                visited.add(parent)
+                parent = parents.get(parent)
+            return False
+
+        result = []
+        for row in rows:
+            segments = json.loads(row["trigger_segments"] or "[]")
+            trigger_text = "".join(str(item.get("data", {}).get("text", ""))
+                                   for item in segments if item.get("type") == "text").strip()
+            feedback = [item for item in observed
+                        if item["kind"] in {"correction", "tone_feedback", "closed"}
+                        and item["created_at"] >= row["created_at"]
+                        and (follows(item, row["id"]) or follows(item, row["parent_message_id"]))]
+            result.append({
+                "message_id": row["id"], "qq_message_id": row["source_message_id"],
+                "said": row["text"], "expression_action": row["action"],
+                "reply_to_message_id": row["parent_message_id"],
+                "trigger_qq_message_id": row["trigger_source_id"], "trigger_said": trigger_text,
+                "trigger_user_id": row["trigger_user_id"], "trigger_speaker": row["trigger_speaker"],
+                "created_at": row["created_at"], "text_provenance": "acknowledged_send",
+                "question_like": bool(QUESTION.search(row["text"])),
+                "direct_reply_message_ids": [item["id"] for item in observed if item["parent_message_id"] == row["id"]],
+                "subsequent_feedback": [{"message_id": item["id"], "user_id": item["user_id"],
+                    "speaker": item["nickname"], "kind": item["kind"], "said": self._utterance(item)[0]}
+                    for item in feedback],
+            })
+        return result
+
 
 def format_interaction_state(state: InteractionState | None) -> str:
     if state is None:
