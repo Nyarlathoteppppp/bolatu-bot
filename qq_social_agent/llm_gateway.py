@@ -12,6 +12,7 @@ from nonebot import logger
 from openai import AsyncOpenAI
 
 from .config import LLMConfig, LLMModelRoute, LLMProviderConfig, parse_llm_model_route
+from .observability import current_correlation_id
 
 LLMUsageRecorder = Callable[[str, str, Optional[int], Optional[int], Optional[int]], None]
 _usage_recorder: LLMUsageRecorder | None = None
@@ -139,6 +140,14 @@ class LLMGateway:
                     operation = timed_client.chat.completions.create(**provider_request)
                 response = await asyncio.wait_for(operation, timeout=current_timeout + 0.25)
                 if provider.api == "responses":
+                    usage = response.usage
+                    if usage is not None:
+                        logger.info(
+                            "qq_social_agent responses usage details: "
+                            f"model={route.label} "
+                            f"cached_tokens={getattr(getattr(usage, 'input_tokens_details', None), 'cached_tokens', None)} "
+                            f"reasoning_tokens={getattr(getattr(usage, 'output_tokens_details', None), 'reasoning_tokens', None)}"
+                        )
                     response = _responses_as_chat(response)
             except Exception as exc:
                 last_error = exc
@@ -353,6 +362,10 @@ def _responses_request(request: dict, provider: LLMProviderConfig) -> dict:
         result["text"] = {"format": request["response_format"]}
     if "prompt_cache_key" in request:
         result["prompt_cache_key"] = request["prompt_cache_key"]
+    else:
+        correlation_id = current_correlation_id()
+        if correlation_id.startswith("group:"):
+            result["prompt_cache_key"] = correlation_id.rsplit(":", 1)[0]
     return result
 
 
