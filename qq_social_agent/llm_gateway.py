@@ -140,6 +140,14 @@ class LLMGateway:
                 )
                 continue
             self._record_provider_success(route.provider)
+            if task in {"reply", "reply_direct", "reply_candidates", "search_answer"}:
+                choice = response.choices[0]
+                logger.info(
+                    "qq_social_agent llm reply completion: "
+                    f"task={task} model={route.label} "
+                    f"finish_reason={getattr(choice, 'finish_reason', None)} "
+                    f"content_chars={len(choice.message.content or '')}"
+                )
             if self.config.usage_tracking_enabled:
                 _log_llm_usage(task, response, model=route.label)
             return response
