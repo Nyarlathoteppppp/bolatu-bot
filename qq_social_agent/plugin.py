@@ -4541,28 +4541,6 @@ async def _handle_group_message_scoped(
         forward_context=forward_context, group_id=group_id,
     )
     forced_buffered_messages: list[BufferedGroupMessage] | None = None
-    if contextual_search_request and group_message_buffers.get(group_id):
-        task = group_buffer_tasks.pop(group_id, None)
-        if task is not None and not task.done():
-            task.cancel()
-        forced_buffered_messages = group_message_buffers.pop(group_id, [])
-        forced_buffered_messages.append(
-            BufferedGroupMessage(
-                bot=bot,
-                event=event,
-                text=text,
-                user_id=int(event.user_id),
-                nickname=_nickname(event),
-                created_at=float(getattr(event, "time", 0) or time.time()),
-                source_message_id=source_message_id or event_message_source_id(event),
-                correlation_id=correlation_id,
-                inbound_sequence=inbound_sequence,
-                pipeline_state=pipeline_state,
-                addressed=True,
-                direct_addressed=addressed_bot,
-                **message_storage_kwargs,
-            )
-        )
     effective_addressed = addressed_bot or contextual_search_request or followup_addressed or followup_soft
     if group_allowed and effective_addressed and _should_defer_group_reply_flow(group_id, now=time.monotonic()):
         _buffer_group_message(
@@ -4592,6 +4570,28 @@ async def _handle_group_message_scoped(
             correlation_id=correlation_id,
         )
         return
+    if contextual_search_request and group_message_buffers.get(group_id):
+        task = group_buffer_tasks.pop(group_id, None)
+        if task is not None and not task.done():
+            task.cancel()
+        forced_buffered_messages = group_message_buffers.pop(group_id, [])
+        forced_buffered_messages.append(
+            BufferedGroupMessage(
+                bot=bot,
+                event=event,
+                text=text,
+                user_id=int(event.user_id),
+                nickname=_nickname(event),
+                created_at=float(getattr(event, "time", 0) or time.time()),
+                source_message_id=source_message_id or event_message_source_id(event),
+                correlation_id=correlation_id,
+                inbound_sequence=inbound_sequence,
+                pipeline_state=pipeline_state,
+                addressed=True,
+                direct_addressed=addressed_bot,
+                **message_storage_kwargs,
+            )
+        )
     if effective_addressed:
         group_addressed_waiters[group_id] = group_addressed_waiters.get(group_id, 0) + 1
     lock_requested_at = time.monotonic()
@@ -7609,7 +7609,11 @@ def _append_market_intent(
 
 
 def _should_defer_group_reply_flow(group_id: int, *, now: float | None = None) -> bool:
-    return group_id in group_generation_inflight or group_addressed_waiters.get(group_id, 0) > 0
+    return (
+        group_id in group_generation_inflight
+        or group_addressed_waiters.get(group_id, 0) > 0
+        or any(item.addressed or item.direct_addressed for item in group_message_buffers.get(group_id, ()))
+    )
 
 def _contextual_followup_search_intent(
     *,
@@ -7696,17 +7700,20 @@ async def _flush_group_buffer_after_delay(group_id: int, *, delay: float = GROUP
             items = group_message_buffers.pop(group_id, [])
             if not items:
                 return
-            addressed_users = list(
-                dict.fromkeys(
-                    item.user_id
-                    for item in items
-                    if item.addressed or item.direct_addressed
-                )
+            first_addressed = next(
+                (index for index, item in enumerate(items) if item.addressed or item.direct_addressed),
+                None,
             )
-            if len(addressed_users) > 1:
-                first_user = addressed_users[0]
-                batch = [item for item in items if item.user_id == first_user]
-                rest = [item for item in items if item.user_id != first_user]
+            if first_addressed is not None:
+                first_user = items[first_addressed].user_id
+                batch_start = first_addressed
+                while batch_start > 0 and items[batch_start - 1].user_id == first_user:
+                    batch_start -= 1
+                batch_end = first_addressed + 1
+                while batch_end < len(items) and items[batch_end].user_id == first_user:
+                    batch_end += 1
+                batch = items[batch_start:batch_end]
+                rest = items[:batch_start] + items[batch_end:]
                 if rest:
                     group_message_buffers[group_id] = rest
                     should_reschedule = True

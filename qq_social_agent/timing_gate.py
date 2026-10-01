@@ -35,6 +35,8 @@ class TimingDecision:
     reason: str = ""
     reaction: str = ""
     side_reaction: str = ""
+    review_required: bool = False
+    reply_angle: str = ""
 
     def to_reply_decision(self) -> ReplyDecision:
         from .deepseek_client import ReplyDecision
@@ -59,6 +61,7 @@ class TimingDecision:
             mode="chat",
             action=INTENT_TO_ACTION.get(self.intent, "reply"),
             side_reaction=self.side_reaction,
+            reply_angle=self.reply_angle,
         )
 
 
@@ -72,9 +75,17 @@ def choose_jev_group_timing(
     answer: float,
     continue_bot: float,
     social: float,
+    other: float = 0.0,
 ) -> TimingDecision:
     """Apply group speaking policy to provider observations."""
     if to_other >= JEV_TIMING_TO_OTHER_MIN:
+        if social > max(silent, answer, continue_bot, other):
+            return TimingDecision(
+                channel=OutputChannel.SILENT,
+                confidence=social,
+                reason="jev_observer_opening_needs_llm",
+                review_required=True,
+            )
         return TimingDecision(
             channel=OutputChannel.SILENT,
             confidence=to_other,
@@ -92,7 +103,10 @@ def choose_jev_group_timing(
             confidence=min(wants_answer, answer),
             reason=f"jev_answer_{wants_answer:.2f}",
         )
-    if followup_addressed and continue_bot >= JEV_TIMING_CONTINUE_CHOICE_MIN and continue_bot > silent:
+    if followup_addressed and continue_bot > silent and (
+        continue_bot >= JEV_TIMING_CONTINUE_CHOICE_MIN
+        or continue_bot > max(answer, social, other)
+    ):
         return TimingDecision(
             channel=OutputChannel.TEXT,
             intent=SocialIntent.CHAT,
@@ -105,6 +119,16 @@ def choose_jev_group_timing(
             intent=SocialIntent.CHAT,
             confidence=social,
             reason=f"jev_social_{social:.2f}",
+        )
+    if social > max(silent, answer, continue_bot, other) or (
+        wants_answer >= JEV_TIMING_ANSWER_INTENT_MIN
+        and answer > max(silent, social, continue_bot, other)
+    ):
+        return TimingDecision(
+            channel=OutputChannel.SILENT,
+            confidence=max(social, answer),
+            reason="jev_opening_needs_llm",
+            review_required=True,
         )
     return TimingDecision(
         channel=OutputChannel.SILENT,
@@ -152,4 +176,5 @@ def parse_timing_decision(raw: object) -> TimingDecision:
         reason=str(data.get("reason", "") or "")[:40],
         reaction=reaction,
         side_reaction=side_reaction,
+        reply_angle=str(data.get("reply_angle", "") or "").strip(),
     )

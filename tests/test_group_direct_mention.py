@@ -89,3 +89,38 @@ def test_direct_mention_reaches_generation_and_excludes_current_message(
     assert generated[0]["addressed_bot"]
     assert generated[0]["text"] == text
     assert [item.source_message_id for item in generated[0]["recent_messages"]] == ["previous"]
+
+
+@pytest.mark.parametrize('busy', ['generation', 'pending_addressed'])
+def test_contextual_search_queues_without_draining_or_cancelling_previous_turn(monkeypatch, tmp_path, busy):
+    store = MemoryStore(tmp_path / 'bot.sqlite3')
+    group_id, user_id, self_id = 1026813421, 1535071184, 1801507496
+    message = Message('搜一下')
+    event = SimpleNamespace(group_id=group_id, user_id=user_id, self_id=self_id,
+        message_id=123456789, time=time.time(), message=message, raw_message=str(message),
+        sender=SimpleNamespace(card='', nickname='奈亚子'), reply=None, get_plaintext=lambda: '搜一下')
+    previous = plugin.BufferedGroupMessage(bot=SimpleNamespace(self_id=self_id), event=event,
+        text='之前排队的问题', user_id=111, nickname='A', created_at=time.time()-1,
+        addressed=busy == 'pending_addressed', source_message_id='previous')
+    monkeypatch.setattr(plugin, 'memory', store)
+    monkeypatch.setattr(plugin, 'group_message_buffers', {group_id: [previous]})
+    monkeypatch.setattr(plugin, 'group_generation_inflight', {group_id} if busy == 'generation' else set())
+    monkeypatch.setattr(plugin, 'group_addressed_waiters', {})
+    cancelled = []
+    task = SimpleNamespace(done=lambda: False, cancel=lambda: cancelled.append(True))
+    monkeypatch.setattr(plugin, 'group_buffer_tasks', {group_id: task})
+    monkeypatch.setattr(plugin, '_record_metric_event', lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(plugin, '_record_addressed_event', lambda *_args, **_kwargs: 0)
+    monkeypatch.setattr(plugin, '_followup_window_kind', lambda *_args, **_kwargs: '')
+    monkeypatch.setattr(plugin, '_contextual_followup_search_intent', lambda **_: SimpleNamespace(query='之前的问题'))
+    monkeypatch.setattr(plugin, '_schedule_group_buffer_flush', lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(plugin, '_maybe_compact_group_context_text', lambda *_args, **_kwargs: asyncio.sleep(0, result='搜一下'))
+    monkeypatch.setattr(plugin, 'file_metadata_context_for_event', lambda *_args, **_kwargs: asyncio.sleep(0, result=''))
+    monkeypatch.setattr(plugin, 'content_ingestion_service', SimpleNamespace(context_for_event=lambda *_args, **_kwargs: asyncio.sleep(0, result=None)))
+    monkeypatch.setattr(plugin, '_ocr_related_image_segments', lambda *_args, **_kwargs: asyncio.sleep(0, result=[]))
+    asyncio.run(plugin._handle_group_message_scoped(SimpleNamespace(self_id=self_id), event, correlation_id='queue-test'))
+    assert cancelled == []
+    assert plugin.group_buffer_tasks[group_id] is task
+    assert plugin.group_message_buffers[group_id][0] is previous
+    assert [item.source_message_id for item in plugin.group_message_buffers[group_id]] == ['previous', '123456789']
+    assert plugin.group_message_buffers[group_id][1].addressed

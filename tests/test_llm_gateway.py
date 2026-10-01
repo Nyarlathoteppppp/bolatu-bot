@@ -138,3 +138,29 @@ def test_responses_gateway_preserves_json_usage_and_timeout_fallback() -> None:
     client.create = timeout
     result = asyncio.run(gateway._chat_completion(task='reply_direct', route_name='reply', request=request))
     assert result.model == 'deepseek-flash'
+
+
+def test_lingsuan_uses_medium_for_reply_low_for_review_and_only_official_fallback():
+    from dataclasses import replace
+    from qq_social_agent.config import LLMProviderConfig, LLMModelRoute
+    gateway = _gateway()
+    provider = LLMProviderConfig('lingsuan', 'https://edge.lingsuan.org/v1', 'LINGSUAN_API_KEY',
+                                'enabled', 'responses', reply_timeout_seconds=30, reply_total_timeout_seconds=50)
+    gateway.config = replace(gateway.config, providers={**gateway.config.providers, 'lingsuan': provider})
+    for route in ['reply', 'decision']:
+        gateway.route_overrides[route] = LLMModelRoute('lingsuan', 'gpt-6.1-sol')
+    calls = []
+    class ResponsesClient(FakeChatClient):
+        def __init__(self):
+            super().__init__()
+            self.responses = self
+        async def create(self, **kwargs):
+            calls.append(kwargs)
+            return SimpleNamespace(output_text='OK', status='completed', usage=None)
+    gateway.clients = {'lingsuan': ResponsesClient()}
+    asyncio.run(gateway._chat_completion(task='reply_direct', route_name='reply', request={'messages': []}))
+    asyncio.run(gateway._chat_completion(task='timing_review', route_name='decision', request={'messages': []}))
+    assert [request['reasoning']['effort'] for request in calls] == ['medium', 'low']
+    assert [route.provider for route in gateway._candidate_routes('reply')] == ['lingsuan', 'deepseek']
+    assert [route.provider for route in gateway._candidate_routes('decision')] == ['lingsuan', 'deepseek']
+    assert gateway._task_timeouts(task='timing_review', route_name='decision') == (30.0, 50.0)

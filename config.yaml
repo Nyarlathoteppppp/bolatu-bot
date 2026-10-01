@@ -26,7 +26,9 @@ llm:
       base_url: https://edge.lingsuan.org/v1
       api_key_env: LINGSUAN_API_KEY
       api: responses
-      thinking: disabled
+      thinking: enabled
+      reasoning_effort: low
+      reply_reasoning_effort: medium
       reply_timeout_seconds: 30
       reply_total_timeout_seconds: 50
     deepseek:
@@ -45,9 +47,9 @@ llm:
       base_url: https://openrouter.ai/api/v1
       api_key_env: OPENROUTER_API_KEY
       thinking: disabled
-  model: siliconflow/deepseek-ai/DeepSeek-V4-Flash
-  decision_model: siliconflow/deepseek-ai/DeepSeek-V4-Flash
-  reply_model: mimo/mimo-v2.6-pro
+  model: lingsuan/gpt-6.1-sol
+  decision_model: lingsuan/gpt-6.1-sol
+  reply_model: lingsuan/gpt-6.1-sol
   reply_peak_routing:
     enabled: true
     timezone: Asia/Shanghai
@@ -58,11 +60,11 @@ llm:
       - start: "14:00"
         end: "18:00"
   search_model: siliconflow/deepseek-ai/DeepSeek-V4-Flash
-  utility_model: siliconflow/deepseek-ai/DeepSeek-V4-Flash
-  jargon_model: siliconflow/deepseek-ai/DeepSeek-V4-Flash
-  memory_model: siliconflow/deepseek-ai/DeepSeek-V4-Flash
-  style_model: siliconflow/deepseek-ai/DeepSeek-V4-Flash
-  member_profile_model: siliconflow/deepseek-ai/DeepSeek-V4-Flash
+  utility_model: lingsuan/gpt-6.1-sol
+  jargon_model: lingsuan/gpt-6.1-sol
+  memory_model: lingsuan/gpt-6.1-sol
+  style_model: lingsuan/gpt-6.1-sol
+  member_profile_model: lingsuan/gpt-6.1-sol
   model_catalog:
     - mimo/mimo-v2.6-pro
     - deepseek/deepseek-flash
@@ -82,6 +84,7 @@ llm:
     member_profile: deepseek/deepseek-v4-flash
   thinking: disabled
   usage_tracking_enabled: true
+  interjection_review_probability: 0.70
   reasoning_effort: high
   temperature: 0.72
   max_tokens: 260
@@ -97,9 +100,10 @@ llm:
   max_retries: 0
 
 background_models:
-  memory: openrouter/z-ai/glm-5.3-flash:batch
-  review: openrouter/z-ai/glm-5.3-flash:batch
+  memory: lingsuan/gpt-6.1-sol
+  review: lingsuan/gpt-6.1-sol
   catalog:
+    - lingsuan/gpt-6.1-sol
     - openrouter/z-ai/glm-5.3-flash:batch
     - siliconflow/deepseek-ai/DeepSeek-V4-Flash
     - deepseek/deepseek-flash

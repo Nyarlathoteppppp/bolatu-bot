@@ -377,6 +377,54 @@ def test_group_buffer_flush_splits_two_addressed_users(monkeypatch) -> None:
     plugin.group_message_buffers.clear()
 
 
+def test_addressed_queue_keeps_fifo_and_original_trigger(monkeypatch):
+    from dataclasses import replace
+    group_id = 90000001
+    items = [
+        replace(_buffered_item(group_id, "A第一问", user_id=111), addressed=True, source_message_id="a1"),
+        replace(_buffered_item(group_id, "B的问题", user_id=222), addressed=True, source_message_id="b1"),
+        replace(_buffered_item(group_id, "A第二问", user_id=111), addressed=True, source_message_id="a2"),
+        replace(_buffered_item(group_id, "C随口聊天", user_id=333), source_message_id="c1"),
+    ]
+    monkeypatch.setattr(plugin, "group_message_buffers", {group_id: items})
+    monkeypatch.setattr(plugin, "group_buffer_tasks", {})
+    monkeypatch.setattr(plugin, "group_generation_inflight", set())
+    monkeypatch.setattr(plugin, "group_addressed_waiters", {})
+    monkeypatch.setattr(plugin, "_schedule_group_buffer_flush", lambda *_args, **_kwargs: None)
+    handled = []
+    async def handle(bot, event, *, buffered_messages):
+        handled.append((event.user_id, [item.source_message_id for item in buffered_messages]))
+    monkeypatch.setattr(plugin, "_handle_group_message_locked", handle)
+    async def run():
+        assert plugin._should_defer_group_reply_flow(group_id)
+        for _ in range(4):
+            await plugin._flush_group_buffer_after_delay(group_id, delay=0)
+    asyncio.run(run())
+    assert handled == [(111, ["a1"]), (222, ["b1"]), (111, ["a2"]), (333, ["c1"])]
+    assert not plugin._should_defer_group_reply_flow(group_id)
+
+
+def test_single_addressed_user_is_not_replaced_by_later_ordinary_speaker(monkeypatch):
+    from dataclasses import replace
+    group_id = 90000002
+    first = replace(_buffered_item(group_id, "A问", user_id=111), addressed=True)
+    topic = _buffered_item(group_id, "A先说主题", user_id=111)
+    continuation = _buffered_item(group_id, "A补充", user_id=111)
+    other = _buffered_item(group_id, "B闲聊", user_id=222)
+    monkeypatch.setattr(plugin, "group_message_buffers", {group_id: [topic, first, continuation, other]})
+    monkeypatch.setattr(plugin, "group_buffer_tasks", {})
+    monkeypatch.setattr(plugin, "group_generation_inflight", set())
+    monkeypatch.setattr(plugin, "group_addressed_waiters", {})
+    monkeypatch.setattr(plugin, "_schedule_group_buffer_flush", lambda *_args, **_kwargs: None)
+    handled = []
+    async def handle(bot, event, *, buffered_messages):
+        handled.append((event.user_id, [item.text for item in buffered_messages]))
+    monkeypatch.setattr(plugin, "_handle_group_message_locked", handle)
+    asyncio.run(plugin._flush_group_buffer_after_delay(group_id, delay=0))
+    assert handled == [(111, ["A先说主题", "A问", "A补充"])]
+    assert plugin.group_message_buffers[group_id] == [other]
+
+
 def test_group_buffer_flush_marks_generation_and_reschedules_pending(monkeypatch) -> None:
     group_id = 1026813421
     plugin.group_message_buffers.clear()
@@ -1111,6 +1159,7 @@ def test_daily_review_does_not_persist_learning_before_successful_send(monkeypat
 
 
 def test_daily_review_persists_learning_after_successful_send(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr(plugin, "_background_sync_model", lambda _group: None)
     store = MemoryStore(tmp_path / "bot.sqlite3")
     monkeypatch.setattr(plugin, "memory", store)
 
@@ -2317,16 +2366,16 @@ def test_background_model_groups_switch_independently(monkeypatch, tmp_path) -> 
     store = _use_temp_plugin_memory(monkeypatch, tmp_path)
     bot = FakeApprovalBot()
 
-    assert asyncio.run(plugin._handle_group_approval_private(bot, 1535071184, "切后台记忆模型 2"))
+    assert asyncio.run(plugin._handle_group_approval_private(bot, 1535071184, "切后台记忆模型 3"))
     assert plugin._background_model_selection("memory") == "siliconflow/deepseek-ai/DeepSeek-V4-Flash"
-    assert plugin._background_model_selection("review") == "openrouter/z-ai/glm-5.3-flash:batch"
+    assert plugin._background_model_selection("review") == "lingsuan/gpt-6.1-sol"
     assert not plugin._background_batch_enabled("memory")
-    assert plugin._background_batch_enabled("review")
+    assert not plugin._background_batch_enabled("review")
     assert "memory" in store.app_kv_get(plugin.BACKGROUND_MODEL_OVERRIDES_KEY)
 
     assert asyncio.run(plugin._handle_group_approval_private(bot, 1535071184, "后台模型状态"))
-    assert "1. openrouter/z-ai/glm-5.3-flash:batch" in bot.private_messages[-1][1]
-    assert "2. siliconflow/deepseek-ai/DeepSeek-V4-Flash" in bot.private_messages[-1][1]
+    assert "2. openrouter/z-ai/glm-5.3-flash:batch" in bot.private_messages[-1][1]
+    assert "3. siliconflow/deepseek-ai/DeepSeek-V4-Flash" in bot.private_messages[-1][1]
 
 
 def test_private_memory_batch_poll_resumes_without_new_message(monkeypatch, tmp_path) -> None:
@@ -3313,6 +3362,7 @@ def test_private_memory_maintenance_skips_group_style_and_profiles(monkeypatch, 
 
 
 def test_mid_memory_attempt_backoff_survives_empty_generation(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr(plugin.memory_maintenance_service, "memory_sync_model", lambda: None)
     store = _use_temp_plugin_memory(monkeypatch, tmp_path)
     # This regression covers the synchronous empty-result backoff. Batch-mode
     # submission and restart recovery are covered by test_memory_maintenance_batch.

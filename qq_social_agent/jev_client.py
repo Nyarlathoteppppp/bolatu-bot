@@ -473,12 +473,12 @@ class JevClient:
         like_question = _timing_looks_like_question(current_text)
         reply_to_other = _timing_looks_like_reply_to_other(current_text)
         short_ack = _timing_is_short_ack(current_text)
-        if short_ack or reply_to_other:
+        if short_ack:
             return TimingDecision(
                 channel=OutputChannel.SILENT,
                 intent=SocialIntent.CHAT,
                 confidence=0.0,
-                reason="code_silent_ack" if short_ack else "code_silent_reply_other",
+                reason="code_silent_ack",
             )
         addressee = getattr(discourse_state, "addressee", None)
         state = {
@@ -492,6 +492,9 @@ class JevClient:
                 for msg in recent_messages[-5:]
             ],
             "current": {"speaker": current_nickname, "text": current_text},
+            "reply_to_other": reply_to_other,
+            "speaking_context": speaker_context,
+            "followup_addressed": followup_addressed,
             "resolved_addressee": {
                 "status": getattr(addressee, "status", "NOT_APPLICABLE"),
                 "target": getattr(addressee, "target", ""),
@@ -508,12 +511,12 @@ class JevClient:
             },
             "timing_route": {
                 "type": "choice",
-                "instructions": "假设风雪没有被点名。在当前消息之后，她此刻最适合采取哪一种群聊参与方式？只选参与时机类别，不写回复、不选说话风格。",
+                "instructions": "判断当前消息给风雪留下了哪一种参与机会。对别人的公开玩笑也可能适合旁观接话；对谁说不等于是否可以加入。只选机会类别，不写回复、不选说话风格，是否实际开口另行决定。",
                 "criteria": {
-                    "silent": "不需要风雪插话：在和别人说话、短确认、纯事实补充、风雪已说过同义内容，或插话会打断当前对话。全群询问某人的近况、安危、是否联系上，风雪没有可靠消息时也选 silent；‘有没有人知道’是在征询知情者，不等于请风雪表态。",
+                    "silent": "风雪没有具体可接的内容：短确认、重复内容、两人的私人约定或插话会打断认真交流。全群询问某人的近况、安危、是否联系上，风雪没有可靠消息时也选 silent；‘有没有人知道’是在征询知情者，不等于请风雪表态。",
                     "answer": "当前发言是在向群里求答案、建议或观点，风雪掌握能回答的具体信息；只说不知道、没消息或劝别人别下结论不算有用回答。",
                     "continue_bot": "当前发言直接接续风雪刚才的话，并期待她进一步回应。",
-                    "social_join": "当前发言向群里抛出开放话题、梗，或明确希望有人接话；风雪加入一句会自然推进聊天。这里只判断是否适合加入，不判断具体回复方式。",
+                    "social_join": "当前有可接的话题、观点、梗或日常分享，风雪作为群友补一句会自然推进聊天。对别人说也可以有旁观接话点，但不替被问的人回答私人问题，不把别人的经历算到自己头上。这里只判断接话机会，不要求对方明确邀请风雪。",
                     "other": "无法从当前消息和近期上下文可靠判断。",
                 },
             },
@@ -538,6 +541,7 @@ class JevClient:
             answer=answer,
             continue_bot=continue_bot,
             social=social,
+            other=_finite_probability(probabilities.get("other")) or 0.0,
         )
 
     async def audit_proactive_reply(

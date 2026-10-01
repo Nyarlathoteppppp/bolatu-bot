@@ -175,15 +175,17 @@ def test_open_knowledge_ping_without_evidence_stays_silent() -> None:
     ) == 2
 
 
-def test_group_decision_skips_timing_when_addressee_is_another_member() -> None:
+def test_group_decision_allows_observer_review_without_private_tool_use() -> None:
     async def keep_decision(decision, **_kwargs):
         return decision
 
     async def keep_tool_plan(decision, *, tool_plan, **_kwargs):
         raise AssertionError("tool router should not run for another member's message")
 
-    async def unexpected_timing(**_kwargs):
-        raise AssertionError("timing gate should not decide a message addressed to another member")
+    async def unexpected_timing(**kwargs):
+        from qq_social_agent.timing_gate import TimingDecision
+        assert "旁观接话" in kwargs["speaker_context"]
+        return TimingDecision(OutputChannel.SILENT, reason="observer_has_nothing_to_add")
 
     services = GroupDecisionServices(
         record_metric_event=lambda *_args, **_kwargs: None,
@@ -238,7 +240,7 @@ def test_group_decision_skips_timing_when_addressee_is_another_member() -> None:
         ))
         assert result is not None
         assert result.decision.should_reply is False
-        assert result.decision.reason == "resolved_other_addressee"
+        assert result.decision.reason == "observer_has_nothing_to_add"
         assert result.tool_plan.requests == ()
         assert pipeline_state.tool_requests == ()
 
@@ -258,7 +260,7 @@ def test_group_generation_returns_reviewed_candidate(mode) -> None:
     result = asyncio.run(
         generate_group_reply(
             client=SimpleNamespace(reply_candidates=reply_candidates, review_draft=review_draft),
-            decision=ReplyDecision(True, 1.0, "local", action="answer"),
+            decision=ReplyDecision(True, 1.0, "local", action="answer", reply_angle="接之前烧烤请客的玩笑"),
             persona=object(),
             recent_messages=[],
             text="你好",
@@ -296,6 +298,7 @@ def test_group_generation_returns_reviewed_candidate(mode) -> None:
     assert result.prompt_flow == ("search_answer" if mode is PipelineMode.SEARCH else "reply_candidates")
     assert calls[0]["speaker_context"].startswith("当前触发人是群友")
     assert ("<self_interaction_context>" in calls[0]["speaker_context"]) is (mode is PipelineMode.CHAT)
+    assert ("接之前烧烤请客的玩笑" in calls[0]["speaker_context"]) is (mode is PipelineMode.CHAT)
     assert calls[0]["include_bot_history"] is True
 
 

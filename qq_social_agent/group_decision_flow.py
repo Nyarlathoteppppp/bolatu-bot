@@ -118,12 +118,9 @@ async def resolve_group_reply_decision(
         and discourse_state.addressee.target_id != int(bot.self_id)
     )
     if addressed_other:
-        decision_source = "discourse"
-        decision = ReplyDecision(
-            should_reply=False,
-            confidence=discourse_state.addressee.confidence,
-            reason="resolved_other_addressee",
-            action="ignore",
+        decision = None
+        speaker_context = (
+            speaker_context + "\n当前消息对另一位群友说：风雪只考虑旁观接话，不替被问的人作答。"
         )
         tool_plan = ToolRoutePlan()
         pipeline_state.tool_requests = tool_plan.requests
@@ -191,6 +188,8 @@ async def resolve_group_reply_decision(
                 followup_addressed=followup_addressed,
             )
             decision = timing.to_reply_decision()
+            if timing.reason.startswith("jev_llm_"):
+                decision_source = "jev_llm"
         except Exception as exc:
             decision = _decision_failure_fallback(
                 addressed_bot=addressed_bot,

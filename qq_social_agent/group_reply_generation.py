@@ -97,6 +97,10 @@ async def generate_group_reply(
     approval_candidates: list[PendingApprovalCandidate] = []
     for attempt in range(2):
         effective_speaker_context = speaker_context
+        if decision.reply_angle and not tool_answer_mode:
+            effective_speaker_context = combine_text_sections(
+                effective_speaker_context, "【本轮接话方向】\n" + decision.reply_angle,
+            )
         if self_interaction_context and not tool_answer_mode:
             effective_speaker_context = combine_text_sections(effective_speaker_context, self_interaction_context)
         if critic_feedback:

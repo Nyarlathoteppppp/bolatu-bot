@@ -135,6 +135,11 @@ class LLMGateway:
                     max_retries=0,
                 )
                 if provider.api == "responses":
+                    provider_request["reasoning_effort"] = (
+                        provider.reply_reasoning_effort
+                        if task in {"reply", "reply_direct", "reply_candidates", "search_answer"}
+                        else provider.reasoning_effort
+                    )
                     operation = timed_client.responses.create(**_responses_request(provider_request, provider))
                 else:
                     operation = timed_client.chat.completions.create(**provider_request)
@@ -183,11 +188,14 @@ class LLMGateway:
         self, *, task: str, route: LLMModelRoute, request: dict[str, object]
     ) -> object:
         """Use a background selection without mutating the live reply route."""
+        routes = (route,)
+        if route.provider == "lingsuan":
+            routes += (self.config.fallback_routes["memory" if task == "mid_memory" else "reply"],)
         return await self._chat_completion(
             task=task,
             route_name="memory" if task == "mid_memory" else "reply",
             request=request,
-            routes_override=(route,),
+            routes_override=routes,
         )
 
     def _task_timeouts(self, *, task: str, route_name: str) -> tuple[float, float]:
@@ -223,6 +231,11 @@ class LLMGateway:
         else:
             attempt = float(self.config.timeout_seconds)
             total = float(self.config.timeout_seconds) * max(1, len(self._candidate_routes(route_name)))
+        routes = self._candidate_routes(route_name)
+        if routes and routes[0].provider == "lingsuan":
+            provider = self.config.providers["lingsuan"]
+            attempt = provider.reply_timeout_seconds or attempt
+            total = max(total, provider.reply_total_timeout_seconds or total)
         attempt = max(1.0, float(attempt))
         total = max(attempt, float(total))
         return attempt, total
@@ -238,8 +251,8 @@ class LLMGateway:
             if fallback is not None:
                 routes.append(fallback)
             routes.extend(getattr(self.config, "additional_fallback_routes", {}).get(route_name, ()))
-            if route_name == "reply" and primary.provider == "lingsuan":
-                routes = [primary, self.config.fallback_routes["reply"]]
+            if primary.provider == "lingsuan":
+                routes = [primary, self.config.fallback_routes[route_name]]
         if route_name == "reply" and route_name not in self.route_overrides and routes[0].provider != "lingsuan":
             # Keep the existing DeepSeek/SiliconFlow peak policy when they are
             # first and second choice, or the two fallbacks after MiMo.
@@ -356,7 +369,7 @@ def _responses_request(request: dict, provider: LLMProviderConfig) -> dict:
         "input": request["messages"],
         "store": False,
         "max_output_tokens": request.get("max_tokens", 320),
-        "reasoning": {"effort": request.get("reasoning_effort", "high") if provider.thinking == "enabled" else "none"},
+        "reasoning": {"effort": request.get("reasoning_effort", provider.reasoning_effort) if provider.thinking == "enabled" else "none"},
     }
     if "response_format" in request:
         result["text"] = {"format": request["response_format"]}

@@ -17,6 +17,8 @@ class LLMProviderConfig:
     api_key_env: str
     thinking: str
     api: str = "chat_completions"
+    reasoning_effort: str = "low"
+    reply_reasoning_effort: str = "medium"
     reply_timeout_seconds: float | None = None
     reply_total_timeout_seconds: float | None = None
 
@@ -72,6 +74,7 @@ class LLMConfig:
     model_catalog: tuple[LLMModelRoute, ...]
     usage_tracking_enabled: bool
     reply_peak_routing: ReplyPeakRouting
+    interjection_review_probability: float = 1.0
 
 
 # Existing callers still use the old name while task code migrates to LLMConfig.
@@ -235,6 +238,7 @@ class AppConfig:
             model_catalog=_model_catalog(deepseek, routes, fallback_routes, providers),
             usage_tracking_enabled=bool(deepseek.get("usage_tracking_enabled", True)),
             reply_peak_routing=reply_peak_routing,
+            interjection_review_probability=float(deepseek.get("interjection_review_probability", 1.0)),
         )
         self.deepseek = self.llm
         self.rate = RateConfig(
@@ -335,6 +339,8 @@ def _llm_providers(deepseek: dict[str, Any]) -> dict[str, LLMProviderConfig]:
                 api_key_env=str(raw.get("api_key_env", f"{provider_name.upper()}_API_KEY")),
                 thinking=str(raw.get("thinking", "disabled")).lower(),
                 api=str(raw.get("api", "chat_completions")),
+                reasoning_effort=str(raw.get("reasoning_effort", "low")),
+                reply_reasoning_effort=str(raw.get("reply_reasoning_effort", "medium")),
                 reply_timeout_seconds=float(raw["reply_timeout_seconds"]) if "reply_timeout_seconds" in raw else None,
                 reply_total_timeout_seconds=float(raw["reply_total_timeout_seconds"]) if "reply_total_timeout_seconds" in raw else None,
             )

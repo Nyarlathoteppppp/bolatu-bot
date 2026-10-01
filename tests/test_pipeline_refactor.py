@@ -298,6 +298,8 @@ def test_mid_memory_has_background_timeout_budget() -> None:
         timeout_seconds=30.0,
     )
 
+    client._candidate_routes = lambda _route: ()
+
     assert client._task_timeouts(task="mid_memory", route_name="memory") == (18.0, 40.0)
 
 

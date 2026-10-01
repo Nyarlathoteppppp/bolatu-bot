@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+import random
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Callable
 
@@ -45,6 +46,7 @@ class ReplyDecision:
     fresh_kind: str = "news"
     reaction: str = ""
     side_reaction: str = ""
+    reply_angle: str = ""
 
 
 @dataclass(frozen=True)
@@ -475,14 +477,26 @@ class LLMTaskClient(LLMGateway):
             ),
             what="timing_gate",
         )
-        if jev_timing is not None:
+        if jev_timing is not None and not jev_timing.review_required:
             return jev_timing
+        if jev_timing is not None:
+            if random.random() >= getattr(self.config, "interjection_review_probability", 1.0):
+                logger.info("qq_social_agent timing review skipped: reason=opening_sample_skip")
+                return replace(jev_timing, review_required=False, reason="jev_opening_sample_skip")
+            user += (
+                "\nJEV 认为这句有接话机会，但尚未确定要不要参与。"
+                "结合这句具体内容，想清楚你能接哪一点，再决定 text 或 silent。"
+                "text 时给出 reply_angle，描述你打算接的具体内容，不写最终回复；"
+                "如果只有泛泛附和、无依据的消息或复读，就 silent。"
+                "当前若在对别人说，只考虑旁观补一句，不替当事人作答、不抢两人的私人约定。"
+            )
+            logger.info(f"qq_social_agent timing review requested: reason={jev_timing.reason}")
         response = await self._chat_completion(
-            task="decision",
+            task="timing_review" if jev_timing is not None else "decision",
             route_name="decision",
             request={
                 "temperature": 0.15,
-                "max_tokens": 100,
+                "max_tokens": 260,
                 "response_format": {"type": "json_object"},
                 "messages": [
                     {"role": "system", "content": system},
@@ -491,7 +505,10 @@ class LLMTaskClient(LLMGateway):
             },
         )
         content = response.choices[0].message.content or ""
-        return parse_timing_decision(_loads_json_object(content))
+        timing = parse_timing_decision(_loads_json_object(content))
+        if jev_timing is not None:
+            timing = replace(timing, reason="jev_llm_" + timing.reason)
+        return timing
 
     async def audit_proactive_reply(
         self,
