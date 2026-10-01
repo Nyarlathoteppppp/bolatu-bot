@@ -106,3 +106,35 @@ def test_selected_background_model_does_not_change_reply_route() -> None:
     assert result.model == selected.model
     assert gateway.current_route("reply").provider == "mimo"
     assert gateway.clients["mimo"].calls == 0
+
+
+def test_responses_gateway_preserves_json_usage_and_timeout_fallback() -> None:
+    from dataclasses import replace
+    from qq_social_agent.config import LLMProviderConfig, LLMModelRoute
+    gateway = _gateway()
+    provider = LLMProviderConfig('lingsuan', 'https://edge.lingsuan.org/v1', 'LINGSUAN_API_KEY', 'disabled', 'responses')
+    gateway.config = replace(gateway.config, providers={**gateway.config.providers, 'lingsuan': provider})
+    gateway.route_overrides['reply'] = LLMModelRoute('lingsuan', 'gpt-6.1-sol')
+    calls = []
+    class ResponsesClient(FakeChatClient):
+        def __init__(self):
+            super().__init__()
+            self.responses = self
+        async def create(self, **kwargs):
+            calls.append(kwargs)
+            return SimpleNamespace(output_text='{"text":"好呀"}', status='completed', usage=SimpleNamespace(input_tokens=11, output_tokens=7, total_tokens=18))
+    client = ResponsesClient()
+    gateway.clients = {'lingsuan': client, 'deepseek': FakeChatClient()}
+    request = {'messages': [{'role': 'user', 'content': 'Return JSON'}], 'max_tokens': 320, 'temperature': 0.6, 'response_format': {'type': 'json_object'}}
+    response = asyncio.run(gateway._chat_completion(task='reply_direct', route_name='reply', request=request))
+    assert response.choices[0].message.content == '{"text":"好呀"}'
+    assert response.usage.prompt_tokens == 11
+    assert calls[0]['store'] is False
+    assert calls[0]['reasoning'] == {'effort': 'none'}
+    assert calls[0]['text'] == {'format': {'type': 'json_object'}}
+    assert 'temperature' not in calls[0] and 'messages' not in calls[0]
+    async def timeout(**kwargs):
+        raise asyncio.TimeoutError()
+    client.create = timeout
+    result = asyncio.run(gateway._chat_completion(task='reply_direct', route_name='reply', request=request))
+    assert result.model == 'deepseek-flash'

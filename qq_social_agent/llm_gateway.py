@@ -5,6 +5,7 @@ import os
 import time
 from datetime import datetime
 from typing import Callable, Optional
+from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
 from nonebot import logger
@@ -65,10 +66,18 @@ class LLMGateway:
         if extra_body:
             request["extra_body"] = extra_body
         try:
+            timed_client = client.with_options(timeout=timeout_seconds, max_retries=0)
+            operation = (
+                timed_client.responses.create(**_responses_request(request, provider))
+                if provider.api == "responses"
+                else timed_client.chat.completions.create(**request)
+            )
             response = await asyncio.wait_for(
-                client.with_options(timeout=timeout_seconds, max_retries=0).chat.completions.create(**request),
+                operation,
                 timeout=timeout_seconds + 0.25,
             )
+            if provider.api == "responses":
+                response = _responses_as_chat(response)
         except Exception as exc:
             if _is_quota_exhaustion(exc):
                 self._provider_exhausted.add(route.provider)
@@ -120,11 +129,17 @@ class LLMGateway:
                 provider_request["extra_body"] = extra_body
             try:
                 current_timeout = max(0.25, min(attempt_timeout, remaining))
-                operation = client.with_options(
+                timed_client = client.with_options(
                     timeout=current_timeout,
                     max_retries=0,
-                ).chat.completions.create(**provider_request)
+                )
+                if provider.api == "responses":
+                    operation = timed_client.responses.create(**_responses_request(provider_request, provider))
+                else:
+                    operation = timed_client.chat.completions.create(**provider_request)
                 response = await asyncio.wait_for(operation, timeout=current_timeout + 0.25)
+                if provider.api == "responses":
+                    response = _responses_as_chat(response)
             except Exception as exc:
                 last_error = exc
                 if _is_quota_exhaustion(exc):
@@ -187,6 +202,12 @@ class LLMGateway:
         }:
             attempt = self.config.reply_timeout_seconds
             total = self.config.reply_total_timeout_seconds
+            if route_name == "reply":
+                routes = self._candidate_routes(route_name)
+                provider = self.config.providers[routes[0].provider] if routes else None
+                if provider is not None:
+                    attempt = provider.reply_timeout_seconds or attempt
+                    total = provider.reply_total_timeout_seconds or total
         elif route_name in {"utility", "jargon", "memory", "style", "member_profile"}:
             attempt = self.config.utility_timeout_seconds
             total = self.config.utility_total_timeout_seconds
@@ -208,7 +229,9 @@ class LLMGateway:
             if fallback is not None:
                 routes.append(fallback)
             routes.extend(getattr(self.config, "additional_fallback_routes", {}).get(route_name, ()))
-        if route_name == "reply" and route_name not in self.route_overrides:
+            if route_name == "reply" and primary.provider == "lingsuan":
+                routes = [primary, self.config.fallback_routes["reply"]]
+        if route_name == "reply" and route_name not in self.route_overrides and routes[0].provider != "lingsuan":
             # Keep the existing DeepSeek/SiliconFlow peak policy when they are
             # first and second choice, or the two fallbacks after MiMo.
             for index in range(len(routes) - 1):
@@ -316,6 +339,36 @@ class LLMGateway:
             routes = self._candidate_routes("reply")
             return routes[0] if routes else self.config.fallback_routes["reply"]
         return self.route_overrides.get(route_name, self.config.routes[route_name])
+
+
+def _responses_request(request: dict, provider: LLMProviderConfig) -> dict:
+    result = {
+        "model": request["model"],
+        "input": request["messages"],
+        "store": False,
+        "max_output_tokens": request.get("max_tokens", 320),
+        "reasoning": {"effort": request.get("reasoning_effort", "high") if provider.thinking == "enabled" else "none"},
+    }
+    if "response_format" in request:
+        result["text"] = {"format": request["response_format"]}
+    if "prompt_cache_key" in request:
+        result["prompt_cache_key"] = request["prompt_cache_key"]
+    return result
+
+
+def _responses_as_chat(response: object) -> object:
+    usage = response.usage
+    return SimpleNamespace(
+        choices=[SimpleNamespace(
+            message=SimpleNamespace(content=response.output_text),
+            finish_reason=response.status,
+        )],
+        usage=SimpleNamespace(
+            prompt_tokens=usage.input_tokens,
+            completion_tokens=usage.output_tokens,
+            total_tokens=usage.total_tokens,
+        ) if usage is not None else None,
+    )
 
 
 def set_usage_recorder(recorder: LLMUsageRecorder | None) -> None:

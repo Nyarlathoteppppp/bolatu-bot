@@ -16,6 +16,9 @@ class LLMProviderConfig:
     base_url: str
     api_key_env: str
     thinking: str
+    api: str = "chat_completions"
+    reply_timeout_seconds: float | None = None
+    reply_total_timeout_seconds: float | None = None
 
 
 @dataclass(frozen=True)
@@ -331,6 +334,9 @@ def _llm_providers(deepseek: dict[str, Any]) -> dict[str, LLMProviderConfig]:
                 base_url=str(raw.get("base_url", providers.get(provider_name, providers["deepseek"]).base_url)),
                 api_key_env=str(raw.get("api_key_env", f"{provider_name.upper()}_API_KEY")),
                 thinking=str(raw.get("thinking", "disabled")).lower(),
+                api=str(raw.get("api", "chat_completions")),
+                reply_timeout_seconds=float(raw["reply_timeout_seconds"]) if "reply_timeout_seconds" in raw else None,
+                reply_total_timeout_seconds=float(raw["reply_total_timeout_seconds"]) if "reply_total_timeout_seconds" in raw else None,
             )
     return providers
 

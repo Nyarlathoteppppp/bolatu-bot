@@ -22,6 +22,13 @@ group_user_policies:
 llm:
   base_url: https://api.deepseek.com
   providers:
+    lingsuan:
+      base_url: https://edge.lingsuan.org/v1
+      api_key_env: LINGSUAN_API_KEY
+      api: responses
+      thinking: disabled
+      reply_timeout_seconds: 30
+      reply_total_timeout_seconds: 50
     deepseek:
       base_url: https://api.deepseek.com
       api_key_env: DEEPSEEK_API_KEY
@@ -61,6 +68,7 @@ llm:
     - deepseek/deepseek-flash
     - siliconflow/deepseek-ai/DeepSeek-V4-Flash
     - openrouter/z-ai/glm-5.3-flash
+    - lingsuan/gpt-6.1-sol
   fallback_models:
     decision: deepseek/deepseek-v4-flash
     reply:

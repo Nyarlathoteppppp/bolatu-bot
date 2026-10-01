@@ -262,8 +262,9 @@ def test_production_config_uses_official_deepseek_flash_for_reply() -> None:
         "deepseek/deepseek-flash",
         "siliconflow/deepseek-ai/DeepSeek-V4-Flash",
         "openrouter/z-ai/glm-5.3-flash",
+        "lingsuan/gpt-6.1-sol",
     )
-    assert set(config.llm.providers) == {"deepseek", "siliconflow", "mimo", "openrouter"}
+    assert set(config.llm.providers) == {"deepseek", "siliconflow", "mimo", "openrouter", "lingsuan"}
     assert config.raw["background_models"]["memory"] == "openrouter/z-ai/glm-5.3-flash:batch"
     assert config.raw["background_models"]["review"] == "openrouter/z-ai/glm-5.3-flash:batch"
     assert config.llm is config.deepseek
