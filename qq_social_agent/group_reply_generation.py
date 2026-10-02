@@ -137,6 +137,16 @@ async def generate_group_reply(
                 "qq_social_agent reply candidate generation failed: "
                 f"group={group_id} addressed={addressed_bot} error={exc}"
             )
+            record_metric_event(
+                "reply_suppressed",
+                group_id=group_id,
+                user_id=user_id,
+                stage="generation",
+                action="generation_error",
+                error_type=type(exc).__name__,
+                error=str(exc)[:200],
+                addressed=addressed_bot,
+            )
             return
         if not reply_candidates:
             if direct_single_reply:
@@ -154,6 +164,14 @@ async def generate_group_reply(
                 )
                 return
             logger.info(f"qq_social_agent skipped group={group_id}: empty_model_reply")
+            record_metric_event(
+                "reply_suppressed",
+                group_id=group_id,
+                user_id=user_id,
+                stage="generation",
+                action="empty_model_reply",
+                addressed=addressed_bot,
+            )
             return
         approval_candidates = build_approval_candidates(
             reply_candidates,
@@ -162,7 +180,36 @@ async def generate_group_reply(
             allow_questions=addressed_bot,
         )
         if not approval_candidates:
+            question_only = not addressed_bot and bool(build_approval_candidates(
+                reply_candidates,
+                market_report=market_report,
+                limit=reply_candidate_limit,
+                allow_questions=True,
+            ))
+            if (
+                question_only
+                and attempt == 0
+                and not reply_budget.skip("critic_retry", time.monotonic())
+            ):
+                # Rewrite instead of silently discarding a paid-for reply.
+                critic_feedback = "【改写要求】没人在问你，别用问句收尾、别反问群友，直接说你的看法或反应。"
+                record_metric_event(
+                    "reply_regenerate",
+                    group_id=group_id,
+                    user_id=user_id,
+                    stage="generation",
+                    action="question_guard",
+                )
+                continue
             logger.info(f"qq_social_agent skipped group={group_id}: empty_candidate_after_guard")
+            record_metric_event(
+                "reply_suppressed",
+                group_id=group_id,
+                user_id=user_id,
+                stage="generation",
+                action="question_guard" if question_only else "empty_candidate_after_guard",
+                addressed=addressed_bot,
+            )
             return
         judged_pronoun, judged_critic = None, None
         if client is not None:

@@ -546,3 +546,45 @@ def test_discourse_stage_returns_single_state_and_speaker_context(monkeypatch) -
     assert result.state.reference == ReferenceResolution()
     assert "当前触发人：群友[#456]" in result.speaker_context
     assert [event for event, _ in metrics] == ["discourse_decision_trace", "message_relation"]
+
+
+def test_unaddressed_question_draft_is_rewritten_not_silently_dropped() -> None:
+    from qq_social_agent.group_reply_generation import generate_group_reply
+    from qq_social_agent.deepseek_client import ReplyCandidateDraft
+
+    drafts = [
+        (ReplyCandidateDraft("你后来怎么处理的？", "reply", ""),),
+        (ReplyCandidateDraft("这驱动确实容易炸。", "reply", ""),),
+    ]
+    seen_feedback: list[str] = []
+    metrics: list[tuple[str, dict]] = []
+
+    async def reply_candidates(**kwargs):
+        seen_feedback.append(kwargs["speaker_context"])
+        return drafts[len(seen_feedback) - 1]
+
+    async def review_draft(**_kwargs):
+        return None, None
+
+    client = SimpleNamespace(reply_candidates=reply_candidates, review_draft=review_draft)
+
+    def build(drafts, *, market_report="", limit, allow_questions):
+        rows = [d for d in drafts if allow_questions or "？" not in d.text]
+        return [SimpleNamespace(text=d.text, action=d.action, style=d.style) for d in rows][:limit]
+
+    result = asyncio.run(generate_group_reply(
+        client=client, decision=ReplyDecision(True, 0.9, "jev_social", action="reply"), persona=object(),
+        recent_messages=[], text="驱动又炸了", nickname="群友", current_label="群友[#00001]",
+        addressed_bot=False, addressed_repeat_count=0, cue_repeat_context="", market_context="",
+        fresh_context="", context_packet=None, mode=PipelineMode.CHAT, mention_targets_context="",
+        priority_context="", speaker_context="", memory_context="",
+        reference_resolution=ReferenceResolution(), ellipsis_resolution=None, repair_resolution=None,
+        discourse_state=DiscourseState(), direct_single_reply=True, market_report="",
+        reply_budget=GroupReplyBudget.start(time.monotonic(), seconds=120), group_id=1, user_id=2,
+        build_approval_candidates=build, combine_text_sections=lambda *parts: "\n".join(p for p in parts if p),
+        record_metric_event=lambda event, **kw: metrics.append((event, kw)), logger=_logger(),
+    ))
+
+    assert result is not None and result.candidates[0].text == "这驱动确实容易炸。"
+    assert "别用问句收尾" in seen_feedback[1]
+    assert ("reply_regenerate", "question_guard") in [(e, kw.get("action")) for e, kw in metrics]

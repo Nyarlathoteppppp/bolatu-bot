@@ -8233,9 +8233,28 @@ def _approval_candidates_from_drafts(
     return rows
 
 
+_DRAFT_QUESTION_TERMS = (
+    "为什么", "为啥", "怎么", "怎样", "如何", "什么", "谁", "哪", "多少", "几点",
+    "能不能", "是不是", "有没有", "要不要", "可不可以", "行不行",
+)
+
+
 def _draft_asks_question(text: str) -> bool:
-    without_urls = _NEARBY_URL_RE.sub("", str(text or ""))
-    return _looks_like_addressed_question(without_urls)
+    """Whether a draft ends by asking someone something.
+
+    Incoming-message detection is keyword-wide on purpose; reusing it here
+    dropped 12% of Fengxue's real replies as "questions" (谁都带故事,
+    非说哪个更恶心, a rhetorical 开智了？ mid-sentence).
+    """
+    clean = _NEARBY_URL_RE.sub("", str(text or "")).strip()
+    clean = re.sub(r"[（(][^（）()]{0,16}[）)]\s*$", "", clean)
+    clean = re.sub(r"[\s~～!！。.…]+$", "", clean)
+    if not clean:
+        return False
+    last_clause = re.split(r"[，,。！!；;…]", clean)[-1]
+    if re.search(r"(?:[?？]|吗)$", last_clause):
+        return True
+    return "你" in last_clause and any(term in last_clause for term in _DRAFT_QUESTION_TERMS)
 
 
 async def _maybe_apply_speaking_action(

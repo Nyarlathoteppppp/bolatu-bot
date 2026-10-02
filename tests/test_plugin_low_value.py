@@ -3860,3 +3860,14 @@ def test_passive_approval_candidates_drop_questions() -> None:
     )
 
     assert [item.text for item in candidates] == ["这驱动确实容易炸。"]
+
+
+def test_draft_question_guard_ignores_question_words_used_as_statements() -> None:
+    for text in (
+        "这话说得没错，估值本来就是给未来定价，谁都带故事。",
+        "非说哪个更恶心，那纯属闲得慌。",
+        "这就开智了？看来这图含金量有点高（笑）",
+    ):
+        assert not plugin._draft_asks_question(text), text
+    for text in ("你后来怎么处理的", "你是在纠结考研还是保研的选择？", "那你说说哪儿的方言算鸟语（掏出小本本）"):
+        assert plugin._draft_asks_question(text), text
