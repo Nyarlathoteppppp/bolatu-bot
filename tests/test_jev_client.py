@@ -265,7 +265,7 @@ def test_jev_audit_rejects_near_duplicate() -> None:
     client = JevClient(api_key="test-key")
 
     async def fake_evaluate(**kwargs):
-        return {"answers": {"send": {"noul": 0.2}}}
+        return {"answers": {"repeats_own_line": {"noul": 0.82}}}
 
     client.evaluate = fake_evaluate
     send, reason = asyncio.run(
@@ -823,10 +823,10 @@ def test_jev_audit_allows_overlapping_answer() -> None:
     client = JevClient(api_key="test-key")
 
     async def fake_evaluate(**kwargs):
-        instructions = kwargs["questions"]["send"]["instructions"]
-        assert "不确定是不是复读时给高分" in instructions
+        instructions = kwargs["questions"]["repeats_own_line"]["instructions"]
+        assert "吃不准为 false" in instructions
         assert "【是否点名/回复风雪】是" in kwargs["state"]
-        return {"answers": {"send": {"noul": 0.49}}}
+        return {"answers": {"repeats_own_line": {"noul": 0.62}}}  # below the addressed bar
 
     client.evaluate = fake_evaluate
     send, reason = asyncio.run(
@@ -847,7 +847,7 @@ def test_jev_audit_blocks_only_when_sure_it_is_repeat() -> None:
     client = JevClient(api_key="test-key")
 
     async def fake_evaluate(**kwargs):
-        return {"answers": {"send": {"noul": 0.12}}}
+        return {"answers": {"repeats_own_line": {"noul": 0.88}}}
 
     client.evaluate = fake_evaluate
     send, reason = asyncio.run(
@@ -935,7 +935,7 @@ def test_jev_audit_state_lists_only_own_lines() -> None:
 
     async def fake_evaluate(**kwargs):
         seen["state"] = kwargs["state"]
-        return {"answers": {"send": {"noul": 0.9}}}
+        return {"answers": {"repeats_own_line": {"noul": 0.1}}}
 
     client.evaluate = fake_evaluate
     asyncio.run(client.audit_proactive_reply(
@@ -949,3 +949,19 @@ def test_jev_audit_state_lists_only_own_lines() -> None:
     ))
     assert "- 风雪刚说的话" in seen["state"]
     assert "群友自己说的话" not in seen["state"]
+
+
+def test_jev_audit_low_repeat_score_sends_fresh_reply() -> None:
+    client = JevClient(api_key="test-key")
+
+    async def fake_evaluate(**kwargs):
+        return {"answers": {"repeats_own_line": {"noul": 0.22}}}  # live fresh replies sat here
+
+    client.evaluate = fake_evaluate
+    send, reason = asyncio.run(client.audit_proactive_reply(
+        persona=_persona(),
+        recent_messages=[ChatMessage(1, 2, "风雪", "这就开智了？看来这图含金量有点高", True, 1.0)],
+        candidate="什么能源之城，我城主的话先把群里的电费结一下",
+        chat_label="QQ 群聊",
+    ))
+    assert send is True and reason == "未复读近期发言_0.22"

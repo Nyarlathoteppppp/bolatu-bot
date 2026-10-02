@@ -147,15 +147,16 @@ async def send_approved_group_reply_inner(
             approval.trigger_sequence,
         ),
         max_messages=3,
+        quote_available=str(approval.source_message_id or "").strip().isdigit(),
     )
     effective_mention_targets = delivery_plan.mention_targets
-    if delivery_plan.forced_trigger_mention:
+    if delivery_plan.stale:
         services.record_metric_event(
             "stale_reply_mention",
             group_id=approval.group_id,
             user_id=approval.trigger_user_id,
             stage="send",
-            action="force_mention",
+            action="force_mention" if delivery_plan.forced_trigger_mention else "quote_only",
             newer_message_count=delivery_plan.sequence_lag,
         )
     progress = approval.delivery_progress.setdefault(candidate.text, DeliveryProgress(parts=delivery_plan.parts))

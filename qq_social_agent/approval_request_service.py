@@ -139,6 +139,17 @@ async def _auto_send_candidate(
     services: ApprovalRequestServices,
 ) -> None:
     duplicate_send, duplicate_reason = await services.duplicate_reply_verdict(approval, candidate)
+    # Passes are recorded too, so the block rate is measurable instead of
+    # inferred from suppressions alone.
+    services.record_metric_event(
+        "duplicate_audit",
+        group_id=approval.group_id,
+        user_id=approval.trigger_user_id,
+        stage="pre_send",
+        action="send" if duplicate_send else "block",
+        reason=duplicate_reason,
+        correlation_id=approval.pipeline_state.correlation_id if approval.pipeline_state is not None else None,
+    )
     if not duplicate_send:
         services.record_metric_event(
             "reply_suppressed",

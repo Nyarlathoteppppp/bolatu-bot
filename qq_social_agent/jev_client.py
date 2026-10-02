@@ -594,28 +594,30 @@ class JevClient:
             f"【当前消息】{current_line or '（无）'}\n"
             "【风雪近期自己发过的话】\n" + "\n".join(f"- {line[:200]}" for line in own_lines) + "\n\n"
             f"【待发送候选】\n{candidate.strip()[:400]}\n"
-            "【约束】只判断候选是不是在复读上面风雪自己发过的某一句。沿用当前消息里的词不算复读。不确定就放行。不要改写候选。"
+            "【约束】只判断候选是不是在重复上面风雪自己发过的某一句。不要改写候选。"
         )
+        # Jev answers the literal question: yes = high. The old "send" item
+        # asked "is it a repeat?" but told Jev to score repeats low; Jev scored
+        # real repeats 0.50-0.84 and fresh replies 0.24-0.57, so the gate
+        # dropped fresh replies and passed repeats. Ask it the plain way round.
         questions = {
-            "send": {
+            "repeats_own_line": {
                 "type": "noul",
                 "instructions": (
-                    "只判断待发送候选是不是在复读风雪自己刚说过的那句话。"
-                    "同一结论、同一玩笑、同一问题只换词复读，选低分。"
-                    "对方刚点名/回复风雪提问，候选在回答这个问题，即使复用了上一句里的词，也必须高分。"
-                    "同一话题的推进、点名短答后的下一句、补充操作步骤都是高分。"
-                    "不确定是不是复读时给高分。不评价好不好笑，不改写候选。"
+                    "待发送候选是否只是在重复上面风雪自己发过的某一句：同一个结论、同一个玩笑或同一个问题换个说法再说一遍？"
+                    "回答新的问题、推进话题、补充新信息、沿用当前消息里的词，都不算重复，应为 false。吃不准为 false。"
                 ),
             }
         }
         data = await self.evaluate(state=state, questions=questions)
-        noul = _optional_noul(data, "send")
-        if noul is None:
+        repeat_score = _optional_noul(data, "repeats_own_line")
+        if repeat_score is None:
             return True, "jev_audit_unknown_pass"
-        block_threshold = 0.20 if addressed else 0.25
-        send = noul >= block_threshold
+        # Calibrated on live replies: fresh <=0.32 (one 0.58), reworded repeats >=0.64.
+        block_threshold = 0.70 if addressed else 0.60
+        send = repeat_score < block_threshold
         reason = "未复读近期发言" if send else "jev判定复读近期发言"
-        return send, f"{reason}_{noul:.2f}"[:80]
+        return send, f"{reason}_{repeat_score:.2f}"[:80]
 
     async def select_meme(
         self,

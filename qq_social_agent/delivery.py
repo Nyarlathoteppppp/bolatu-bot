@@ -11,6 +11,7 @@ class DeliveryPlan:
     mention_targets: dict[int, str]
     sequence_lag: int
     forced_trigger_mention: bool
+    stale: bool = False
 
 
 def build_delivery_plan(
@@ -22,10 +23,15 @@ def build_delivery_plan(
     trigger_sequence: int,
     current_sequence: int,
     max_messages: int = 3,
+    quote_available: bool = False,
 ) -> DeliveryPlan:
     effective_targets = dict(mention_targets)
     sequence_lag = max(0, current_sequence - trigger_sequence)
-    force_mention = trigger_sequence > 0 and sequence_lag >= 3
+    stale = trigger_sequence > 0 and sequence_lag >= 3
+    # A late reply already quotes its trigger, which anchors it and notifies
+    # the author; an extra @ only made casual asides look like summons. Fall
+    # back to @ only when the trigger cannot be quoted.
+    force_mention = stale and not quote_available
     prepared_text = reply_text
     if force_mention:
         effective_targets[trigger_user_id] = (
@@ -39,4 +45,5 @@ def build_delivery_plan(
         mention_targets=effective_targets,
         sequence_lag=sequence_lag,
         forced_trigger_mention=force_mention,
+        stale=stale,
     )

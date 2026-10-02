@@ -1457,10 +1457,6 @@ def _runtime_target_groups() -> tuple[int, ...]:
 
 
 async def _send_approval_rules_to_approvers(bot: Bot, *, reason: str) -> None:
-    if reason == "bot_connect" and not _approval_review_enabled():
-        # Replies auto-send while review is off; re-sending the review manual
-        # to approvers on every restart was pure noise.
-        return
     for approver_id in _approval_user_ids():
         marker = f"approval_rules_sent:{bot.self_id}:{approver_id}"
         if reason == "bot_connect":
