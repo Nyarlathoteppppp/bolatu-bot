@@ -127,3 +127,33 @@ def test_obfuscated_hard_term_is_still_masked() -> None:
     reply, guarded = sanitize_political_output("习 近 平今天发话了")
     assert guarded
     assert "*" in reply
+
+
+def test_word_boundary_collisions_are_judged_not_hard_masked() -> None:
+    from qq_social_agent.political_guard import sanitize_political_output_detail
+
+    for text in ("其中共有三个方案", "我在写学习总结", "这段舞台独白挺好", "利润六四开"):
+        assert [c.needs_segmentation for c in political_candidates(text)] == [True], text
+        # Jev unavailable: fail closed, same as before.
+        assert "*" in sanitize_political_output_detail(text).public_text
+        # Jev reads the span as two separate words: leave the sentence alone.
+        assert sanitize_political_output_detail(text, contextual_keys=()).public_text == text
+    assert "*" in sanitize_political_output_detail("中国共产党", contextual_keys=()).public_text
+
+
+def test_segmentation_spans_need_a_confident_political_reading() -> None:
+    import asyncio
+
+    from qq_social_agent.jev_client import JevClient
+
+    client = JevClient(api_key="test")
+    scores = {"其中共有三个方案": 0.43, "中共党史课期末考": 0.92}
+
+    async def evaluate(*, state, questions):
+        text = state.split("\n", 1)[0].removeprefix("【待群发原文】")
+        assert "同一个词" in next(iter(questions.values()))["instructions"]
+        return {"answers": {key: {"noul": scores[text]} for key in questions}}
+
+    client.evaluate = evaluate
+    assert asyncio.run(client.political_mask_keys(text="其中共有三个方案")) == ()
+    assert asyncio.run(client.political_mask_keys(text="中共党史课期末考")) == ("span_0",)

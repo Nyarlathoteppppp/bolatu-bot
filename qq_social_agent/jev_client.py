@@ -1525,21 +1525,32 @@ class JevClient:
             "只判断各候选出现处的含义，不因为全文涉及政治就把普通用法也判成政治。"
             "不修改、不补写正文。"
         )
-        questions = {
-            row.key: {
-                "type": "noul",
-                "instructions": (
-                    f"原文区间[{row.start},{row.end})的「{row.text}」是否在指中国政治人物、组织、历史事件或其代称？"
-                    "教员指普通老师、维尼指动画角色、gcd指最大公约数或编程符号、wenge指木材或普通姓名时为 false。"
-                    "政治代称、双关、影射或故意拆字仍为 true。只看这个出现位置，不替其他位置回答。"
-                    "吃不准给中间值，不要武断给 false。"
-                ),
-            } for row in candidates
-        }
+        def instructions(row) -> str:
+            if row.needs_segmentation:
+                return (
+                    f"原文区间[{row.start},{row.end})的「{row.text}」：先看这几个字在句子里是不是连成同一个词。"
+                    "如果它们分属前后两个不同的词（例如 其中｜共有、学习｜总结、舞台｜独白、宝藏｜独家、东｜突然、"
+                    "抢占｜中国、六四开表示六比四分成），就不是政治用法，为 false。"
+                    "只有这几个字作为一个词，并且在指中国政治人物、组织、历史事件或其代称时才为 true；"
+                    "政治双关、影射、故意拆字仍为 true。只看这个出现位置。"
+                )
+            return (
+                f"原文区间[{row.start},{row.end})的「{row.text}」是否在指中国政治人物、组织、历史事件或其代称？"
+                "教员指普通老师、维尼指动画角色、gcd指最大公约数或编程符号、wenge指木材或普通姓名时为 false。"
+                "政治代称、双关、影射或故意拆字仍为 true。只看这个出现位置，不替其他位置回答。"
+                "吃不准给中间值，不要武断给 false。"
+            )
+
+        questions = {row.key: {"type": "noul", "instructions": instructions(row)} for row in candidates}
         data = await self.evaluate(state=state, questions=questions)
         # User policy: prefer recall. Only a confident ordinary reading unmasks.
-        return tuple(row.key for row in candidates
-                     if (score := _optional_noul(data, row.key)) is None or score >= 0.28)
+        # Word-boundary spans were calibrated on live Jev: ordinary splits scored
+        # 0.08-0.43, real political uses 0.85-0.93.
+        return tuple(
+            row.key for row in candidates
+            if (score := _optional_noul(data, row.key)) is None
+            or score >= (0.50 if row.needs_segmentation else 0.28)
+        )
 
     async def review_draft(
         self, *, draft: str, current_text: str, current_label: str, action: str,

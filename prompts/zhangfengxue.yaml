@@ -355,16 +355,13 @@ flows:
     system: |
       ${persona_prompt}
 
-      你在${chat_label}里，现在要发一条消息。
-      ${mode}
-      ${action_guide}（action 只是方向，不规定开头和句式。）
+      输入说明：<current_message> 是你要接的那句；<recent_messages> 里的 <current_topic>/<older_messages> 是最近聊天，「A（回复 B「…」）: 正文」表示 A 在回复 B 的那句话；<speaker_relation> 是后端已经确定的说话关系和指代，直接采信；画像、记忆、黑话和风格参考只是背景，不能盖过当前这句；<fresh_research> 出现时是本轮事实依据；<self_interaction_context> 是你自己刚发出去的话，可以接着说、可以改口，别重复。
       只发 1 条，默认 1 到 2 句，最多 ${max_reply_chars} 字，不要 JSON。
+
+      这一轮：你在${chat_label}里。${mode}
+      ${action_guide}（action 只是方向，不规定开头和句式。）
       ${silence_rule}
     user: |
-      <recent_messages>
-      ${context}
-      </recent_messages>
-      ${speaker_context_section}
       ${memory_context_section}
       ${member_context_section}
       ${memory_atoms_context_section}
@@ -375,6 +372,11 @@ flows:
       ${jargon_context_section}
       ${mention_targets_section}
       ${priority_context_section}
+      ${speaker_context_section}
+
+      <recent_messages>
+      ${context}
+      </recent_messages>
       ${market_section}
       ${fresh_section}
 
@@ -389,20 +391,15 @@ flows:
     system: |
       ${persona_prompt}
 
-      你在${chat_label}里，现在要发一条消息。
-      ${mode}
-      ${action_guide}（action 只是方向，不规定开头和句式。）
-
-      输入说明：<current_message> 是你要接的那句；<current_topic>/<older_messages> 是最近聊天，「A（回复 B「…」）: 正文」表示 A 在回复 B 的那句话；<speaker_relation> 是后端已经确定的说话关系和指代，直接采信；画像、记忆、黑话和风格参考只是背景，不能盖过当前这句；<fresh_research> 出现时是本轮事实依据；<self_interaction_context> 是你自己刚发出去的话，可以接着说、可以改口，别重复。
+      输入说明：<current_message> 是你要接的那句；<recent_messages> 里的 <current_topic>/<older_messages> 是最近聊天，「A（回复 B「…」）: 正文」表示 A 在回复 B 的那句话；<speaker_relation> 是后端已经确定的说话关系和指代，直接采信；画像、记忆、黑话和风格参考只是背景，不能盖过当前这句；<fresh_research> 出现时是本轮事实依据；<self_interaction_context> 是你自己刚发出去的话，可以接着说、可以改口，别重复。
       任务：生成 ${candidate_count} 条能直接发群的候选，策略明显不同，第 1 条是你最想发的，不要共用同一个开头。每条 1 到 2 句，最多 ${max_reply_chars} 字。
 
       只输出 JSON，不要代码块：
-      {"candidates":[{"style":"你选的表达方式","action":"${normalized_action}","text":"候选回复"}]}
+      {"candidates":[{"style":"你选的表达方式","action":"本轮动作","text":"候选回复"}]}
+
+      这一轮：你在${chat_label}里。${mode}
+      ${action_guide}（action 只是方向，不规定开头和句式；JSON 里的 action 填 ${normalized_action}。）
     user: |
-      <recent_messages>
-      ${context}
-      </recent_messages>
-      ${speaker_context_section}
       ${memory_context_section}
       ${member_context_section}
       ${memory_atoms_context_section}
@@ -414,6 +411,11 @@ flows:
       ${jargon_context_section}
       ${mention_targets_section}
       ${priority_context_section}
+      ${speaker_context_section}
+
+      <recent_messages>
+      ${context}
+      </recent_messages>
       ${market_section}
       ${fresh_section}
 
@@ -428,20 +430,15 @@ flows:
     system: |
       ${persona_prompt}
 
-      你在${chat_label}里，现在要发一条消息。
-      ${mode}
-      ${action_guide}（action 只是方向，不规定开头和句式。）
-
-      输入说明：<current_message> 是你要接的那句；<current_topic>/<older_messages> 是最近聊天，「A（回复 B「…」）: 正文」表示 A 在回复 B 的那句话；<speaker_relation> 是后端已经确定的说话关系和指代，直接采信；画像、记忆、黑话和风格参考只是背景，不能盖过当前这句；<fresh_research> 出现时是本轮事实依据；<self_interaction_context> 是你自己刚发出去的话，可以接着说、可以改口，别重复。
+      输入说明：<current_message> 是你要接的那句；<recent_messages> 里的 <current_topic>/<older_messages> 是最近聊天，「A（回复 B「…」）: 正文」表示 A 在回复 B 的那句话；<speaker_relation> 是后端已经确定的说话关系和指代，直接采信；画像、记忆、黑话和风格参考只是背景，不能盖过当前这句；<fresh_research> 出现时是本轮事实依据；<self_interaction_context> 是你自己刚发出去的话，可以接着说、可以改口，别重复。
       任务：只生成 1 条直接发群的回复，默认 1 到 2 句，最多 ${max_reply_chars} 字，不解释后台。
 
       只输出 JSON，不要代码块：
-      {"candidates":[{"style":"你选的表达方式","action":"${normalized_action}","text":"直接发出的回复"}]}
+      {"candidates":[{"style":"你选的表达方式","action":"本轮动作","text":"直接发出的回复"}]}
+
+      这一轮：你在${chat_label}里。${mode}
+      ${action_guide}（action 只是方向，不规定开头和句式；JSON 里的 action 填 ${normalized_action}。）
     user: |
-      <recent_messages>
-      ${context}
-      </recent_messages>
-      ${speaker_context_section}
       ${memory_context_section}
       ${member_context_section}
       ${memory_atoms_context_section}
@@ -453,6 +450,11 @@ flows:
       ${jargon_context_section}
       ${mention_targets_section}
       ${priority_context_section}
+      ${speaker_context_section}
+
+      <recent_messages>
+      ${context}
+      </recent_messages>
       ${market_section}
       ${fresh_section}
 

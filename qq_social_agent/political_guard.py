@@ -157,7 +157,11 @@ def _term_pattern(term: str) -> str:
 
 # These existing entries have common non-political senses. Keep them out of the
 # hard mask and ask Jev about each occurrence, not the entire message/topic.
-_CONTEXTUAL_TERMS = frozenset({"教员", "维尼", "gcd", "wenge"})
+# The second group are two-character names that straddle ordinary word
+# boundaries (其中|共有, 学习|总结, 舞台|独白, 利润六四开), which the substring
+# mask blanked out; Jev is asked whether the span is one word at all.
+SEGMENTATION_TERMS = frozenset({"中共", "习总", "台独", "藏独", "东突", "占中", "六四"})
+_CONTEXTUAL_TERMS = frozenset({"教员", "维尼", "gcd", "wenge"}) | SEGMENTATION_TERMS
 _CONTEXTUAL_RE = re.compile(
     "|".join(_term_pattern(term) for term in sorted(_CONTEXTUAL_TERMS)), re.IGNORECASE,
 )
@@ -169,6 +173,10 @@ class PoliticalCandidate:
     start: int
     end: int
     text: str
+
+    @property
+    def needs_segmentation(self) -> bool:
+        return re.sub(r"[\s·._\u200b-\u200d\ufeff]", "", self.text) in SEGMENTATION_TERMS
 
 
 def political_candidates(text: str) -> tuple[PoliticalCandidate, ...]:
