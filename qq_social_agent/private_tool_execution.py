@@ -99,7 +99,6 @@ async def plan_and_execute_private_tools(
             market_intents=market_intents,
             fresh_intent=fresh_intent,
             addressed=True,
-            market_required=bool(market_intents) and services.is_explicit_market_lookup(context_query),
         ),
         addressed=True,
         group_id=turn.chat_id,

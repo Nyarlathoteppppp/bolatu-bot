@@ -290,7 +290,7 @@ from .tools.fresh_context import (
 )
 from .tools.deep_content import DeepContentTool
 from .tools.market import MarketTool
-from .tools.market_intent import MarketIntent, detect_market_intents, is_market_topic
+from .tools.market_intent import MarketIntent, canonical_market_intent, detect_market_intents
 from .tools.voice_transcript import VoiceTranscriptContext
 from .tools.probability_tool import JevProbabilityTool
 from .tool_router import (
@@ -4867,16 +4867,13 @@ async def _handle_group_message_locked(
     normalized_rag_query = normalize_rag_query(text)
     tool_query_text = normalized_rag_query.current_utterance or text
     market_intents = detect_market_intents(tool_query_text, limit=2)
-    market_topic = bool(market_intents) or is_market_topic(tool_query_text)
     fresh_intent = detect_fresh_intent(tool_query_text)
-    market_forced = bool(market_intents) and _is_explicit_market_lookup(tool_query_text)
     tool_plan = _tool_plan_with_runtime_context(
         _route_tools(
             tool_query_text,
             market_intents=market_intents,
             fresh_intent=fresh_intent,
             addressed=addressed_bot,
-            market_required=market_forced,
         ),
         addressed=addressed_bot,
         group_id=group_id,
@@ -5065,7 +5062,6 @@ async def _handle_group_message_locked(
                     market_intents=market_intents,
                     fresh_intent=fresh_intent,
                     addressed=addressed_bot,
-                    market_required=market_forced,
                 ),
                 addressed=addressed_bot,
                 group_id=group_id,
@@ -6824,11 +6820,13 @@ async def _execute_registered_market(request: ToolRequest) -> ToolResult:
         for raw in raw_symbols[:2]:
             if not isinstance(raw, dict) or not raw.get("symbol"):
                 continue
+            # The tool router writes symbols the way people do (btc, sol);
+            # CoinGecko and Gate only answer to canonical ids (bitcoin, solana).
             intents.append(
-                MarketIntent(
-                    kind=str(raw.get("kind") or "stock"),
-                    symbol=str(raw.get("symbol") or ""),
-                    display_name=str(raw.get("display") or raw.get("symbol") or ""),
+                canonical_market_intent(
+                    str(raw.get("kind") or "stock"),
+                    str(raw.get("symbol") or ""),
+                    str(raw.get("display") or ""),
                 )
             )
     if not intents:

@@ -3,10 +3,17 @@ from qq_social_agent.tools.market_intent import detect_market_intents, is_market
 
 def test_detect_stock_alias_and_crypto_symbol() -> None:
     intents = detect_market_intents("英伟达今天咋样，BTC多少了")
-    assert [(intent.kind, intent.symbol) for intent in intents] == [
+    assert {(intent.kind, intent.symbol) for intent in intents} == {
         ("crypto", "bitcoin"),
         ("stock", "NVDA"),
-    ]
+    }
+
+
+def test_short_latin_aliases_need_a_standalone_token() -> None:
+    for text in ("6.1sol现在怎么样", "gpt-6.1-sol 感觉好多了", "method 和 ethernet", "canada adapter", "suite"):
+        assert detect_market_intents(text) == [], text
+    assert [i.symbol for i in detect_market_intents("sol涨了")] == ["solana"]
+    assert [i.symbol for i in detect_market_intents("比特币今天跌了")] == ["bitcoin"]
 
 
 def test_detect_known_stock_ticker_without_market_hint() -> None:
@@ -46,3 +53,14 @@ def test_unknown_ticker_requires_explicit_stock_code_signal() -> None:
 def test_plain_english_name_with_market_hint_is_not_unknown_ticker() -> None:
     assert detect_market_intents("Jane Street 给多少") == []
 
+
+
+def test_router_symbols_map_to_price_api_ids() -> None:
+    from qq_social_agent.tools.market_intent import canonical_market_intent
+
+    assert canonical_market_intent("crypto", "btc", "") == canonical_market_intent("crypto", "BTC", "")
+    assert canonical_market_intent("crypto", "btc").symbol == "bitcoin"
+    assert canonical_market_intent("crypto", "SOL").symbol == "solana"
+    assert canonical_market_intent("crypto", "bitcoin").symbol == "bitcoin"
+    assert canonical_market_intent("stock", "nvda").symbol == "NVDA"
+    assert canonical_market_intent("stock", "英伟达").symbol == "NVDA"

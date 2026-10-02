@@ -1267,7 +1267,7 @@ def test_pre_decision_gate_skips_plain_ack_as_low_value() -> None:
     assert result.skip_reason == "low_value_local"
 
 
-def test_pre_decision_gate_handles_explicit_market_lookup_locally() -> None:
+def test_pre_decision_gate_leaves_market_lookup_to_the_tool_router() -> None:
     result = _pre_decision_gate(
         text="BTC 怎么了",
         recent_messages=[],
@@ -1280,28 +1280,22 @@ def test_pre_decision_gate_handles_explicit_market_lookup_locally() -> None:
         fresh_intent=None,
     )
 
-    assert _is_explicit_market_lookup("BTC 怎么了")
-    assert _is_explicit_market_lookup("NVDA 咋样")
+    # A coin name plus 怎么了 no longer forces a market call or a reply; the
+    # timing gate decides whether to speak and the tool router whether to look.
     assert result.skip_reason == ""
-    assert result.decision is not None
-    assert result.decision.action == "market_check"
-    assert result.decision.need_tool
-    assert result.decision.symbols[0].display == "BTC"
+    assert result.decision is None
 
 
-def test_backend_tool_decision_overrides_addressed_market_reply() -> None:
+def test_backend_tool_decision_keeps_the_social_action_for_market_topics() -> None:
+    original = ReplyDecision(True, 0.7, "正常回答", mode="chat", action="answer")
     decision = _apply_backend_tool_decision(
-        ReplyDecision(True, 0.7, "正常回答", mode="chat", action="answer"),
+        original,
         text="NVDA 今天咋样",
         market_intents=[MarketIntent("stock", "NVDA", "NVDA")],
         fresh_intent=None,
     )
 
-    assert decision.action == "market_check"
-    assert decision.need_tool
-    assert decision.tool == "market"
-    assert decision.comment_after_tool
-    assert decision.symbols[0].symbol == "NVDA"
+    assert decision == original
 
 
 def test_fresh_lookup_goes_to_llm_decision() -> None:

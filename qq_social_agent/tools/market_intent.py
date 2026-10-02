@@ -104,17 +104,40 @@ EXPLICIT_STOCK_CODE_PREFIXES = (
 )
 
 
+_CRYPTO_IDS = {coin_id: display for coin_id, display in CRYPTO_ALIASES.values()}
+
+
+def canonical_market_intent(kind: str, symbol: str, display_name: str = "") -> MarketIntent:
+    """Map router-written symbols (btc, SOL, Bitcoin) to the ids the price APIs use."""
+    raw = str(symbol or "").strip()
+    lowered = raw.casefold()
+    if lowered in _CRYPTO_IDS:
+        return MarketIntent("crypto", lowered, display_name or _CRYPTO_IDS[lowered])
+    if lowered in CRYPTO_ALIASES:
+        coin_id, display = CRYPTO_ALIASES[lowered]
+        return MarketIntent("crypto", coin_id, display)
+    if str(kind or "").strip().casefold() == "crypto":
+        return MarketIntent("crypto", lowered, display_name or raw.upper())
+    if lowered in STOCK_ALIASES:
+        ticker, display = STOCK_ALIASES[lowered]
+        return MarketIntent("stock", ticker, display)
+    return MarketIntent("stock", raw.upper(), display_name or raw.upper())
+
+
 def detect_market_intents(text: str, *, limit: int = 2) -> list[MarketIntent]:
     lowered = text.lower()
     intents: list[MarketIntent] = []
     seen: set[tuple[str, str]] = set()
 
+    # Chinese names are distinctive enough to match inside a sentence; short
+    # Latin aliases are not ("6.1sol" is a model name, "method" is not ETH),
+    # so those only count as standalone tokens below.
     for alias, (symbol, display_name) in CRYPTO_ALIASES.items():
-        if alias in lowered:
+        if _has_cjk(alias) and alias in lowered:
             _append_unique(intents, seen, MarketIntent("crypto", symbol, display_name), limit)
 
     for alias, (symbol, display_name) in STOCK_ALIASES.items():
-        if alias in lowered:
+        if alias in lowered if _has_cjk(alias) else _has_token(lowered, alias):
             _append_unique(intents, seen, MarketIntent("stock", symbol, display_name), limit)
 
     for token in _candidate_alpha_tokens(text):
@@ -139,11 +162,22 @@ def detect_market_intents(text: str, *, limit: int = 2) -> list[MarketIntent]:
     return intents[:limit]
 
 
+_TOKEN_EDGE = r"A-Za-z0-9._\-"
+
+
 def _candidate_alpha_tokens(text: str) -> list[str]:
     return [
         match.group(1).upper()
-        for match in re.finditer(r"(?<![A-Za-z])([A-Za-z]{2,5})(?![A-Za-z])", text)
+        for match in re.finditer(rf"(?<![{_TOKEN_EDGE}])([A-Za-z]{{2,5}})(?![{_TOKEN_EDGE}])", text)
     ]
+
+
+def _has_token(lowered: str, alias: str) -> bool:
+    return re.search(rf"(?<![{_TOKEN_EDGE}]){re.escape(alias)}(?![{_TOKEN_EDGE}])", lowered) is not None
+
+
+def _has_cjk(text: str) -> bool:
+    return any("\u4e00" <= char <= "\u9fff" for char in text)
 
 
 def _explicit_stock_code_tokens(text: str) -> list[str]:

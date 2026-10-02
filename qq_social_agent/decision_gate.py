@@ -29,17 +29,9 @@ def pre_decision_gate(
     market_intents: list[MarketIntent],
     fresh_intent: FreshIntent | None,
 ) -> PreDecisionGateResult:
+    # Market data is a tool the router picks (Jev + LLM fill the symbols);
+    # a coin or ticker name plus a word like 现在/怎么了 no longer forces it.
     if addressed_bot:
-        if market_intents and is_explicit_market_lookup(text):
-            return PreDecisionGateResult(
-                decision=_market_decision(
-                    text=text,
-                    market_intents=market_intents,
-                    reason="local_addressed_market_lookup",
-                    confidence=1.0,
-                    mode="addressed",
-                )
-            )
         if fresh_intent is not None and (fresh_intent.explicit or fresh_intent.required):
             return PreDecisionGateResult(
                 decision=ReplyDecision(
@@ -66,15 +58,6 @@ def pre_decision_gate(
     if is_low_value_group_text(text):
         return PreDecisionGateResult(skip_reason="low_value_local")
 
-    if market_intents and is_explicit_market_lookup(text):
-        return PreDecisionGateResult(
-            decision=_market_decision(
-                text=text,
-                market_intents=market_intents,
-                reason="local_explicit_market_lookup",
-            )
-        )
-
     return PreDecisionGateResult()
 
 
@@ -88,14 +71,6 @@ def apply_backend_tool_decision(
     if not decision.should_reply:
         return decision
     result = decision
-    if market_intents and is_explicit_market_lookup(text):
-        result = _market_decision(
-            text=text,
-            market_intents=market_intents,
-            reason=decision.reason or "backend_market_lookup",
-            confidence=decision.confidence,
-            mode=decision.mode,
-        )
     if fresh_intent is not None and (fresh_intent.explicit or fresh_intent.required):
         action = "answer" if result.action == "fresh_context" else result.action
         result = replace(
