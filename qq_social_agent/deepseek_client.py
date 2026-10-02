@@ -1208,8 +1208,10 @@ class LLMTaskClient(LLMGateway):
         request = {
             # Responses-API reasoning tokens count against this cap, so a
             # one-line reply still needs headroom beyond its visible text.
+            # search_answer asks for up to 480 chars inside a JSON object, which
+            # does not fit in 180 tokens.
             "max_tokens": (
-                180
+                900
                 if search_reply
                 else max(self.config.max_tokens, 640)
                 if direct_reply

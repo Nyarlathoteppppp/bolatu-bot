@@ -938,7 +938,7 @@ def test_search_answer_uses_fast_route_and_small_prompt_budget() -> None:
 
     assert candidates[0].text.startswith("截至今天")
     assert captured_calls[0][0:2] == ("search_answer", "search")
-    assert captured_calls[0][2]["max_tokens"] == 180
+    assert captured_calls[0][2]["max_tokens"] == 900
     assert "旧说法" in captured_calls[0][2]["messages"][0]["content"]
 
 
