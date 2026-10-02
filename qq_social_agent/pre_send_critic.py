@@ -163,7 +163,7 @@ def critic_choice_criteria(key: str) -> dict[str, str]:
             "真实群友的经历和对现实行动的承诺仍需依据"
         ),
         "unsupported": "至少一个具体事实增加了来源中不存在的人、数字、地点、事件、承诺或工具结论；括号里明确声称已执行的现实行动也按具体事实核验",
-        "not_applicable": "草稿只有建议、观点、提问、确认或表情、心理反应、玩笑动作，没有具体事实主张",
+        "not_applicable": "草稿只有建议、观点、提问、确认、常识性解释、风雪的角色设定或表情、心理反应、玩笑动作，没有关于群友、现实事件、数字或工具结论的具体事实主张",
         "other": "证据不足或不符合以上情况",
     }
 
@@ -211,7 +211,8 @@ def format_critic_jev_state(
         )
     if speaker_context.strip():
         lines.append("【说话关系】")
-        lines.append(speaker_context.strip()[:400])
+        # The relation view carries image/OCR content the draft may cite.
+        lines.append(speaker_context.strip()[:1200])
     history = []
     for msg in list(recent_messages or [])[-6:]:
         nick = getattr(msg, "nickname", None) or str(getattr(msg, "user_id", ""))
@@ -220,10 +221,16 @@ def format_critic_jev_state(
     if history:
         lines.append("【近期聊天】")
         lines.extend(history)
+    # Evidence the writer saw must be visible here too: at 300 chars a search
+    # answer's figures from later in the result were all judged unsupported.
     if str(memory_context or "").strip():
-        lines.append("【memory】" + str(memory_context).strip()[:300])
+        lines.append("【memory】" + str(memory_context).strip()[:800])
     if str(tool_context or "").strip():
-        lines.append("【tool result】" + str(tool_context).strip()[:300])
+        lines.append("【tool result】" + str(tool_context).strip()[:2400])
+    lines.append(
+        "【风雪设定】风雪自称北大计算机大二学生、想申请 CMU，以及她自己的日常、感受和偏好，"
+        "都是角色设定，不是需要核验的事实。"
+    )
     lines.append("【约束】只根据上面材料判断。不要改写待发送草稿。不要判断外部世界真假。")
     lines.append("当前消息和已解析状态优先于待发送草稿；已解析修正之前的旧对象一律作废。")
     lines.append("具体事实是否存在，只看近期聊天、memory、tool result，不查外部世界。")
@@ -287,6 +294,8 @@ def critic_questions() -> dict:
                 "只核对【待发送草稿】中可外部核验的具体事实是否有【近期聊天】、【memory】或【tool result】支持。"
                 "角色扮演中风雪自己的日常、感受和小反应不作事实拦截；真实群友的经历和现实行动承诺仍需依据。"
                 "一般建议、观点、带不确定标记的推测及承认纠正都不是具体事实主张。"
+                "概念是什么、东西怎么做、某个说法的来历这类常识性解释不作事实拦截；"
+                "需要依据的是关于群友、刚发生的现实事件、具体数字日期价格行情和工具结论的新增事实。"
                 "纯比喻或玩笑中的非核心近似数字和泛化例子不作事实拦截；"
                 "简短的括号表情、心理反应或玩笑动作（如‘（伸手）’）不作为现实事件核验；"
                 "括号里明确声称已执行的现实行动仍按具体事实核验。"

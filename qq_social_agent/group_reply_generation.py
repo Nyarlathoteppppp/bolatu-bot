@@ -171,7 +171,7 @@ async def generate_group_reply(
                 current_text=text,
                 current_label=current_label,
                 action=decision.action,
-                speaker_context=speaker_context,
+                speaker_context=generation_relation or speaker_context,
                 recent_messages=recent_messages,
                 memory_context=memory_context,
                 tool_context=combine_text_sections(fresh_context, market_context),

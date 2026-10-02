@@ -45,7 +45,10 @@ STAGE_NEED_SECONDS = {
     "speaking_action": 3.0,
     "ask_back": 3.0,
     "optional_rag": 4.0,
-    "critic_retry": 8.0,
+    # The retry is itself a generation, already covered by the generation
+    # reserve; this is only the second critic pass. At 8s the retry needed
+    # 20s left and was skipped on 24 of 27 failures.
+    "critic_retry": 2.0,
 }
 
 

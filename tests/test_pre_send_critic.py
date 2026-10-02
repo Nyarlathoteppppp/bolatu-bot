@@ -234,3 +234,14 @@ def test_addressed_referent_conflict_still_sends_after_retry() -> None:
     assert next_critic_action(failed, attempt=0, addressed=True) == "regenerate"
     assert next_critic_action(failed, attempt=1, addressed=True) == "send"
     assert critic_needs_clarify(failed) is True
+
+
+def test_critic_state_keeps_evidence_the_writer_saw() -> None:
+    from qq_social_agent.pre_send_critic import format_critic_jev_state
+
+    tool = "前文" * 300 + "【S2】Cerebras 盘中下跌 8.18%"
+    state = format_critic_jev_state(
+        draft="Cerebras 跌了 8.18%", current_text="cerebras为什么跌", action="answer", tool_context=tool,
+    )
+    assert "8.18%" in state
+    assert "【风雪设定】" in state
