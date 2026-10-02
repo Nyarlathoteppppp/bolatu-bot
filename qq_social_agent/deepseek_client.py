@@ -15,7 +15,7 @@ from .jev_client import JevClient
 from .llm_gateway import LLMGateway, _log_llm_usage, _usage_value, set_usage_recorder
 from .memory import ChatMessage
 from .persona import Persona
-from .pipeline_types import ContextPacket
+from .pipeline_types import ContextPacket, OutputChannel
 from .prompts import PromptRegistry
 from .timing_gate import TimingDecision, parse_timing_decision
 
@@ -477,12 +477,15 @@ class LLMTaskClient(LLMGateway):
             ),
             what="timing_gate",
         )
-        if jev_timing is not None and not jev_timing.review_required:
-            return jev_timing
         if jev_timing is not None:
-            if random.random() >= getattr(self.config, "interjection_review_probability", 1.0):
-                logger.info("qq_social_agent timing review skipped: reason=opening_sample_skip")
-                return replace(jev_timing, review_required=False, reason="jev_opening_sample_skip")
+            optional_opening = jev_timing.review_required or jev_timing.reason.startswith(
+                ("jev_social_", "jev_observer_social_")
+            )
+            if optional_opening and random.random() >= getattr(self.config, "interjection_probability", 1.0):
+                logger.info("qq_social_agent optional opening skipped: reason=opening_sample_skip")
+                return replace(jev_timing, channel=OutputChannel.SILENT, review_required=False, reason="jev_opening_sample_skip")
+            if not jev_timing.review_required:
+                return jev_timing
             user += (
                 "\nJEV 认为这句有接话机会，但尚未确定要不要参与。"
                 "结合这句具体内容，判断你有没有自己的反应或观点想说，再决定 text 或 silent。"

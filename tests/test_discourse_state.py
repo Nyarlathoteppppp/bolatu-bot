@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import asyncio
 from types import SimpleNamespace
+import pytest
 
 from qq_social_agent.discourse_effects import (
     AmbiguityJudgement,
+    AmbiguityResolution,
     RepairJudgement,
     RepairTarget,
     apply_jev_repair_judgement,
@@ -37,7 +39,7 @@ from qq_social_agent.ellipsis_resolver import (
 )
 from qq_social_agent.memory import ChatMessage
 from qq_social_agent.pre_send_critic import format_critic_jev_state
-from qq_social_agent.reference_resolver import ReferenceResolution, ReplyHint
+from qq_social_agent.reference_resolver import ReferenceResolution, ReferentJudgement, ReplyHint
 from qq_social_agent.resolver_result import AMBIGUOUS, NONE, NOT_APPLICABLE, RESOLVED, UNAVAILABLE
 
 
@@ -681,3 +683,52 @@ def test_resolve_group_discourse_isolates_conflicting_addressee_from_batch() -> 
     assert "ellipsis" not in jev.calls
     assert state.addressee.target_id == P2
     assert state.deixis.status == RESOLVED
+
+
+@pytest.mark.parametrize('status,keeps_ambiguity', [(RESOLVED, False), (AMBIGUOUS, True), (UNAVAILABLE, True)])
+def test_person_ambiguity_cannot_reopen_a_valid_binding(status, keeps_ambiguity) -> None:
+    reference = ReferenceResolution(user_ids=(P2,), kind='PERSON', confidence=0.6, status=status)
+    state = assemble_discourse_state(
+        speaker_id=P1, speaker_label='P1', current_text='你知道他在说什么吗',
+        third_person_referent=reference, ambiguity_effect='BLOCKING',
+        ambiguity_resolution=AmbiguityResolution(kind='PERSON', status=AMBIGUOUS),
+    )
+    assert (state.ambiguity_resolution.kind == 'PERSON') is keeps_ambiguity
+    assert (state.ambiguity == 'BLOCKING') is keeps_ambiguity
+    assert state.reference.status == status
+
+
+def test_resolved_person_does_not_clear_other_missing_information() -> None:
+    reference = ReferenceResolution(user_ids=(P2,), kind='PERSON', confidence=0.9)
+    state = assemble_discourse_state(
+        speaker_id=P1, speaker_label='P1', current_text='帮他选第二个方案',
+        third_person_referent=reference, ambiguity_effect='BLOCKING',
+        ambiguity_resolution=AmbiguityResolution(kind='ITEM', status=AMBIGUOUS),
+    )
+    assert state.ambiguity == 'BLOCKING'
+    assert state.ambiguity_resolution.kind == 'ITEM'
+
+
+def test_real_reply_question_keeps_resolved_he_despite_unresolved_ellipsis() -> None:
+    recent = [
+        _msg(P2, '春天', '有这么好玩的东西怎么不早点教我玩', mid='1', ts=10),
+        _msg(1801507496, '风雪', '哪敢啊，主要是我也刚摸到门道', mid='2', ts=11, is_bot=True),
+        _msg(P1, '奈亚子', '玩', mid='3', ts=12),
+    ]
+    jev = ScriptedJev(
+        referent=ReferentJudgement(kind='PERSON', person_key=f'u{P2}', confidence=0.6),
+        ellipsis=EllipsisJudgement(kind='ITEM_DEIXIS', inherit_from='s1', confidence=0.3),
+        ambiguity=AmbiguityJudgement(kind='PERSON', confidence=0.8),
+    )
+    state = asyncio.run(resolve_group_discourse(
+        current_text='你知道他在说什么吗', current_user_id=P1, current_nickname='奈亚子',
+        self_id=1801507496, recent_messages=recent,
+        reply=ReplyHint(exists=True, author_id=1801507496, author_label='风雪', text=recent[1].text),
+        at_user_ids=(), named_resolver=lambda _: (), jev=jev,
+    ))
+    assert 'ambiguity' in jev.calls
+    assert state.reference.status == RESOLVED
+    assert state.reference.user_ids == (P2,)
+    assert state.ambiguity == 'NONE'
+    assert state.ambiguity_resolution.kind == 'NONE'
+    assert '优先 clarify' not in format_discourse_prompt_block(state)

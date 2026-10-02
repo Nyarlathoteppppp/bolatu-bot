@@ -246,7 +246,8 @@ def test_group_decision_allows_observer_review_without_private_tool_use() -> Non
 
 
 @pytest.mark.parametrize("mode", [PipelineMode.CHAT, PipelineMode.SEARCH])
-def test_group_generation_returns_reviewed_candidate(mode) -> None:
+@pytest.mark.parametrize("needs_retry", [False, True])
+def test_group_generation_returns_reviewed_candidate(mode, needs_retry) -> None:
     candidate = PendingApprovalCandidate(1, "你好", "answer", "自然")
     calls = []
 
@@ -255,6 +256,9 @@ def test_group_generation_returns_reviewed_candidate(mode) -> None:
         return ["你好"]
 
     async def review_draft(**_kwargs):
+        if needs_retry and len(calls) == 1:
+            from qq_social_agent.pre_send_critic import CriticJudgement
+            return None, CriticJudgement(intent_covered="NO", reason="jev_intent_missed")
         return None, None
 
     result = asyncio.run(
@@ -300,6 +304,10 @@ def test_group_generation_returns_reviewed_candidate(mode) -> None:
     assert ("<self_interaction_context>" in calls[0]["speaker_context"]) is (mode is PipelineMode.CHAT)
     assert ("接之前烧烤请客的玩笑" in calls[0]["speaker_context"]) is (mode is PipelineMode.CHAT)
     assert calls[0]["include_bot_history"] is True
+    assert len(calls) == (2 if needs_retry else 1)
+    assert all(call["action"] == "answer" for call in calls)
+    if needs_retry:
+        assert "[critic]" in calls[1]["speaker_context"]
 
 
 def test_market_report_skips_generation_and_enters_approval() -> None:

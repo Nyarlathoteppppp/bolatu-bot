@@ -74,7 +74,7 @@ class LLMConfig:
     model_catalog: tuple[LLMModelRoute, ...]
     usage_tracking_enabled: bool
     reply_peak_routing: ReplyPeakRouting
-    interjection_review_probability: float = 1.0
+    interjection_probability: float = 1.0
 
 
 # Existing callers still use the old name while task code migrates to LLMConfig.
@@ -238,7 +238,7 @@ class AppConfig:
             model_catalog=_model_catalog(deepseek, routes, fallback_routes, providers),
             usage_tracking_enabled=bool(deepseek.get("usage_tracking_enabled", True)),
             reply_peak_routing=reply_peak_routing,
-            interjection_review_probability=float(deepseek.get("interjection_review_probability", 1.0)),
+            interjection_probability=float(deepseek.get("interjection_probability", 1.0)),
         )
         self.deepseek = self.llm
         self.rate = RateConfig(

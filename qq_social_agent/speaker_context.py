@@ -166,11 +166,9 @@ def _format_speaker_reference_context(
     elif reference_resolution.status in {UNAVAILABLE, ERROR}:
         lines.append("- 指代检查不可用，不要把失败当成没有指代，也不要猜人。")
     elif reference_resolution.status == AMBIGUOUS:
-        lines.append("- unresolved_reference=true：确实在指人但后端未能唯一解析；优先 clarify，不确定时不要点名或套用某人画像。")
-        lines.append("- 当前消息含他/她/这个人/那个人等指代，但后端未能唯一解析；不确定时不要点名或套用某人画像。")
+        lines.append("- unresolved_reference=true：人物未唯一解析，不确定时不要点名或套用画像；能从原话理解的内容直接回应，只有回答确实依赖具体身份时才问。")
     elif has_strong_person_reference(current_text) and not reference_resolution.user_ids:
-        lines.append("- unresolved_reference=true：确实在指人但后端未能唯一解析；优先 clarify，不确定时不要点名或套用某人画像。")
-        lines.append("- 当前消息含他/她/这个人/那个人等指代，但后端未能唯一解析；不确定时不要点名或套用某人画像。")
+        lines.append("- unresolved_reference=true：人物未唯一解析，不确定时不要点名或套用画像；能从原话理解的内容直接回应，只有回答确实依赖具体身份时才问。")
     elif str(getattr(reference_resolution, "kind", "")) == "NON_PERSON":
         if ellipsis_resolution is not None and ellipsis_resolution.status == RESOLVED and ellipsis_resolution.source_text:
             lines.append(

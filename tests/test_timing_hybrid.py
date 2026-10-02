@@ -60,7 +60,7 @@ def test_bound_continuation_does_not_need_another_vote():
 @pytest.mark.parametrize('sample,review', [(0.29, True), (0.30, False)])
 def test_sampling_happens_before_llm_and_preserves_reply_angle(monkeypatch, sample, review):
     client = object.__new__(DeepSeekClient)
-    client.config = SimpleNamespace(interjection_review_probability=0.3)
+    client.config = SimpleNamespace(interjection_probability=0.3)
     client.prompts = PromptRegistry()
     client._try_jev = lambda *_args, **_kwargs: asyncio.sleep(0, result=choose())
     monkeypatch.setattr('qq_social_agent.deepseek_client.random.random', lambda: sample)
@@ -85,11 +85,11 @@ def test_sampling_happens_before_llm_and_preserves_reply_angle(monkeypatch, samp
 
 
 @pytest.mark.parametrize('decision', [choose(silent=0.8, social=0.1),
-    choose(to_other=0.95, social=0.9, silent=0.05),
+    choose(looks_like_question=True, wants_answer=0.95, answer=0.9, silent=0.05, social=0.01),
     choose(followup_addressed=True, continue_bot=0.7, silent=0.2)])
 def test_clear_jev_decisions_bypass_sampling_and_llm(monkeypatch, decision):
     client = object.__new__(DeepSeekClient)
-    client.config = SimpleNamespace(interjection_review_probability=0)
+    client.config = SimpleNamespace(interjection_probability=0)
     client.prompts = PromptRegistry()
     client._try_jev = lambda *_args, **_kwargs: asyncio.sleep(0, result=decision)
     def unexpected(*_args, **_kwargs):
@@ -99,3 +99,28 @@ def test_clear_jev_decisions_bypass_sampling_and_llm(monkeypatch, decision):
     result = asyncio.run(client.timing_gate(persona=SimpleNamespace(name='风雪', decision_prompt=''),
         recent_messages=[], current_text='那换个编译器呢', current_nickname='A'))
     assert result is decision
+
+
+@pytest.mark.parametrize('to_other', [0.1, 0.95])
+@pytest.mark.parametrize('sample,speaks', [(0.29, True), (0.30, False)])
+def test_strong_social_openings_are_sampled_after_jev_without_llm(monkeypatch, to_other, sample, speaks):
+    client = object.__new__(DeepSeekClient)
+    client.config = SimpleNamespace(interjection_probability=0.3)
+    client.prompts = PromptRegistry()
+    observed = []
+
+    async def jev(*_args, **_kwargs):
+        observed.append(True)
+        return choose(to_other=to_other, social=0.9, silent=0.05)
+
+    async def unexpected(**_kwargs):
+        raise AssertionError('confident JEV opening needs no LLM timing review')
+
+    client._try_jev = jev
+    client._chat_completion = unexpected
+    monkeypatch.setattr('qq_social_agent.deepseek_client.random.random', lambda: sample)
+    result = asyncio.run(client.timing_gate(persona=SimpleNamespace(name='风雪', decision_prompt=''),
+        recent_messages=[], current_text='AI又给我编了个不存在的API', current_nickname='A'))
+    assert observed == [True]
+    assert (result.channel == OutputChannel.TEXT) == speaks
+    assert not result.review_required

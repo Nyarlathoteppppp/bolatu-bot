@@ -829,6 +829,18 @@ def assemble_discourse_state(
         third_binding = third_person_referent
     else:
         third_binding = _binding_from_reference(reference_res)
+    ambiguity_res = ambiguity_resolution or AmbiguityResolution()
+    if (
+        ambiguity_res.kind == "PERSON"
+        and ambiguity_res.status == AMBIGUOUS
+        and third_binding.status == RESOLVED
+        and third_binding.kind == "PERSON"
+        and third_binding.target_id is not None
+    ):
+        # A generic ambiguity check cannot reopen a valid person binding.
+        # Explicit repairs invalidate that binding before state assembly.
+        ambiguity_res = AmbiguityResolution(reason="resolved_person_binding")
+        ambiguity_effect = "NONE"
     deixis_binding = _binding_from_ellipsis(deixis if deixis is not None else ellipsis_res)
     addressee_binding = addressee or Binding(status=NOT_APPLICABLE)
     overall = RESOLVED
@@ -873,7 +885,7 @@ def assemble_discourse_state(
         reference=reference_res,
         ellipsis=ellipsis_res or EllipsisResolution(),
         repair=repair or RepairResolution(),
-        ambiguity_resolution=ambiguity_resolution or AmbiguityResolution(),
+        ambiguity_resolution=ambiguity_res,
         invalidated_layers=tuple(invalidated_layers),
         recomputed_layers=tuple(recomputed_layers),
     )
@@ -901,9 +913,9 @@ def format_discourse_prompt_block(state: DiscourseState) -> str:
     if state.addressee.status == UNAVAILABLE or state.deixis.status == UNAVAILABLE:
         lines.append("- 有检查结果不可用，不要把 UNAVAILABLE 当成没有指代。")
     if state.ambiguity == "NON_BLOCKING":
-        lines.append("- 候选对象语义一致，不要追问。")
+        lines.append("- 歧义不影响当前回答，不要追问。")
     if state.ambiguity == "BLOCKING":
-        lines.append("- 歧义会改变回答对象或事实，优先 clarify。")
+        lines.append("- 有未解析的信息；只有它会改变当前回答时才澄清，能理解的内容直接接，不必确认每个代词。")
     return "\n".join(lines)
 
 

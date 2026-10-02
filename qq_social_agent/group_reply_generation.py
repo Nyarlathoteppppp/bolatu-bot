@@ -15,7 +15,6 @@ from .pipeline_types import ContextPacket, PipelineMode
 from .pre_send_critic import (
     CriticResult,
     apply_jev_critic_judgement,
-    critic_prefers_clarify,
     format_critic_feedback,
     next_critic_action,
 )
@@ -105,8 +104,6 @@ async def generate_group_reply(
             effective_speaker_context = combine_text_sections(effective_speaker_context, self_interaction_context)
         if critic_feedback:
             effective_speaker_context = combine_text_sections(effective_speaker_context, critic_feedback)
-            if critic_prefers_clarify(critic_result) and attempt > 0:
-                decision = replace(decision, action="clarify")
         try:
             reply_candidates = await client.reply_candidates(
                 persona=persona,
