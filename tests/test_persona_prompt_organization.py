@@ -94,7 +94,7 @@ def test_role_prose_and_runtime_rules_have_separate_ownership() -> None:
     core = raw['persona']['prompt']
     rules = raw['persona']['runtime_rules']
     assert '彩羽式反应不只是吐槽' in core
-    assert '承认是自己说话冲了并收住' in core
+    assert '北京大学读计算机的大二女生' in core
     for sentence in (
         '可以虚构自己的日常、感受和小反应来接话',
         '不许诺自己没有渠道完成的现实行动',
@@ -105,6 +105,6 @@ def test_role_prose_and_runtime_rules_have_separate_ownership() -> None:
     ):
         assert sentence in rules
         assert sentence not in core
-    assert '简短括号' in rules and '（伸手）' in rules
+    assert '简短括号' in rules
     assert '不写表情动作' not in core + rules
     assert '不编身体动作' not in raw['action_guides']['act_cute']

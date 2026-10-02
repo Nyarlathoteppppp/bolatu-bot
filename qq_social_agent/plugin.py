@@ -8010,7 +8010,10 @@ def _format_style_context(rules: list[StyleRule]) -> str:
         for rule in rules
         if _is_useful_style_rule(rule.situation, rule.style, rule.source_text)
     ]
-    return "\n".join(lines)
+    return (
+        "以下是群友的表达参考，自行选择，不规定你的立场或表达顺序。\n" + "\n".join(lines)
+        if lines else ""
+    )
 
 
 def _format_raw_corpus_context(examples: list[RawCorpusExample]) -> str:

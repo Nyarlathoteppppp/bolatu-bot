@@ -84,7 +84,7 @@ llm:
     member_profile: deepseek/deepseek-v4-flash
   thinking: disabled
   usage_tracking_enabled: true
-  interjection_review_probability: 0.70
+  interjection_review_probability: 0.30
   reasoning_effort: high
   temperature: 0.72
   max_tokens: 260

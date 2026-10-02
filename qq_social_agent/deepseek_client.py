@@ -485,7 +485,7 @@ class LLMTaskClient(LLMGateway):
                 return replace(jev_timing, review_required=False, reason="jev_opening_sample_skip")
             user += (
                 "\nJEV 认为这句有接话机会，但尚未确定要不要参与。"
-                "结合这句具体内容，想清楚你能接哪一点，再决定 text 或 silent。"
+                "结合这句具体内容，判断你有没有自己的反应或观点想说，再决定 text 或 silent。"
                 "text 时给出 reply_angle，描述你打算接的具体内容，不写最终回复；"
                 "如果只有泛泛附和、无依据的消息或复读，就 silent。"
                 "当前若在对别人说，只考虑旁观补一句，不替当事人作答、不抢两人的私人约定。"

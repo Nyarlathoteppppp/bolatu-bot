@@ -12,8 +12,8 @@ from qq_social_agent.timing_gate import TimingDecision, choose_jev_group_timing
 
 def choose(**values):
     defaults = dict(looks_like_question=False, followup_addressed=False,
-                    wants_answer=0.1, to_other=0.1, silent=0.35,
-                    answer=0.1, continue_bot=0.1, social=0.4, other=0.05)
+                    wants_answer=0.1, to_other=0.1, silent=0.3,
+                    answer=0.1, continue_bot=0.1, social=0.5, other=0.05)
     return choose_jev_group_timing(**(defaults | values))
 
 
@@ -32,6 +32,22 @@ def test_other_addressee_can_have_observer_opening():
     assert private.channel == OutputChannel.SILENT and not private.review_required
 
 
+@pytest.mark.parametrize('to_other', [0.1, 0.9])
+def test_weak_top_choice_is_not_worth_an_llm_call(to_other):
+    weak = choose(to_other=to_other, social=0.4, silent=0.3)
+    assert weak.channel == OutputChannel.SILENT
+    assert not weak.review_required
+    worthwhile = choose(to_other=to_other, social=0.5, silent=0.3)
+    assert worthwhile.review_required
+
+
+def test_confident_observer_opening_goes_straight_to_generation():
+    strong = choose(to_other=0.95, social=0.9, silent=0.05)
+    assert strong.channel == OutputChannel.TEXT
+    assert not strong.review_required
+    assert strong.to_reply_decision().action == 'reply'
+
+
 def test_bound_continuation_does_not_need_another_vote():
     continuation = choose(followup_addressed=True, continue_bot=0.55, silent=0.3,
                           social=0.1, other=0.025, answer=0.025)
@@ -41,10 +57,10 @@ def test_bound_continuation_does_not_need_another_vote():
                   social=0.1).channel == OutputChannel.SILENT
 
 
-@pytest.mark.parametrize('sample,review', [(0.69, True), (0.70, False)])
+@pytest.mark.parametrize('sample,review', [(0.29, True), (0.30, False)])
 def test_sampling_happens_before_llm_and_preserves_reply_angle(monkeypatch, sample, review):
     client = object.__new__(DeepSeekClient)
-    client.config = SimpleNamespace(interjection_review_probability=0.7)
+    client.config = SimpleNamespace(interjection_review_probability=0.3)
     client.prompts = PromptRegistry()
     client._try_jev = lambda *_args, **_kwargs: asyncio.sleep(0, result=choose())
     monkeypatch.setattr('qq_social_agent.deepseek_client.random.random', lambda: sample)
@@ -69,6 +85,7 @@ def test_sampling_happens_before_llm_and_preserves_reply_angle(monkeypatch, samp
 
 
 @pytest.mark.parametrize('decision', [choose(silent=0.8, social=0.1),
+    choose(to_other=0.95, social=0.9, silent=0.05),
     choose(followup_addressed=True, continue_bot=0.7, silent=0.2)])
 def test_clear_jev_decisions_bypass_sampling_and_llm(monkeypatch, decision):
     client = object.__new__(DeepSeekClient)

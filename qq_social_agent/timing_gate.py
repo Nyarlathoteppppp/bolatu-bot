@@ -11,6 +11,7 @@ from .jev_policy import (
     JEV_TIMING_SEMANTIC_REQUEST_MIN,
     JEV_TIMING_SOCIAL_CHOICE_MIN,
     JEV_TIMING_SOCIAL_SILENT_MAX,
+    JEV_TIMING_REVIEW_CHOICE_MIN,
     JEV_TIMING_TO_OTHER_MIN,
 )
 from .pipeline_types import OutputChannel, SocialIntent
@@ -79,7 +80,13 @@ def choose_jev_group_timing(
 ) -> TimingDecision:
     """Apply group speaking policy to provider observations."""
     if to_other >= JEV_TIMING_TO_OTHER_MIN:
-        if social > max(silent, answer, continue_bot, other):
+        if social >= JEV_TIMING_SOCIAL_CHOICE_MIN and social > max(silent, answer, continue_bot, other):
+            return TimingDecision(
+                channel=OutputChannel.TEXT,
+                confidence=social,
+                reason=f"jev_observer_social_{social:.2f}",
+            )
+        if social >= JEV_TIMING_REVIEW_CHOICE_MIN and social > max(silent, answer, continue_bot, other):
             return TimingDecision(
                 channel=OutputChannel.SILENT,
                 confidence=social,
@@ -120,8 +127,9 @@ def choose_jev_group_timing(
             confidence=social,
             reason=f"jev_social_{social:.2f}",
         )
-    if social > max(silent, answer, continue_bot, other) or (
+    if (social >= JEV_TIMING_REVIEW_CHOICE_MIN and social > max(silent, answer, continue_bot, other)) or (
         wants_answer >= JEV_TIMING_ANSWER_INTENT_MIN
+        and answer >= JEV_TIMING_REVIEW_CHOICE_MIN
         and answer > max(silent, social, continue_bot, other)
     ):
         return TimingDecision(
