@@ -197,6 +197,83 @@ def _format_speaker_reference_context(
     return "\n".join(lines)
 
 
+def format_generation_relation(
+    *,
+    current_user_id: int,
+    current_nickname: str,
+    recent_messages: list[ChatMessage],
+    facts: MessageRelationFacts,
+    discourse_state: DiscourseState,
+    followup_soft: bool,
+    self_id: int,
+) -> str:
+    """The resolved discourse state in plain words for the reply writer.
+
+    Decision, critic and Jev keep the full rule/field view; the writer only
+    needs the facts, and every extra prohibition makes a strong instruction
+    follower stiffer.
+    """
+    state = discourse_state
+    lines = [f"说话人：{facts.current_label}"]
+    addressee = state.addressee
+    to_other = (
+        addressee.status == RESOLVED
+        and addressee.target_id is not None
+        and int(addressee.target_id) not in {int(self_id), int(current_user_id)}
+    )
+    if facts.target_scope == "reply_to_bot":
+        lines.append("对象：在回复你之前说的话。")
+    elif facts.target_scope == "reply_to_other_mentions_bot":
+        lines.append(f"对象：在回复 {facts.reply_target_label}，顺带提到了你。")
+    elif facts.target_scope == "mention_bot":
+        lines.append("对象：在叫你。")
+    elif facts.target_scope == "followup_bot":
+        lines.append("对象：刚和你聊过，这句多半还在接着跟你说；看内容不像就别硬接。")
+    elif to_other:
+        lines.append(f"对象：在对 {addressee.target} 说，不是对你。你是旁观插一句，别替 {addressee.target} 回答。")
+    else:
+        lines.append("对象：群里随口说的，没有特定对象；你是自然插话。")
+        if followup_soft:
+            lines.append("你刚和他聊过，但这句不是在接你的话。")
+    if not facts.addressed_bot:
+        lines.append("没人在问你，插话就直接说你的反应，不反问、不追问。")
+
+    reference = state.reference
+    if reference.status == RESOLVED and reference.user_ids:
+        labels = _labels_for_user_ids(
+            reference.user_ids,
+            recent_messages,
+            current_user_id=current_user_id,
+            current_nickname=current_nickname,
+            self_id=self_id,
+        )
+        if labels:
+            lines.append(f"句里的「他/她/这人」指：{'、'.join(labels)}。")
+    elif reference.status in {UNAVAILABLE, ERROR}:
+        lines.append("人称指代没查出来，别点名说是谁。")
+    if state.deixis.status == RESOLVED and state.deixis.target_text:
+        lines.append(f"「这个/那个」指：{_short_notice_text(state.deixis.target_text, 80)}")
+    elif state.ellipsis.status == RESOLVED and state.ellipsis.source_text:
+        lines.append(f"省略的部分接的是：{_short_notice_text(state.ellipsis.source_text, 80)}")
+    repair = state.repair
+    if repair.status == RESOLVED and (repair.replacement_item or repair.replacement_user_ids):
+        replacement = repair.replacement_item or "、".join(
+            _labels_for_user_ids(
+                repair.replacement_user_ids,
+                recent_messages,
+                current_user_id=current_user_id,
+                current_nickname=current_nickname,
+                self_id=self_id,
+            )
+        )
+        lines.append(f"他在纠正前面的说法，现在指的是：{replacement}")
+    if state.ambiguity == "BLOCKING" or reference.status == AMBIGUOUS:
+        lines.append("有一处指代不确定；按原话能理解就直接接，只有答案真取决于它时才简短问一句。")
+    if not state.media_present and state.deixis.status in {AMBIGUOUS, UNAVAILABLE, ERROR}:
+        lines.append("这条和它回复的消息里都没有图片或链接，别找人要图。")
+    return "\n".join(lines)
+
+
 def _extract_reply_relation(text: str) -> tuple[str, str] | None:
     match = REPLY_RELATION_RE.search(text)
     if not match:

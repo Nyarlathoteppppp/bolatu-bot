@@ -8,16 +8,19 @@ from .pipeline_types import ContextPacket, ContextSection, PipelineMode
 STRUCTURED_RAG_TYPES = frozenset({"memory_atom", "member"})
 
 _MODE_SECTION_BUDGETS: dict[PipelineMode, dict[str, int]] = {
+    # Sized for a strong instruction follower: background evidence stays, but
+    # style crutches (corpus quotes, style rules) are kept short so they flavour
+    # the reply instead of being imitated.
     PipelineMode.CHAT: {
-        "memory": 2200,
-        "memory_atoms": 1200,
-        "member": 1000,
-        "jargon": 700,
-        "recall_feedback": 700,
-        "positive_feedback": 600,
-        "style": 700,
-        "raw_corpus": 1500,
-        "social_actions": 500,
+        "memory": 1600,
+        "memory_atoms": 900,
+        "member": 800,
+        "jargon": 600,
+        "recall_feedback": 500,
+        "positive_feedback": 300,
+        "style": 400,
+        "raw_corpus": 600,
+        "social_actions": 300,
     },
     # Fresh facts must not be overridden by old chat summaries or style
     # examples. The recent message window and the fresh fact pack are supplied
@@ -29,7 +32,7 @@ _MODE_SECTION_BUDGETS: dict[PipelineMode, dict[str, int]] = {
 }
 
 _MODE_TOTAL_BUDGETS: dict[PipelineMode, int] = {
-    PipelineMode.CHAT: 6500,
+    PipelineMode.CHAT: 4500,
     PipelineMode.SEARCH: 500,
     PipelineMode.MARKET: 500,
     PipelineMode.DEEP_URL: 500,

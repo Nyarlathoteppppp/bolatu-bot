@@ -56,6 +56,8 @@ from .image_read_state import resolved_image_message
 MAX_DEIXIS_CANDIDATES = 8
 MAX_LOGICAL_GAP_SECONDS = 90.0
 SAME_SPEAKER_BURST = 3
+SPEAKER_CONTINUATION_WINDOW_SECONDS = 45.0
+_CQ_REPLY_ID_RE = re.compile(r"\[CQ:reply,id=(-?\d+)")
 REAL_MEDIA_TYPES = frozenset({"image", "file", "video"})
 URL_RE = re.compile(r"https?://[^\s<>\"']+", re.IGNORECASE)
 MEDIA_ASK_RE = re.compile(
@@ -329,6 +331,59 @@ def build_addressee_candidates(
     add(AddresseeCandidate(key="generic", user_id=None, label="群里泛说/没有特定对象", source="generic"))
     add(AddresseeCandidate(key="other", user_id=None, label="以上均不符合或无法判断", source="other"))
     return rows
+
+
+def _explicit_addressee_of(message: object, by_source_id: dict[str, object]) -> int | None:
+    """The person a stored message @-ed or QQ-replied to, if it named one."""
+    try:
+        segments = json.loads(getattr(message, "message_segments_json", "") or "[]")
+    except ValueError:
+        segments = []
+    for segment in segments if isinstance(segments, list) else []:
+        segment_type, data = segment_type_and_data(segment)
+        qq = str(data.get("qq") or "").strip()
+        if segment_type == "at" and qq.isdigit():
+            return int(qq)
+    match = _CQ_REPLY_ID_RE.search(getattr(message, "raw_message_json", "") or "")
+    quoted = by_source_id.get(match.group(1)) if match else None
+    if quoted is not None:
+        return int(getattr(quoted, "user_id", 0) or 0) or None
+    return None
+
+
+def continued_addressee(
+    recent_messages: Iterable[object],
+    *,
+    current_user_id: int,
+    self_id: int,
+    now: float,
+    window_seconds: float = SPEAKER_CONTINUATION_WINDOW_SECONDS,
+) -> tuple[int | None, str]:
+    """An untargeted follow-up keeps the person the speaker's own burst addressed.
+
+    Only an unbroken run of the same speaker counts: anyone else speaking, the
+    bot speaking, or a pause longer than the window ends the run.
+    """
+    messages = tuple(recent_messages)
+    by_source_id = {
+        str(getattr(message, "source_message_id", "") or ""): message
+        for message in messages
+        if getattr(message, "source_message_id", "")
+    }
+    newer_at = float(now)
+    for message in reversed(messages):
+        if getattr(message, "is_bot", False) or int(getattr(message, "user_id", 0) or 0) != int(current_user_id):
+            return None, ""
+        created_at = float(getattr(message, "created_at", 0.0) or 0.0)
+        if newer_at - created_at > window_seconds:
+            return None, ""
+        target = _explicit_addressee_of(message, by_source_id)
+        if target is not None:
+            if target in {int(self_id), int(current_user_id)}:
+                return None, ""
+            return target, _member_label(target, _nickname_for(target, messages))
+        newer_at = created_at
+    return None, ""
 
 
 def addressee_choice_criteria(candidates: Iterable[AddresseeCandidate]) -> dict[str, str]:
@@ -1139,6 +1194,22 @@ async def resolve_group_discourse(
             target=row.label,
             target_id=row.user_id,
             reason="single_at",
+            value=str(row.user_id),
+            kind="PERSON",
+        )
+    elif (
+        (reply is None or not reply.exists)
+        and explicit_addressee_rows
+        and all(row.source == "previous_addressee" for row in explicit_addressee_rows)
+    ):
+        row = explicit_addressee_rows[0]
+        direct_addressee = Binding(
+            status=RESOLVED,
+            source=SOURCE_RULE,
+            confidence=0.9,
+            target=row.label,
+            target_id=row.user_id,
+            reason="speaker_continuation",
             value=str(row.user_id),
             kind="PERSON",
         )

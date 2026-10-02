@@ -534,6 +534,7 @@ def test_discourse_stage_returns_single_state_and_speaker_context(monkeypatch) -
             followup_addressed=False,
             followup_soft=False,
             source_message_id="m1",
+            current_at=0.0,
             client=object(),
             memory=object(),
             rag_service=SimpleNamespace(resolve_named_user_ids=lambda *_: ()),

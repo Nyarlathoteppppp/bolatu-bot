@@ -24,7 +24,7 @@
 
 没有文字段的历史入库消息不从引用包装文本推断语气；其 `text_provenance` 为 `unavailable`。字面类别不是心理判断，结构中不保存推测情绪、亲密度、校园经历或待办承诺。
 
-格式化数据附入已有 `speaker_context`，沿现有调用传给决策、动作选择、回复生成和 critic。没有新增模型请求，没有重写角色卡，没有新增定时发言。
+格式化数据附入已有 `speaker_context`，沿现有调用传给决策、动作选择和 critic。回复生成不读这份 JSON，改用 `format_generation_relation()` 从同一个 `DiscourseState` 渲染的白话关系摘要，以及可读化的 `<self_interaction_context>`。没有新增模型请求，没有重写角色卡，没有新增定时发言。
 
 ## 生命周期与验证
 

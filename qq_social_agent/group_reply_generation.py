@@ -74,6 +74,7 @@ async def generate_group_reply(
     pinned_source_ids: set[str] | None = None,
     pinned_db_ids: set[int] | None = None,
     self_interaction_context: str = "",
+    generation_relation: str = "",
 ) -> GeneratedGroupReply | None:
     tool_answer_mode = mode in {
         PipelineMode.SEARCH,
@@ -95,10 +96,12 @@ async def generate_group_reply(
     critic_result = None
     approval_candidates: list[PendingApprovalCandidate] = []
     for attempt in range(2):
-        effective_speaker_context = speaker_context
+        # The writer gets the plain-words relation view; the critic below still
+        # reviews against the full speaker_context.
+        effective_speaker_context = generation_relation or speaker_context
         if decision.reply_angle and not tool_answer_mode:
             effective_speaker_context = combine_text_sections(
-                effective_speaker_context, "【本轮接话方向】\n" + decision.reply_angle,
+                effective_speaker_context, "你打算接的点：" + decision.reply_angle,
             )
         if self_interaction_context and not tool_answer_mode:
             effective_speaker_context = combine_text_sections(effective_speaker_context, self_interaction_context)

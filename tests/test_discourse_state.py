@@ -23,6 +23,7 @@ from qq_social_agent.discourse_state import (
     build_addressee_candidates,
     build_deixis_candidates,
     classify_ambiguity_effect,
+    continued_addressee,
     discourse_decision_trace,
     draft_violates_media_gate,
     format_discourse_prompt_block,
@@ -541,6 +542,59 @@ def test_reply_only_addressee_is_bound_without_jev() -> None:
     assert state.addressee.confidence == 1.0
     assert state.addressee.reason == "single_reply"
     assert "addressee" not in jev.calls
+
+
+def _at_segments(user_id: int, text: str) -> str:
+    return (
+        f'[{{"type":"at","data":{{"qq":"{user_id}"}}}},'
+        f'{{"type":"text","data":{{"text":" {text}"}}}}]'
+    )
+
+
+def test_untargeted_follow_up_keeps_addressee_of_own_burst() -> None:
+    history = [
+        _msg(P2, "P2", "早上好", mid="0", ts=1.0),
+        _msg(P1, "P1", "有好玩的怎么不早点教我", mid="1", ts=100.0, segments=_at_segments(A, "有好玩的怎么不早点教我")),
+    ]
+    assert continued_addressee(history, current_user_id=P1, self_id=1801507496, now=106.0) == (A, f"{A}[#{str(A)[-5:]}]")
+
+    state = asyncio.run(
+        resolve_group_discourse(
+            current_text="偷偷玩不带我",
+            current_user_id=P1,
+            current_nickname="P1",
+            self_id=1801507496,
+            recent_messages=history,
+            named_resolver=lambda _text: (),
+            jev=ScriptedJev(addressee=AddresseeJudgement("generic", 0.99)),
+            previous_addressee_id=A,
+            previous_addressee_label=_label(A, "A"),
+        )
+    )
+    assert state.addressee.status == RESOLVED
+    assert state.addressee.target_id == A
+    assert state.addressee.reason == "speaker_continuation"
+
+
+def test_continued_addressee_breaks_on_other_speaker_bot_or_pause() -> None:
+    addressed = _msg(P1, "P1", "在吗", mid="1", ts=100.0, segments=_at_segments(A, "在吗"))
+    assert continued_addressee(
+        [addressed, _msg(P2, "P2", "插一句", mid="2", ts=101.0)],
+        current_user_id=P1, self_id=1801507496, now=102.0,
+    ) == (None, "")
+    assert continued_addressee(
+        [addressed, _msg(1801507496, "风雪", "我在", mid="2", ts=101.0, is_bot=True)],
+        current_user_id=P1, self_id=1801507496, now=102.0,
+    ) == (None, "")
+    assert continued_addressee([addressed], current_user_id=P1, self_id=1801507496, now=200.0) == (None, "")
+    to_bot = _msg(P1, "P1", "风雪在吗", mid="3", ts=100.0, segments=_at_segments(1801507496, "在吗"))
+    assert continued_addressee([to_bot], current_user_id=P1, self_id=1801507496, now=101.0) == (None, "")
+
+
+def test_continued_addressee_follows_qq_reply_target() -> None:
+    quoted = _msg(B, "B", "我先睡了", mid="9", ts=90.0)
+    reply = ChatMessage(1, P1, "P1", "晚安", False, 100.0, source_message_id="10", raw_message_json='{"raw_message":"[CQ:reply,id=9]晚安"}')
+    assert continued_addressee([quoted, reply], current_user_id=P1, self_id=1801507496, now=105.0)[0] == B
 
 
 def test_self_reply_is_not_bound_as_addressing_self() -> None:

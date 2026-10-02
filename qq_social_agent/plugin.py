@@ -5007,6 +5007,7 @@ async def _handle_group_message_locked(
         followup_addressed=followup_addressed,
         followup_soft=followup_soft,
         source_message_id=source_message_id,
+        current_at=event_at,
         client=deepseek_client,
         memory=memory,
         rag_service=rag_service,
@@ -5015,9 +5016,11 @@ async def _handle_group_message_locked(
     )
     discourse_state = discourse_context.state
     speaker_context = discourse_context.speaker_context
+    generation_relation = discourse_context.generation_relation
     image_context = await _resolved_image_context(bot, discourse_state, context_recent, group_id=group_id)
     if image_context:
         speaker_context = _combine_text_sections(speaker_context, image_context)
+        generation_relation = _combine_text_sections(generation_relation, image_context)
         # Keep the same history snapshot and identities, replacing only the
         # image observations that became ready during resolution.
         recent = memory.images.enrich(recent)
@@ -5362,6 +5365,7 @@ async def _handle_group_message_locked(
             _owner_user_tone_context(user_id),
         ),
         speaker_context=speaker_context,
+        generation_relation=generation_relation,
         memory_context=memory_context,
         reference_resolution=reference_resolution,
         ellipsis_resolution=ellipsis_resolution,

@@ -74,6 +74,40 @@ def semantic_message_text(text: str) -> str:
     return current or value
 
 
+_ENVELOPE_HEAD_RE = re.compile(r"^(?P<speaker>.+?\[#\d+\])回复(?P<target>.+?\[#\d+\])$")
+
+
+@dataclass(frozen=True)
+class ReplyEnvelope:
+    speaker: str
+    target: str
+    quoted: str
+    reply: str
+
+
+def parse_reply_envelope(text: str) -> ReplyEnvelope | None:
+    """Split the stored `A回复B消息【B说：…；A回复B：…】` wrapper into its parts."""
+    value = str(text or "").strip()
+    marker = value.find("消息【")
+    if marker <= 0 or not value.endswith("】"):
+        return None
+    head = _ENVELOPE_HEAD_RE.match(value[:marker])
+    if head is None:
+        return None
+    speaker, target = head.group("speaker"), head.group("target")
+    body = value[marker + 3 : -1]
+    separator = f"；{speaker}回复{target}："
+    split_at = body.rfind(separator)
+    if split_at < 0:
+        return None
+    quoted = body[:split_at]
+    if quoted.startswith(f"{target}说："):
+        quoted = quoted[len(target) + 2 :]
+    elif quoted.startswith(f"{target}原消息内容未知"):
+        quoted = ""
+    return ReplyEnvelope(speaker, target, quoted.strip(), body[split_at + len(separator) :].strip())
+
+
 @dataclass(frozen=True)
 class EllipsisSource:
     key: str

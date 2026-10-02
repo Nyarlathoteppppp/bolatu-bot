@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Callable
 from nonebot import logger
 
 from .config import LLMConfig
+from .ellipsis_resolver import parse_reply_envelope
 from .generation_message_context import select_generation_messages, shortlist_older_messages
 from .jev_client import JevClient
 from .llm_gateway import LLMGateway, _log_llm_usage, _usage_value, set_usage_recorder
@@ -461,8 +462,8 @@ class LLMTaskClient(LLMGateway):
             chat_label=chat_label,
             speaker_context_section=_optional_section("本轮说话关系", speaker_context),
             context=context,
-            current_nickname=current_nickname,
-            current_text=current_text,
+            current_nickname=_render_utterance(current_nickname, current_text)[0],
+            current_text=_render_utterance(current_nickname, current_text)[1],
         )
         jev_timing = await self._try_jev(
             lambda: self.jev_client.timing_gate(
@@ -865,9 +866,9 @@ class LLMTaskClient(LLMGateway):
         if not context:
             context = "（暂无更多上下文）"
         mode = (
-            "你被直接点名或回复，要回应当前这句话。认真提问先回答；玩笑或离谱设定按聊天来接，不必给建议。"
+            "有人在跟你说话，回应这一句：认真问题先回答，玩笑就按玩笑接。"
             if mentioned
-            else "你是自然插话，只能在合适时短句接话。"
+            else "没人叫你，你是自己插一句，短一点。"
         )
         normalized_action = _normalize_action(action, should_reply=True)
         action_guide = self.prompts.action_guide(
@@ -908,9 +909,10 @@ class LLMTaskClient(LLMGateway):
             priority_context_section=_optional_section("私聊优先级", priority_context),
             market_section=market_section,
             fresh_section=fresh_section,
-            current_nickname=current_nickname,
-            current_text=current_text,
+            current_nickname=_render_utterance(current_nickname, current_text)[0],
+            current_text=_render_utterance(current_nickname, current_text)[1],
         )
+        user = re.sub(r"\n{3,}", "\n\n", user)
         request = {
             "max_tokens": self.config.max_tokens,
             "messages": [
@@ -1123,9 +1125,9 @@ class LLMTaskClient(LLMGateway):
         if not context:
             context = "（暂无更多上下文）"
         mode = (
-            "你被直接点名或回复，要回应当前这句话。认真提问先回答；玩笑或离谱设定按聊天来接，不必给建议。"
+            "有人在跟你说话，回应这一句：认真问题先回答，玩笑就按玩笑接。"
             if mentioned
-            else "你是自然插话，只能在合适时短句接话。"
+            else "没人叫你，你是自己插一句，短一点。"
         )
         normalized_action = _normalize_action(action, should_reply=True)
         action_guide = self.prompts.action_guide(
@@ -1163,15 +1165,37 @@ class LLMTaskClient(LLMGateway):
             priority_context_section=_optional_section("最高优先级语气要求", priority_context),
             market_section=market_section,
             fresh_section=fresh_section,
-            current_nickname=current_nickname,
-            current_text=current_text,
+            current_nickname=_render_utterance(current_nickname, current_text)[0],
+            current_text=_render_utterance(current_nickname, current_text)[1],
             candidate_count=candidate_count,
         )
+        user = re.sub(r"\n{3,}", "\n\n", user)
+        logger.info(
+            "qq_social_agent reply prompt chars: "
+            f"flow={prompt_flow} system={len(system)} user={len(user)} context={len(context)} "
+            f"relation={len(speaker_context)} "
+            + " ".join(
+                f"{name}={len(value)}"
+                for name, value in (
+                    ("memory", memory_context),
+                    ("member", member_context),
+                    ("atoms", memory_atoms_context),
+                    ("style", style_context),
+                    ("corpus", raw_corpus_context),
+                    ("jargon", jargon_context),
+                    ("feedback", recall_feedback_context + positive_feedback_context),
+                    ("fresh", fresh_context + market_context),
+                )
+                if value
+            )
+        )
         request = {
+            # Responses-API reasoning tokens count against this cap, so a
+            # one-line reply still needs headroom beyond its visible text.
             "max_tokens": (
                 180
                 if search_reply
-                else max(self.config.max_tokens, 320)
+                else max(self.config.max_tokens, 640)
                 if direct_reply
                 else max(self.config.max_tokens, 900)
             ),
@@ -1404,7 +1428,28 @@ class LLMTaskClient(LLMGateway):
 
 def _format_message(msg: ChatMessage) -> str:
     speaker = "风雪" if msg.is_bot else _speaker_label(msg.user_id, msg.nickname)
-    return f"{speaker}: {msg.text}"
+    speaker, text = _render_utterance(speaker, msg.text)
+    return f"{speaker}: {text}"
+
+
+_BOT_LABEL_ALIASES = ("张风雪", "风雪")
+
+
+def _render_utterance(label: str, text: str) -> tuple[str, str]:
+    """Show a QQ reply as `A（回复 B「原话」）: 正文` instead of the stored wrapper.
+
+    The wrapper repeats both labels three times; models then read nicknames as
+    message content. Storage keeps the wrapper because resolvers parse it.
+    """
+    envelope = parse_reply_envelope(text)
+    if envelope is None:
+        return label, text
+    target = "风雪" if any(alias in envelope.target for alias in _BOT_LABEL_ALIASES) else envelope.target
+    quoted = re.sub(r"\s+", " ", envelope.quoted)
+    if len(quoted) > 40:
+        quoted = quoted[:39] + "…"
+    cue = f"「{quoted}」" if quoted else ""
+    return f"{label}（回复 {target}{cue}）", envelope.reply or "（空）"
 
 
 def _format_learning_source_message(msg: ChatMessage) -> str:
@@ -1451,10 +1496,8 @@ def _append_recent_bot_duplicate_guard(context: str, recent_bot_replies: tuple[s
         return context
     lines = "\n".join(f"- {text}" for text in recent_bot_replies)
     guard = (
-        "【风雪刚刚发过的话（只用于查重，禁止复用措辞或核心答案）】\n"
-        f"{lines}\n"
-        "如果不同群友连续问同一种模板问题，必须按当前这个人分别回答；"
-        "不要把刚给别人的人名、结论或包袱机械再给一次。"
+        "【风雪刚发过的话：别再用这些措辞和包袱；不同人问同类问题，按当前这个人重新回答】\n"
+        f"{lines}"
     )
     return f"{context}\n\n{guard}" if context else guard
 
@@ -1481,8 +1524,7 @@ def _format_context_with_local_focus(
         older_block = "\n".join(formatter(msg) for msg in older)
         sections.append(f"<older_messages>\n{older_block}\n</older_messages>")
     local_block = (
-        "【紧邻当前消息的连续话题（最高优先级）：解释‘这/那/太可怕了/是吧’等省略表达时，"
-        "必须优先承接下面这些消息，禁止跨越话题断点拼接旧词】\n"
+        "【紧邻当前消息的连续话题；「这/那/是吧」这类省略先从这里接，别跨过话题断点拼旧词】\n"
         + "\n".join(formatter(msg) for msg in local)
     )
     sections.append(f"<current_topic>\n{local_block}\n</current_topic>")

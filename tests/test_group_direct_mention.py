@@ -57,7 +57,7 @@ def test_direct_mention_reaches_generation_and_excludes_current_message(
     monkeypatch.setattr(plugin, "_resolved_image_context",
                         lambda *_args, **_kwargs: asyncio.sleep(0, result=""))
     monkeypatch.setattr(plugin, "resolve_group_discourse_context", lambda **_: asyncio.sleep(0, result=SimpleNamespace(
-        state=DiscourseState(), speaker_context="", memory_effect=None,
+        state=DiscourseState(), speaker_context="", generation_relation="", memory_effect=None,
         memory_candidate=None, invalidated_layers=[], recomputed_layers=[],
     )))
 

@@ -878,7 +878,7 @@ def test_reply_direct_uses_direct_prompt_and_one_candidate() -> None:
 
     assert [candidate.text for candidate in candidates] == ["风雪觉得这句可以接一下"]
     assert captured_calls[0][0:2] == ("reply_direct", "reply")
-    assert captured_calls[0][2]["max_tokens"] == 320
+    assert captured_calls[0][2]["max_tokens"] == 640
     system_prompt = captured_calls[0][2]["messages"][0]["content"]
     user_prompt = captured_calls[0][2]["messages"][1]["content"]
     assert "只生成 1 条" in system_prompt

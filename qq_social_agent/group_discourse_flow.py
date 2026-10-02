@@ -11,19 +11,29 @@ from .discourse_effects import (
     related_memories_for_candidate,
     should_ask_jev_memory_effect,
 )
-from .discourse_state import DiscourseState, discourse_decision_trace, resolve_group_discourse
+from .discourse_state import (
+    DiscourseState,
+    continued_addressee,
+    discourse_decision_trace,
+    resolve_group_discourse,
+)
 from .member_context import related_member_user_ids as _related_member_user_ids
 from .memory import ChatMessage, MemoryStore
 from .rag_retriever import RAGService
 from .reference_resolver import ReplyHint
 from .resolver_result import AMBIGUOUS, ERROR, NOT_APPLICABLE, RESOLVED, UNAVAILABLE
-from .speaker_context import _format_speaker_reference_context, _message_relation_facts
+from .speaker_context import (
+    _format_speaker_reference_context,
+    _message_relation_facts,
+    format_generation_relation,
+)
 
 
 @dataclass(frozen=True)
 class GroupDiscourseContext:
     state: DiscourseState
     speaker_context: str
+    generation_relation: str
     memory_effect: MemoryEffectResolution
     memory_candidate: MemoryCandidate | None
     invalidated_layers: list[str]
@@ -49,6 +59,7 @@ async def resolve_group_discourse_context(
     followup_addressed: bool,
     followup_soft: bool,
     source_message_id: str,
+    current_at: float,
     client: DeepSeekClient,
     memory: MemoryStore,
     rag_service: RAGService,
@@ -57,6 +68,12 @@ async def resolve_group_discourse_context(
 ) -> GroupDiscourseContext:
     related_member_user_ids = _related_member_user_ids(recent_messages, current_user_id=user_id)
     named_resolver = lambda candidate: rag_service.resolve_named_user_ids(group_id, candidate)
+    previous_addressee_id, previous_addressee_label = continued_addressee(
+        recent_messages,
+        current_user_id=user_id,
+        self_id=self_id,
+        now=current_at,
+    )
     discourse_state = await resolve_group_discourse(
         current_text=normalized_text,
         current_user_id=user_id,
@@ -70,6 +87,8 @@ async def resolve_group_discourse_context(
         current_has_media=current_has_media,
         reply_has_media=reply_has_media,
         relation_user_ids=related_member_user_ids,
+        previous_addressee_id=previous_addressee_id,
+        previous_addressee_label=previous_addressee_label,
     )
     reference_resolution = discourse_state.reference
     ellipsis_resolution = discourse_state.ellipsis
@@ -172,6 +191,15 @@ async def resolve_group_discourse_context(
         ambiguity_resolution=ambiguity_resolution,
         discourse_state=discourse_state,
     )
+    generation_relation = format_generation_relation(
+        current_user_id=user_id,
+        current_nickname=nickname,
+        recent_messages=recent_messages,
+        facts=relation_facts,
+        discourse_state=discourse_state,
+        followup_soft=followup_soft,
+        self_id=self_id,
+    )
     record_metric_event(
         "discourse_decision_trace",
         group_id=group_id,
@@ -225,6 +253,7 @@ async def resolve_group_discourse_context(
     return GroupDiscourseContext(
         state=discourse_state,
         speaker_context=speaker_context,
+        generation_relation=generation_relation,
         memory_effect=memory_effect_resolution,
         memory_candidate=memory_candidate,
         invalidated_layers=invalidated_layers,
