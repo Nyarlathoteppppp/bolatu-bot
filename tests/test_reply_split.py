@@ -56,4 +56,17 @@ def test_split_comma_only_reply_below_model_character_limit() -> None:
 
     assert len(text) < 120
     assert len(parts) >= 2
-    assert "".join(parts) == text
+    # Split points drop the dangling comma but lose no content.
+    assert "，".join(parts) == text
+
+
+def test_clause_split_does_not_leave_a_dangling_comma() -> None:
+    from qq_social_agent.reply_splitter import split_reply_messages
+
+    text = (
+        "82% 服从率就是测它听指令办事的通过率，日常玩或者单次任务完全够用；但剩下那 18% 是随机翻车，"
+        "真拿去跑批量自动化就不稳了，最好拿你自己的场景实测一下，别只看平均数"
+    )
+    parts = split_reply_messages(text, max_messages=2)
+    assert len(parts) == 2
+    assert not parts[0].endswith(("，", "；", ","))

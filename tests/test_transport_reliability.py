@@ -226,6 +226,7 @@ def test_scheduler_enablement_stays_in_plugin_adapter(monkeypatch):
 def test_reconnect_notice_has_cooldown_but_manual_switch_does_not(monkeypatch, tmp_path):
     monkeypatch.setattr(plugin, "memory", MemoryStore(tmp_path / "bot.sqlite3"))
     monkeypatch.setattr(plugin, "_approval_user_ids", lambda: [200])
+    monkeypatch.setattr(plugin, "_approval_review_enabled", lambda: True)
     calls = []
     async def send(*args, **kwargs):
         calls.append(kwargs)
@@ -235,6 +236,19 @@ def test_reconnect_notice_has_cooldown_but_manual_switch_does_not(monkeypatch, t
             await plugin._send_approval_rules_to_approvers(SimpleNamespace(self_id=123), reason=reason)
     asyncio.run(run())
     assert len(calls) == 2
+
+
+def test_reconnect_does_not_resend_rules_while_review_is_off(monkeypatch, tmp_path):
+    monkeypatch.setattr(plugin, "memory", MemoryStore(tmp_path / "bot.sqlite3"))
+    monkeypatch.setattr(plugin, "_approval_user_ids", lambda: [200])
+    monkeypatch.setattr(plugin, "_approval_review_enabled", lambda: False)
+    calls = []
+    async def send(*args, **kwargs):
+        calls.append(kwargs)
+    monkeypatch.setattr(plugin, "_send_private_message", send)
+    asyncio.run(plugin._send_approval_rules_to_approvers(SimpleNamespace(self_id=123), reason="bot_connect"))
+    asyncio.run(plugin._send_approval_rules_to_approvers(SimpleNamespace(self_id=123), reason="review_switch"))
+    assert len(calls) == 1
 
 
 def test_duplicate_approvals_are_serialized(monkeypatch, delivery):

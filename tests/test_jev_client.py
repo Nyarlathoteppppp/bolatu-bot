@@ -908,3 +908,44 @@ def test_jev_choose_proactive_topic_other_returns_none() -> None:
         )
     )
     assert chosen is None
+
+
+def test_jev_audit_passes_without_a_recent_own_line_to_repeat() -> None:
+    client = JevClient(api_key="test-key")
+
+    async def unexpected(**_kwargs):
+        raise AssertionError("nothing of Fengxue's to repeat; Jev must not be asked")
+
+    client.evaluate = unexpected
+    humans_only = [ChatMessage(1, 2, "群友", "约了一个中国电影博物馆", False, 1000.0)]
+    stale_own = [
+        ChatMessage(1, 9, "风雪", "忍者小鸟现身，第一招就是用日语把群友迷惑住了", True, 100.0),
+        ChatMessage(1, 2, "群友", "约了一个中国电影博物馆", False, 1000.0),
+    ]
+    for recent in (humans_only, stale_own):
+        send, reason = asyncio.run(client.audit_proactive_reply(
+            persona=_persona(), recent_messages=recent, candidate="博物馆一日游，腿会先投降", chat_label="QQ 群聊",
+        ))
+        assert (send, reason) == (True, "no_recent_own_line")
+
+
+def test_jev_audit_state_lists_only_own_lines() -> None:
+    client = JevClient(api_key="test-key")
+    seen = {}
+
+    async def fake_evaluate(**kwargs):
+        seen["state"] = kwargs["state"]
+        return {"answers": {"send": {"noul": 0.9}}}
+
+    client.evaluate = fake_evaluate
+    asyncio.run(client.audit_proactive_reply(
+        persona=_persona(),
+        recent_messages=[
+            ChatMessage(1, 2, "群友", "群友自己说的话", False, 10.0),
+            ChatMessage(1, 9, "风雪", "风雪刚说的话", True, 20.0),
+        ],
+        candidate="新的回复",
+        chat_label="QQ 群聊",
+    ))
+    assert "- 风雪刚说的话" in seen["state"]
+    assert "群友自己说的话" not in seen["state"]

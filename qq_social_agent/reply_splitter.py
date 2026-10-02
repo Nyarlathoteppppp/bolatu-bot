@@ -54,7 +54,10 @@ def _split_long_single_sentence(text: str, *, max_messages: int) -> list[str]:
         tail = "".join(parts[max_messages - 1 :])
         parts = [*head, tail]
 
-    return [part.strip() for part in parts if part.strip()]
+    parts = [part.strip() for part in parts if part.strip()]
+    # A clause cut mid-sentence should not end its own message on a dangling
+    # comma; the next bubble carries on naturally.
+    return [part.rstrip("，,；;：:、 ") if index < len(parts) - 1 else part for index, part in enumerate(parts)]
 
 
 def _split_sentences(text: str) -> list[str]:

@@ -168,6 +168,9 @@ def _compact_timing_text(text: str) -> str:
     return re.sub(r"\s+", "", text or "")
 
 
+_AUDIT_OWN_LINE_WINDOW_SECONDS = 600.0
+
+
 def _addressee_is_other_person(addressee: object) -> bool:
     return (
         getattr(addressee, "status", "") == RESOLVED
@@ -567,20 +570,31 @@ class JevClient:
         addressed: bool = False,
         current_text: str = "",
     ) -> tuple[bool, str]:
-        history_lines = []
-        for msg in recent_messages[-8:]:
-            nick = msg.nickname or str(msg.user_id)
-            prefix = "风雪" if getattr(msg, "is_bot", False) else nick
-            history_lines.append(f"{prefix}: {msg.text}")
-        context_str = "\n".join(history_lines) if history_lines else "（暂无近期消息）"
+        # A repeat needs something of Fengxue's own to repeat. Comparing against
+        # the whole chat made Jev flag replies that merely reused the trigger's
+        # words, including when Fengxue had not spoken in the window at all.
+        recent = list(recent_messages[-8:])
+        newest_at = max((float(getattr(msg, "created_at", 0.0) or 0.0) for msg in recent), default=0.0)
+        # Group chat moves on within minutes; a private proactive opener can
+        # still repeat something said hours earlier, so it keeps the window.
+        window = _AUDIT_OWN_LINE_WINDOW_SECONDS if "群" in chat_label else float("inf")
+        own_lines = [
+            str(msg.text).strip()
+            for msg in recent
+            if getattr(msg, "is_bot", False)
+            and str(msg.text).strip()
+            and newest_at - float(getattr(msg, "created_at", 0.0) or 0.0) <= window
+        ][-4:]
+        if not own_lines:
+            return True, "no_recent_own_line"
         current_line = (current_text or "").strip()[:240]
         state = (
             f"【场景】{chat_label}\n"
             f"【是否点名/回复风雪】{'是' if addressed else '否'}\n"
             f"【当前消息】{current_line or '（无）'}\n"
-            f"【近期消息】\n{context_str}\n\n"
+            "【风雪近期自己发过的话】\n" + "\n".join(f"- {line[:200]}" for line in own_lines) + "\n\n"
             f"【待发送候选】\n{candidate.strip()[:400]}\n"
-            "【约束】只判断候选是不是在复读风雪自己刚说过的那句话。不确定就放行。不要改写候选。"
+            "【约束】只判断候选是不是在复读上面风雪自己发过的某一句。沿用当前消息里的词不算复读。不确定就放行。不要改写候选。"
         )
         questions = {
             "send": {
