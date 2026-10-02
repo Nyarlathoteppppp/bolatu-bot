@@ -443,8 +443,16 @@ class LLMTaskClient(LLMGateway):
         speaker_context: str = "",
         discourse_state: DiscourseState | None = None,
         followup_addressed: bool = False,
+        review_context: str = "",
+        opening_probability: float | None = None,
     ) -> TimingDecision:
-        """Decide only whether/how to surface; tools and memory route elsewhere."""
+        """Decide only whether/how to surface; tools and memory route elsewhere.
+
+        `review_context` is the plain relation view for the LLM review; Jev
+        keeps the full `speaker_context`. `opening_probability` overrides the
+        configured interjection rate (the caller decays it after recent
+        unprompted sends).
+        """
 
         context = _format_context_with_local_focus(
             recent_messages[-14:],
@@ -460,7 +468,7 @@ class LLMTaskClient(LLMGateway):
             "timing_gate",
             "user",
             chat_label=chat_label,
-            speaker_context_section=_optional_section("本轮说话关系", speaker_context),
+            speaker_context_section=_optional_section("本轮说话关系", review_context or speaker_context),
             context=context,
             current_nickname=_render_utterance(current_nickname, current_text)[0],
             current_text=_render_utterance(current_nickname, current_text)[1],
@@ -482,8 +490,16 @@ class LLMTaskClient(LLMGateway):
             optional_opening = jev_timing.review_required or jev_timing.reason.startswith(
                 ("jev_social_", "jev_observer_social_")
             )
-            if optional_opening and random.random() >= getattr(self.config, "interjection_probability", 1.0):
-                logger.info("qq_social_agent optional opening skipped: reason=opening_sample_skip")
+            probability = (
+                getattr(self.config, "interjection_probability", 1.0)
+                if opening_probability is None
+                else opening_probability
+            )
+            if optional_opening and random.random() >= probability:
+                logger.info(
+                    "qq_social_agent optional opening skipped: "
+                    f"reason=opening_sample_skip probability={probability:.3f}"
+                )
                 return replace(jev_timing, channel=OutputChannel.SILENT, review_required=False, reason="jev_opening_sample_skip")
             if not jev_timing.review_required:
                 return jev_timing
@@ -1468,7 +1484,7 @@ def _format_style_source_message(index: int, msg: ChatMessage) -> str:
 
 def _format_decision_message(msg: ChatMessage) -> str:
     if msg.is_bot:
-        return f"风雪之前发言（只判断互动状态，禁止复用措辞）: {msg.text}"
+        return f"风雪（之前说的）: {msg.text}"
     return _format_message(msg)
 
 

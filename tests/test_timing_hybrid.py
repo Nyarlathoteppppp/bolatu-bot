@@ -124,3 +124,48 @@ def test_strong_social_openings_are_sampled_after_jev_without_llm(monkeypatch, t
     assert observed == [True]
     assert (result.channel == OutputChannel.TEXT) == speaks
     assert not result.review_required
+
+
+def test_resolved_other_addressee_overrides_jev_to_other_guess():
+    from qq_social_agent.discourse_state import Binding, DiscourseState
+    from qq_social_agent.jev_client import JevClient
+    from qq_social_agent.resolver_result import RESOLVED
+
+    client = JevClient(api_key='test')
+
+    async def evaluate(**_kwargs):
+        return {'answers': {
+            'wants_answer': {'noul': 0.1},
+            'to_other': {'noul': 0.05},  # Jev misses the inherited @ target
+            'timing_route': {'probabilities': {'silent': 0.05, 'answer': 0.0, 'continue_bot': 0.0, 'social_join': 0.95}},
+        }}
+
+    client.evaluate = evaluate
+    state = DiscourseState(addressee=Binding(status=RESOLVED, target='奈亚子[#71184]', target_id=1535071184, kind='PERSON'))
+    result = asyncio.run(client.timing_gate(persona=SimpleNamespace(decision_prompt=''), recent_messages=[],
+        current_text='偷偷玩不带我', current_nickname='A', discourse_state=state))
+    assert result.reason.startswith('jev_observer_social_')
+
+
+def test_caller_probability_and_review_context_reach_timing_gate(monkeypatch):
+    client = object.__new__(DeepSeekClient)
+    client.config = SimpleNamespace(interjection_probability=0.3)
+    client.prompts = PromptRegistry()
+    client._try_jev = lambda *_args, **_kwargs: asyncio.sleep(0, result=choose())
+    monkeypatch.setattr('qq_social_agent.deepseek_client.random.random', lambda: 0.2)
+    calls = []
+
+    async def completion(**kwargs):
+        calls.append(kwargs)
+        return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content='{"channel":"silent"}'))])
+
+    client._chat_completion = completion
+    decayed = asyncio.run(client.timing_gate(persona=SimpleNamespace(name='风雪', decision_prompt=''),
+        recent_messages=[], current_text='编译器又和我过不去', current_nickname='A', opening_probability=0.12))
+    assert decayed.reason == 'jev_opening_sample_skip' and not calls
+
+    asyncio.run(client.timing_gate(persona=SimpleNamespace(name='风雪', decision_prompt=''),
+        recent_messages=[], current_text='编译器又和我过不去', current_nickname='A',
+        speaker_context='target=group_chat；mentioned_bot=false', review_context='对象：群里随口说的'))
+    user = calls[0]['request']['messages'][1]['content']
+    assert '对象：群里随口说的' in user and 'mentioned_bot' not in user

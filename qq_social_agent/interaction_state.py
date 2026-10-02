@@ -181,6 +181,17 @@ class InteractionStateStore:
         """, (row["id"], group_id, trigger["id"], action, context_at))
         self.conn.commit()
 
+    def recent_unprompted_sends(self, group_id: int, *, since: float) -> int:
+        """Unaddressed triggers the bot answered since `since` (a split reply counts once)."""
+        row = self.conn.execute("""
+            select count(distinct sent.parent_message_id) from interaction_events sent
+            join messages m on m.id = sent.message_id
+            join interaction_events trigger on trigger.message_id = sent.parent_message_id
+            where sent.group_id = ? and sent.kind = 'sent' and sent.action != 'meme'
+              and m.created_at >= ? and trigger.addressed_bot = 0
+        """, (group_id, since)).fetchone()
+        return int(row[0] or 0)
+
     def for_source(self, group_id: int, source_message_id: str, *,
                    context_message_ids: Iterable[int]) -> InteractionState | None:
         row = self._source_row(group_id, source_message_id)

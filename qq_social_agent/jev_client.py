@@ -15,6 +15,7 @@ if TYPE_CHECKING:
     from .discourse_state import DiscourseState
 from .memory import ChatMessage
 from .persona import Persona
+from .resolver_result import RESOLVED
 
 
 from .jev_policy import (
@@ -165,6 +166,14 @@ def _optional_noul(data: Any, key: str) -> float | None:
 
 def _compact_timing_text(text: str) -> str:
     return re.sub(r"\s+", "", text or "")
+
+
+def _addressee_is_other_person(addressee: object) -> bool:
+    return (
+        getattr(addressee, "status", "") == RESOLVED
+        and getattr(addressee, "kind", "") == "PERSON"
+        and not any(alias in str(getattr(addressee, "target", "")) for alias in ("张风雪", "风雪"))
+    )
 
 
 def _timing_looks_like_question(text: str) -> bool:
@@ -532,6 +541,10 @@ class JevClient:
         social = _finite_probability(probabilities.get("social_join")) if isinstance(probabilities, dict) else None
         if None in (wants_answer, to_other, silent, answer, continue_bot, social):
             raise ValueError("Missing or invalid Jev timing observation")
+        if _addressee_is_other_person(addressee) and not followup_addressed:
+            # DiscourseState already bound who this is said to; the observation
+            # must not re-decide it (a speaker's untargeted follow-up to an @).
+            to_other = 1.0
         return choose_jev_group_timing(
             looks_like_question=like_question,
             followup_addressed=followup_addressed,

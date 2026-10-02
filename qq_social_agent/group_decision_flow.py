@@ -93,6 +93,8 @@ async def resolve_group_reply_decision(
     decision_started_at: float,
     flow_started_at: float,
     services: GroupDecisionServices,
+    review_context: str = "",
+    opening_probability: float | None = None,
 ) -> ResolvedGroupDecision | None:
     _record_metric_event = services.record_metric_event
     _record_tool_router_shadow = services.record_tool_router_shadow
@@ -186,6 +188,8 @@ async def resolve_group_reply_decision(
                 speaker_context=speaker_context,
                 discourse_state=discourse_state,
                 followup_addressed=followup_addressed,
+                review_context=review_context,
+                opening_probability=opening_probability,
             )
             decision = timing.to_reply_decision()
             if timing.reason.startswith("jev_llm_"):

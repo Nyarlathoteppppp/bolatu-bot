@@ -5033,6 +5033,11 @@ async def _handle_group_message_locked(
         context_message_ids=(message.id for message in recent),
     )
     speaker_context = _combine_text_sections(speaker_context, format_interaction_state(interaction_state))
+    self_interaction_context = format_self_interaction_context(memory.interactions.own_contributions(
+        interaction_state,
+        source_message_id=source_message_id,
+        context_message_ids=(message.id for message in recent),
+    ))
     memory_effect_resolution = discourse_context.memory_effect
     memory_candidate = discourse_context.memory_candidate
     invalidated_layers = discourse_context.invalidated_layers
@@ -5126,6 +5131,8 @@ async def _handle_group_message_locked(
         fresh_intent=fresh_intent,
         decision_started_at=decision_started_at,
         flow_started_at=flow_started_at,
+        review_context=_combine_text_sections(generation_relation, self_interaction_context),
+        opening_probability=_interjection_probability(group_id),
         services=GroupDecisionServices(
             record_metric_event=_record_metric_event,
             record_tool_router_shadow=_record_tool_router_shadow,
@@ -5336,11 +5343,6 @@ async def _handle_group_message_locked(
         lookback_seconds=rag_service.config.exclude_recent_seconds,
     )
     generation_messages = memory.images.enrich(generation_messages)
-    self_interaction_context = format_self_interaction_context(memory.interactions.own_contributions(
-        interaction_state,
-        source_message_id=source_message_id,
-        context_message_ids=(message.id for message in recent),
-    ))
     generated_reply = await generate_group_reply(
         client=deepseek_client,
         decision=decision,
@@ -8591,6 +8593,27 @@ def _handle_memory_atom_command_text(user_id: int, group_id: int | None, text: s
     if _scoped_atom(atom_id) is None:
         return "没找到这个记忆单元。"
     return "已将记忆软过期并保留审计记录。" if memory.delete_memory_atom(atom_id) else "没找到这个记忆单元。"
+
+
+INTERJECTION_DECAY_WINDOW_SECONDS = 300
+INTERJECTION_DECAY_FACTOR = 0.4
+
+
+def _interjection_probability(group_id: int) -> float:
+    """Each recent unprompted reply makes the next optional opening rarer.
+
+    A flat per-message coin let Fengxue chime in four times in a minute on one
+    person's thread; decaying on actual sends keeps a single aside cheap.
+    """
+    base = float(getattr(getattr(app_config, "llm", None), "interjection_probability", 1.0))
+    try:
+        recent = memory.interactions.recent_unprompted_sends(
+            group_id, since=time.time() - INTERJECTION_DECAY_WINDOW_SECONDS,
+        )
+    except Exception as exc:
+        logger.warning(f"qq_social_agent interjection decay unavailable: group={group_id} error={exc}")
+        return base
+    return base * (INTERJECTION_DECAY_FACTOR ** recent)
 
 
 def _focused_user_tone_context(user_id: int) -> str:

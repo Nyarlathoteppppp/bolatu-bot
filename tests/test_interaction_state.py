@@ -253,3 +253,16 @@ def test_exact_quote_to_own_sent_message_survives_snapshot_cutoff(store):
     sent(store, 's', 'q', at=2, text='我选这个')
     current = incoming(store, 'next', '你刚才为什么选这个', reply='s', at=300)
     assert [item['said'] for item in own(store, 'next', [current])] == ['我选这个']
+
+
+def test_recent_unprompted_sends_counts_unaddressed_triggers_once(store):
+    incoming(store, 'a', '今天编译器又炸了', addressed=False, at=100)
+    sent(store, 'a1', 'a', at=101, text='第一段')
+    sent(store, 'a2', 'a', at=102, text='第二段')  # one split reply
+    incoming(store, 'b', '风雪你怎么看', addressed=True, at=103)
+    sent(store, 'b1', 'b', at=104)
+    incoming(store, 'c', '早上好', addressed=False, at=10)
+    sent(store, 'c1', 'c', at=11)  # outside the window
+
+    assert store.interactions.recent_unprompted_sends(100, since=50) == 1
+    assert store.interactions.recent_unprompted_sends(100, since=0) == 2
