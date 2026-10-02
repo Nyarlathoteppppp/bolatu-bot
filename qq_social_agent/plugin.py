@@ -513,6 +513,9 @@ PRIVATE_HOURLY_CHAT_QUIET_END_HOUR = 9
 PRIVATE_HOURLY_CHAT_MIN_IDLE_SECONDS = 45 * 60
 PRIVATE_HOURLY_CHAT_MIN_JITTER_SECONDS = 3 * 60
 PRIVATE_HOURLY_CHAT_MAX_JITTER_SECONDS = 53 * 60
+# Stop opening topics after this many unanswered openers; the user speaking
+# again resumes it.
+PRIVATE_HOURLY_CHAT_MAX_UNANSWERED = 3
 PRIVATE_HOURLY_CHAT_LAST_SLOT_KEY = f"private_hourly_chat:{PRIVATE_HOURLY_CHAT_USER_ID}:last_slot"
 PRIVATE_HOURLY_CHAT_START_AT_KEY = f"private_hourly_chat:{PRIVATE_HOURLY_CHAT_USER_ID}:start_at"
 SOCIAL_TOPIC_KEYWORDS: tuple[str, ...] = (
@@ -1828,6 +1831,20 @@ def _private_hourly_chat_recently_active(recent: list[ChatMessage], *, now: floa
     return now - float(recent[-1].created_at or 0) < PRIVATE_HOURLY_CHAT_MIN_IDLE_SECONDS
 
 
+def _private_unanswered_openers(recent: list[ChatMessage]) -> int:
+    """Bot sends since the user last spoke; parts sent within a minute count once."""
+    count = 0
+    newer_at: float | None = None
+    for message in reversed(recent):
+        if not message.is_bot:
+            break
+        created_at = float(message.created_at or 0)
+        if newer_at is None or newer_at - created_at > 60:
+            count += 1
+        newer_at = created_at
+    return count
+
+
 def _private_hourly_chat_start_at() -> float:
     raw = memory.app_kv_get(PRIVATE_HOURLY_CHAT_START_AT_KEY)
     try:
@@ -1895,6 +1912,18 @@ async def _run_private_hourly_chat(bot: Bot, bot_key: str) -> None:
                 )
                 continue
             recent = memory.recent_messages(chat_id, PRIVATE_CONTEXT_LIMIT)
+            unanswered = _private_unanswered_openers(recent)
+            if unanswered >= PRIVATE_HOURLY_CHAT_MAX_UNANSWERED:
+                _record_metric_event(
+                    "private_hourly_chat",
+                    group_id=chat_id,
+                    user_id=PRIVATE_HOURLY_CHAT_USER_ID,
+                    stage="unanswered",
+                    action="skipped",
+                    unanswered=unanswered,
+                    slot=slot,
+                )
+                continue
             if _private_hourly_chat_recently_active(recent, now=now):
                 _record_metric_event(
                     "private_hourly_chat",

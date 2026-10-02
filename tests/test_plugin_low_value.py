@@ -3871,3 +3871,15 @@ def test_draft_question_guard_ignores_question_words_used_as_statements() -> Non
         assert not plugin._draft_asks_question(text), text
     for text in ("你后来怎么处理的", "你是在纠结考研还是保研的选择？", "那你说说哪儿的方言算鸟语（掏出小本本）"):
         assert plugin._draft_asks_question(text), text
+
+
+def test_private_openers_pause_after_three_unanswered() -> None:
+    def msg(is_bot: bool, at: float) -> ChatMessage:
+        return ChatMessage(1, 9 if is_bot else 7, "n", "x", is_bot, at)
+
+    replied = [msg(False, 0), msg(True, 10), msg(False, 20), msg(True, 3600)]
+    assert plugin._private_unanswered_openers(replied) == 1
+    # split reply + meme within a minute is one opener
+    ignored = [msg(False, 0), msg(True, 100), msg(True, 3700), msg(True, 3710), msg(True, 9000)]
+    assert plugin._private_unanswered_openers(ignored) == 3
+    assert plugin._private_unanswered_openers([]) == 0
