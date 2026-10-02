@@ -5439,7 +5439,10 @@ async def _handle_group_message_locked(
         pending_recompute=[layer for layer in invalidated_layers if layer not in recomputed_layers],
         critic=critic_result,
     )
-    if next_critic_action(critic_result, attempt=1, addressed=addressed_bot) == "block":
+    # Only a draft that was actually regenerated and still fails may be dropped;
+    # when the retry was skipped for time, a first-pass failure must not
+    # silently discard the reply (13 knowledge answers were lost this way).
+    if regenerated and next_critic_action(critic_result, attempt=1, addressed=addressed_bot) == "block":
         _record_metric_event(
             "reply_suppressed",
             group_id=group_id,
