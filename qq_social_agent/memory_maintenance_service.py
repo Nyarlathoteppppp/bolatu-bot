@@ -36,6 +36,9 @@ class MemoryMaintenancePolicy:
     member_profile_min_chars: int
 
 
+_MEMBER_PROFILE_FAILURE_BACKOFF_SECONDS = 6 * 3600
+
+
 class MemoryMaintenanceService:
     """Run one memory-maintenance sweep without owning chat event handling."""
 
@@ -72,6 +75,9 @@ class MemoryMaintenanceService:
         self.last_mid_memory_attempt: dict[int, float] = {}
         self.mid_memory_empty_streak: dict[int, int] = {}
         self.last_style_learn_attempt: dict[int, float] = {}
+        # A failed profile writes nothing, so without this the same members
+        # were re-sent every sweep (about 50 calls per stored profile).
+        self.member_profile_retry_after: dict[tuple[int, int], float] = {}
 
     @staticmethod
     def _mid_memory_batch_pointer_key(group_id: int) -> str:
@@ -466,8 +472,10 @@ class MemoryMaintenanceService:
         )
         if not active_user_ids:
             return
-        updated = 0
+        attempted = 0
         for user_id in active_user_ids:
+            if not force and self.member_profile_retry_after.get((group_id, user_id), 0.0) > now:
+                continue
             previous = memory.latest_member_profile_summary(group_id, user_id)
             last_summary_at = previous.created_at if previous is not None else 0.0
             if not force and last_summary_at and now - last_summary_at < policy.member_profile_interval_seconds:
@@ -489,6 +497,8 @@ class MemoryMaintenanceService:
                 continue
             label = self.member_label(user_id, messages[-1].nickname)
             previous_text = member_profile_previous_text(previous)
+            attempted += 1
+            self.member_profile_retry_after[(group_id, user_id)] = now + _MEMBER_PROFILE_FAILURE_BACKOFF_SECONDS
             try:
                 draft = await client.summarize_member_profile(
                     messages=messages,
@@ -501,28 +511,35 @@ class MemoryMaintenanceService:
                     "qq_social_agent member profile summary skipped: "
                     f"group={group_id} user={user_id} error={exc}"
                 )
-                continue
-            if not draft.summary:
-                continue
-            memory.add_member_profile_summary(
-                group_id=group_id,
-                user_id=user_id,
-                profile_summary=draft.summary,
-                interests=list(draft.interests),
-                speaking_style=draft.speaking_style,
-                representative_texts=list(draft.representative_texts),
-                start_at=messages[0].created_at,
-                end_at=messages[-1].created_at,
-                message_count=len(messages),
-            )
-            logger.info(
-                "qq_social_agent member profile summarized: "
-                f"group={group_id} user={user_id} messages={len(messages)} "
-                f"incremental={previous is not None}"
-            )
-            updated += 1
-            if max_updates is not None and updated >= max(1, max_updates):
+            else:
+                if draft.summary:
+                    self._store_member_profile(memory, group_id, user_id, draft, messages, previous)
+                    self.member_profile_retry_after.pop((group_id, user_id), None)
+                else:
+                    logger.warning(
+                        "qq_social_agent member profile returned no summary: "
+                        f"group={group_id} user={user_id}"
+                    )
+            if max_updates is not None and attempted >= max(1, max_updates):
                 break
+
+    def _store_member_profile(self, memory, group_id: int, user_id: int, draft, messages, previous) -> None:
+        memory.add_member_profile_summary(
+            group_id=group_id,
+            user_id=user_id,
+            profile_summary=draft.summary,
+            interests=list(draft.interests),
+            speaking_style=draft.speaking_style,
+            representative_texts=list(draft.representative_texts),
+            start_at=messages[0].created_at,
+            end_at=messages[-1].created_at,
+            message_count=len(messages),
+        )
+        logger.info(
+            "qq_social_agent member profile summarized: "
+            f"group={group_id} user={user_id} messages={len(messages)} "
+            f"incremental={previous is not None}"
+        )
 
 
 def balanced_style_learning_messages(

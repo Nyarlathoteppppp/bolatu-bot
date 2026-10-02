@@ -206,3 +206,51 @@ def test_mid_memory_sync_selection_uses_selected_route(tmp_path):
     assert [item.summary for item in memory.recent_memory_summaries(88, 5)] == [
         "同步模型摘要"
     ]
+
+
+def test_failed_member_profile_backs_off_and_counts_toward_sweep_cap() -> None:
+    import asyncio
+    from types import SimpleNamespace
+
+    from qq_social_agent.deepseek_client import MemberProfileDraft
+    from qq_social_agent.memory import ChatMessage
+    from qq_social_agent.memory_maintenance_service import MemoryMaintenanceService
+
+    calls: list[str] = []
+    stored: list[int] = []
+
+    class Client:
+        async def summarize_member_profile(self, *, member_label, **_kwargs):
+            calls.append(member_label)
+            return MemberProfileDraft("", (), "", ())  # truncated JSON parses to nothing
+
+    messages = [ChatMessage(1, 0, "n", "这是一条足够长的群聊发言内容", False, float(i)) for i in range(6)]
+    memory = SimpleNamespace(
+        active_member_ids_since=lambda *_a, **_k: [101, 102, 103],
+        latest_member_profile_summary=lambda *_a: None,
+        member_messages_between=lambda *_a, **_k: messages,
+        add_member_profile_summary=lambda **kwargs: stored.append(kwargs["user_id"]),
+    )
+    policy = SimpleNamespace(
+        member_profile_lookback_seconds=86400,
+        member_profile_active_limit=10,
+        member_profile_min_messages=1,
+        member_profile_interval_seconds=3600,
+        member_profile_message_limit=50,
+        member_profile_min_chars=1,
+    )
+    service = MemoryMaintenanceService(
+        memory_provider=lambda: memory,
+        client_provider=lambda: Client(),
+        policy_provider=lambda: policy,
+        record_metric_event=lambda *_a, **_k: None,
+        member_label=lambda user_id, _nick: str(user_id),
+        useful_style_rule=lambda *_a: True,
+    )
+
+    asyncio.run(service.maintain_member_profile_summaries(1, max_updates=1))
+    asyncio.run(service.maintain_member_profile_summaries(1, max_updates=1))
+
+    # One call per sweep, and the member that just failed is not retried next sweep.
+    assert calls == ["101", "102"]
+    assert stored == []

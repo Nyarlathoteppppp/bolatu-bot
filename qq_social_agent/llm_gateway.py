@@ -19,6 +19,10 @@ _usage_recorder: LLMUsageRecorder | None = None
 _PROVIDER_FAILURE_WINDOW_SECONDS = 120.0
 _PROVIDER_FAILURE_THRESHOLD = 3
 _PROVIDER_CIRCUIT_SECONDS = 300.0
+# Off the reply path; no user is waiting on these.
+_BACKGROUND_TASKS = frozenset({"mid_memory", "daily_review", "member_profile", "style_learning"})
+_BACKGROUND_ATTEMPT_SECONDS = 90.0
+_BACKGROUND_TOTAL_SECONDS = 150.0
 
 
 class LLMGateway:
@@ -232,7 +236,12 @@ class LLMGateway:
             attempt = float(self.config.timeout_seconds)
             total = float(self.config.timeout_seconds) * max(1, len(self._candidate_routes(route_name)))
         routes = self._candidate_routes(route_name)
-        if routes and routes[0].provider == "lingsuan":
+        if task in _BACKGROUND_TASKS:
+            # Structured summaries write 1-3k tokens; a reply-sized deadline
+            # made the primary model time out and the truncating fallback win.
+            attempt = max(float(attempt), _BACKGROUND_ATTEMPT_SECONDS)
+            total = max(float(total), _BACKGROUND_TOTAL_SECONDS)
+        elif routes and routes[0].provider == "lingsuan":
             provider = self.config.providers["lingsuan"]
             attempt = provider.reply_timeout_seconds or attempt
             total = max(total, provider.reply_total_timeout_seconds or total)

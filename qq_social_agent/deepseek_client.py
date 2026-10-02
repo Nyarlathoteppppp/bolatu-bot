@@ -739,8 +739,8 @@ class LLMTaskClient(LLMGateway):
         *,
         current_text: str,
         current_nickname: str,
-        keep_recent: int = 6,
-        target_total: int = 12,
+        keep_recent: int = 10,
+        target_total: int = 20,
         pinned_source_ids: set[str] | None = None,
         pinned_db_ids: set[int] | None = None,
     ) -> list[ChatMessage]:
@@ -1038,7 +1038,7 @@ class LLMTaskClient(LLMGateway):
             route_name="member_profile",
             request={
                 "temperature": 0.2,
-                "max_tokens": 220,
+                "max_tokens": 900,
                 "response_format": {"type": "json_object"},
                 "messages": [
                     {"role": "system", "content": system},
@@ -1111,7 +1111,7 @@ class LLMTaskClient(LLMGateway):
                 context_messages,
                 current_text=current_text,
                 current_nickname=current_nickname,
-                target_total=context_message_limit or 12,
+                target_total=context_message_limit or 20,
                 pinned_source_ids=pinned_sources,
                 pinned_db_ids=pinned_ids,
             )
@@ -1338,7 +1338,7 @@ class LLMTaskClient(LLMGateway):
             feedback_context=feedback_context.strip() or "（无审批反馈）",
         )
         request = {
-            "max_tokens": max(self.config.max_tokens, 1200),
+            "max_tokens": max(self.config.max_tokens, 2400),
             "response_format": {"type": "json_object"},
             "messages": [
                 {"role": "system", "content": system},
@@ -1383,7 +1383,7 @@ class LLMTaskClient(LLMGateway):
         )
         return {
                 "temperature": 0.2,
-                "max_tokens": 900,
+                "max_tokens": 3000,
                 "response_format": {"type": "json_object"},
                 "messages": [
                     {"role": "system", "content": system},
@@ -1416,7 +1416,7 @@ class LLMTaskClient(LLMGateway):
             route_name="style",
             request={
                 "temperature": 0.2,
-                "max_tokens": 420,
+                "max_tokens": 1200,
                 "response_format": {"type": "json_object"},
                 "messages": [
                     {"role": "system", "content": system},
