@@ -31,6 +31,12 @@ from .group_message_types import (
     buffered_last_created_at as _buffered_last_created_at,
 )
 from .group_session_service import GroupSessionService, GroupSessionState
+from .group_post_send_service import (
+    GroupFollowupPolicy,
+    GroupPostSendService,
+    GroupPostSendServices,
+    group_meme_context_eligible as _group_meme_context_eligible,
+)
 from .forward_context import (
     ForwardContextPolicy,
     ForwardContextService,
@@ -8807,12 +8813,22 @@ async def _send_approved_group_reply_inner(
     )
 
 
-def _group_meme_context_eligible(approval: PendingGroupApproval, candidate: PendingApprovalCandidate) -> bool:
-    if candidate.action in {"market_check", "fresh_context"}:
-        return False
-    if approval.tool_evidence.strip():
-        return False
-    return 0 < len(candidate.text.strip()) <= 150
+def _group_post_send_service() -> GroupPostSendService:
+    return GroupPostSendService(GroupPostSendServices(
+        memory=memory,
+        client=deepseek_client,
+        meme_library=private_meme_library,
+        social_actions=social_action_service,
+        followup_windows=followup_window_opened_at,
+        followup_policy=GroupFollowupPolicy(
+            hard_seconds=ADDRESS_FOLLOWUP_HARD_SECONDS,
+            soft_seconds=ADDRESS_FOLLOWUP_SOFT_SECONDS,
+        ),
+        send_group_message=_send_group_message,
+        record_metric_event=_record_metric_event,
+        memory_text_from_reply_part=_memory_text_from_reply_part,
+        logger=logger,
+    ))
 
 
 async def _maybe_send_group_meme(
@@ -8820,102 +8836,7 @@ async def _maybe_send_group_meme(
     approval: PendingGroupApproval,
     candidate: PendingApprovalCandidate,
 ) -> None:
-    if deepseek_client is None or not _group_meme_context_eligible(approval, candidate):
-        return
-    gate = private_meme_library.group_gate(approval.group_id)
-    if not gate.allowed:
-        _record_metric_event(
-            "group_meme_selector",
-            group_id=approval.group_id,
-            user_id=approval.trigger_user_id,
-            stage="eligibility",
-            action="skipped",
-            gate_reason=gate.reason,
-        )
-        return
-    candidates = private_meme_library.group_candidates(
-        approval.group_id,
-        query=f"{approval.trigger_text}\n{candidate.text}",
-    )
-    if not candidates:
-        return
-    try:
-        choice = await deepseek_client.select_private_meme(
-            current_text=approval.trigger_text,
-            reply_text=_memory_text_from_reply_part(candidate.text, approval.mention_targets),
-            candidates=private_meme_library.candidate_text(candidates),
-        )
-    except Exception as exc:
-        logger.warning(
-            "qq_social_agent group meme selector failed: "
-            f"group={approval.group_id} error={exc}"
-        )
-        return
-    candidate_ids = {asset.id for asset in candidates}
-    if not choice.send or choice.meme_id not in candidate_ids:
-        _record_metric_event(
-            "group_meme_selector",
-            group_id=approval.group_id,
-            user_id=approval.trigger_user_id,
-            stage="selection",
-            action="skipped",
-            gate_reason=gate.reason,
-            reason=choice.reason,
-        )
-        return
-    image_ref = private_meme_library.image_base64_ref(choice.meme_id)
-    if not image_ref:
-        return
-    try:
-        message_id = await _send_group_message(
-            bot,
-            approval.group_id,
-            Message(MessageSegment.image(file=image_ref)),
-        )
-    except ActionFailed as exc:
-        logger.warning(
-            "qq_social_agent failed sending group meme: "
-            f"group={approval.group_id} meme={choice.meme_id} {_action_failed_summary(exc)}"
-        )
-        _record_metric_event(
-            "group_meme_selector",
-            group_id=approval.group_id,
-            user_id=approval.trigger_user_id,
-            stage="delivery",
-            action="failed",
-            meme_id=choice.meme_id,
-            error=_action_failed_summary(exc),
-        )
-        return
-    private_meme_library.mark_group_sent(approval.group_id, choice.meme_id)
-    asset = memory.meme_asset(choice.meme_id)
-    memory.add_message(
-        approval.group_id,
-        approval.self_id,
-        approval.persona_name,
-        f"[风雪附了一张已授权表情包：{asset.description if asset else choice.meme_id}]",
-        is_bot=True,
-        source_message_id=message_id,
-        source_kind="live",
-        correlation_id=approval.correlation_id,
-    )
-    if message_id is not None:
-        memory.interactions.observe_sent(
-            group_id=approval.group_id,
-            source_message_id=str(message_id),
-            trigger_source_id=approval.source_message_id,
-            action="meme",
-            context_at=approval.pipeline_state.interaction_context_at if approval.pipeline_state is not None else None,
-        )
-    _record_metric_event(
-        "group_meme_selector",
-        group_id=approval.group_id,
-        user_id=approval.trigger_user_id,
-        stage="delivery",
-        action="sent",
-        meme_id=choice.meme_id,
-        reason=choice.reason,
-    )
+    await _group_post_send_service().maybe_send_meme(bot, approval, candidate)
 
 
 def _record_post_reply_followup_window(
@@ -8925,113 +8846,14 @@ def _record_post_reply_followup_window(
     mention_user_id: int | None = None,
     conversation_engaged: bool = True,
 ) -> None:
-    if not conversation_engaged:
-        return
-    now = time.time()
-    target_user_ids = {int(trigger_user_id or 0)}
-    if mention_user_id is not None:
-        target_user_ids.add(int(mention_user_id or 0))
-    target_user_ids.discard(0)
-    opened_user_ids: list[int] = []
-    refreshed_skipped: list[int] = []
-    for target_user_id in sorted(target_user_ids):
-        key = (group_id, target_user_id)
-        opened_at = followup_window_opened_at.get(key, 0.0)
-        if opened_at and now - opened_at <= ADDRESS_FOLLOWUP_SOFT_SECONDS:
-            refreshed_skipped.append(target_user_id)
-            continue
-        followup_window_opened_at[key] = now
-        opened_user_ids.append(target_user_id)
-    if opened_user_ids or refreshed_skipped:
-        _record_metric_event(
-            "followup_window_opened",
-            group_id=group_id,
-            user_id=trigger_user_id,
-            stage="send",
-            action="post_reply",
-            target_user_ids=sorted(target_user_ids),
-            opened_user_ids=opened_user_ids,
-            skipped_refresh_user_ids=refreshed_skipped,
-            window_seconds=ADDRESS_FOLLOWUP_HARD_SECONDS,
-            soft_window_seconds=ADDRESS_FOLLOWUP_SOFT_SECONDS,
-        )
+    _group_post_send_service().record_followup_window(
+        group_id, trigger_user_id=trigger_user_id, mention_user_id=mention_user_id,
+        conversation_engaged=conversation_engaged,
+    )
 
 
 async def _execute_approved_side_reaction(bot: Bot, approval: PendingGroupApproval) -> None:
-    pipeline_state = approval.pipeline_state
-    side_reaction = _approval_side_reaction(approval)
-    if pipeline_state is None or not side_reaction:
-        return
-    target_message_id = str(pipeline_state.source_message_id or "").strip()
-    if not target_message_id.isdigit():
-        logger.info(
-            "qq_social_agent approved side reaction skipped: "
-            f"group={approval.group_id} reason=missing_message_id reaction={side_reaction}"
-        )
-        return
-    reaction = reaction_from_action(pipeline_state.decision_action, side_reaction)
-    try:
-        result = await social_action_service.react_to_message(
-            bot,
-            group_id=approval.group_id,
-            user_id=approval.trigger_user_id,
-            message_id=target_message_id,
-            reaction=reaction,
-            target_label=_member_label(approval.trigger_user_id, approval.trigger_nickname),
-        )
-    except ActionFailed as exc:
-        logger.warning(
-            "qq_social_agent approved side reaction failed: "
-            f"group={approval.group_id} message_id={target_message_id} {_action_failed_summary(exc)}"
-        )
-        _record_metric_event(
-            "social_action_failed",
-            group_id=approval.group_id,
-            user_id=approval.trigger_user_id,
-            stage="approved_side_reaction",
-            action="react",
-            reaction=reaction,
-            error=_action_failed_summary(exc),
-        )
-        return
-    except Exception as exc:
-        logger.warning(
-            "qq_social_agent approved side reaction failed: "
-            f"group={approval.group_id} message_id={target_message_id} error={exc}"
-        )
-        _record_metric_event(
-            "social_action_failed",
-            group_id=approval.group_id,
-            user_id=approval.trigger_user_id,
-            stage="approved_side_reaction",
-            action="react",
-            reaction=reaction,
-            error=str(exc)[:160],
-        )
-        return
-    _record_metric_event(
-        "social_action",
-        group_id=approval.group_id,
-        user_id=approval.trigger_user_id,
-        stage="approved_side_reaction",
-        action="react",
-        reaction=result.reaction,
-        reason=result.reason,
-        emoji_id=result.emoji_id,
-        sent=result.sent,
-        approval_id=approval.approval_id,
-    )
-    if result.sent:
-        logger.info(
-            "qq_social_agent approved side reaction sent: "
-            f"group={approval.group_id} message_id={target_message_id} "
-            f"reaction={result.reaction} emoji_id={result.emoji_id}"
-        )
-    else:
-        logger.info(
-            "qq_social_agent approved side reaction skipped: "
-            f"group={approval.group_id} message_id={target_message_id} reason={result.reason}"
-        )
+    await _group_post_send_service().execute_side_reaction(bot, approval)
 
 
 def _is_group_send_blocked_error(exc: ActionFailed) -> bool:
@@ -9110,20 +8932,10 @@ def _record_bot_sent_message(
     trigger_text: str,
     action: str,
 ) -> None:
-    if message_id is None:
-        logger.warning(
-            "qq_social_agent bot sent message missing message_id: "
-            f"group={group_id} action={action}"
-        )
-        return
-    memory.add_bot_sent_message(
-        group_id=group_id,
-        message_id=message_id,
-        bot_reply=bot_reply,
-        trigger_user_id=trigger_user_id,
-        trigger_nickname=trigger_nickname,
-        trigger_text=trigger_text,
-        action=action,
+    _group_post_send_service().record_bot_sent_message(
+        group_id=group_id, message_id=message_id, bot_reply=bot_reply,
+        trigger_user_id=trigger_user_id, trigger_nickname=trigger_nickname,
+        trigger_text=trigger_text, action=action,
     )
 
 
