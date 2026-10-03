@@ -22,7 +22,7 @@ _PROVIDER_CIRCUIT_SECONDS = 300.0
 # Off the reply path; no user is waiting on these.
 _BACKGROUND_TASKS = frozenset({"mid_memory", "daily_review", "member_profile", "style_learning"})
 _BACKGROUND_ATTEMPT_SECONDS = 90.0
-_BACKGROUND_TOTAL_SECONDS = 150.0
+_BACKGROUND_TOTAL_SECONDS = 240.0  # room for VerySadai, Lingsuan and DeepSeek in turn
 
 
 class LLMGateway:
@@ -193,7 +193,10 @@ class LLMGateway:
     ) -> object:
         """Use a background selection without mutating the live reply route."""
         routes = (route,)
-        if route.provider == "lingsuan":
+        chain = self.config.providers[route.provider].reply_fallback_models if route.provider in self.config.providers else ()
+        if chain:
+            routes += tuple(self.parse_model_route(model) for model in chain)
+        elif route.provider == "lingsuan":
             routes += (self.config.fallback_routes["memory" if task == "mid_memory" else "reply"],)
         return await self._chat_completion(
             task=task,
@@ -261,7 +264,9 @@ class LLMGateway:
                 routes.append(fallback)
             routes.extend(getattr(self.config, "additional_fallback_routes", {}).get(route_name, ()))
             provider = self.config.providers[primary.provider]
-            if route_name == "reply" and provider.reply_fallback_models:
+            # A provider's own fallback chain (VerySadai -> Lingsuan -> DeepSeek)
+            # applies wherever it is primary: replies and background summaries.
+            if provider.reply_fallback_models:
                 routes = [primary, *(self.parse_model_route(model) for model in provider.reply_fallback_models)]
             elif primary.provider == "lingsuan":
                 routes = [primary, self.config.fallback_routes[route_name]]

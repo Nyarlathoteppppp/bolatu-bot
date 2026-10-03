@@ -300,13 +300,13 @@ def test_mid_memory_has_background_timeout_budget() -> None:
 
     client._candidate_routes = lambda _route: ()
 
-    assert client._task_timeouts(task="mid_memory", route_name="memory") == (90.0, 150.0)
-    assert client._task_timeouts(task="member_profile", route_name="member_profile") == (90.0, 150.0)
+    assert client._task_timeouts(task="mid_memory", route_name="memory") == (90.0, 240.0)
+    assert client._task_timeouts(task="member_profile", route_name="member_profile") == (90.0, 240.0)
     # The reply-sized Lingsuan deadline must not cap background summaries.
     from qq_social_agent.config import LLMModelRoute
     client._candidate_routes = lambda _route: (LLMModelRoute("lingsuan", "gpt-6.1-sol"),)
     client.config.providers = {"lingsuan": SimpleNamespace(reply_timeout_seconds=30, reply_total_timeout_seconds=50)}
-    assert client._task_timeouts(task="style_learning", route_name="style") == (90.0, 150.0)
+    assert client._task_timeouts(task="style_learning", route_name="style") == (90.0, 240.0)
     assert client._task_timeouts(task="jargon_select", route_name="jargon") == (30.0, 50.0)
 
 

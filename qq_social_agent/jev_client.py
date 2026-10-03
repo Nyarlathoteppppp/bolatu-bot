@@ -666,6 +666,22 @@ class JevClient:
             return MemeSelectionDecision(False, None, f"jev_skip_{noul:.2f}"[:40])
         return MemeSelectionDecision(True, int(choice), f"jev_meme_{noul:.2f}"[:40])
 
+    async def judge_search_query(self, *, query: str, current_text: str) -> tuple[bool, str]:
+        """Drop router-proposed searches whose query names nothing searchable."""
+        data = await self.evaluate(
+            state=f"【当前消息】{current_text[:400]}\n【准备搜索的词】{query[:200]}",
+            questions={"worth_searching": {"type": "noul", "instructions": (
+                "这个搜索词是否值得联网搜索：它指向明确、公开可检索的具体对象或事实"
+                "（作品、人物、公司、产品、事件、术语、行情、地点、教程、版本）为 true；"
+                "情绪、玩笑和群内梗、群友的私人状态、泛泛的空话、没有具体对象的问题为 false。"
+            )}},
+        )
+        score = _optional_noul(data, "worth_searching")
+        if score is None:
+            return True, "jev_query_unknown_keep"
+        # Live calibration: real queries 0.52-0.97, junk 0.02-0.34.
+        return score >= 0.45, f"jev_query_{score:.2f}"
+
     async def judge_search_useful(
         self,
         *,

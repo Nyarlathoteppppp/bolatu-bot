@@ -9842,6 +9842,17 @@ def _is_group_send_blocked_error(exc: ActionFailed) -> bool:
     )
 
 
+# NapCat acknowledges a send only after uploading it; a multi-MB generated PNG
+# (VerySadai ignores output_format) overran the 10s default and was reported
+# as failed.
+IMAGE_SEND_TIMEOUT_SECONDS = 90.0
+
+
+def _send_timeout_for(message: Message) -> float:
+    has_image = any(str(getattr(segment, "type", "")) == "image" for segment in message)
+    return IMAGE_SEND_TIMEOUT_SECONDS if has_image else onebot_gateway.DEFAULT_API_TIMEOUT_SECONDS
+
+
 async def _send_group_message(bot: Bot, group_id: int, message: Message) -> int | None:
     if hasattr(bot, "call_api"):
         result = await onebot_gateway.call_api(
@@ -9849,6 +9860,7 @@ async def _send_group_message(bot: Bot, group_id: int, message: Message) -> int 
             "send_group_msg",
             group_id=group_id,
             message=message,
+            timeout_seconds=_send_timeout_for(message),
         )
     else:
         result = await bot.send_group_msg(group_id=group_id, message=message)
@@ -9862,6 +9874,7 @@ async def _send_private_message(bot: Bot, *, user_id: int, message: Message) -> 
             "send_private_msg",
             user_id=user_id,
             message=message,
+            timeout_seconds=_send_timeout_for(message),
         )
     return await bot.send_private_msg(user_id=user_id, message=message)
 

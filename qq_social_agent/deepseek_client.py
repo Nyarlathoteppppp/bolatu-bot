@@ -432,6 +432,14 @@ class LLMTaskClient(LLMGateway):
         result = _parse_tool_routing_decision(response.choices[0].message.content or "")
         if jev_routed is not None and result.tool not in {"none", jev_routed.tool}:
             return ToolRoutingDecision(tool="none", reason="tool_parameters_mismatch")
+        if result.tool == "fresh_search":
+            verdict = await self._try_jev(
+                lambda: self.jev_client.judge_search_query(query=result.query, current_text=current_text),
+                what="search_query",
+            )
+            if verdict is not None and not verdict[0]:
+                logger.info(f"qq_social_agent dropped junk search query: query={result.query!r} reason={verdict[1]}")
+                return ToolRoutingDecision(tool="none", reason=verdict[1])
         return result
 
     async def timing_gate(

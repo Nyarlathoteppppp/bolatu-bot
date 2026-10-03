@@ -211,3 +211,17 @@ def test_both_sol_providers_fail_then_official_deepseek_receives_original_messag
     assert ds.calls == 1
     gateway._provider_circuit_until['verysadai'] = float('inf')
     assert [r.provider for r in gateway._candidate_routes('reply')] == ['lingsuan', 'deepseek']
+
+
+def test_background_summaries_use_the_verysadai_chain():
+    from qq_social_agent.config import LLMModelRoute
+    gateway = _production_gateway()
+    assert [r.provider for r in gateway._candidate_routes('memory')] == ['verysadai', 'lingsuan', 'deepseek']
+    assert [r.provider for r in gateway._candidate_routes('member_profile')] == ['verysadai', 'lingsuan', 'deepseek']
+    calls = []
+
+    async def fake(*, task, route_name, request, routes_override=None):
+        calls.append(tuple(r.provider for r in routes_override))
+    gateway._chat_completion = fake
+    asyncio.run(gateway.complete_on_model(task='mid_memory', route=LLMModelRoute('verysadai', 'gpt-6.1-sol'), request={}))
+    assert calls == [('verysadai', 'lingsuan', 'deepseek')]

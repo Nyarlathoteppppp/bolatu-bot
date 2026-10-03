@@ -965,3 +965,16 @@ def test_jev_audit_low_repeat_score_sends_fresh_reply() -> None:
         chat_label="QQ 群聊",
     ))
     assert send is True and reason == "未复读近期发言_0.22"
+
+
+def test_junk_search_queries_are_dropped_before_searching() -> None:
+    client = JevClient(api_key="test-key")
+    scores = {"哈哈哈": 0.02, "Cerebras 股价下跌 原因": 0.94}
+
+    async def fake_evaluate(*, state, questions):
+        query = state.split("【准备搜索的词】", 1)[1]
+        return {"answers": {"worth_searching": {"noul": scores[query]}}}
+
+    client.evaluate = fake_evaluate
+    assert asyncio.run(client.judge_search_query(query="哈哈哈", current_text="哈哈哈"))[0] is False
+    assert asyncio.run(client.judge_search_query(query="Cerebras 股价下跌 原因", current_text="cerebras为什么跌"))[0] is True

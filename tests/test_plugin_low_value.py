@@ -3884,3 +3884,10 @@ def test_private_openers_pause_after_three_unanswered() -> None:
     ignored = [msg(False, 0), msg(True, 100), msg(True, 3700), msg(True, 3710), msg(True, 9000)]
     assert plugin._private_unanswered_openers(ignored) == 3
     assert plugin._private_unanswered_openers([]) == 0
+
+
+def test_image_messages_get_a_longer_send_timeout() -> None:
+    from nonebot.adapters.onebot.v11 import Message, MessageSegment
+
+    assert plugin._send_timeout_for(Message("纯文字")) == plugin.onebot_gateway.DEFAULT_API_TIMEOUT_SECONDS
+    assert plugin._send_timeout_for(Message(MessageSegment.image(file="base64://aGk="))) == plugin.IMAGE_SEND_TIMEOUT_SECONDS

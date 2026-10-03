@@ -85,6 +85,10 @@ def _tool_router_should_run(
 ) -> bool:
     if not decision.should_reply:
         return False
+    # Any reply may lean on a fact worth checking; Jev decides cheaply, and a
+    # separate Jev check drops junk queries before a search is made.
+    if decision.action not in {"react", "poke"}:
+        return True
     if decision.need_fresh_context or decision.need_tool or tool_plan.requests:
         return True
     if fresh_intent is not None or market_intents:

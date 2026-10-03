@@ -74,9 +74,9 @@ llm:
   search_model: siliconflow/deepseek-ai/DeepSeek-V4-Flash
   utility_model: lingsuan/gpt-6.1-sol
   jargon_model: lingsuan/gpt-6.1-sol
-  memory_model: lingsuan/gpt-6.1-sol
+  memory_model: verysadai/gpt-6.1-sol
   style_model: lingsuan/gpt-6.1-sol
-  member_profile_model: lingsuan/gpt-6.1-sol
+  member_profile_model: verysadai/gpt-6.1-sol
   model_catalog:
     - mimo/mimo-v2.6-pro
     - deepseek/deepseek-flash
@@ -113,13 +113,14 @@ llm:
   max_retries: 0
 
 background_models:
-  memory: lingsuan/gpt-6.1-sol
+  memory: verysadai/gpt-6.1-sol
   review: lingsuan/gpt-6.1-sol
   catalog:
     - lingsuan/gpt-6.1-sol
     - openrouter/z-ai/glm-5.3-flash:batch
     - siliconflow/deepseek-ai/DeepSeek-V4-Flash
     - deepseek/deepseek-flash
+    - verysadai/gpt-6.1-sol
 
 rate_control:
   default_work_intensity_percent: 100
@@ -226,7 +227,8 @@ fresh_search:
   provider: tavily
   max_external_queries_per_minute: 8
   # 首轮默认三个检索角度并发执行，给正文核验留足总预算。
-  timeout_seconds: 15
+  # 25 秒：Tavily 单独用掉 13s+ 超时时，Bing/Google News 回退仍有时间跑完。
+  timeout_seconds: 25
   max_results: 5
   followup_page_max_tries: 6
   followup_page_max_chars: 2800

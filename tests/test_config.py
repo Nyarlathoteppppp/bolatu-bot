@@ -269,7 +269,9 @@ def test_production_config_replies_on_lingsuan_with_verysadai_available() -> Non
         "verysadai/gpt-6.1-sol",
     )
     assert set(config.llm.providers) == {"deepseek", "siliconflow", "mimo", "openrouter", "lingsuan", "verysadai"}
-    assert config.raw["background_models"]["memory"] == "lingsuan/gpt-6.1-sol"
+    assert config.raw["background_models"]["memory"] == "verysadai/gpt-6.1-sol"
+    assert config.llm.routes["memory"].label == "verysadai/gpt-6.1-sol"
+    assert config.llm.routes["member_profile"].label == "verysadai/gpt-6.1-sol"
     assert config.raw["background_models"]["review"] == "lingsuan/gpt-6.1-sol"
     assert config.llm is config.deepseek
     assert config.raw["image_ocr"]["deepseek_vision_enabled"] is True
