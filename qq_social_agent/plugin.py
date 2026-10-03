@@ -124,6 +124,7 @@ from .group_discourse_flow import resolve_group_discourse_context
 from .group_generation_context import GroupContextLimits, build_group_generation_context, load_group_generation_messages
 from .interaction_state import format_interaction_state
 from .self_interaction_context import format_self_interaction_context
+from .reply_mode import pick_reply_mode, reply_mode_guide
 from .group_reply_generation import generate_group_reply
 from .group_tool_execution import execute_group_tools
 from .group_jargon import (
@@ -246,6 +247,7 @@ from .pipeline_types import (
     ToolKind,
     ToolRequest,
     ToolResult,
+    PipelineMode,
 )
 from .pipeline_stages import (
     apply_candidates as _pipeline_apply_candidates,
@@ -5383,6 +5385,15 @@ async def _handle_group_message_locked(
         lookback_seconds=rag_service.config.exclude_recent_seconds,
     )
     generation_messages = memory.images.enrich(generation_messages)
+    reply_mode_text = ""
+    if pipeline_state.mode is PipelineMode.CHAT:
+        addressed_question = addressed_bot and _looks_like_addressed_question(text)
+        reply_mode = pick_reply_mode()
+        reply_mode_text = reply_mode_guide(reply_mode, addressed_question=addressed_question)
+        _record_metric_event(
+            "reply_mode", group_id=group_id, user_id=user_id, stage="generation", action=reply_mode,
+            addressed_question=addressed_question,
+        )
     generated_reply = await generate_group_reply(
         client=deepseek_client,
         decision=decision,
@@ -5408,6 +5419,7 @@ async def _handle_group_message_locked(
         ),
         speaker_context=speaker_context,
         generation_relation=generation_relation,
+        reply_mode_guide=reply_mode_text,
         memory_context=memory_context,
         reference_resolution=reference_resolution,
         ellipsis_resolution=ellipsis_resolution,

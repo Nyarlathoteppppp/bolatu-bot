@@ -75,6 +75,7 @@ async def generate_group_reply(
     pinned_db_ids: set[int] | None = None,
     self_interaction_context: str = "",
     generation_relation: str = "",
+    reply_mode_guide: str = "",
 ) -> GeneratedGroupReply | None:
     tool_answer_mode = mode in {
         PipelineMode.SEARCH,
@@ -99,6 +100,8 @@ async def generate_group_reply(
         # The writer gets the plain-words relation view; the critic below still
         # reviews against the full speaker_context.
         effective_speaker_context = generation_relation or speaker_context
+        if reply_mode_guide and not tool_answer_mode:
+            effective_speaker_context = combine_text_sections(effective_speaker_context, reply_mode_guide)
         if decision.reply_angle and not tool_answer_mode:
             effective_speaker_context = combine_text_sections(
                 effective_speaker_context, "你打算接的点：" + decision.reply_angle,
