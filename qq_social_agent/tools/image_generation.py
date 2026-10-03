@@ -33,6 +33,40 @@ def _rate_limit_reason(group_id: int, user_id: int, now: float) -> str:
     return ""
 
 
+POLITICAL_BLOCK_CONTEXT = "[生图拒绝] 这个画面涉及中国政治人物，不画；本轮没有生成图片。"
+
+
+async def _depicts_china_political_figure(text: str) -> bool:
+    """No Chinese (incl. HK/Macau/Taiwan) political figures, by name, nickname or allusion."""
+    from ..political_guard import political_candidates, sanitize_political_output_detail
+
+    if sanitize_political_output_detail(text, contextual_keys=()).guarded:
+        return True  # hard names: 习近平, 毛主席, 江泽民 ...
+    try:
+        from ..jev_client import JevClient, _optional_noul
+
+        client = JevClient()
+        try:
+            data = await client.evaluate(
+                state=f"【画图请求】{text[:600]}",
+                questions={"china_political_figure": {"type": "noul", "instructions": (
+                    "这个画图请求是否要画出或影射中国（含港澳台）的政治人物：现任或历史领导人、官员、政党人物、政治异见人士；"
+                    "包括真名、外号、谐音、梗图称呼，以及明显指向某位领导人的外貌、职务或场景描述。"
+                    "其他国家的政治人物、动漫角色、普通人物和动物为 false。"
+                )}},
+            )
+        finally:
+            await client.aclose()
+        score = _optional_noul(data, "china_political_figure")
+    except Exception:
+        score = None
+    if score is None:
+        # Judge unavailable: ambiguous names (维尼, 教员 ...) fail closed.
+        return bool(political_candidates(text))
+    # Live calibration: allusions 0.35-0.99, ordinary requests 0.01-0.02.
+    return score >= 0.30
+
+
 def _prune_old_images(now: float) -> None:
     for path in IMAGE_DIRECTORY.glob("*.png"):
         try:
@@ -47,6 +81,12 @@ async def generate_image(request: ToolRequest) -> ToolResult:
     if not key:
         return ToolResult(ToolKind.IMAGE_GENERATION, "unavailable",
                           context="[生图失败] 服务密钥未配置，本轮没有生成图片。", error="image_key_missing")
+    request_text = "\n".join(
+        part for part in (str(request.arguments.get("source_text") or ""), request.query) if part
+    )
+    if await _depicts_china_political_figure(request_text):
+        return ToolResult(ToolKind.IMAGE_GENERATION, "refused", context=POLITICAL_BLOCK_CONTEXT,
+                          error="image_political_figure")
     group_id = int(request.arguments.get("group_id") or 0)
     user_id = int(request.arguments.get("user_id") or 0)
     now = time.time()

@@ -262,3 +262,35 @@ def _reset_image_rate_limits(monkeypatch):
 
     monkeypatch.setattr(ig, "_last_by_user", {})
     monkeypatch.setattr(ig, "_daily_by_chat", {})
+
+
+def test_china_political_figures_are_never_drawn(monkeypatch) -> None:
+    import asyncio
+    from qq_social_agent.pipeline_types import ToolKind, ToolRequest
+    from qq_social_agent.tools import image_generation as ig
+    import qq_social_agent.jev_client as jc
+
+    monkeypatch.setenv("VERYSADAI_API_KEY", "test")
+
+    def no_http(*_a, **_k):
+        raise AssertionError("refused requests must not reach the image API")
+    monkeypatch.setattr(ig.httpx, "AsyncClient", no_http)
+
+    # Hard names are refused without asking Jev.
+    r = asyncio.run(ig.generate_image(ToolRequest(ToolKind.IMAGE_GENERATION, query="画一张习近平的漫画")))
+    assert r.status == "refused" and "政治人物" in r.context
+
+    # Allusions are refused when Jev reads them as political.
+    async def political(self, **_):
+        return {"answers": {"china_political_figure": {"noul": 0.74}}}
+    monkeypatch.setattr(jc.JevClient, "evaluate", political)
+    r = asyncio.run(ig.generate_image(ToolRequest(ToolKind.IMAGE_GENERATION, query="一个长得像包子的领导人在视察",
+                                                  arguments={"source_text": "画个包子领导"})))
+    assert r.status == "refused"
+
+    # Jev down: ambiguous names fail closed.
+    async def down(self, **_):
+        raise RuntimeError("jev down")
+    monkeypatch.setattr(jc.JevClient, "evaluate", down)
+    r = asyncio.run(ig.generate_image(ToolRequest(ToolKind.IMAGE_GENERATION, query="维尼熊在城楼上挥手")))
+    assert r.status == "refused"

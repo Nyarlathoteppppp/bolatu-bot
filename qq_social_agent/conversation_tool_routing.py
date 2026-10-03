@@ -378,7 +378,7 @@ def _finalize_routed_tool_plan(
     if image_request is not None:
         final_plan = ToolRoutePlan(
             tuple(
-                replace(r, arguments={**dict(r.arguments), "group_id": group_id, "user_id": user_id})
+                replace(r, arguments={**dict(r.arguments), "group_id": group_id, "user_id": user_id, "source_text": text})
                 if r.kind is ToolKind.IMAGE_GENERATION else r
                 for r in final_plan.requests
             ),
