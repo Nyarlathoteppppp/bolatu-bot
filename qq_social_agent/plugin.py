@@ -23,6 +23,14 @@ from starlette.requests import Request
 from starlette.responses import HTMLResponse, JSONResponse
 
 from . import onebot_gateway
+from .group_message_types import (
+    BufferedGroupMessage,
+    buffered_current_text as _buffered_current_text,
+    buffered_current_user_id as _buffered_current_user_id,
+    buffered_current_nickname as _buffered_current_nickname,
+    buffered_last_created_at as _buffered_last_created_at,
+)
+from .group_session_service import GroupSessionService, GroupSessionState
 from .forward_context import (
     ForwardContextPolicy,
     ForwardContextService,
@@ -386,13 +394,14 @@ addressed_event_times: dict[tuple[int, int], list[float]] = {}
 followup_window_opened_at: dict[tuple[int, int], float] = {}
 last_group_mention_targets: dict[int, tuple[int, float]] = {}
 last_user_reply_times: dict[tuple[int, int], float] = {}
-group_processing_locks: dict[int, asyncio.Lock] = {}
+group_session_state = GroupSessionState()
+group_processing_locks = group_session_state.processing_locks
 group_learning_tasks: dict[int, asyncio.Task[None]] = {}
 private_memory_tasks: dict[int, asyncio.Task[None]] = {}
 learning_coordinator: BackgroundLearningCoordinator | None = None
-group_message_buffers: dict[int, list["BufferedGroupMessage"]] = {}
-group_buffer_tasks: dict[int, asyncio.Task[None]] = {}
-group_generation_inflight: set[int] = set()
+group_message_buffers = group_session_state.message_buffers
+group_buffer_tasks = group_session_state.buffer_tasks
+group_generation_inflight = group_session_state.generation_inflight
 private_session_service = PrivateSessionService()
 private_processing_locks = private_session_service.processing_locks
 private_message_buffers = private_session_service.message_buffers
@@ -400,8 +409,8 @@ private_buffer_tasks = private_session_service.buffer_tasks
 private_generation_inflight = private_session_service.generation_inflight
 private_inbound_message_counts = private_session_service.inbound_message_counts
 private_followup_tasks = private_session_service.followup_tasks
-group_addressed_waiters: dict[int, int] = {}
-group_inbound_sequences: dict[int, int] = {}
+group_addressed_waiters = group_session_state.addressed_waiters
+group_inbound_sequences = group_session_state.inbound_sequences
 group_directory_tasks: dict[str, asyncio.Task[None]] = {}
 history_backfill_tasks: dict[str, asyncio.Task[None]] = {}
 notice_directory_refresh_tasks: dict[int, asyncio.Task[None]] = {}
@@ -829,27 +838,6 @@ CHANGELOG_NOTICE_MESSAGE = """张风雪后端更新记录：
 - 审批：A/B/C 或 1/2/3 发送；D/X/取消 不发。
 - 工具：回 bot工具 或 审批规则详情；回 模型状态 查看模型清单。
 """
-
-
-@dataclass(frozen=True)
-class BufferedGroupMessage:
-    bot: Bot
-    event: GroupMessageEvent
-    text: str
-    user_id: int
-    nickname: str
-    created_at: float
-    source_message_id: str = ""
-    correlation_id: str = ""
-    inbound_sequence: int = 0
-    pipeline_state: PipelineState | None = None
-    addressed: bool = False
-    direct_addressed: bool = False
-    followup_soft: bool = False
-    session_id: str = ""
-    message_segments_json: str = ""
-    raw_message_json: str = ""
-    sender_json: str = ""
 
 
 @dataclass(frozen=True)
@@ -3948,8 +3936,7 @@ async def _handle_group_message_scoped(
             correlation_id=correlation_id,
         )
         return
-    inbound_sequence = group_inbound_sequences.get(group_id, 0) + 1
-    group_inbound_sequences[group_id] = inbound_sequence
+    inbound_sequence = _group_session_service().next_inbound_sequence(group_id)
     pipeline_state.trigger_sequence = inbound_sequence
     # Publish image arrival before any network enrichment. A following turn
     # must be able to refer to the real image even while vision is running.
@@ -4380,10 +4367,7 @@ async def _handle_group_message_scoped(
         )
         return
     if contextual_search_request and group_message_buffers.get(group_id):
-        task = group_buffer_tasks.pop(group_id, None)
-        if task is not None and not task.done():
-            task.cancel()
-        forced_buffered_messages = group_message_buffers.pop(group_id, [])
+        forced_buffered_messages = _group_session_service().drain_for_contextual_search(group_id)
         forced_buffered_messages.append(
             BufferedGroupMessage(
                 bot=bot,
@@ -4402,7 +4386,7 @@ async def _handle_group_message_scoped(
             )
         )
     if effective_addressed:
-        group_addressed_waiters[group_id] = group_addressed_waiters.get(group_id, 0) + 1
+        _group_session_service().begin_addressed(group_id)
     lock_requested_at = time.monotonic()
     try:
         async with _group_processing_lock(group_id):
@@ -4430,11 +4414,7 @@ async def _handle_group_message_scoped(
             )
     finally:
         if effective_addressed:
-            remaining = group_addressed_waiters.get(group_id, 1) - 1
-            if remaining > 0:
-                group_addressed_waiters[group_id] = remaining
-            else:
-                group_addressed_waiters.pop(group_id, None)
+            _group_session_service().end_addressed(group_id)
 
 
 async def _handle_group_message_locked(
@@ -7176,11 +7156,8 @@ def _append_market_intent(
 
 
 def _should_defer_group_reply_flow(group_id: int, *, now: float | None = None) -> bool:
-    return (
-        group_id in group_generation_inflight
-        or group_addressed_waiters.get(group_id, 0) > 0
-        or any(item.addressed or item.direct_addressed for item in group_message_buffers.get(group_id, ()))
-    )
+    return _group_session_service().should_defer_reply(group_id)
+
 
 def _contextual_followup_search_intent(
     *,
@@ -7234,163 +7211,42 @@ def _buffer_group_message(
         followup_soft=followup_soft,
         **_event_message_storage_kwargs(event, bot=bot),
     )
-    group_message_buffers.setdefault(group_id, []).append(item)
-    _schedule_group_buffer_flush(group_id)
-    logger.info(
-        "qq_social_agent buffered group message: "
-        f"group={group_id} size={len(group_message_buffers.get(group_id, []))}"
+    _group_session_service().buffer_message(
+        group_id, item, schedule_buffer_flush=_schedule_group_buffer_flush, logger=logger,
     )
 
 
 def _schedule_group_buffer_flush(group_id: int, *, delay: float = GROUP_BUFFER_SECONDS) -> None:
-    task = group_buffer_tasks.get(group_id)
-    if task is None or task.done():
-        group_buffer_tasks[group_id] = asyncio.create_task(_flush_group_buffer_after_delay(group_id, delay=delay))
+    _group_session_service().schedule_buffer_flush(group_id, delay=delay, flush=_flush_group_buffer_after_delay)
 
 
 async def _flush_group_buffer_after_delay(group_id: int, *, delay: float = GROUP_BUFFER_SECONDS) -> None:
-    should_reschedule = False
-    reschedule_delay = GROUP_INFLIGHT_BUFFER_RETRY_SECONDS
-    try:
-        await asyncio.sleep(delay)
-        async with _group_processing_lock(group_id):
-            if group_addressed_waiters.get(group_id, 0) > 0:
-                should_reschedule = True
-                return
-            if group_id in group_generation_inflight:
-                logger.info(
-                    "qq_social_agent group generation inflight: "
-                    f"group={group_id} buffer_deferred size={len(group_message_buffers.get(group_id, []))}"
-                )
-                should_reschedule = True
-                return
-            items = group_message_buffers.pop(group_id, [])
-            if not items:
-                return
-            first_addressed = next(
-                (index for index, item in enumerate(items) if item.addressed or item.direct_addressed),
-                None,
-            )
-            if first_addressed is not None:
-                first_user = items[first_addressed].user_id
-                batch_start = first_addressed
-                while batch_start > 0 and items[batch_start - 1].user_id == first_user:
-                    batch_start -= 1
-                batch_end = first_addressed + 1
-                while batch_end < len(items) and items[batch_end].user_id == first_user:
-                    batch_end += 1
-                batch = items[batch_start:batch_end]
-                rest = items[:batch_start] + items[batch_end:]
-                if rest:
-                    group_message_buffers[group_id] = rest
-                    should_reschedule = True
-                items = batch
-                logger.info(
-                    "qq_social_agent split addressed group buffer: "
-                    f"group={group_id} keep_user={first_user} "
-                    f"batch={len(items)} remaining={len(rest)}"
-                )
-            logger.info(
-                "qq_social_agent flushing group buffer: "
-                f"group={group_id} size={len(items)}"
-            )
-            latest = items[-1]
-            if latest.pipeline_state is not None:
-                _record_metric_event(
-                    "group_flow_timing", group_id=group_id, user_id=latest.user_id,
-                    stage="buffer_wait", action="completed",
-                    elapsed_ms=int((time.monotonic() - latest.pipeline_state.received_monotonic) * 1000),
-                    correlation_id=latest.correlation_id,
-                )
-            group_generation_inflight.add(group_id)
-            try:
-                with correlation_scope(latest.correlation_id):
-                    await _handle_group_message_locked(latest.bot, latest.event, buffered_messages=items)
-            finally:
-                group_generation_inflight.discard(group_id)
-                pending_size = len(group_message_buffers.get(group_id, []))
-                logger.info(
-                    "qq_social_agent group generation finished: "
-                    f"group={group_id} pending_buffer={pending_size}"
-                )
-                if pending_size:
-                    should_reschedule = True
-    finally:
-        task = asyncio.current_task()
-        if group_buffer_tasks.get(group_id) is task:
-            group_buffer_tasks.pop(group_id, None)
-        if should_reschedule and group_message_buffers.get(group_id):
-            _schedule_group_buffer_flush(group_id, delay=reschedule_delay)
+    await _group_session_service().flush_after_delay(
+        group_id,
+        delay=delay,
+        retry_delay=GROUP_INFLIGHT_BUFFER_RETRY_SECONDS,
+        handle_group_message=_handle_group_message_locked,
+        schedule_buffer_flush=_schedule_group_buffer_flush,
+        record_metric_event=_record_metric_event,
+        logger=logger,
+    )
 
 
-def _buffered_current_text(items: list[BufferedGroupMessage] | None) -> str:
-    if not items:
-        return ""
-    if len(items) == 1:
-        return items[0].text
-    recent_items = items[-6:]
-    last_item = items[-1]
-    last_label = _member_label(last_item.user_id, last_item.nickname)
-    speaker_count = len({item.user_id for item in recent_items})
-    lines = [
-        f"【连续消息，按时间顺序；最后触发者：{last_label}】",
-        f"当前发言人只有 {last_label}。",
-    ]
-    if speaker_count > 1:
-        lines.append(
-            f"上面编号里还有其他人，他们不是 {last_label}；不要把旁人的话当成 {last_label} 说的，也不要把两个人认成同一个。"
-        )
-    if len(items) > len(recent_items):
-        lines.append(f"（前面还有 {len(items) - len(recent_items)} 条普通群消息）")
-    for index, item in enumerate(recent_items, start=1):
-        line = _buffered_message_context_line(index, item, last_user_id=last_item.user_id)
-        if line:
-            lines.append(line)
-    return "\n".join(lines).strip()
-
-
-def _buffered_message_context_line(
-    index: int,
-    item: BufferedGroupMessage,
-    *,
-    last_user_id: int | None = None,
-) -> str:
-    text = (item.text or "").strip()
-    if not text:
-        return ""
-    label = _member_label(item.user_id, item.nickname)
-    if text.startswith(f"{label}回复") or text.startswith(f"{label}说"):
-        body = text
-    else:
-        body = f"{label}说：{text}"
-    role = "当前发言" if last_user_id is not None and item.user_id == last_user_id else "旁人"
-    return f"{index}. [{role}] {body}"
-
-
-def _buffered_current_user_id(items: list[BufferedGroupMessage] | None) -> int:
-    if not items:
-        return 0
-    return items[-1].user_id
-
-
-def _buffered_current_nickname(items: list[BufferedGroupMessage] | None) -> str:
-    if not items:
-        return "群友"
-    return items[-1].nickname
-
-
-def _buffered_last_created_at(items: list[BufferedGroupMessage] | None) -> float:
-    if not items:
-        return time.time()
-    return items[-1].created_at
+def _group_session_service() -> GroupSessionService:
+    # These adapter names remain shared with schedulers, admin state and tests.
+    # Each view holds the current registries by reference, never a copied queue.
+    return GroupSessionService(GroupSessionState(
+        processing_locks=group_processing_locks,
+        message_buffers=group_message_buffers,
+        buffer_tasks=group_buffer_tasks,
+        generation_inflight=group_generation_inflight,
+        addressed_waiters=group_addressed_waiters,
+        inbound_sequences=group_inbound_sequences,
+    ))
 
 
 def _group_processing_lock(group_id: int) -> asyncio.Lock:
-    lock = group_processing_locks.get(group_id)
-    if lock is None:
-        lock = asyncio.Lock()
-        group_processing_locks[group_id] = lock
-    return lock
+    return _group_session_service().processing_lock(group_id)
 
 
 def _memory_maintenance_policy() -> MemoryMaintenancePolicy:

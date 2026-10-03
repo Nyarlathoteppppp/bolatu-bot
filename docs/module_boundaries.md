@@ -42,6 +42,7 @@ entrypoint/plugin -> orchestration -> domain/storage/tools -> provider adapters
 | --- | --- | --- | --- |
 | QQ 接入 | `plugin.py`、`onebot_gateway.py`、`history_sync.py` | OneBot 事件、API、历史同步 | 人格回复判断 |
 | 私聊轮次 | `private_message_types.py`、`private_turn_preparation.py` | 合并后的 `PrivateTurn`、去重与审批优先、媒体/语音/OCR/转发上下文、命令处理和用户消息入库 | 工具决策、模型 Prompt 拼装、QQ 回复发送 |
+| 群聊会话 | `group_session_service.py`、`group_message_types.py` | 同群处理锁、消息缓冲、flush task、生成 inflight、已点名等待计数与接收序号；保持多人艾特 FIFO、同一人连续消息及原触发消息身份 | 开口判断、模型调用、OneBot 正文适配、角色 Prompt |
 | 私聊会话 | `private_session_service.py` | 按用户缓冲与顺序 flush、processing lock、生成 inflight 状态、followup 计数/取消/延时/概率 | 读取 OneBot 事件正文、私聊模型上下文和审批状态 |
 | 私聊工具与上下文 | `private_tool_execution.py`、`private_generation_context.py`、`conversation_tool_routing.py`、`tool_registry.py` | 共享工具路由、工具执行、并行 RAG 与记忆上下文，使用有类型的阶段结果交接 | 原始 OneBot 事件适配、审批状态 |
 | 私聊生成与发送 | `private_reply_delivery.py`、`reply_splitter.py`、`meme_library.py` | 私聊模型调用、表情包选择、分段回复、首段引用及成功后的机器人消息入库 | 入口注册、会话 buffer 调度 |
@@ -109,7 +110,8 @@ entrypoint/plugin -> orchestration -> domain/storage/tools -> provider adapters
 3. **后台记忆维护（已完成）**：`memory_maintenance_service.py` 负责中期摘要、风格规则和成员画像维护；`plugin.py` 保留 task/coordinator 装配与兼容入口。attempt 时间、空摘要 streak、摘要游标推进、私聊早退、持久化和指标名沿用原逻辑；状态字典只有 service 一份，plugin 的旧名称是同对象别名。
 4. **定时群消息（本批完成）**：`daily_review_service.py` 管理定时/手动复盘的目标群、共享发送锁、生成、逐段投递与成功后的 sent marker/学习回写；`proactive_group_message_service.py` 管理主动群消息的上下文、生成、逐段投递和成功后的 topic marker。`plugin.py` 保留运行时依赖装配与原函数入口；daily review 锁仍与手动/定时路径共用同一对象，proactive 使用群聊共享的 inflight 集合。私聊小时任务继续经 plugin 的 `_select_proactive_topic` 选择话题。周报格式化和私聊投递仍留在入口，后续按相同边界单独评估。
 5. **模型管理与输入内容（2026-10-03 完成）**：`ModelRouteService` 统一 QQ 命令与管理台的模型选择、切换、重置及覆盖存储；`BackgroundModelSettings` 独立读取后台配置和 KV，查询 batch 模式不要求 LLM 客户端或完整 LLM 配置。`ForwardContextService` 保留转发原发言人、时间和逐条图片归属；`MessageSummaryService` 只处理内容摘要。入口按调用装配当前依赖，避免持有过期客户端或额外覆盖副本。原命令文案、目录顺序、探测并发、摘要参数和失败分支沿用原实现，Prompt/config 文件未改。`plugin.py` 本轮从 10,505 行降到 9,837 行。
-6. **普通消息发送**：评估 `message_delivery_service.py`，集中普通正文与表情发送结果回写。已批准群回复的分段交付主体已在 `approved_reply_delivery.py`，后续重点评估剩余发送适配与成功后副作用边界。
+6. **群聊会话（2026-10-03 完成）**：`GroupSessionState` 保存共享 registry；`GroupSessionService` 统一缓冲、锁、任务去重、等待计数、接收序号与 flush。入口只构造 OneBot 对应的 `BufferedGroupMessage` 并装配当前处理/调度/指标回调。旧 registry 名称是同一状态对象的适配别名，scheduler/admin/shutdown 仍共享原对象；工厂以当前 registry 引用创建服务视图，不复制队列。普通消息立即 flush、生成中的 1 秒等待、多用户点名 FIFO、同人连续消息、原消息/关联 ID 以及异常取消后的清理沿用现有逻辑。群缓冲文本格式迁入 `group_message_types.py`，措辞未改。
+7. **普通消息发送**：评估 `message_delivery_service.py`，集中普通正文与表情发送结果回写。已批准群回复的分段交付主体已在 `approved_reply_delivery.py`，后续重点评估剩余发送适配与成功后副作用边界。
 
 不要优先拆 `memory.py` 或 `deepseek_client.py`。先补 repository/service 边界和表级测试，再动内部结构。
 
