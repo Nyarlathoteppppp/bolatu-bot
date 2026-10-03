@@ -364,7 +364,22 @@ def _finalize_routed_tool_plan(
             tool="probability",
         )
     image_request = final_plan.first(ToolKind.IMAGE_GENERATION)
+    if image_request is not None and not addressed_bot:
+        # Paid, slow and run under the group lock: only draw when asked directly.
+        final_plan = ToolRoutePlan(
+            tuple(r for r in final_plan.requests if r.kind is not ToolKind.IMAGE_GENERATION),
+            source=final_plan.source,
+        )
+        image_request = None
     if image_request is not None:
+        final_plan = ToolRoutePlan(
+            tuple(
+                replace(r, arguments={**dict(r.arguments), "group_id": group_id, "user_id": user_id})
+                if r.kind is ToolKind.IMAGE_GENERATION else r
+                for r in final_plan.requests
+            ),
+            source=final_plan.source,
+        )
         decision = replace(decision, should_reply=True, need_tool=True, tool="image_generation",
                            action="answer" if decision.action == "ignore" else decision.action)
     return decision, final_plan

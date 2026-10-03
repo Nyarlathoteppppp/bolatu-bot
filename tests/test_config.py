@@ -251,10 +251,10 @@ def test_central_prompt_file_contains_all_runtime_flows() -> None:
         )
 
 
-def test_production_config_uses_verysadai_reply_and_preserves_other_routes() -> None:
+def test_production_config_replies_on_lingsuan_with_verysadai_available() -> None:
     config = load_config(PROJECT_ROOT / "config.yaml")
 
-    assert config.llm.routes["reply"].label == "verysadai/gpt-6.1-sol"
+    assert config.llm.routes["reply"].label == "lingsuan/gpt-6.1-sol"
     assert config.llm.providers["verysadai"].reply_fallback_models == (
         "lingsuan/gpt-6.1-sol", "deepseek/deepseek-flash",
     )

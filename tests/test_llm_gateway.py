@@ -177,6 +177,10 @@ def test_verysadai_chain_preserves_manual_lingsuan_and_peak_combo():
     from qq_social_agent.config import LLMModelRoute
     gateway = _production_gateway()
     gateway._is_reply_peak_now = lambda: True
+    # Default reply route is Lingsuan; VerySadai is a manual switch (its group
+    # injects Codex instructions that break the persona).
+    assert [r.provider for r in gateway._candidate_routes('reply')] == ['lingsuan', 'deepseek']
+    gateway.set_route_override('reply', LLMModelRoute('verysadai', 'gpt-6.1-sol'))
     assert [r.provider for r in gateway._candidate_routes('reply')] == ['verysadai', 'lingsuan', 'deepseek']
     assert gateway._task_timeouts(task='reply_direct', route_name='reply') == (30.0, 80.0)
     gateway.set_route_override('reply', LLMModelRoute('lingsuan', 'gpt-6.1-sol'))
@@ -186,7 +190,9 @@ def test_verysadai_chain_preserves_manual_lingsuan_and_peak_combo():
 
 
 def test_both_sol_providers_fail_then_official_deepseek_receives_original_messages():
+    from qq_social_agent.config import LLMModelRoute
     gateway = _production_gateway()
+    gateway.set_route_override('reply', LLMModelRoute('verysadai', 'gpt-6.1-sol'))
     calls = []
     class BrokenResponsesClient(FakeChatClient):
         def __init__(self, label):

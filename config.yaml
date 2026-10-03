@@ -61,7 +61,7 @@ llm:
       thinking: disabled
   model: lingsuan/gpt-6.1-sol
   decision_model: lingsuan/gpt-6.1-sol
-  reply_model: verysadai/gpt-6.1-sol
+  reply_model: lingsuan/gpt-6.1-sol
   reply_peak_routing:
     enabled: true
     timezone: Asia/Shanghai

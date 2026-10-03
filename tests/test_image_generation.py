@@ -215,4 +215,50 @@ def test_tool_manifest_and_active_reply_fallback_display(monkeypatch, tmp_path):
     )
     state = plugin._admin_tools_state(None)
     reply = next(row for row in state['models'] if row['route'] == 'reply')
-    assert reply['fallback'] == 'lingsuan/gpt-6.1-sol → deepseek/deepseek-flash'
+    assert reply['fallback'] == 'deepseek/deepseek-flash'  # default reply route is Lingsuan
+
+
+def test_image_generation_is_rate_limited_per_user_and_chat(monkeypatch) -> None:
+    import asyncio
+    from qq_social_agent.pipeline_types import ToolKind, ToolRequest
+    from qq_social_agent.tools import image_generation as ig
+
+    monkeypatch.setenv("VERYSADAI_API_KEY", "test")
+    monkeypatch.setattr(ig, "_last_by_user", {})
+    monkeypatch.setattr(ig, "_daily_by_chat", {})
+    now = [1000.0]
+    monkeypatch.setattr(ig.time, "time", lambda: now[0])
+    ig._last_by_user[(1, 2)] = 990.0
+    result = asyncio.run(ig.generate_image(ToolRequest(ToolKind.IMAGE_GENERATION, query="猫", arguments={"group_id": 1, "user_id": 2})))
+    assert result.status == "rate_limited" and "隔一会儿" in result.context
+    ig._daily_by_chat[(1, ig.time.strftime("%Y-%m-%d", ig.time.localtime(now[0])))] = ig.CHAT_DAILY_LIMIT
+    result = asyncio.run(ig.generate_image(ToolRequest(ToolKind.IMAGE_GENERATION, query="猫", arguments={"group_id": 1, "user_id": 3})))
+    assert result.status == "rate_limited" and "明天" in result.context
+
+
+def test_unaddressed_image_requests_are_dropped() -> None:
+    from qq_social_agent.conversation_tool_routing import _finalize_routed_tool_plan
+    from qq_social_agent.deepseek_client import ReplyDecision
+    from qq_social_agent.pipeline_types import ToolKind, ToolRequest
+    from qq_social_agent.tool_router import ToolRoutePlan
+
+    plan = ToolRoutePlan((ToolRequest(ToolKind.IMAGE_GENERATION, query="猫", required=True),))
+    decision = ReplyDecision(True, 0.9, "social", action="reply")
+    _, unaddressed = _finalize_routed_tool_plan(decision, plan, text="画个猫", context_recent=[], addressed_bot=False,
+                                                group_id=1, user_id=2, source_message_id="m")
+    assert unaddressed.first(ToolKind.IMAGE_GENERATION) is None
+    routed, addressed = _finalize_routed_tool_plan(decision, plan, text="画个猫", context_recent=[], addressed_bot=True,
+                                                   group_id=1, user_id=2, source_message_id="m")
+    assert addressed.first(ToolKind.IMAGE_GENERATION).arguments["user_id"] == 2
+    assert routed.tool == "image_generation"
+
+
+import pytest as _pytest
+
+
+@_pytest.fixture(autouse=True)
+def _reset_image_rate_limits(monkeypatch):
+    from qq_social_agent.tools import image_generation as ig
+
+    monkeypatch.setattr(ig, "_last_by_user", {})
+    monkeypatch.setattr(ig, "_daily_by_chat", {})

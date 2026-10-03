@@ -2,7 +2,9 @@
 
 ## 回复路由
 
-默认回复：`verysadai/gpt-6.1-sol` → `lingsuan/gpt-6.1-sol` → `deepseek/deepseek-flash`。
+默认回复：`lingsuan/gpt-6.1-sol` → `deepseek/deepseek-flash`。VerySadai Sol 保留在模型列表，可手动切换；切到它时回退链为 `verysadai` → `lingsuan` → `deepseek-flash`。
+
+2026-10-03 复测：VerySadai 响应仍附带约 2.3 万字符的 Codex 默认指令（换分组后未消失），被问「是不是 AI」时直接出戏；prompt cache 始终 0 命中。因此聊天默认不走 VerySadai，只用于生图。生图仅响应点名请求，同一人 90 秒冷却、每个聊天每天 20 张，超时 120 秒，图片保留 7 天。
 两条 Sol 路由均使用 Responses API，`reasoning.effort=medium`、`store=false`。
 每次请求沿用 `max_retries=0`。Sadai 主链路单次超时 30 秒、总预算 80 秒，给两个回退提供时间；沿用既有余额耗尽处理和熔断机制。
 

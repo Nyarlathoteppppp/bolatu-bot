@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import time
 import base64
 from pathlib import Path
 from uuid import uuid4
@@ -13,6 +14,32 @@ from ..pipeline_types import GeneratedImage, ToolKind, ToolRequest, ToolResult
 IMAGE_MODEL = "gpt-image-2.5-sunburst"
 IMAGE_ENDPOINT = "https://verysadai.com/v1/images/generations"
 IMAGE_DIRECTORY = PROJECT_ROOT / ".pi" / "generated-images"
+# Generation runs inside the group's serialized flow; a long wait blocks every
+# other reply in that group, so the deadline is kept well under 300s.
+IMAGE_TIMEOUT_SECONDS = 120.0
+USER_COOLDOWN_SECONDS = 90.0
+CHAT_DAILY_LIMIT = 20
+RETENTION_SECONDS = 7 * 86400
+
+_last_by_user: dict[tuple[int, int], float] = {}
+_daily_by_chat: dict[tuple[int, str], int] = {}
+
+
+def _rate_limit_reason(group_id: int, user_id: int, now: float) -> str:
+    if now - _last_by_user.get((group_id, user_id), 0.0) < USER_COOLDOWN_SECONDS:
+        return "刚画完一张，同一个人要隔一会儿再画"
+    if _daily_by_chat.get((group_id, time.strftime("%Y-%m-%d", time.localtime(now))), 0) >= CHAT_DAILY_LIMIT:
+        return "今天这里画得太多了，明天再画"
+    return ""
+
+
+def _prune_old_images(now: float) -> None:
+    for path in IMAGE_DIRECTORY.glob("*.png"):
+        try:
+            if now - path.stat().st_mtime > RETENTION_SECONDS:
+                path.unlink()
+        except OSError:
+            continue
 
 
 async def generate_image(request: ToolRequest) -> ToolResult:
@@ -20,7 +47,17 @@ async def generate_image(request: ToolRequest) -> ToolResult:
     if not key:
         return ToolResult(ToolKind.IMAGE_GENERATION, "unavailable",
                           context="[生图失败] 服务密钥未配置，本轮没有生成图片。", error="image_key_missing")
-    async with httpx.AsyncClient(timeout=300.0) as client:
+    group_id = int(request.arguments.get("group_id") or 0)
+    user_id = int(request.arguments.get("user_id") or 0)
+    now = time.time()
+    limited = _rate_limit_reason(group_id, user_id, now)
+    if limited:
+        return ToolResult(ToolKind.IMAGE_GENERATION, "rate_limited",
+                          context=f"[生图暂停] {limited}，本轮没有生成图片。", error="image_rate_limited")
+    _last_by_user[(group_id, user_id)] = now
+    day_key = (group_id, time.strftime("%Y-%m-%d", time.localtime(now)))
+    _daily_by_chat[day_key] = _daily_by_chat.get(day_key, 0) + 1
+    async with httpx.AsyncClient(timeout=IMAGE_TIMEOUT_SECONDS) as client:
         response = await client.post(
             IMAGE_ENDPOINT,
             headers={"Authorization": f"Bearer {key}", "Accept-Encoding": "identity"},
@@ -34,6 +71,7 @@ async def generate_image(request: ToolRequest) -> ToolResult:
     IMAGE_DIRECTORY.mkdir(parents=True, exist_ok=True)
     saved_path = IMAGE_DIRECTORY / f"{uuid4().hex}.png"
     saved_path.write_bytes(base64.b64decode(image.base64_data))
+    _prune_old_images(now)
     usage = payload.get("usage") or {}
     return ToolResult(
         ToolKind.IMAGE_GENERATION, "ok",
