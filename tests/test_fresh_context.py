@@ -1350,3 +1350,31 @@ async def test_lookup_jev_can_request_second_round(monkeypatch) -> None:
     assert lookup.status == "ok"
     assert lookup.research_rounds >= 2
     assert len(seen) > 1
+
+
+def test_sadai_web_search_uses_last_message_and_citations(monkeypatch) -> None:
+    import asyncio
+    from qq_social_agent.tools import fresh_context as fc
+
+    class Resp:
+        status_code = 200
+        def json(self):
+            return {"output": [
+                {"type": "message", "content": [{"type": "output_text", "text": "我会先核实一下。"}]},
+                {"type": "web_search_call"},
+                {"type": "message", "content": [{"type": "output_text", "text": "9月30日收盘跌8.87%。",
+                    "annotations": [{"type": "url_citation", "url": "https://www.investing.com/x", "title": "Why is Cerebras sliding"}]}]},
+            ]}
+
+    class Client:
+        def __init__(self, **_): pass
+        async def __aenter__(self): return self
+        async def __aexit__(self, *_): return False
+        async def post(self, url, **kwargs):
+            assert kwargs["json"]["tools"] == [{"type": "web_search"}]
+            return Resp()
+
+    monkeypatch.setattr(fc.httpx, "AsyncClient", Client)
+    answer, items = asyncio.run(fc._fetch_sadai_web_lookup("cerebras 下跌", kind="news", api_key="k"))
+    assert answer == "9月30日收盘跌8.87%。"
+    assert items[0].url == "https://www.investing.com/x" and items[0].source == "www.investing.com"

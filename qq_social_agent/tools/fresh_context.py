@@ -127,6 +127,8 @@ class FreshContextTool:
         provider: str | None = None,
         tavily_api_key: str | None = None,
         searxng_base_url: str | None = None,
+        sadai_api_key: str | None = None,
+        sadai_model: str = "gpt-6.1-sol",
         timeout_seconds: float = 15.0,
         max_results: int = 5,
         cache_max_entries: int = 256,
@@ -148,6 +150,8 @@ class FreshContextTool:
         self.provider = (provider or os.getenv("FRESH_SEARCH_PROVIDER") or "auto").strip().lower()
         self.tavily_api_key = (tavily_api_key or os.getenv("TAVILY_API_KEY") or "").strip()
         self.searxng_base_url = (searxng_base_url or os.getenv("SEARXNG_BASE_URL") or "").strip().rstrip("/")
+        self.sadai_api_key = (sadai_api_key or "").strip()
+        self.sadai_model = str(sadai_model or "gpt-6.1-sol").strip()
         self.timeout_seconds = max(1.0, float(timeout_seconds))
         self.max_results = max(1, min(10, int(max_results)))
         self.cache_max_entries = max(1, int(cache_max_entries))
@@ -189,6 +193,10 @@ class FreshContextTool:
         searxng_cfg = cfg.get("searxng", {})
         if not isinstance(searxng_cfg, dict):
             searxng_cfg = {}
+        sadai_cfg = cfg.get("sadai_web", {})
+        if not isinstance(sadai_cfg, dict):
+            sadai_cfg = {}
+        sadai_key_env = str(sadai_cfg.get("api_key_env") or "VERYSADAI_API_KEY").strip()
         api_key_env = str(
             tavily_cfg.get("api_key_env")
             or cfg.get("tavily_api_key_env")
@@ -210,6 +218,8 @@ class FreshContextTool:
                 or cfg.get("searxng_base_url")
                 or ""
             ),
+            sadai_api_key=os.getenv(sadai_key_env, "") if sadai_key_env else "",
+            sadai_model=str(sadai_cfg.get("model") or "gpt-6.1-sol"),
             timeout_seconds=_config_float(cfg, "timeout_seconds", default=15.0),
             max_results=_config_int(cfg, "max_results", default=5),
             cache_max_entries=_config_int(cfg, "cache_max_entries", default=256),
@@ -337,7 +347,13 @@ class FreshContextTool:
         self._stats["external_requests"] += 1
         initial_provider = self._resolved_provider(normalized_kind)
         providers = [initial_provider]
-        if initial_provider == "searxng":
+        if initial_provider == "sadai_web":
+            # The model's own web search reads and cites pages itself; the
+            # search APIs stay as fallbacks when it fails or is rate limited.
+            if self.tavily_api_key:
+                providers.append("tavily")
+            providers.append(_fallback_provider(normalized_kind))
+        elif initial_provider == "searxng":
             # SearXNG is the keyless primary source.  Keep the old providers as
             # bounded fallbacks so a temporary engine outage never blocks chat.
             if self.tavily_api_key:
@@ -373,7 +389,9 @@ class FreshContextTool:
                 provider_timeout = min(provider_timeout, 1.5)
             attempted.append(provider_name)
             used_provider = provider_name
-            provider_queries = research_queries if index == 0 else research_queries[:1]
+            provider_queries = (
+                research_queries if index == 0 and provider_name != "sadai_web" else research_queries[:1]
+            )
             outcomes = await asyncio.gather(*(
                 self._lookup_provider_outcome(
                     provider_name,
@@ -407,7 +425,7 @@ class FreshContextTool:
         if status == "ok" and items:
             ok_pages, page = await self._read_followup_pages(items, query=normalized_query, deadline=deadline)
             hop_provider = used_provider or self._resolved_provider(normalized_kind)
-            while await self._should_followup_round(
+            while hop_provider != "sadai_web" and await self._should_followup_round(
                 query=normalized_query,
                 kind=normalized_kind,
                 items=items,
@@ -715,6 +733,18 @@ class FreshContextTool:
                 timeout_seconds=request_timeout,
                 max_results=self.max_results,
             )
+        if provider == "sadai_web":
+            if not self.sadai_api_key:
+                raise SearchProviderError("missing_api_key")
+            return await _invoke_provider(
+                _fetch_sadai_web_lookup,
+                query,
+                kind=kind,
+                api_key=self.sadai_api_key,
+                model=self.sadai_model,
+                timeout_seconds=request_timeout,
+                max_results=self.max_results,
+            )
         if provider == "searxng":
             if not self.searxng_base_url:
                 raise SearchProviderError("missing_base_url")
@@ -744,6 +774,8 @@ class FreshContextTool:
         raise SearchProviderError("unsupported_provider")
 
     def _resolved_provider(self, kind: str = "news") -> str:
+        if self.provider == "sadai_web":
+            return "sadai_web" if self.sadai_api_key else ("tavily" if self.tavily_api_key else _fallback_provider(kind))
         if self.provider == "searxng":
             return "searxng"
         if self.provider == "tavily":
@@ -1144,6 +1176,71 @@ def _dedupe_strings(items: list[str]) -> list[str]:
         seen.add(key)
         result.append(clean)
     return result
+
+
+async def _fetch_sadai_web_lookup(
+    query: str,
+    *,
+    kind: str,
+    api_key: str,
+    model: str = "gpt-6.1-sol",
+    timeout_seconds: float = 30.0,
+    max_results: int = 5,
+) -> tuple[str, tuple[FreshItem, ...]]:
+    """VerySadai Responses with the built-in web_search tool.
+
+    The answer is taken from the last message only: the provider prepends a
+    Codex-style "我会先核实…" message before the search call.
+    """
+    focus = "最新新闻" if kind == "news" else "赛程比分" if kind == "sports" else "资料"
+    payload = {
+        "model": model,
+        "store": False,
+        "max_output_tokens": 1200,
+        "reasoning": {"effort": "low"},
+        "tools": [{"type": "web_search"}],
+        "input": [{"role": "user", "content": (
+            f"联网检索{focus}并用中文回答：{query}\n"
+            "给出关键事实、数字和日期，3 到 6 句；只写查到的内容，查不到就直说。"
+        )}],
+    }
+    async with httpx.AsyncClient(timeout=timeout_seconds) as client:
+        response = await client.post(
+            "https://verysadai.com/v1/responses",
+            headers={"Authorization": f"Bearer {api_key}", "Accept-Encoding": "identity"},
+            json=payload,
+        )
+    if response.status_code == 429:
+        raise SearchProviderError("rate_limited")
+    if response.status_code >= 400:
+        raise SearchProviderError(f"http_{response.status_code}")
+    data = response.json()
+    messages = [item for item in data.get("output") or () if isinstance(item, dict) and item.get("type") == "message"]
+    searched = any(isinstance(item, dict) and item.get("type") == "web_search_call" for item in data.get("output") or ())
+    if not messages or not searched:
+        raise SearchProviderError("no_web_search")
+    answer_parts: list[str] = []
+    items: list[FreshItem] = []
+    seen: set[str] = set()
+    for part in messages[-1].get("content") or ():
+        if not isinstance(part, dict) or part.get("type") != "output_text":
+            continue
+        answer_parts.append(str(part.get("text") or ""))
+        for note in part.get("annotations") or ():
+            url = str((note or {}).get("url") or "").strip()
+            if not url or url in seen:
+                continue
+            seen.add(url)
+            items.append(FreshItem(
+                title=str(note.get("title") or url)[:160],
+                source=urlparse(url).netloc,
+                published_at="",
+                url=url,
+            ))
+    answer = "".join(answer_parts).strip()
+    if not answer:
+        raise SearchProviderError("empty_answer")
+    return answer, tuple(items[: max(1, max_results)])
 
 
 async def _fetch_tavily_lookup(

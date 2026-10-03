@@ -223,12 +223,13 @@ meme_library:
 
 fresh_search:
   enabled: true
-  # 当前宿主机 SearXNG 引擎持续超时；使用已验证可达的 Tavily，失败仍走 RSS 回退。
-  provider: tavily
+  # 主用 VerySadai 的模型内置 web_search（自己检索、读页、带引用）；失败依次回退 Tavily、Bing/Google News。
+  # 宿主机 SearXNG 引擎查询返回 0 条结果，不在链路里。
+  provider: sadai_web
   max_external_queries_per_minute: 8
   # 首轮默认三个检索角度并发执行，给正文核验留足总预算。
-  # 25 秒：Tavily 单独用掉 13s+ 超时时，Bing/Google News 回退仍有时间跑完。
-  timeout_seconds: 25
+  # 45 秒：内置搜索约 18s，失败后 Tavily 与 Bing/Google News 回退仍有时间。
+  timeout_seconds: 45
   max_results: 5
   followup_page_max_tries: 6
   followup_page_max_chars: 2800
@@ -242,6 +243,9 @@ fresh_search:
   web_cache_ttl_seconds: 1800
   failure_ttl_seconds: 30
   query_max_chars: 120
+  sadai_web:
+    api_key_env: VERYSADAI_API_KEY
+    model: gpt-6.1-sol
   tavily:
     api_key_env: TAVILY_API_KEY
   searxng:
