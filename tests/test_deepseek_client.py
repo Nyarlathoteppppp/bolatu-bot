@@ -42,6 +42,7 @@ def test_provider_circuit_uses_fallback_after_repeated_failures() -> None:
     fallback = SimpleNamespace(provider="deepseek", model="deepseek-v4-flash")
     client.config = SimpleNamespace(
         routes={"reply": primary},
+        providers={primary.provider: SimpleNamespace(reply_fallback_models=())},
         fallback_routes={"reply": fallback},
     )
     client.route_overrides = {}
@@ -69,6 +70,7 @@ def test_provider_circuit_mixed_timeouts_still_open() -> None:
     fallback = SimpleNamespace(provider="deepseek", model="deepseek-v4-flash")
     client.config = SimpleNamespace(
         routes={"reply": primary},
+        providers={primary.provider: SimpleNamespace(reply_fallback_models=())},
         fallback_routes={"reply": fallback},
     )
     client.route_overrides = {}
@@ -93,6 +95,7 @@ def test_reply_peak_prefers_siliconflow_but_manual_override_wins() -> None:
     siliconflow = SimpleNamespace(provider="siliconflow", model="deepseek-ai/DeepSeek-V4-Flash")
     client.config = SimpleNamespace(
         routes={"reply": official},
+        providers={official.provider: SimpleNamespace(reply_fallback_models=())},
         fallback_routes={"reply": siliconflow},
         reply_peak_routing=SimpleNamespace(
             enabled=True,

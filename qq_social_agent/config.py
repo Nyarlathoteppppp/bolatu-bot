@@ -21,6 +21,7 @@ class LLMProviderConfig:
     reply_reasoning_effort: str = "medium"
     reply_timeout_seconds: float | None = None
     reply_total_timeout_seconds: float | None = None
+    reply_fallback_models: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -343,6 +344,7 @@ def _llm_providers(deepseek: dict[str, Any]) -> dict[str, LLMProviderConfig]:
                 reply_reasoning_effort=str(raw.get("reply_reasoning_effort", "medium")),
                 reply_timeout_seconds=float(raw["reply_timeout_seconds"]) if "reply_timeout_seconds" in raw else None,
                 reply_total_timeout_seconds=float(raw["reply_total_timeout_seconds"]) if "reply_total_timeout_seconds" in raw else None,
+                reply_fallback_models=tuple(str(model) for model in raw.get("reply_fallback_models", ())),
             )
     return providers
 

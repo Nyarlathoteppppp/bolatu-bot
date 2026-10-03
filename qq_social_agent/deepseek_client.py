@@ -401,6 +401,8 @@ class LLMTaskClient(LLMGateway):
                 "结合当前句和已解析上下文补全对象，不把‘那个/刚才那个’原样当搜索词。"
                 "若上下文无法确定对象，返回 tool=none，不猜查询主题。"
             )
+            if jev_routed.tool == "image_generation":
+                system += "\n生图 query 是完整画面描述，保留风格、构图、文字等要求，不按搜索关键词缩写。"
         user = self.prompts.render(
             "tool_router",
             "user",
@@ -1664,6 +1666,8 @@ def _parse_tool_routing_decision(content: str) -> ToolRoutingDecision:
         "prob": "probability",
         "jev": "probability",
         "jev_probability": "probability",
+        "image_generation": "image_generation",
+        "generate_image": "image_generation",
     }
     tool = aliases.get(tool, "none")
     query = re.sub(
@@ -1681,7 +1685,7 @@ def _parse_tool_routing_decision(content: str) -> ToolRoutingDecision:
         confidence = 0.0
     reason = str(raw.get("reason", "") or "").strip()
     comment_after_tool = bool(raw.get("comment_after_tool", True))
-    if tool == "fresh_search" and not query:
+    if tool in {"fresh_search", "image_generation"} and not query:
         tool = "none"
         reason = reason or "empty_query"
     if tool == "deep_url" and not re.search(r"https?://", query, re.IGNORECASE):
@@ -1698,7 +1702,7 @@ def _parse_tool_routing_decision(content: str) -> ToolRoutingDecision:
         queries = ()
     return ToolRoutingDecision(
         tool=tool,
-        query=query[:160],
+        query=query if tool == "image_generation" else query[:160],
         queries=queries,
         kind=kind,
         symbols=symbols,

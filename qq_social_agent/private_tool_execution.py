@@ -273,6 +273,18 @@ async def plan_and_execute_private_tools(
             error=probability_result.error,
             **dict(probability_result.metadata),
         )
+    generated_images = ()
+    image_request = tool_plan.first(ToolKind.IMAGE_GENERATION)
+    if image_request is not None:
+        image_result = await services.tool_registry.execute(image_request)
+        generated_images = image_result.generated_images if image_result.ok else ()
+        image_context = image_result.context or f"[生图失败] {image_result.error or image_result.status}；本轮没有生成图片。"
+        fresh_context = services.combine_text_sections(fresh_context, image_context)
+        services.record_metric_event("tool_call", group_id=turn.chat_id, user_id=turn.user_id,
+                                     stage="private_image_generation", action="registry_execute",
+                                     tool_kind=ToolKind.IMAGE_GENERATION.value, success=image_result.ok,
+                                     status=image_result.status, latency_ms=image_result.elapsed_ms,
+                                     error=image_result.error, **dict(image_result.metadata))
     return PrivateToolStage(
         turn=turn,
         persona=persona,
@@ -285,4 +297,5 @@ async def plan_and_execute_private_tools(
         market_context=market_context,
         fresh_context=fresh_context,
         rag_task=rag_task,
+        generated_images=generated_images,
     )

@@ -22,6 +22,18 @@ group_user_policies:
 llm:
   base_url: https://api.deepseek.com
   providers:
+    verysadai:
+      base_url: https://verysadai.com/v1
+      api_key_env: VERYSADAI_API_KEY
+      api: responses
+      thinking: enabled
+      reasoning_effort: low
+      reply_reasoning_effort: medium
+      reply_timeout_seconds: 30
+      reply_total_timeout_seconds: 80
+      reply_fallback_models:
+        - lingsuan/gpt-6.1-sol
+        - deepseek/deepseek-flash
     lingsuan:
       base_url: https://edge.lingsuan.org/v1
       api_key_env: LINGSUAN_API_KEY
@@ -49,7 +61,7 @@ llm:
       thinking: disabled
   model: lingsuan/gpt-6.1-sol
   decision_model: lingsuan/gpt-6.1-sol
-  reply_model: lingsuan/gpt-6.1-sol
+  reply_model: verysadai/gpt-6.1-sol
   reply_peak_routing:
     enabled: true
     timezone: Asia/Shanghai
@@ -71,6 +83,7 @@ llm:
     - siliconflow/deepseek-ai/DeepSeek-V4-Flash
     - openrouter/z-ai/glm-5.3-flash
     - lingsuan/gpt-6.1-sol
+    - verysadai/gpt-6.1-sol
   fallback_models:
     decision: deepseek/deepseek-v4-flash
     reply:

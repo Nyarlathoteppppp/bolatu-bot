@@ -2336,7 +2336,8 @@ def test_owner_probe_list_uses_switch_numbers(monkeypatch, tmp_path) -> None:
         "3. ❌ siliconflow/deepseek-ai/DeepSeek-V4-Flash：HTTP 403",
         "4. ❌ openrouter/z-ai/glm-5.3-flash：HTTP 403",
         "5. ❌ lingsuan/gpt-6.1-sol：HTTP 403",
-        "6. 高峰 DeepSeek/SiliconFlow 组合：deepseek ❌HTTP 403 / siliconflow ❌HTTP 403",
+        "6. ❌ verysadai/gpt-6.1-sol：HTTP 403",
+        "7. 高峰 DeepSeek/SiliconFlow 组合：deepseek ❌HTTP 403 / siliconflow ❌HTTP 403",
     ]
 
 

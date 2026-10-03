@@ -1,0 +1,18 @@
+id: image_generation
+name: 图片生成
+version: 0.1.0
+enabled: true
+description: 使用 VerySadai 生成图片，并通过现有群聊或私聊回复发送。
+entrypoint: qq_social_agent.tools.image_generation
+permissions:
+  - tool.image_generation
+capabilities:
+  tools:
+    - name: generate_image
+      handler: qq_social_agent.tools.image_generation.generate_image
+      description: 根据绘画请求生成一张新图片。
+      permission: tool.image_generation
+  commands: []
+  scheduled_tasks: []
+  web_routes: []
+  event_handlers: []

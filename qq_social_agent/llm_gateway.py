@@ -260,7 +260,10 @@ class LLMGateway:
             if fallback is not None:
                 routes.append(fallback)
             routes.extend(getattr(self.config, "additional_fallback_routes", {}).get(route_name, ()))
-            if primary.provider == "lingsuan":
+            provider = self.config.providers[primary.provider]
+            if route_name == "reply" and provider.reply_fallback_models:
+                routes = [primary, *(self.parse_model_route(model) for model in provider.reply_fallback_models)]
+            elif primary.provider == "lingsuan":
                 routes = [primary, self.config.fallback_routes[route_name]]
         if route_name == "reply" and route_name not in self.route_overrides and routes[0].provider != "lingsuan":
             # Keep the existing DeepSeek/SiliconFlow peak policy when they are

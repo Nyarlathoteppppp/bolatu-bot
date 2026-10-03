@@ -148,4 +148,5 @@ async def build_private_generation_context(
         recall_feedback_context=recall_feedback_context,
         speaker_context=stage.speaker_context,
         priority_context=priority_context,
+        generated_images=stage.generated_images,
     )

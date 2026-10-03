@@ -119,6 +119,12 @@ def _tool_router_should_run(
         "币价",
         "比特币",
         "以太坊",
+        "画一张",
+        "画个",
+        "帮我画",
+        "生图",
+        "生成图片",
+        "生成一张",
     )
     return any(term in compact for term in proactive_terms)
 
@@ -154,6 +160,11 @@ def _tool_request_from_llm_route(route: object, *, fallback_text: str) -> ToolRe
             required=True,
             arguments={"kind": kind, "queries": queries},
         )
+    if tool == "image_generation":
+        if not query:
+            return None
+        return ToolRequest(ToolKind.IMAGE_GENERATION, query=query, reason=reason,
+                           confidence=confidence, required=True)
     if tool == "market":
         raw_symbols = tuple(getattr(route, "symbols", ()) or ())
         symbols = tuple(
@@ -352,6 +363,10 @@ def _finalize_routed_tool_plan(
             need_tool=True,
             tool="probability",
         )
+    image_request = final_plan.first(ToolKind.IMAGE_GENERATION)
+    if image_request is not None:
+        decision = replace(decision, should_reply=True, need_tool=True, tool="image_generation",
+                           action="answer" if decision.action == "ignore" else decision.action)
     return decision, final_plan
 
 

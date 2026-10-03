@@ -108,6 +108,21 @@ async def execute_group_tools(
                 )
 
     fresh_context = ""
+    image_request = tool_plan.first(ToolKind.IMAGE_GENERATION)
+    if image_request is not None:
+        image_result = await tool_registry.execute(image_request)
+        pipeline_state.add_tool_result(image_result)
+        fresh_context = image_result.context or f"[生图失败] {image_result.error or image_result.status}；本轮没有生成图片。"
+        record_metric_event("tool_call", group_id=group_id, user_id=user_id, stage="image_generation",
+                            action="registry_execute", tool_kind=ToolKind.IMAGE_GENERATION.value,
+                            success=image_result.ok, status=image_result.status,
+                            latency_ms=image_result.elapsed_ms, error=image_result.error,
+                            **dict(image_result.metadata))
+        if image_result.ok and image_result.generated_images:
+            return GroupToolExecutionResult(
+                market_context=market_context, market_report=market_report, fresh_context=fresh_context,
+                direct_candidates=(PendingApprovalCandidate(1, "", "answer", "生图工具结果"),),
+            )
     if decision.need_fresh_context:
         query = _compact_search_query(decision.fresh_query.strip() or text.strip()) or (
             decision.fresh_query.strip() or text.strip()
@@ -135,7 +150,7 @@ async def execute_group_tools(
             user_id=user_id,
         )
         pipeline_state.add_tool_result(fresh_result)
-        fresh_context = fresh_result.context
+        fresh_context = combine_text_sections(fresh_context, fresh_result.context) if fresh_context else fresh_result.context
         if str(fresh_result.status) != "ok" and not fresh_context.strip():
             query_text = decision.fresh_query.strip() or text.strip()
             failure_reason = fresh_result.error or fresh_result.status or "搜索工具没有返回可用结果"

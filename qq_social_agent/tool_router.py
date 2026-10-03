@@ -284,6 +284,9 @@ def apply_tool_plan(decision: ReplyDecision, plan: ToolRoutePlan) -> ReplyDecisi
             need_tool=True,
             tool="probability",
         )
+    if plan.first(ToolKind.IMAGE_GENERATION) is not None:
+        result = replace(result, should_reply=True, need_tool=True, tool="image_generation",
+                         action="answer" if result.action == "ignore" else result.action)
     return result
 
 
@@ -295,6 +298,8 @@ def compare_legacy_decision(decision: ReplyDecision, plan: ToolRoutePlan) -> Too
         legacy.append(ToolKind.FRESH_SEARCH.value)
     if decision.need_tool and decision.tool == "probability":
         legacy.append(ToolKind.PROBABILITY.value)
+    if decision.need_tool and decision.tool == "image_generation":
+        legacy.append(ToolKind.IMAGE_GENERATION.value)
     legacy_kinds = tuple(sorted(set(legacy)))
     routed_kinds = tuple(sorted(set(plan.kinds)))
     return ToolRouteComparison(legacy_kinds == routed_kinds, legacy_kinds, routed_kinds)

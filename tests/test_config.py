@@ -251,10 +251,13 @@ def test_central_prompt_file_contains_all_runtime_flows() -> None:
         )
 
 
-def test_production_config_uses_lingsuan_except_search() -> None:
+def test_production_config_uses_verysadai_reply_and_preserves_other_routes() -> None:
     config = load_config(PROJECT_ROOT / "config.yaml")
 
-    assert config.llm.routes["reply"].label == "lingsuan/gpt-6.1-sol"
+    assert config.llm.routes["reply"].label == "verysadai/gpt-6.1-sol"
+    assert config.llm.providers["verysadai"].reply_fallback_models == (
+        "lingsuan/gpt-6.1-sol", "deepseek/deepseek-flash",
+    )
     assert config.llm.fallback_routes["reply"].label == "deepseek/deepseek-flash"
     assert config.llm.additional_fallback_routes["reply"][0].label == "siliconflow/deepseek-ai/DeepSeek-V4-Flash"
     assert tuple(route.label for route in config.llm.model_catalog) == (
@@ -263,8 +266,9 @@ def test_production_config_uses_lingsuan_except_search() -> None:
         "siliconflow/deepseek-ai/DeepSeek-V4-Flash",
         "openrouter/z-ai/glm-5.3-flash",
         "lingsuan/gpt-6.1-sol",
+        "verysadai/gpt-6.1-sol",
     )
-    assert set(config.llm.providers) == {"deepseek", "siliconflow", "mimo", "openrouter", "lingsuan"}
+    assert set(config.llm.providers) == {"deepseek", "siliconflow", "mimo", "openrouter", "lingsuan", "verysadai"}
     assert config.raw["background_models"]["memory"] == "lingsuan/gpt-6.1-sol"
     assert config.raw["background_models"]["review"] == "lingsuan/gpt-6.1-sol"
     assert config.llm is config.deepseek

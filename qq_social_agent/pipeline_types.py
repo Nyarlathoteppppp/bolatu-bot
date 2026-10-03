@@ -47,6 +47,18 @@ class ToolKind(str, Enum):
     DEEP_URL = "deep_url"
     MEMORY = "memory"
     PROBABILITY = "probability"
+    IMAGE_GENERATION = "image_generation"
+
+
+@dataclass(frozen=True)
+class GeneratedImage:
+    base64_data: str = field(repr=False)
+    prompt: str
+    model: str
+
+    @property
+    def file_ref(self) -> str:
+        return "base64://" + self.base64_data
 
 
 @dataclass(frozen=True)
@@ -68,6 +80,7 @@ class ToolResult:
     elapsed_ms: int = 0
     error: str = ""
     metadata: Mapping[str, object] = field(default_factory=dict)
+    generated_images: tuple[GeneratedImage, ...] = ()
 
     @property
     def ok(self) -> bool:

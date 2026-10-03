@@ -353,6 +353,21 @@ def test_private_tool_stage_uses_the_shared_router_and_preserves_private_scope(m
         await multi_stage.rag_task
         assert observed["search_request"].arguments["queries"] == ("GLM 官方公告", "GLM 更新日志")
 
+        from qq_social_agent.pipeline_types import GeneratedImage, ToolResult
+        image = GeneratedImage("dGVzdA==", "白猫", "gpt-image-2.5-sunburst")
+        async def image_route(decision, tool_plan, **kwargs):
+            return decision, ToolRoutePlan((ToolRequest(ToolKind.IMAGE_GENERATION, query="水彩白猫", required=True),))
+        async def image_execute(request):
+            assert request.kind == ToolKind.IMAGE_GENERATION and request.query == "水彩白猫"
+            return ToolResult(request.kind, "ok", context="生图已完成", generated_images=(image,))
+        image_services = replace(services, apply_tool_use_router=image_route,
+                                 tool_registry=SimpleNamespace(execute=image_execute))
+        image_stage = await plan_and_execute_private_tools(replace(turn, text="画一张白猫"), services=image_services)
+        assert image_stage is not None
+        await image_stage.rag_task
+        assert image_stage.generated_images == (image,)
+        assert image_stage.fresh_context == "生图已完成"
+
     asyncio.run(search_checks())
 
 

@@ -10,6 +10,7 @@ from .memory import ChatMessage
 from .persona import Persona
 from .rag_retriever import RAGRetrievalResult
 from .tool_router import ToolRoutePlan
+from .pipeline_types import GeneratedImage
 
 
 @dataclass(frozen=True)
@@ -54,6 +55,7 @@ class PrivateToolStage:
     market_context: str
     fresh_context: str
     rag_task: asyncio.Task[RAGRetrievalResult]
+    generated_images: tuple[GeneratedImage, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -74,3 +76,4 @@ class PrivateGenerationContext:
     recall_feedback_context: str
     speaker_context: str
     priority_context: str
+    generated_images: tuple[GeneratedImage, ...] = ()

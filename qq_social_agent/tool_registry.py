@@ -74,6 +74,7 @@ class ToolRegistry:
                 elapsed_ms=int((time.monotonic() - started) * 1000),
                 error=result.error,
                 metadata=result.metadata,
+                generated_images=result.generated_images,
             )
         except Exception as exc:
             return ToolResult(

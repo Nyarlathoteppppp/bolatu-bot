@@ -5,7 +5,7 @@ import time
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable
 
-from nonebot.adapters.onebot.v11 import Bot, Message
+from nonebot.adapters.onebot.v11 import Bot, Message, MessageSegment
 from nonebot.adapters.onebot.v11.exception import ActionFailed
 
 from .approval_models import DeliveryProgress, PendingApprovalCandidate, PendingGroupApproval
@@ -20,6 +20,7 @@ class ApprovedReplyDeliveryServices:
     group_inbound_sequences: dict[int, int]
     last_group_mention_targets: dict[int, tuple[int, float]]
     send_private_message: Callable[..., Awaitable[object]]
+    private_chat_id: Callable[[int], int]
     send_private_text: Callable[[Bot, int, str], Awaitable[None]]
     send_group_message: Callable[..., Awaitable[int | None]]
     extract_message_id: Callable[[object], int | None]
@@ -77,16 +78,33 @@ async def send_approved_group_reply_inner(
         approval_wait_ms=max(0, int((time.time() - approval.created_at) * 1000)),
         correlation_id=pipeline_state.correlation_id if pipeline_state is not None else None,
     )
+    generated_images = tuple(image for result in pipeline_state.tool_results if result.ok
+                             for image in result.generated_images) if pipeline_state is not None else ()
     private_reply_user_id = pipeline_state.private_reply_user_id if pipeline_state is not None else 0
     if private_reply_user_id:
+        progress = approval.delivery_progress.setdefault(candidate.text, DeliveryProgress(parts=(candidate.text,)))
+        if progress.completed:
+            if pipeline_state is not None:
+                services.pipeline_mark_completed(pipeline_state)
+            return
         private_text = services.memory_text_from_reply_part(candidate.text, approval.mention_targets)
         try:
             result = await services.send_private_message(
                 bot,
                 user_id=private_reply_user_id,
-                message=Message(f"（回复你刚才在群里的提问）\n{private_text}"),
+                message=Message(f"（回复你刚才在群里的提问）\n{private_text}") +
+                        Message([MessageSegment.image(file=image.file_ref) for image in generated_images]),
             )
             sent_message_id = services.extract_message_id(result)
+            progress.sent_message_ids.append(sent_message_id)
+            progress.completed = True
+            services.memory.add_message(
+                services.private_chat_id(private_reply_user_id), approval.self_id, approval.persona_name,
+                private_text + ("\n" + "\n".join(f"[生成图片：{image.prompt}]" for image in generated_images)
+                                if generated_images else ""),
+                is_bot=True, source_message_id=sent_message_id, source_kind="live",
+                correlation_id=approval.correlation_id,
+            )
             if pipeline_state is not None:
                 services.pipeline_mark_sent(pipeline_state, sent_message_id)
                 services.pipeline_mark_completed(
@@ -159,7 +177,8 @@ async def send_approved_group_reply_inner(
             action="force_mention" if delivery_plan.forced_trigger_mention else "quote_only",
             newer_message_count=delivery_plan.sequence_lag,
         )
-    progress = approval.delivery_progress.setdefault(candidate.text, DeliveryProgress(parts=delivery_plan.parts))
+    parts = delivery_plan.parts or (("",) if generated_images else ())
+    progress = approval.delivery_progress.setdefault(candidate.text, DeliveryProgress(parts=parts))
     if progress.completed:
         if pipeline_state is not None:
             services.pipeline_mark_completed(pipeline_state)
@@ -199,16 +218,15 @@ async def send_approved_group_reply_inner(
                 part_text,
                 context=approval.trigger_text + "\n" + candidate.text,
             )
-            attempted = True
-            sent_message_id = await services.send_group_message(
-                bot,
-                approval.group_id,
-                services.message_from_reply_part(
-                    public_text,
-                    effective_mention_targets,
-                    quote_message_id=approval.source_message_id if index == 0 else "",
-                ),
+            message = services.message_from_reply_part(
+                public_text, effective_mention_targets,
+                quote_message_id=approval.source_message_id if index == 0 else "",
             )
+            if index == 0:
+                for image in generated_images:
+                    message += MessageSegment.image(file=image.file_ref)
+            attempted = True
+            sent_message_id = await services.send_group_message(bot, approval.group_id, message)
             acknowledged = True
             progress.sent_message_ids.append(sent_message_id)
             if pipeline_state is not None:
@@ -232,7 +250,8 @@ async def send_approved_group_reply_inner(
                 approval.group_id,
                 approval.self_id,
                 approval.persona_name,
-                memory_text,
+                memory_text + ("\n" + "\n".join(f"[生成图片：{image.prompt}]" for image in generated_images)
+                               if index == 0 and generated_images else ""),
                 is_bot=True,
                 source_message_id=sent_message_id,
                 source_kind="live",

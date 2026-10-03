@@ -17,3 +17,4 @@ docker-compose.server.yml.bak-*
 .DS_Store
 ._*
 backups/
+.pi/generated-images/

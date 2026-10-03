@@ -34,33 +34,35 @@ async def generate_and_send_private_reply(
     services: PrivateReplyServices,
 ) -> None:
     deepseek_client = services.get_deepseek_client()
-    try:
-        reply = await deepseek_client.reply(
-            persona=context.persona,
-            recent_messages=list(context.recent_messages),
-            current_text=context.current_text,
-            current_nickname=context.current_nickname,
-            mentioned=True,
-            chat_label="QQ 私聊",
-            action=context.decision.action,
-            market_context=context.market_context,
-            fresh_context=context.fresh_context,
-            memory_context=context.memory_context,
-            member_context=context.member_context,
-            memory_atoms_context=context.memory_atoms_context,
-            style_context=context.style_context,
-            raw_corpus_context=context.raw_corpus_context,
-            jargon_context=context.jargon_context,
-            recall_feedback_context=context.recall_feedback_context,
-            speaker_context=context.speaker_context,
-            priority_context=context.priority_context,
-        )
-    except Exception as exc:
-        services.logger.warning(
-            f"qq_social_agent private reply generation failed: user={turn.user_id} error={exc}"
-        )
-        return
-    if not reply:
+    reply = ""
+    if not context.generated_images:
+        try:
+            reply = await deepseek_client.reply(
+                persona=context.persona,
+                recent_messages=list(context.recent_messages),
+                current_text=context.current_text,
+                current_nickname=context.current_nickname,
+                mentioned=True,
+                chat_label="QQ 私聊",
+                action=context.decision.action,
+                market_context=context.market_context,
+                fresh_context=context.fresh_context,
+                memory_context=context.memory_context,
+                member_context=context.member_context,
+                memory_atoms_context=context.memory_atoms_context,
+                style_context=context.style_context,
+                raw_corpus_context=context.raw_corpus_context,
+                jargon_context=context.jargon_context,
+                recall_feedback_context=context.recall_feedback_context,
+                speaker_context=context.speaker_context,
+                priority_context=context.priority_context,
+            )
+        except Exception as exc:
+            services.logger.warning(
+                f"qq_social_agent private reply generation failed: user={turn.user_id} error={exc}"
+            )
+            return
+    if not reply and not context.generated_images:
         services.logger.info(f"qq_social_agent skipped private reply: user={turn.user_id} reason=empty_model_reply")
         return
     reply = services.sanitize_generated_text(reply)
@@ -117,19 +119,22 @@ async def generate_and_send_private_reply(
             turn_count=meme_gate.messages_since_last_meme,
         )
 
-    reply_parts = split_reply_messages(reply, max_messages=3)
+    reply_parts = split_reply_messages(reply, max_messages=3) or ([""] if context.generated_images else [])
     services.logger.info(
         "qq_social_agent sending private reply: "
         f"user={turn.user_id} chars={len(reply)} parts={len(reply_parts)}"
     )
     for index, part in enumerate(reply_parts):
         try:
-            await services.send_private_message(
-                turn.bot,
-                user_id=turn.user_id,
-                message=services.message_with_reply_quote(Message(part), turn.source_message_id if index == 0 else ""),
-            )
-            services.memory.add_message(turn.chat_id, turn.self_id, context.persona.name, part, is_bot=True)
+            message = services.message_with_reply_quote(Message(part), turn.source_message_id if index == 0 else "")
+            if index == 0:
+                for image in context.generated_images:
+                    message += MessageSegment.image(file=image.file_ref)
+            await services.send_private_message(turn.bot, user_id=turn.user_id, message=message)
+            memory_text = part
+            if index == 0 and context.generated_images:
+                memory_text += "\n" + "\n".join(f"[生成图片：{image.prompt}]" for image in context.generated_images)
+            services.memory.add_message(turn.chat_id, turn.self_id, context.persona.name, memory_text, is_bot=True)
         except ActionFailed as exc:
             services.logger.warning(
                 "qq_social_agent failed sending private reply: "

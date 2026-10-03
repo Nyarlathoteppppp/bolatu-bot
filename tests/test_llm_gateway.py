@@ -164,3 +164,44 @@ def test_lingsuan_uses_medium_for_reply_low_for_review_and_only_official_fallbac
     assert [route.provider for route in gateway._candidate_routes('reply')] == ['lingsuan', 'deepseek']
     assert [route.provider for route in gateway._candidate_routes('decision')] == ['lingsuan', 'deepseek']
     assert gateway._task_timeouts(task='timing_review', route_name='decision') == (30.0, 50.0)
+
+
+def _production_gateway():
+    from qq_social_agent.config import PROJECT_ROOT, load_config
+    gateway = _gateway()
+    gateway.config = load_config(PROJECT_ROOT / 'config.yaml').llm
+    return gateway
+
+
+def test_verysadai_chain_preserves_manual_lingsuan_and_peak_combo():
+    from qq_social_agent.config import LLMModelRoute
+    gateway = _production_gateway()
+    gateway._is_reply_peak_now = lambda: True
+    assert [r.provider for r in gateway._candidate_routes('reply')] == ['verysadai', 'lingsuan', 'deepseek']
+    assert gateway._task_timeouts(task='reply_direct', route_name='reply') == (30.0, 80.0)
+    gateway.set_route_override('reply', LLMModelRoute('lingsuan', 'gpt-6.1-sol'))
+    assert [r.provider for r in gateway._candidate_routes('reply')] == ['lingsuan', 'deepseek']
+    gateway.set_reply_peak_combo()
+    assert [r.provider for r in gateway._candidate_routes('reply')] == ['siliconflow', 'deepseek']
+
+
+def test_both_sol_providers_fail_then_official_deepseek_receives_original_messages():
+    gateway = _production_gateway()
+    calls = []
+    class BrokenResponsesClient(FakeChatClient):
+        def __init__(self, label):
+            super().__init__()
+            self.responses = self
+            self.label = label
+        async def create(self, **kwargs):
+            calls.append((self.label, kwargs))
+            raise asyncio.TimeoutError()
+    ds = FakeChatClient()
+    gateway.clients = {'verysadai': BrokenResponsesClient('verysadai'), 'lingsuan': BrokenResponsesClient('lingsuan'), 'deepseek': ds}
+    result = asyncio.run(gateway._chat_completion(task='reply_direct', route_name='reply', request={'messages': [{'role': 'user', 'content': '你好'}]}))
+    assert result.model == 'deepseek-flash'
+    assert [label for label, _ in calls] == ['verysadai', 'lingsuan']
+    assert [request['reasoning']['effort'] for _, request in calls] == ['medium', 'medium']
+    assert ds.calls == 1
+    gateway._provider_circuit_until['verysadai'] = float('inf')
+    assert [r.provider for r in gateway._candidate_routes('reply')] == ['lingsuan', 'deepseek']

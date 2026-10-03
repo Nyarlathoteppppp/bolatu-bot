@@ -25,6 +25,7 @@ services:
     volumes:
       - ./qq_social_agent:/app/qq_social_agent
       - ./data:/app/data
+      - ./.pi/generated-images:/app/.pi/generated-images
       - ./logs:/app/logs
       - ./prompts:/app/prompts
       - ./plugins:/app/plugins

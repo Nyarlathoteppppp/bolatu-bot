@@ -293,6 +293,7 @@ from .tools.market import MarketTool
 from .tools.market_intent import MarketIntent, canonical_market_intent, detect_market_intents
 from .tools.voice_transcript import VoiceTranscriptContext
 from .tools.probability_tool import JevProbabilityTool
+from .tools.image_generation import generate_image
 from .tool_router import (
     ToolRoutePlan,
     apply_tool_plan as _apply_tool_plan,
@@ -925,6 +926,8 @@ async def _init_client() -> None:
 
 
 PLUGIN_TOOL_BINDINGS: tuple[tuple[str, str, ToolKind, str, str, str], ...] = (
+    ("image_generation", "generate_image", ToolKind.IMAGE_GENERATION,
+     "按明确绘画请求生成新图片", "_execute_registered_image_generation", "tool.image_generation"),
     (
         "fresh_search",
         "fresh_context",
@@ -2974,6 +2977,19 @@ def _active_model_label(route_name: str, overrides: dict[str, str]) -> str:
     return overrides.get(route_name, app_config.llm.routes[route_name].label)
 
 
+def _model_fallback_labels(route_name: str, active: str) -> tuple[str, ...]:
+    fallback = app_config.llm.fallback_routes[route_name]
+    if active == REPLY_PEAK_COMBO_LABEL:
+        return tuple(route.label for route in app_config.llm.additional_fallback_routes.get(route_name, ()))
+    route = parse_llm_model_route(active, app_config.llm.providers, default_provider="deepseek")
+    provider = app_config.llm.providers[route.provider]
+    if route_name == "reply" and provider.reply_fallback_models:
+        return provider.reply_fallback_models
+    if route.provider == "lingsuan":
+        return (fallback.label,)
+    return (fallback.label, *(route.label for route in app_config.llm.additional_fallback_routes.get(route_name, ())))
+
+
 def _format_model_route_status() -> str:
     overrides = _model_route_overrides()
     lines = ["模型状态：", "可切换部分："]
@@ -2985,8 +3001,7 @@ def _format_model_route_status() -> str:
         lines.append(f"- {title}模型（{route_name}）：{flow}")
         lines.append(f"  当前：{active} {suffix}")
         lines.append(f"  config：{configured}")
-        more_fallbacks = app_config.llm.additional_fallback_routes.get(route_name, ())
-        fallback_chain = " → ".join((fallback, *(route.label for route in more_fallbacks)))
+        fallback_chain = " → ".join(_model_fallback_labels(route_name, active))
         lines.append(f"  fallback：{fallback_chain}")
     lines.append("兼容命令：切工具模型 <模型> = 同时切黑话/记忆/风格/画像。")
     lines.append("")
@@ -3390,7 +3405,7 @@ def _admin_tools_state(group_id: int | None) -> dict[str, object]:
                 "flow": flow,
                 "active": active,
                 "configured": configured,
-                "fallback": fallback,
+                "fallback": " → ".join(_model_fallback_labels(route_name, active)),
                 "overridden": route_name in overrides,
             }
         )
@@ -6935,6 +6950,10 @@ async def _execute_registered_deep_url(request: ToolRequest) -> ToolResult:
     )
 
 
+async def _execute_registered_image_generation(request: ToolRequest) -> ToolResult:
+    return await generate_image(request)
+
+
 async def _execute_registered_probability(request: ToolRequest) -> ToolResult:
     started_at = time.monotonic()
     if jev_probability_tool is None:
@@ -9560,6 +9579,7 @@ async def _send_approved_group_reply_inner(
             send_private_message=_send_private_message,
             send_private_text=_send_private_text,
             send_group_message=_send_group_message,
+            private_chat_id=_private_chat_id,
             extract_message_id=_extract_message_id,
             record_metric_event=_record_metric_event,
             pipeline_mark_sending=_pipeline_mark_sending,

@@ -445,14 +445,14 @@ class JevClient:
         if need_tool_score is None:
             raise ValueError("Missing or invalid Jev need_tool observation")
         tool_choice = str(answers.get("tool_choice", {}).get("choice", "")).strip().lower()
-        if tool_choice not in {"none", "probability", "fresh_search", "market", "deep_url", "other"}:
+        if tool_choice not in {"none", "probability", "fresh_search", "market", "deep_url", "image_generation", "other"}:
             raise ValueError("Missing or invalid Jev tool_choice observation")
         confidence = choice_confidence(answers, "tool_choice")
         if confidence is None or confidence < JEV_TOOL_CHOICE_CONFIDENCE_MIN or tool_choice == "other":
             raise ValueError("Uncertain Jev tool choice; use LLM routing")
 
         from .deepseek_client import ToolRoutingDecision
-        allowed = {"probability", "fresh_search", "market", "deep_url"}
+        allowed = {"probability", "fresh_search", "market", "deep_url", "image_generation"}
         if tool_choice not in allowed or need_tool_score < JEV_TOOL_NOUL_MIN:
             return ToolRoutingDecision(
                 tool="none",
