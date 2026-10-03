@@ -23,6 +23,20 @@ from starlette.requests import Request
 from starlette.responses import HTMLResponse, JSONResponse
 
 from . import onebot_gateway
+from .forward_context import (
+    ForwardContextPolicy,
+    ForwardContextService,
+    extract_forward_record_lines,
+    forward_message_ids as _forward_message_ids,
+    inline_forward_payloads as _inline_forward_payloads,
+)
+from .message_summary import (
+    MessageSummaryPolicy,
+    MessageSummaryService,
+    compact_forward_records as _compact_forward_fallback,
+    compact_long_message,
+)
+from .onebot_gateway import action_failed_summary as _action_failed_summary
 
 from .approval_rules import (
     APPROVAL_CHOICE_RE,
@@ -6727,16 +6741,6 @@ def _format_custom_jargon_list(entries: list[CustomJargonEntry]) -> str:
     return "\n".join(lines)
 
 
-def _action_failed_summary(exc: ActionFailed) -> str:
-    retcode = getattr(exc, "retcode", None)
-    message = getattr(exc, "message", None)
-    if retcode is None:
-        retcode = getattr(exc, "code", None)
-    if message is None:
-        message = getattr(exc, "wording", None)
-    return f"retcode={retcode or 'unknown'} message={message or str(exc)!r}"
-
-
 def _nickname(event: GroupMessageEvent) -> str:
     sender = event.sender
     return sender.card or sender.nickname or str(event.user_id)
@@ -7267,35 +7271,7 @@ def _format_fresh_context_hint(intent: object | None) -> str:
 
 
 async def _message_text_for_context(text: str, *, nickname: str, chat_label: str) -> str:
-    clean = text.strip()
-    if len(clean) <= LONG_MESSAGE_SUMMARY_THRESHOLD:
-        return text
-    fallback = _compact_long_message_fallback(clean)
-    if deepseek_client is None:
-        return fallback
-    try:
-        summary = await deepseek_client.summarize_long_message(
-            text=clean[:LONG_MESSAGE_SUMMARY_SOURCE_LIMIT],
-            speaker_label=nickname,
-            chat_label=chat_label,
-            original_chars=len(clean),
-        )
-    except Exception as exc:
-        logger.warning(
-            "qq_social_agent long message summary failed: "
-            f"chat={chat_label} nickname={nickname!r} chars={len(clean)} error={exc}"
-        )
-        return fallback
-    summary = re.sub(r"\s+", " ", summary).strip()
-    if not summary:
-        return fallback
-    if len(summary) > 160:
-        summary = summary[:157].rstrip() + "..."
-    logger.info(
-        "qq_social_agent compacted long message: "
-        f"chat={chat_label} nickname={nickname!r} raw_chars={len(clean)} summary_chars={len(summary)}"
-    )
-    return f"[长消息{len(clean)}字摘要] {summary}"
+    return await _message_summary_service().message_text(text, nickname=nickname, chat_label=chat_label)
 
 
 async def _maybe_compact_group_context_text(
@@ -7336,257 +7312,39 @@ def _should_compact_group_context_message(
     return len(plain_clean) > LONG_MESSAGE_SUMMARY_THRESHOLD
 
 
+def _message_summary_policy() -> MessageSummaryPolicy:
+    return MessageSummaryPolicy(
+        threshold=LONG_MESSAGE_SUMMARY_THRESHOLD,
+        source_limit=LONG_MESSAGE_SUMMARY_SOURCE_LIMIT,
+        fallback_head=LONG_MESSAGE_SUMMARY_FALLBACK_HEAD,
+        fallback_tail=LONG_MESSAGE_SUMMARY_FALLBACK_TAIL,
+        forward_threshold=FORWARD_CONTEXT_SUMMARY_THRESHOLD,
+    )
+
+
+def _message_summary_service() -> MessageSummaryService:
+    return MessageSummaryService(deepseek_client, _message_summary_policy())
+
+
+def _forward_context_policy() -> ForwardContextPolicy:
+    return ForwardContextPolicy(
+        timezone=DAILY_REVIEW_TIMEZONE, max_records=FORWARD_CONTEXT_MAX_RECORDS,
+        max_images=FORWARD_OCR_MAX_IMAGES, line_limit=FORWARD_RECORD_LINE_LIMIT,
+    )
+
+
 async def _forward_context_text(
-    bot: Bot,
-    event: GroupMessageEvent | PrivateMessageEvent,
-    *,
-    nickname: str,
+    bot: Bot, event: GroupMessageEvent | PrivateMessageEvent, *, nickname: str,
 ) -> str:
-    payloads: list[object] = list(_inline_forward_payloads(event))
-    if not payloads:
-        for forward_id in _forward_message_ids(event)[:2]:
-            try:
-                payload = await onebot_gateway.get_forward_msg(bot, forward_id)
-            except ActionFailed as exc:
-                logger.warning(
-                    "qq_social_agent forward context fetch failed: "
-                    f"forward_id={forward_id} {_action_failed_summary(exc)}"
-                )
-                continue
-            except Exception as exc:
-                logger.warning(
-                    "qq_social_agent forward context fetch failed: "
-                    f"forward_id={forward_id} error={exc}"
-                )
-                continue
-            if payload:
-                payloads.append(payload)
-            if payloads:
-                break
-    records = await _forward_records_from_payloads(bot, payloads)
-    if not records:
-        return ""
-    raw = "\n".join(records)
-    summary = await _summarize_forward_records(raw, nickname=nickname)
-    if not summary:
-        return ""
-    return f"{nickname}传了聊天记录，内容如下：\n{summary}"
-
-
-def _forward_message_ids(event: GroupMessageEvent | PrivateMessageEvent) -> list[str]:
-    ids: list[str] = []
-    for segment in event.message:
-        segment_type, data = segment_type_and_data(segment)
-        if segment_type != "forward":
-            continue
-        for key in ("id", "forward_id", "resid"):
-            value = str(data.get(key, "") or "").strip()
-            if value:
-                ids.append(value)
-                break
-    return ids
-
-
-def _inline_forward_payloads(event: GroupMessageEvent | PrivateMessageEvent) -> list[object]:
-    payloads: list[object] = []
-    for segment in event.message:
-        segment_type, data = segment_type_and_data(segment)
-        if segment_type != "forward":
-            continue
-        for key in ("content", "messages", "message"):
-            value = data.get(key)
-            if isinstance(value, (list, dict)) and value:
-                payloads.append(value)
-                break
-    return payloads
+    service = ForwardContextService(
+        summaries=_message_summary_service(), images=image_ocr_service,
+        policy=_forward_context_policy(),
+    )
+    return await service.context_text(bot, event, nickname=nickname)
 
 
 def _extract_forward_record_lines(payload: object, *, limit: int) -> list[str]:
-    if limit <= 0:
-        return []
-    lines: list[str] = []
-    for item in _forward_messages_from_payload(payload):
-        if len(lines) >= limit:
-            break
-        line = _format_forward_record_line(item)
-        if line:
-            lines.append(line)
-    return lines
-
-
-def _normalized_forward_item(item: object) -> dict[str, object] | None:
-    if not isinstance(item, dict):
-        return None
-    node = item.get("data") if str(item.get("type", "") or "").casefold() == "node" else None
-    normalized = node if isinstance(node, dict) else item
-    return normalized if isinstance(normalized, dict) else None
-
-
-def _format_forward_record_line(item: object, *, ocr_text: str = "") -> str:
-    normalized = _normalized_forward_item(item)
-    if normalized is None:
-        return ""
-    sender = normalized.get("sender") if isinstance(normalized.get("sender"), dict) else {}
-    sender_name = _forward_sender_label(sender, normalized)
-    content = normalized.get("content", normalized.get("message", ""))
-    text = _forward_content_plain_text(content)
-    extra = _short_notice_text(ocr_text, 360)
-    if extra and extra not in text:
-        text = f"{text} {extra}".strip() if text else extra
-    if not text:
-        return ""
-    timestamp = _forward_record_time_label(normalized)
-    prefix = f"[{timestamp}] " if timestamp else ""
-    return f"{prefix}{sender_name}: {_short_notice_text(text, FORWARD_RECORD_LINE_LIMIT)}"
-
-
-async def _forward_records_from_payloads(bot: Bot, payloads: list[object]) -> list[str]:
-    records: list[str] = []
-    ocr_remaining = FORWARD_OCR_MAX_IMAGES
-    for payload in payloads:
-        for item in _forward_messages_from_payload(payload):
-            if len(records) >= FORWARD_CONTEXT_MAX_RECORDS:
-                return records
-            ocr_text = ""
-            used = 0
-            if ocr_remaining > 0:
-                ocr_text, used = await _ocr_forward_record_images(bot, item, remaining=ocr_remaining)
-                ocr_remaining = max(0, ocr_remaining - used)
-            line = _format_forward_record_line(item, ocr_text=ocr_text)
-            if line:
-                records.append(line)
-    return records
-
-
-async def _ocr_forward_record_images(
-    bot: Bot,
-    item: object,
-    *,
-    remaining: int,
-) -> tuple[str, int]:
-    if remaining <= 0 or image_ocr_service is None:
-        return "", 0
-    normalized = _normalized_forward_item(item)
-    if normalized is None:
-        return "", 0
-    content = normalized.get("content", normalized.get("message", ""))
-    images = collect_ocr_image_segments(content, limit=remaining)
-    if not images:
-        return "", 0
-    texts: list[str] = []
-    used = 0
-    for data in images:
-        if used >= remaining:
-            break
-        used += 1
-        try:
-            result = await image_ocr_service.ocr_image_segment(bot, data)
-        except Exception as exc:
-            logger.warning(f"qq_social_agent forward image ocr failed: error={exc}")
-            continue
-        if result is None or not result.text:
-            continue
-        texts.append(_short_notice_text(result.text, 280))
-    if not texts:
-        return "", used
-    rendered = "；".join(f"[图:{item}]" for item in texts)
-    return rendered, used
-
-
-def _forward_record_time_label(item: dict[str, object]) -> str:
-    raw_time = item.get("time", item.get("timestamp", item.get("msg_time", 0)))
-    try:
-        timestamp = float(raw_time or 0)
-    except (TypeError, ValueError):
-        return ""
-    if timestamp <= 0:
-        return ""
-    if timestamp > 10_000_000_000:
-        timestamp /= 1000.0
-    try:
-        return datetime.fromtimestamp(timestamp, DAILY_REVIEW_TIMEZONE).strftime("%m-%d %H:%M")
-    except (OSError, OverflowError, ValueError):
-        return ""
-
-
-def _forward_messages_from_payload(payload: object) -> list[object]:
-    if isinstance(payload, list):
-        return payload
-    if not isinstance(payload, dict):
-        return []
-    if str(payload.get("type", "") or "").casefold() == "node":
-        return [payload]
-    for key in ("messages", "message", "content"):
-        value = payload.get(key)
-        if isinstance(value, list):
-            return value
-    data = payload.get("data")
-    if isinstance(data, dict):
-        for key in ("messages", "message", "content"):
-            value = data.get(key)
-            if isinstance(value, list):
-                return value
-    return []
-
-
-def _forward_sender_label(sender: object, item: dict[str, object]) -> str:
-    if isinstance(sender, dict):
-        name = str(sender.get("card") or sender.get("nickname") or sender.get("name") or "").strip()
-        user_id = str(sender.get("user_id") or sender.get("uin") or "").strip()
-        if name and user_id:
-            return _member_label(int(user_id), name) if user_id.isdigit() else name
-        if name:
-            return name
-        if user_id:
-            return f"QQ{user_id}"
-    fallback = str(item.get("sender_name") or item.get("nickname") or item.get("user_id") or "某人").strip()
-    return fallback or "某人"
-
-
-def _forward_content_plain_text(content: object) -> str:
-    return message_text_from_payload(content, language="zh")
-
-
-async def _summarize_forward_records(raw: str, *, nickname: str) -> str:
-    clean = raw.strip()
-    if not clean:
-        return ""
-    if len(clean) <= FORWARD_CONTEXT_SUMMARY_THRESHOLD:
-        return clean
-    fallback = _compact_forward_fallback(clean)
-    if deepseek_client is None:
-        return fallback
-    try:
-        summary = await deepseek_client.summarize_long_message(
-            text=raw[:LONG_MESSAGE_SUMMARY_SOURCE_LIMIT],
-            speaker_label=f"多位原发言人（由{nickname}转发）",
-            chat_label="QQ 转发聊天记录，每行已标明原发言人，不要把内容算成转发者说的",
-            original_chars=len(raw),
-        )
-    except Exception as exc:
-        logger.warning(
-            "qq_social_agent forward context summary failed: "
-            f"nickname={nickname!r} chars={len(raw)} error={exc}"
-        )
-        return fallback
-    summary = re.sub(r"\s+", " ", summary).strip()
-    return _short_notice_text(summary, 360) if summary else fallback
-
-
-def _compact_forward_fallback(text: str) -> str:
-    lines = [line.strip() for line in str(text or "").splitlines() if line.strip()]
-    if not lines:
-        return ""
-    if len(lines) <= 8 and sum(len(line) for line in lines) <= 900:
-        return "\n".join(lines)
-    head = lines[:5]
-    tail = lines[-2:] if len(lines) > 7 else []
-    omitted = max(0, len(lines) - len(head) - len(tail))
-    parts = list(head)
-    if omitted:
-        parts.append(f"...[另有{omitted}条转发记录]")
-    parts.extend(tail)
-    return "\n".join(parts)
+    return extract_forward_record_lines(payload, limit=limit, policy=_forward_context_policy())
 
 
 def _join_context_blocks(*parts: str) -> str:
@@ -7598,14 +7356,7 @@ def _join_context_parts(*parts: str) -> str:
 
 
 def _compact_long_message_fallback(text: str) -> str:
-    clean = re.sub(r"\s+", " ", text).strip()
-    if len(clean) <= LONG_MESSAGE_SUMMARY_THRESHOLD:
-        return clean
-    head = clean[:LONG_MESSAGE_SUMMARY_FALLBACK_HEAD].rstrip()
-    tail = clean[-LONG_MESSAGE_SUMMARY_FALLBACK_TAIL:].lstrip()
-    if tail and tail not in head:
-        return f"{head} ... [长消息{len(clean)}字，已省略] ... {tail}"
-    return f"{head} ... [长消息{len(clean)}字，已省略]"
+    return compact_long_message(text, _message_summary_policy())
 
 
 async def _private_fresh_context_for(text: str) -> str:

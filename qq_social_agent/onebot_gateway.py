@@ -365,3 +365,13 @@ def _list_payload(payload: Any, *keys: str) -> list[dict[str, Any]]:
         if isinstance(value, list):
             return [item for item in value if isinstance(item, dict)]
     return []
+
+
+def action_failed_summary(exc: Exception) -> str:
+    retcode = getattr(exc, "retcode", None)
+    message = getattr(exc, "message", None)
+    if retcode is None:
+        retcode = getattr(exc, "code", None)
+    if message is None:
+        message = getattr(exc, "wording", None)
+    return f"retcode={retcode or 'unknown'} message={message or str(exc)!r}"
