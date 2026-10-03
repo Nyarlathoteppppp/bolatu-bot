@@ -1,6 +1,6 @@
 # 模块边界与维护手册
 
-最后更新：2026-09-30。
+最后更新：2026-10-03。
 
 这份文档给在服务器上继续维护张风雪的开发者和 AI 使用。目标是让功能继续增长，但不再把所有事情塞进 `qq_social_agent/plugin.py`。
 
@@ -46,6 +46,8 @@ entrypoint/plugin -> orchestration -> domain/storage/tools -> provider adapters
 | 私聊工具与上下文 | `private_tool_execution.py`、`private_generation_context.py`、`conversation_tool_routing.py`、`tool_registry.py` | 共享工具路由、工具执行、并行 RAG 与记忆上下文，使用有类型的阶段结果交接 | 原始 OneBot 事件适配、审批状态 |
 | 私聊生成与发送 | `private_reply_delivery.py`、`reply_splitter.py`、`meme_library.py` | 私聊模型调用、表情包选择、分段回复、首段引用及成功后的机器人消息入库 | 入口注册、会话 buffer 调度 |
 | MessageChain | `message_segments.py`、`reference_resolver.py`、`media_context.py` | 原始 segment、引用/艾特/媒体事实 | 凭文本猜人物关系 |
+| 转发聊天记录 | `forward_context.py` | 内联/远端转发读取、原发言人和时间格式化、逐条图片 OCR 与整批图片预算 | 群聊开口判断、转发者画像、运行时单例 |
+| 输入内容摘要 | `message_summary.py` | 长消息和大型转发摘要、原文退化格式；通过显式客户端和 policy 保留已有阈值与文本 | 选择模型、QQ 发送、读取插件全局 |
 | 图片识别状态 | `image_read_state.py`、`media_context.py` | 原消息接收事实、识图状态持久化、共享任务与原消息结果关联；只消费统一指代绑定 | 重新猜图片来源、插入迟到的用户消息、学习临时识别状态 |
 | 前置筛选 | `decision_gate.py`、`rate_limiter.py` | 去重、低价值、频控、buffer | 社交氛围或搜索词 |
 | 社交决策 | `decision_gate.py`、`group_decision_flow.py`、`timing_gate.py`、`pipeline_types.py`、`pipeline_stages.py` | channel、action、状态转移；`timing_gate.py` 根据 Jev 观察执行开口策略 | 最终回复正文 |
@@ -56,6 +58,7 @@ entrypoint/plugin -> orchestration -> domain/storage/tools -> provider adapters
 | 审批状态与请求 | `approval_state_service.py`、`approval_request_service.py`、`approval_models.py` | 待审批单集合、串行候选选择、取消反馈、stale choice 冷却、审批请求和自动发送决策 | 群消息发送与 delivery progress 写回 |
 | 审批发送 | `approved_reply_delivery.py`、`delivery.py`、`approval_models.py` | 已批准消息发送、分段进度和数据库/Trace 回写；未知结果标记后阻止盲目重试 | 审批命令解析与工具权限 |
 | 文本模型 | `llm_gateway.py`、`deepseek_client.py`、`prompts.py` | gateway 统一 provider、任务路由、超时、回退和用量；task client 负责提示词与结果解析 | QQ 发送与审批状态 |
+| 模型管理 | `model_route_service.py` | 模型目录/编号、覆盖持久化与启动应用、状态、探测、切换和重置；QQ 命令与管理台共享操作。`BackgroundModelSettings` 仅依赖后台配置与 KV | 改变生成路由算法、模型请求协议、聊天 Prompt、后台任务生命周期 |
 | 专用模型接口 | `jev_client.py`、`embedding_client.py`、`siliconflow_ocr.py`、语音客户端 | 各自协议和模态的请求 | 文本聊天路由 |
 | 短期互动 | `interaction_state.py` | 引用原消息与真实发送回执；消费唯一话语状态，按当前窗口整理回复链、字面反馈与结束标记 | 再次判断说话人；推测情绪、亲密度或校园经历；生成角色卡措辞 |
 | 自身互动连续性 | `interaction_state.py` 的 `own_contributions()`、`self_interaction_context.py` | 从当前分支和原有窗口读取已确认发送的原话、表达动作、触发人、直接回应与后续明确反馈；仅喂普通聊天生成阶段 | 写入推测的内心或情绪；影响发言时机；用旧观点覆盖联网事实 |
@@ -105,7 +108,8 @@ entrypoint/plugin -> orchestration -> domain/storage/tools -> provider adapters
 2. **管理 controller（已完成）**：26 条 `/admin` 路由由 `admin_controller.py` 聚合，并按 tools、editable files、summaries、memory/private-memory 划分资源 controller；`admin_ui.py` 只负责渲染。各 controller 通过窄依赖对象调用运行时，不反向导入 `plugin.py`。原有本地请求判定和注册顺序保留；状态与 Trace 路由仍由入口注册。编辑服务保留项目路径校验、YAML/Prompt/config 校验、保存前备份、临时文件替换及 Docker 单文件 bind mount 的原地写入处理。
 3. **后台记忆维护（已完成）**：`memory_maintenance_service.py` 负责中期摘要、风格规则和成员画像维护；`plugin.py` 保留 task/coordinator 装配与兼容入口。attempt 时间、空摘要 streak、摘要游标推进、私聊早退、持久化和指标名沿用原逻辑；状态字典只有 service 一份，plugin 的旧名称是同对象别名。
 4. **定时群消息（本批完成）**：`daily_review_service.py` 管理定时/手动复盘的目标群、共享发送锁、生成、逐段投递与成功后的 sent marker/学习回写；`proactive_group_message_service.py` 管理主动群消息的上下文、生成、逐段投递和成功后的 topic marker。`plugin.py` 保留运行时依赖装配与原函数入口；daily review 锁仍与手动/定时路径共用同一对象，proactive 使用群聊共享的 inflight 集合。私聊小时任务继续经 plugin 的 `_select_proactive_topic` 选择话题。周报格式化和私聊投递仍留在入口，后续按相同边界单独评估。
-5. **普通消息发送**：评估 `message_delivery_service.py`，集中普通正文与表情发送结果回写。已批准群回复的分段交付主体已在 `approved_reply_delivery.py`，后续重点评估剩余发送适配与成功后副作用边界。
+5. **模型管理与输入内容（2026-10-03 完成）**：`ModelRouteService` 统一 QQ 命令与管理台的模型选择、切换、重置及覆盖存储；`BackgroundModelSettings` 独立读取后台配置和 KV，查询 batch 模式不要求 LLM 客户端或完整 LLM 配置。`ForwardContextService` 保留转发原发言人、时间和逐条图片归属；`MessageSummaryService` 只处理内容摘要。入口按调用装配当前依赖，避免持有过期客户端或额外覆盖副本。原命令文案、目录顺序、探测并发、摘要参数和失败分支沿用原实现，Prompt/config 文件未改。`plugin.py` 本轮从 10,505 行降到 9,837 行。
+6. **普通消息发送**：评估 `message_delivery_service.py`，集中普通正文与表情发送结果回写。已批准群回复的分段交付主体已在 `approved_reply_delivery.py`，后续重点评估剩余发送适配与成功后副作用边界。
 
 不要优先拆 `memory.py` 或 `deepseek_client.py`。先补 repository/service 边界和表级测试，再动内部结构。
 

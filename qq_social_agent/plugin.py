@@ -97,6 +97,19 @@ from .approval_state_service import ApprovalStateService, ApprovalStateServices
 from .approved_reply_delivery import ApprovedReplyDeliveryServices, send_approved_group_reply_inner
 from .background_learning import BackgroundLearningCoordinator
 from .config import LLMModelRoute, load_config, parse_llm_model_route
+from .model_route_service import (
+    BACKGROUND_MODEL_OVERRIDES_KEY,
+    BackgroundModelSettings,
+    MODEL_PROBE_COMMAND_RE,
+    MODEL_ROUTE_COMMAND_RE,
+    MODEL_ROUTE_OVERRIDES_KEY,
+    MODEL_ROUTE_RESET_COMMANDS,
+    MODEL_ROUTE_STATUS_COMMANDS,
+    REPLY_PEAK_COMBO_KEY,
+    REPLY_PEAK_COMBO_LABEL,
+    ModelOption,
+    ModelRouteService,
+)
 from .context_assembler import assemble_generation_context, merge_rag_and_summary_context
 from .content_ingestion import ContentIngestionService, explicit_file_read_requested
 from .cue_patterns import CuePatternTracker, CueRepeatState
@@ -765,22 +778,6 @@ AI_WORK_INTENSITY_STATUS_COMMANDS = {"工作强度", "AI强度", "ai强度", "�
 AI_WORK_INTENSITY_PERCENT_RE = re.compile(
     r"^(?:/)?(?:工作强度|AI强度|ai强度|活跃度|触发概率)\s*[:：]?\s*(?P<percent>\d{1,3})?%?$"
 )
-MODEL_ROUTE_OVERRIDES_KEY = "llm_model_route_overrides"
-REPLY_PEAK_COMBO_KEY = "reply_peak_deepseek_siliconflow"
-REPLY_PEAK_COMBO_LABEL = "高峰 DeepSeek/SiliconFlow 组合"
-MODEL_ROUTE_STATUS_COMMANDS = {"模型状态", "模型", "model status", "/模型状态"}
-MODEL_ROUTE_RESET_COMMANDS = {"清模型覆盖", "清除模型覆盖", "重置模型", "恢复默认模型", "model reset", "/清模型覆盖"}
-MODEL_PROBE_COMMAND_RE = re.compile(r"^(?:/)?(?:测试模型|检测模型|model test)(?:\s+(?P<model>\S+))?$", re.IGNORECASE)
-MODEL_ROUTE_COMMAND_RE = re.compile(
-    r"^(?:/)?(?:切|设置|更换|改)?(?P<target>回复|reply|搜索|search|决策|decision|黑话|jargon|记忆|memory|回想|风格|style|学习|style_learning|画像|群友画像|member_profile|profile|工具|utility|utility_model)模型\s+"
-    r"(?P<model>\S+)$",
-    re.IGNORECASE,
-)
-BACKGROUND_MODEL_OVERRIDES_KEY = "llm_background_model_overrides"
-BACKGROUND_MODEL_STATUS_COMMANDS = {"后台模型状态", "后台模型", "后台模型列表"}
-BACKGROUND_MODEL_RESET_COMMANDS = {"清后台模型覆盖", "重置后台模型"}
-BACKGROUND_MODEL_PROBE_RE = re.compile(r"^(?:测试|检测)后台模型(?:\s+(?P<model>\S+))?$")
-BACKGROUND_MODEL_COMMAND_RE = re.compile(r"^(?:切|设置|更换|改)后台(?P<target>记忆|复盘)模型\s+(?P<model>\S+)$")
 MEMORY_REPORT_COMMAND_RE = re.compile(r"^(?:/)?(?:记忆|近期记忆|查看记忆|回想|聊天回想|memory)\s*(?P<limit>\d{0,2})$")
 STYLE_REPORT_COMMAND_RE = re.compile(r"^(?:/)?(?:风格|近期风格|查看风格|风格学习|学习风格|style)\s*(?P<limit>\d{0,2})$")
 MEMBER_IMPRESSION_REPORT_COMMAND_RE = re.compile(
@@ -820,18 +817,6 @@ PRIVATE_CONTEXT_RESET_COMMANDS = {
     "/清空上下文",
     "/reset",
 }
-MODEL_ROUTE_INFOS = (
-    ("decision", "决策", "群聊是否插嘴、action、是否需要联网搜索"),
-    ("reply", "回复", "私聊回复、群聊审批三候选生成"),
-    ("search", "搜索回复", "消化联网事实并生成精简回答"),
-    ("jargon", "黑话", "黑话词典注入选择"),
-    ("memory", "记忆", "中期聊天回想压缩"),
-    ("style", "风格", "群聊表达风格学习"),
-    ("member_profile", "画像", "群友长期画像摘要"),
-)
-MODEL_ROUTE_NAMES = tuple(route_name for route_name, _, _ in MODEL_ROUTE_INFOS)
-MODEL_ROUTE_STORAGE_NAMES = (*MODEL_ROUTE_NAMES, "utility")
-UTILITY_GROUP_ROUTE_NAMES = ("jargon", "memory", "style", "member_profile")
 CHANGELOG_NOTICE_KEY = "2026-09-12-official-reply-vision-v1"
 CHANGELOG_NOTICE_MESSAGE = """张风雪后端更新记录：
 1. 回复模型默认改为官方 deepseek/deepseek-flash（V4.1 Flash，可看图）。
@@ -884,12 +869,6 @@ class SuppressionEvent:
     reason: str
     created_at: float
 
-
-@dataclass(frozen=True)
-class ModelOption:
-    label: str
-    routes: tuple[LLMModelRoute, ...]
-    preset: str = ""
 
 
 @get_driver().on_startup
@@ -2581,52 +2560,17 @@ def _join_user_ids(user_ids: list[int] | tuple[int, ...]) -> str:
     return "、".join(str(user_id) for user_id in user_ids) or "无"
 
 
-def _model_route_overrides() -> dict[str, str]:
-    raw = memory.app_kv_get(MODEL_ROUTE_OVERRIDES_KEY)
-    if raw is None:
-        return {}
-    try:
-        data = json.loads(raw)
-    except json.JSONDecodeError:
-        logger.warning("qq_social_agent invalid model route overrides json, clearing")
-        return {}
-    if not isinstance(data, dict):
-        return {}
-    overrides: dict[str, str] = {}
-    for route_name, route_label in data.items():
-        route = str(route_name).strip()
-        label = str(route_label).strip()
-        if route in MODEL_ROUTE_STORAGE_NAMES and label:
-            overrides[route] = label
-    return overrides
 
-
-def _save_model_route_overrides(overrides: dict[str, str]) -> None:
-    cleaned = {
-        route_name: route_label
-        for route_name, route_label in overrides.items()
-        if route_name in MODEL_ROUTE_STORAGE_NAMES and route_label
-    }
-    memory.app_kv_set(MODEL_ROUTE_OVERRIDES_KEY, json.dumps(cleaned, ensure_ascii=False, sort_keys=True))
+def _model_route_service() -> ModelRouteService:
+    return ModelRouteService(
+        llm=app_config.llm, background_models=_background_model_config(), kv=memory,
+        client=deepseek_client, batch_service=background_batch_service,
+        is_owner=_is_owner_user, send_private_text=_send_private_text, logger=logger,
+    )
 
 
 def _apply_model_route_overrides() -> None:
-    if deepseek_client is None:
-        return
-    for route_name, route_label in _model_route_overrides().items():
-        try:
-            if route_name == "reply" and route_label == REPLY_PEAK_COMBO_KEY:
-                deepseek_client.set_reply_peak_combo()
-                continue
-            deepseek_client.set_route_override(
-                route_name,
-                deepseek_client.parse_model_route(route_label, default_provider="siliconflow"),
-            )
-        except Exception as exc:
-            logger.warning(
-                "qq_social_agent failed applying model route override: "
-                f"route={route_name} label={route_label!r} error={exc}"
-            )
+    return _model_route_service().apply_saved_overrides()
 
 
 def _basic_approval_user_ids() -> set[int]:
@@ -2927,12 +2871,7 @@ def _format_approval_review_status() -> str:
 
 
 def _model_options() -> tuple[ModelOption, ...]:
-    models = tuple(ModelOption(route.label, (route,)) for route in app_config.llm.model_catalog)
-    combo_routes = (
-        app_config.llm.fallback_routes["reply"],
-        *app_config.llm.additional_fallback_routes["reply"],
-    )
-    return (*models, ModelOption(REPLY_PEAK_COMBO_LABEL, combo_routes, REPLY_PEAK_COMBO_KEY))
+    return _model_route_service().model_options()
 
 
 def _background_model_config() -> dict[str, object]:
@@ -2941,27 +2880,17 @@ def _background_model_config() -> dict[str, object]:
     return raw if isinstance(raw, dict) else {}
 
 
-def _background_model_catalog() -> tuple[str, ...]:
-    raw = _background_model_config().get("catalog", ())
-    return tuple(str(value).strip() for value in raw if str(value).strip()) if isinstance(raw, list) else ()
 
-
-def _background_model_overrides() -> dict[str, str]:
-    raw = memory.app_kv_get(BACKGROUND_MODEL_OVERRIDES_KEY)
-    try:
-        data = json.loads(raw) if raw else {}
-    except json.JSONDecodeError:
-        return {}
-    catalog = _background_model_catalog()
-    return {key: value for key, value in data.items() if key in {"memory", "review"} and value in catalog} if isinstance(data, dict) else {}
+def _background_model_settings() -> BackgroundModelSettings:
+    return BackgroundModelSettings(kv=memory, config=_background_model_config())
 
 
 def _background_model_selection(group: str) -> str:
-    return _background_model_overrides().get(group, str(_background_model_config().get(group, "")))
+    return _background_model_settings().selection(group)
 
 
 def _background_batch_enabled(group: str) -> bool:
-    return _background_model_selection(group).endswith(":batch")
+    return _background_model_settings().batch_enabled(group)
 
 
 def _background_sync_model(group: str) -> LLMModelRoute | None:
@@ -2971,67 +2900,10 @@ def _background_sync_model(group: str) -> LLMModelRoute | None:
     return parse_llm_model_route(label, app_config.llm.providers, default_provider="siliconflow")
 
 
-def _format_background_model_status() -> str:
-    lines = ["后台模型状态："]
-    for group, name in (("memory", "记忆"), ("review", "复盘")):
-        lines.append(f"- 后台{name}：{_background_model_selection(group)}")
-    lines.append("可切换后台模型：")
-    for number, label in enumerate(_background_model_catalog(), 1):
-        lines.append(f"{number}. {label}{'（异步批处理）' if label.endswith(':batch') else '（实时）'}")
-    counts = background_batch_service.status_snapshot().get("counts", {})
-    if counts:
-        lines.append("批任务：" + "、".join(f"{status} {count}" for status, count in counts.items()))
-    lines.append("命令：测试后台模型；切后台记忆模型 1；切后台复盘模型 1；清后台模型覆盖。")
-    return "\n".join(lines)
-
-
-def _active_model_label(route_name: str, overrides: dict[str, str]) -> str:
-    if route_name == "reply" and overrides.get(route_name) == REPLY_PEAK_COMBO_KEY:
-        return REPLY_PEAK_COMBO_LABEL
-    if deepseek_client is not None:
-        return deepseek_client.current_route(route_name).label
-    return overrides.get(route_name, app_config.llm.routes[route_name].label)
-
 
 def _model_fallback_labels(route_name: str, active: str) -> tuple[str, ...]:
-    fallback = app_config.llm.fallback_routes[route_name]
-    if active == REPLY_PEAK_COMBO_LABEL:
-        return tuple(route.label for route in app_config.llm.additional_fallback_routes.get(route_name, ()))
-    route = parse_llm_model_route(active, app_config.llm.providers, default_provider="deepseek")
-    provider = app_config.llm.providers[route.provider]
-    if route_name == "reply" and provider.reply_fallback_models:
-        return provider.reply_fallback_models
-    if route.provider == "lingsuan":
-        return (fallback.label,)
-    return (fallback.label, *(route.label for route in app_config.llm.additional_fallback_routes.get(route_name, ())))
+    return _model_route_service().fallback_labels(route_name, active)
 
-
-def _format_model_route_status() -> str:
-    overrides = _model_route_overrides()
-    lines = ["模型状态：", "可切换部分："]
-    for route_name, title, flow in MODEL_ROUTE_INFOS:
-        configured = app_config.llm.routes[route_name].label
-        fallback = app_config.llm.fallback_routes[route_name].label
-        active = _active_model_label(route_name, overrides)
-        suffix = "（覆盖）" if route_name in overrides else "（配置）"
-        lines.append(f"- {title}模型（{route_name}）：{flow}")
-        lines.append(f"  当前：{active} {suffix}")
-        lines.append(f"  config：{configured}")
-        fallback_chain = " → ".join(_model_fallback_labels(route_name, active))
-        lines.append(f"  fallback：{fallback_chain}")
-    lines.append("兼容命令：切工具模型 <模型> = 同时切黑话/记忆/风格/画像。")
-    lines.append("")
-    lines.append("可切换模型：")
-    for index, option in enumerate(_model_options(), start=1):
-        if option.preset:
-            lines.append(f"{index}. {option.label}（平峰 DeepSeek，高峰 SiliconFlow）")
-            continue
-        route = option.routes[0]
-        provider = app_config.llm.providers[route.provider]
-        lines.append(f"{index}. {option.label}（{_provider_key_source(provider.name)} / {provider.api_key_env}）")
-    lines.append("")
-    lines.append("命令：测试模型（检测清单）；测试模型 1（单测）；切回复模型 1；清模型覆盖。编号与上方列表对应。")
-    return "\n".join(lines)
 
 
 def _parse_memory_report_limit(text: str, pattern: re.Pattern[str]) -> int | None:
@@ -3115,42 +2987,6 @@ def _format_member_impression_report(group_id: int | None, limit: int) -> str:
 def _format_local_time(timestamp: float) -> str:
     return time.strftime("%m-%d %H:%M", time.localtime(timestamp))
 
-
-def _provider_key_source(provider_name: str) -> str:
-    if provider_name == "deepseek":
-        return "DeepSeek 官方 key，第一次提供"
-    if provider_name == "siliconflow":
-        return "硅基流动 key，第二次提供"
-    return f"{provider_name} key"
-
-
-def _model_route_name_from_text(target: str) -> str | None:
-    key = target.strip().casefold()
-    mapping = {
-        "回复": "reply",
-        "reply": "reply",
-        "搜索": "search",
-        "search": "search",
-        "决策": "decision",
-        "decision": "decision",
-        "黑话": "jargon",
-        "jargon": "jargon",
-        "记忆": "memory",
-        "memory": "memory",
-        "回想": "memory",
-        "风格": "style",
-        "style": "style",
-        "学习": "style",
-        "style_learning": "style",
-        "画像": "member_profile",
-        "群友画像": "member_profile",
-        "member_profile": "member_profile",
-        "profile": "member_profile",
-        "工具": "utility_group",
-        "utility": "utility_group",
-        "utility_model": "utility_group",
-    }
-    return mapping.get(key)
 
 
 def _new_approval_id(group_id: int) -> str:
@@ -3408,23 +3244,7 @@ def _reload_prompt_runtime() -> None:
 
 
 def _admin_tools_state(group_id: int | None) -> dict[str, object]:
-    overrides = _model_route_overrides()
-    model_rows: list[dict[str, object]] = []
-    for route_name, title, flow in MODEL_ROUTE_INFOS:
-        configured = app_config.llm.routes[route_name].label
-        fallback = app_config.llm.fallback_routes[route_name].label
-        active = _active_model_label(route_name, overrides)
-        model_rows.append(
-            {
-                "route": route_name,
-                "title": title,
-                "flow": flow,
-                "active": active,
-                "configured": configured,
-                "fallback": " → ".join(_model_fallback_labels(route_name, active)),
-                "overridden": route_name in overrides,
-            }
-        )
+    model_state = _model_route_service().admin_model_state()
     jargon_entries = []
     if group_id is not None:
         jargon_entries = [
@@ -3461,24 +3281,7 @@ def _admin_tools_state(group_id: int | None) -> dict[str, object]:
                 _private_force_obey_enabled(user_id) for user_id in PRIVATE_FORCE_OBEY_ALLOWED_USER_IDS
             ),
         },
-        "models": model_rows,
-        "model_catalog": [
-            {
-                "label": option.label,
-                "source": (
-                    "平峰 DeepSeek，高峰 SiliconFlow"
-                    if option.preset else
-                    f"{_provider_key_source(option.routes[0].provider)} / {app_config.llm.providers[option.routes[0].provider].api_key_env}"
-                ),
-            }
-            for option in _model_options()
-        ],
-        "background_models": [
-            {"group": group, "title": title, "active": _background_model_selection(group)}
-            for group, title in (("memory", "后台记忆"), ("review", "后台复盘"))
-        ],
-        "background_model_catalog": list(_background_model_catalog()),
-        "background_batch_status": background_batch_service.status_snapshot().get("counts", {}),
+        **model_state,
         "jargon_entries": jargon_entries,
         "tool_docs": {
             "目录": BOT_TOOL_INDEX_MESSAGE,
@@ -3551,48 +3354,9 @@ async def _admin_apply_tool_action(form: dict[str, str], *, group_id: int | None
         if not ok:
             return "强服从设置失败。"
         return "已开启主人/测试号强服从。" if enabled else "已关闭主人/测试号强服从。"
-    if action == "model_reset":
-        _save_model_route_overrides({})
-        if deepseek_client is not None:
-            for route_name in MODEL_ROUTE_STORAGE_NAMES:
-                deepseek_client.set_route_override(route_name, None)
-        return "已清除模型覆盖，恢复 config.yaml 默认模型。"
-    if action == "model_route":
-        if deepseek_client is None:
-            return "模型客户端还没初始化。"
-        route_name = form.get("route", "").strip()
-        route_label = form.get("model", "").strip()
-        if route_name not in (*MODEL_ROUTE_NAMES, "utility_group"):
-            return "未知模型流程。"
-        try:
-            option = _select_model_option(route_label)
-        except Exception as exc:
-            return f"模型路由解析失败：{exc}"
-        if option.preset and route_name != "reply":
-            return "高峰组合只适用于回复模型。"
-        target_routes = UTILITY_GROUP_ROUTE_NAMES if route_name == "utility_group" else (route_name,)
-        overrides = _model_route_overrides()
-        if option.preset:
-            deepseek_client.set_reply_peak_combo()
-            overrides["reply"] = option.preset
-        else:
-            for target_route in target_routes:
-                deepseek_client.set_route_override(target_route, option.routes[0])
-                overrides[target_route] = option.routes[0].label
-        _save_model_route_overrides(overrides)
-        return f"已切换模型：{', '.join(target_routes)} -> {option.label}。"
-    if action == "background_model_route":
-        group = form.get("route", "").strip()
-        label = form.get("model", "").strip()
-        if group not in {"memory", "review"} or label not in _background_model_catalog():
-            return "后台模型或任务组无效。"
-        overrides = _background_model_overrides()
-        overrides[group] = label
-        memory.app_kv_set(BACKGROUND_MODEL_OVERRIDES_KEY, json.dumps(overrides, ensure_ascii=False, sort_keys=True))
-        return f"已切换后台模型：{group} -> {label}。"
-    if action == "background_model_reset":
-        memory.app_kv_set(BACKGROUND_MODEL_OVERRIDES_KEY, "{}")
-        return "已恢复后台记忆和复盘的默认模型。"
+    model_result = _model_route_service().apply_admin_action(action, form)
+    if model_result is not None:
+        return model_result
     if action == "jargon_add":
         if group_id is None:
             return "没有目标群。"
@@ -3804,22 +3568,7 @@ def _status_db_health() -> tuple[bool, str]:
 
 
 def _status_model_routes() -> dict[str, str]:
-    overrides = _model_route_overrides()
-    routes: dict[str, str] = {}
-    for route_name in MODEL_ROUTE_STORAGE_NAMES:
-        if route_name == "utility_group":
-            continue
-        try:
-            route = (
-                deepseek_client.current_route(route_name)
-                if deepseek_client is not None
-                else app_config.llm.routes.get(route_name)
-            )
-        except Exception:
-            route = app_config.llm.routes.get(route_name)
-        if route is not None:
-            routes[route_name] = _active_model_label(route_name, overrides)
-    return routes
+    return _model_route_service().status_routes()
 
 
 def _status_image_ocr() -> dict[str, object]:
@@ -8826,177 +8575,9 @@ async def _handle_private_whitelist_command(bot: Bot, user_id: int, text: str) -
     return True
 
 
-def _select_model_option(value: str) -> ModelOption:
-    if value.isdecimal():
-        index = int(value) - 1
-        options = _model_options()
-        if not 0 <= index < len(options):
-            raise ValueError(f"模型编号无效，请输入 1-{len(options)}。")
-        return options[index]
-    if deepseek_client is None:
-        raise ValueError("模型客户端还没初始化。")
-    if value.endswith(":batch"):
-        raise ValueError("批处理模型只能用于后台记忆/复盘。")
-    route = deepseek_client.parse_model_route(value, default_provider="siliconflow")
-    return ModelOption(route.label, (route,))
-
-
-async def _handle_background_model_command(bot: Bot, user_id: int, text: str) -> bool:
-    switch_match = BACKGROUND_MODEL_COMMAND_RE.match(text)
-    probe_match = BACKGROUND_MODEL_PROBE_RE.match(text)
-    if text not in BACKGROUND_MODEL_STATUS_COMMANDS | BACKGROUND_MODEL_RESET_COMMANDS and switch_match is None and probe_match is None:
-        return False
-    if not _is_owner_user(user_id):
-        await _send_private_text(bot, user_id, "只有主人能查询、测试和切换后台模型。")
-        return True
-    if text in BACKGROUND_MODEL_STATUS_COMMANDS:
-        await _send_private_text(bot, user_id, _format_background_model_status())
-        return True
-    if text in BACKGROUND_MODEL_RESET_COMMANDS:
-        memory.app_kv_set(BACKGROUND_MODEL_OVERRIDES_KEY, "{}")
-        await _send_private_text(bot, user_id, "已恢复后台记忆和复盘的默认模型。")
-        return True
-    catalog = _background_model_catalog()
-    if switch_match is not None:
-        value = switch_match.group("model")
-        index = int(value) - 1 if value.isdecimal() else -1
-        label = catalog[index] if 0 <= index < len(catalog) else value if value in catalog else ""
-        if not label:
-            await _send_private_text(bot, user_id, f"后台模型编号无效，请输入 1-{len(catalog)}。")
-            return True
-        group = "memory" if switch_match.group("target") == "记忆" else "review"
-        overrides = _background_model_overrides()
-        overrides[group] = label
-        memory.app_kv_set(BACKGROUND_MODEL_OVERRIDES_KEY, json.dumps(overrides, ensure_ascii=False, sort_keys=True))
-        await _send_private_text(bot, user_id, f"已切后台{switch_match.group('target')}模型：{label}")
-        return True
-    value = (probe_match.group("model") or "").strip()
-    if value.isdecimal():
-        index = int(value) - 1
-        if not 0 <= index < len(catalog):
-            await _send_private_text(bot, user_id, f"后台模型编号无效，请输入 1-{len(catalog)}。")
-            return True
-        targets = ((index + 1, catalog[index]),)
-    elif value:
-        targets = ((catalog.index(value) + 1, value),) if value in catalog else ()
-    else:
-        targets = tuple(enumerate(catalog, 1))
-    if not targets:
-        await _send_private_text(bot, user_id, "后台模型不在可切换清单中。")
-        return True
-    lines = ["后台模型实测："]
-    for number, label in targets:
-        try:
-            if label.endswith(":batch"):
-                result = await background_batch_service.probe()
-                status = "✅ 可用" if result.status == "completed" and result.content else (
-                    f"⏳ {result.status}，等待批处理完成" if result.status in {"queued", "in_progress"}
-                    else f"❌ {result.status}: {result.error or '无有效回复'}"
-                )
-            elif deepseek_client is None:
-                status = "❌ 模型客户端尚未初始化"
-            else:
-                route = parse_llm_model_route(label, app_config.llm.providers, default_provider="siliconflow")
-                available, reason = await deepseek_client.probe_model(route)
-                status = f"{'✅' if available else '❌'} {reason}"
-        except Exception as exc:
-            status = f"❌ {type(exc).__name__}: {_short_notice_text(str(exc), 80)}"
-        lines.append(f"{number}. {label}：{status}")
-    await _send_private_text(bot, user_id, "\n".join(lines))
-    return True
-
 
 async def _handle_model_route_command(bot: Bot, user_id: int, text: str) -> bool:
-    if await _handle_background_model_command(bot, user_id, text):
-        return True
-    route_match = MODEL_ROUTE_COMMAND_RE.match(text)
-    probe_match = MODEL_PROBE_COMMAND_RE.match(text)
-    if text not in MODEL_ROUTE_STATUS_COMMANDS | MODEL_ROUTE_RESET_COMMANDS and route_match is None and probe_match is None:
-        return False
-    if not _is_owner_user(user_id):
-        await _send_private_text(bot, user_id, "只有主人能查询、测试和切换模型。")
-        return True
-    if text in MODEL_ROUTE_STATUS_COMMANDS:
-        await _send_private_text(bot, user_id, _format_model_route_status())
-        return True
-    if probe_match is not None:
-        if deepseek_client is None:
-            await _send_private_text(bot, user_id, "模型客户端还没初始化，稍后再测。")
-            return True
-        model_label = (probe_match.group("model") or "").strip()
-        if model_label:
-            try:
-                options = (_select_model_option(model_label),)
-            except ValueError as exc:
-                await _send_private_text(bot, user_id, str(exc))
-                return True
-        else:
-            options = _model_options()
-        semaphore = asyncio.Semaphore(3)
-        catalog_numbers = {option.label: index for index, option in enumerate(_model_options(), start=1)}
-
-        async def _probe_one(route):
-            async with semaphore:
-                return await deepseek_client.probe_model(route)
-
-        probe_tasks = {
-            route.label: asyncio.create_task(_probe_one(route))
-            for option in options
-            for route in option.routes
-        }
-        probe_results = dict(zip(probe_tasks, await asyncio.gather(*probe_tasks.values())))
-        results = []
-        for option in options:
-            number = catalog_numbers.get(option.label)
-            prefix = f"{number}. " if number is not None else ""
-            if option.preset:
-                details = " / ".join(
-                    f"{route.provider} {'✅' if probe_results[route.label][0] else '❌'}{probe_results[route.label][1]}"
-                    for route in option.routes
-                )
-                results.append(f"{prefix}{option.label}：{details}")
-            else:
-                available, reason = probe_results[option.routes[0].label]
-                results.append(f"{prefix}{'✅' if available else '❌'} {option.label}：{reason}")
-        await _send_private_text(bot, user_id, "模型实测：\n" + "\n".join(results))
-        return True
-    if text in MODEL_ROUTE_RESET_COMMANDS:
-        _save_model_route_overrides({})
-        if deepseek_client is not None:
-            for route_name in MODEL_ROUTE_STORAGE_NAMES:
-                deepseek_client.set_route_override(route_name, None)
-        await _send_private_text(bot, user_id, "已清除模型覆盖，恢复 config.yaml 默认模型。")
-        return True
-    match = route_match
-    if deepseek_client is None:
-        await _send_private_text(bot, user_id, "模型客户端还没初始化，稍后再切。")
-        return True
-    route_name = _model_route_name_from_text(match.group("target"))
-    if route_name is None:
-        await _send_private_text(bot, user_id, "未知模型类型，只能切 决策/回复/搜索/黑话/记忆/风格/画像/工具 模型。")
-        return True
-    route_label = match.group("model").strip()
-    try:
-        option = _select_model_option(route_label)
-    except ValueError as exc:
-        await _send_private_text(bot, user_id, f"模型路由解析失败：{exc}")
-        return True
-    if option.preset and route_name != "reply":
-        await _send_private_text(bot, user_id, "这个组合只适用于回复模型。")
-        return True
-    target_routes = UTILITY_GROUP_ROUTE_NAMES if route_name == "utility_group" else (route_name,)
-    overrides = _model_route_overrides()
-    if option.preset:
-        deepseek_client.set_reply_peak_combo()
-        overrides["reply"] = option.preset
-    else:
-        for target_route in target_routes:
-            deepseek_client.set_route_override(target_route, option.routes[0])
-            overrides[target_route] = option.routes[0].label
-    _save_model_route_overrides(overrides)
-    target_label = "、".join(target_routes)
-    await _send_private_text(bot, user_id, f"已切{match.group('target')}模型：{option.label}\n影响路由：{target_label}")
-    return True
+    return await _model_route_service().handle_private_command(bot, user_id, text)
 
 
 def _private_tool_reply_delay_seconds() -> float:
