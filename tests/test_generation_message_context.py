@@ -83,3 +83,19 @@ def test_jev_failure_keeps_recent_history_and_exact_evidence() -> None:
         pinned_source_ids={"qq-1"}, pinned_db_ids=set(),
     )
     assert selected == [messages[1], *messages[-11:]]
+
+
+def test_omitted_counts_follow_original_rows_not_database_ids():
+    from dataclasses import replace
+    from qq_social_agent.generation_message_context import omitted_message_counts
+    messages = [replace(message, id=100 + index * 100) for index, message in enumerate(_messages(9))]
+    assert omitted_message_counts(messages, [messages[0], messages[6], messages[8]]) == [0, 5, 1]
+    assert omitted_message_counts(messages, messages[3:6]) == [0, 0, 0]
+
+
+def test_omitted_counts_survive_enriched_text_and_repeated_utterances():
+    from dataclasses import replace
+    from qq_social_agent.generation_message_context import omitted_message_counts
+    messages = [replace(message, text='哈哈') for message in _messages(8)]
+    enriched = replace(messages[6], text='[图片OCR:一只猫]')
+    assert omitted_message_counts(messages, [messages[0], enriched, messages[7]]) == [0, 5, 0]

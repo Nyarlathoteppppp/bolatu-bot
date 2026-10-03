@@ -1197,3 +1197,38 @@ def test_parenthetical_expression_survives_candidate_and_delivery():
         plan = build_delivery_plan(reply_text=candidates[0].text, mention_targets={}, trigger_user_id=1,
                                    trigger_nickname='奈亚子', trigger_sequence=1, current_sequence=1)
         assert plan.parts == (text,)
+
+
+def test_selected_context_marks_omission_between_older_and_current_topic():
+    messages = [ChatMessage(1, 2, 'A', f'消息{index}', False, index * 100., id=index + 1) for index in range(8)]
+    selected = [messages[0], messages[6], messages[7]]
+    context = _format_context_with_local_focus(selected, formatter=lambda m: f'A: {m.text}', original_messages=messages)
+    assert context.count('【此处省略5条群内聊天记录】') == 1
+    assert context.index('A: 消息0') < context.index('【此处省略5条群内聊天记录】') < context.index('A: 消息6')
+    assert 'A: 消息1' not in context
+    assert '省略0条' not in context
+    assert '此处省略' not in _format_context_with_local_focus(messages, formatter=lambda m: m.text, original_messages=messages)
+
+
+def test_reply_writer_receives_gap_markers_after_jev_selection():
+    client = DeepSeekClient.__new__(DeepSeekClient)
+    client.prompts = PromptRegistry()
+    client.config = SimpleNamespace(max_tokens=260, temperature=.7, thinking="disabled")
+    captured = []
+    async def select(messages, **kwargs):
+        return [messages[0], messages[6], messages[7]]
+    async def completion(**kwargs):
+        captured.append(kwargs['request']['messages'][1]['content'])
+        return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content='{"candidates":[{"text":"这句接得上","action":"reply"}]}'))])
+    client._select_relevant_generation_context = select
+    client._chat_completion = completion
+    messages = [ChatMessage(1, 2, 'A', f'消息{index}', False, float(index), id=index + 1) for index in range(8)]
+    persona = Persona('test', '风雪', '', '角色', '决策', 220, .5)
+    result = asyncio.run(client.reply_candidates(persona=persona, recent_messages=messages,
+        current_text='继续说', current_nickname='A', mentioned=True, action='reply', candidate_count=1,
+        prompt_flow='reply_direct', task_name='reply_direct'))
+    assert result and '【此处省略5条群内聊天记录】' in captured[0]
+    captured.clear()
+    result = asyncio.run(client.reply(persona=persona, recent_messages=messages, current_text='继续说',
+                                     current_nickname='A', mentioned=True, action='reply'))
+    assert '【此处省略5条群内聊天记录】' in captured[0]

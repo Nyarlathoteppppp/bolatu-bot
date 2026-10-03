@@ -24,6 +24,20 @@ def _pinned(message: ChatMessage, source_ids: set[str], db_ids: set[int]) -> boo
     return message.source_message_id in source_ids or message.id in db_ids
 
 
+def omitted_message_counts(
+    original: Sequence[ChatMessage], selected: Sequence[ChatMessage],
+) -> list[int]:
+    """Count actual unselected rows between retained messages, never DB ID gaps."""
+    positions = {_key(message): index for index, message in enumerate(original)}
+    counts: list[int] = []
+    previous: int | None = None
+    for message in selected:
+        position = positions.get(_key(message))
+        counts.append(max(0, position - previous - 1) if position is not None and previous is not None else 0)
+        previous = position
+    return counts
+
+
 def _terms(text: str) -> set[str]:
     terms: set[str] = set()
     for match in _TERMS.findall(text.casefold()):

@@ -11,7 +11,7 @@ from nonebot import logger
 
 from .config import LLMConfig
 from .ellipsis_resolver import parse_reply_envelope
-from .generation_message_context import select_generation_messages, shortlist_older_messages
+from .generation_message_context import omitted_message_counts, select_generation_messages, shortlist_older_messages
 from .jev_client import JevClient
 from .llm_gateway import LLMGateway, _log_llm_usage, _usage_value, set_usage_recorder
 from .memory import ChatMessage
@@ -883,12 +883,16 @@ class LLMTaskClient(LLMGateway):
             include_bot_history=include_bot_history,
             limit=len(recent_messages),
         )
+        original_context_messages = context_messages
         context_messages = await self._select_relevant_generation_context(
             context_messages,
             current_text=current_text,
             current_nickname=current_nickname,
         )
-        context = _format_context_with_local_focus(context_messages, formatter=_format_message)
+        context = _format_context_with_local_focus(
+            context_messages, formatter=_format_message, original_messages=original_context_messages,
+            omitted_record_label="私聊记录" if "私聊" in chat_label else "群内聊天记录",
+        )
         if not context:
             context = "（暂无更多上下文）"
         mode = (
@@ -1132,6 +1136,7 @@ class LLMTaskClient(LLMGateway):
             include_bot_history=include_bot_history,
             limit=len(selected_recent),
         )
+        original_context_messages = context_messages
         if context_message_limit is None or int(context_message_limit) >= 20 or has_pinned_evidence:
             context_messages = await self._select_relevant_generation_context(
                 context_messages,
@@ -1141,7 +1146,10 @@ class LLMTaskClient(LLMGateway):
                 pinned_source_ids=pinned_sources,
                 pinned_db_ids=pinned_ids,
             )
-        context = _format_context_with_local_focus(context_messages, formatter=_format_message)
+        context = _format_context_with_local_focus(
+            context_messages, formatter=_format_message, original_messages=original_context_messages,
+            omitted_record_label="私聊记录" if "私聊" in chat_label else "群内聊天记录",
+        )
         search_reply = prompt_flow == "search_answer" and candidate_count == 1
         direct_reply = prompt_flow == "reply_direct" and candidate_count == 1
         single_reply = candidate_count == 1
@@ -1536,6 +1544,8 @@ def _format_context_with_local_focus(
     formatter: Callable[[ChatMessage], str],
     local_limit: int = 6,
     topic_gap_seconds: float = 180.0,
+    original_messages: list[ChatMessage] | None = None,
+    omitted_record_label: str = "群内聊天记录",
 ) -> str:
     if not messages:
         return ""
@@ -1545,15 +1555,21 @@ def _format_context_with_local_focus(
         if gap > topic_gap_seconds:
             local_start = index
             break
-    older = messages[:local_start]
-    local = messages[local_start:]
+    omitted = omitted_message_counts(original_messages, messages) if original_messages is not None else [0] * len(messages)
+    # Notices belong to the input structure, never to a speaker's utterance.
+    rendered = [
+        (f"【此处省略{count}条{omitted_record_label}】\n" if count else "") + formatter(message)
+        for message, count in zip(messages, omitted)
+    ]
+    older = rendered[:local_start]
+    local = rendered[local_start:]
     sections: list[str] = []
     if older:
-        older_block = "\n".join(formatter(msg) for msg in older)
+        older_block = "\n".join(older)
         sections.append(f"<older_messages>\n{older_block}\n</older_messages>")
     local_block = (
         "【紧邻当前消息的连续话题；「这/那/是吧」这类省略先从这里接，别跨过话题断点拼旧词】\n"
-        + "\n".join(formatter(msg) for msg in local)
+        + "\n".join(local)
     )
     sections.append(f"<current_topic>\n{local_block}\n</current_topic>")
     return "\n\n".join(sections)
