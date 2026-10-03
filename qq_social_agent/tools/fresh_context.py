@@ -1237,10 +1237,18 @@ async def _fetch_sadai_web_lookup(
                 published_at="",
                 url=url,
             ))
-    answer = "".join(answer_parts).strip()
+    answer = _plain_cited_text("".join(answer_parts))
     if not answer:
         raise SearchProviderError("empty_answer")
     return answer, tuple(items[: max(1, max_results)])
+
+
+def _plain_cited_text(text: str) -> str:
+    """Markdown citations -> plain source names, so QQ replies never paste raw links."""
+    text = re.sub(r"\(\[([^\]]+)\]\((?:https?://)[^)]+\)\)", r"（\1）", str(text or ""))
+    text = re.sub(r"\[([^\]]+)\]\((?:https?://)[^)]+\)", r"\1", text)
+    text = text.replace("**", "")
+    return re.sub(r"[ \t]+", " ", text).strip()
 
 
 async def _fetch_tavily_lookup(
