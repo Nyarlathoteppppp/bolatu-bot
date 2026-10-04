@@ -66,8 +66,9 @@ entrypoint/plugin -> orchestration -> domain/storage/tools -> provider adapters
 | 专用模型接口 | `jev_client.py`、`embedding_client.py`、`siliconflow_ocr.py`、语音客户端 | 各自协议和模态的请求 | 文本聊天路由 |
 | 短期互动 | `interaction_state.py` | 引用原消息与真实发送回执；消费唯一话语状态，按当前窗口整理回复链、字面反馈与结束标记 | 再次判断说话人；推测情绪、亲密度或校园经历；生成角色卡措辞 |
 | 自身互动连续性 | `interaction_state.py` 的 `own_contributions()`、`self_interaction_context.py` | 从当前分支和原有窗口读取已确认发送的原话、表达动作、触发人、直接回应与后续明确反馈；仅喂普通聊天生成阶段 | 写入推测的内心或情绪；影响发言时机；用旧观点覆盖联网事实 |
-| 记忆存储入口 | `memory.py`、`memory_models.py` | SQLite 连接、Schema/迁移、消息/摘要/成员存储；兼容入口委托领域 repository | 指标、私聊状态、表情包、atoms 和风格存储的实现 |
-| 记忆领域存储 | `memory_metrics_repository.py`、`memory_private_state_repository.py`、`memory_meme_repository.py`、`memory_atom_repository.py`、`memory_style_repository.py` | 共用原连接的指标/用量、私聊状态、素材、原子生命周期/审计/召回、风格学习/合并/召回 | 新建连接、修改事务边界、运行时单例、Prompt |
+| 记忆存储入口 | `memory.py`、`memory_models.py` | 单一 SQLite 连接、repository/Schema 装配、原 API 的显式委托；少量群开关、自定义词与 KV 读写 | 消息、摘要、成员、指标、私聊状态、表情包、atoms 和风格存储的实现 |
+| 记忆领域存储 | `memory_*_repository.py` | 共用原连接的消息/反馈、群目录/成员画像与印象、摘要、指标/用量、私聊状态、素材、原子生命周期/审计/召回、风格学习/合并/召回 | 新建连接、修改事务边界、运行时单例、Prompt |
+| 记忆 Schema | `memory_schema.py` | 原建表、逐列升级与历史回填的有序执行；显式接收原子过期、成员画像与印象回调 | 独立数据库连接、开口策略、后台调度 |
 | 记忆学习与 RAG | `memory_learning.py`、`memory_maintenance_service.py`、`rag_*.py` | 学习草稿持久化、异步记忆总结、风格学习和成员画像更新、索引 | QQ 生命周期、聊天热路径 |
 | 发送 | `delivery.py`、`reply_splitter.py`、`social_actions.py` | 拆分、艾特、表情、节流 | 写长期事实 |
 | 定时任务调度 | `daily_review_scheduler_service.py`、`weekly_usage_report_scheduler_service.py`、`proactive_chat_scheduler_service.py` | 按 Bot 管理 task 去重、时间窗口/概率策略、周期 tick、异常记录和取消清理 | 群消息生成、周报格式化与投递 |
@@ -106,7 +107,7 @@ entrypoint/plugin -> orchestration -> domain/storage/tools -> provider adapters
 主要技术债：
 
 - `plugin.py` 仍承载生命周期、群聊编排和私聊阶段依赖装配；26 条 `/admin` 路由已迁入资源 controller，`plugin.py` 只保留本地鉴权策略、运行时依赖组装和 `/status`、`/healthz`、`/readyz`、`/trace(s)` 观测路由。
-- `memory.py`、`deepseek_client.py`、`rag_store.py` 仍大；消息/记忆记录与模型任务 DTO 已移入独立类型模块，部分数据库方法已按领域迁入共享连接的 repository；其余消息/摘要/成员查询与 Schema、模型请求和解析应继续按边界迁移。
+- `memory.py`、`deepseek_client.py`、`rag_store.py` 仍大；消息/记忆记录与模型任务 DTO 已移入独立类型模块，部分数据库方法已按领域迁入共享连接的 repository；消息/摘要/成员查询与 Schema 已分别独立；剩余主要是显式兼容接口、少量设置存储，以及模型请求和解析的后续维护。
 - manifest 能声明能力，但实际 handler 注册仍集中在主文件。
 
 ## 6. 下一步拆分顺序
@@ -128,7 +129,10 @@ entrypoint/plugin -> orchestration -> domain/storage/tools -> provider adapters
 
 11. **记忆 repository 第一、二批（2026-10-04 完成）**：指标/模型用量、私聊会话状态、表情包素材、记忆原子与风格规则分别迁入五个 repository。`MemoryStore` 保留全部原方法签名与委托入口，五个 repository 均接收同一个 `self.conn`，构造函数只保存连接引用。原子的创建/纠正/反证/争议/过期与审计仍由同一 repository 在原事务中执行，SQL、commit/rollback、排序、评分和 TTL 未改。原子 repository 在 Schema 初始化前构造，满足初始化最后触发过期维护的现有调用；其他 repository 在 Schema 完成后构造。共享身份映射与账号展开迁到 `memory_identity.py`；清洗/行转换/相关度辅助迁到 `memory_text.py` 和 `memory_repository_utils.py`，原模块显式再导出旧符号，领域存储不反向导入 `memory.py`。46 个方法实现、40 个辅助函数及全部常量与迁移前 AST 一致。新增边界测试覆盖独立导入、连接身份、随主连接关闭和五个领域原有的共享提交行为。`memory.py` 从 5,188 行降到 3,421 行。
 
-后续可按第三批拆消息、摘要和成员存储，最后处理 Schema/迁移；继续保留连接和事务边界，沿用表级回归测试。
+12. **记忆 repository 第三批与 Schema（2026-10-04 完成）**：`memory_message_repository.py` 管理消息、接收去重、上下文更新、原文例子、机器人已发送记录及反馈；`memory_member_repository.py` 管理群目录、成员画像/印象及成员总结；`memory_summary_repository.py` 管理摘要、游标、召回和管理台编辑。原文分类辅助统一归 `memory_corpus.py`。消息 repository 显式接收原 ImageReadStateStore 与成员更新回调，入库→图片登记→画像→印象→提交的原顺序不变。`memory_schema.py` 管理原建表、升级和回填，原子与成员 repository 在建表前只保存连接引用，Schema 通过显式回调执行原过期维护与回填；消息 repository 在 images 创建后装配。旧方法仍显式委托，不使用动态属性代理。64 个方法及 19 个辅助函数的实现、签名和全部 SQL 与迁移前 AST 一致；新库和含旧消息/摘要/原子的旧库回放，完整数据库 dump 与原实现一致，重开库也保持一致。`memory.py` 从 3,421 行降到 1,535 行，剩余主要是兼容 API、装配及少量群设置、词条和 KV 操作。
+
+现阶段无需继续为减少 `memory.py` 行数拆它的委托接口。后续功能修改进入所属 repository，连接管理留在入口。
+
 
 
 ## 7. 数据与部署边界

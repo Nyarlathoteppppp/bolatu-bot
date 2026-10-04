@@ -15,6 +15,10 @@ from qq_social_agent.memory_private_state_repository import PrivateStateReposito
 from qq_social_agent.memory_meme_repository import MemeRepository
 from qq_social_agent.memory_atom_repository import MemoryAtomRepository
 from qq_social_agent.memory_style_repository import StyleRepository
+from qq_social_agent.memory_message_repository import MessageRepository
+from qq_social_agent.memory_member_repository import MemberRepository
+from qq_social_agent.memory_summary_repository import SummaryRepository
+from qq_social_agent.memory_schema import MemorySchema
 assert "qq_social_agent.memory" not in sys.modules
 assert "qq_social_agent.plugin" not in sys.modules
 '''
@@ -26,10 +30,12 @@ def test_repositories_share_connection_and_close_with_store(tmp_path):
     repositories = (
         store._metrics_repository, store._private_state_repository, store._meme_repository,
         store._atom_repository, store._style_repository,
+        store._message_repository, store._member_repository, store._summary_repository, store._schema,
     )
     assert all(repo.conn is store.conn for repo in repositories)
     assert store.interactions.conn is store.conn
     assert store.images.conn is store.conn
+    assert store._message_repository.images is store.images
     store.conn.close()
     for read in (
         lambda: store.metric_event_count('test'),
@@ -37,12 +43,15 @@ def test_repositories_share_connection_and_close_with_store(tmp_path):
         lambda: store.meme_asset(123),
         lambda: store.memory_atom(123),
         lambda: store.recent_style_rules(100, 2),
+        lambda: store.recent_messages(100, 2),
+        lambda: store.group_info(100),
+        lambda: store.recent_memory_summaries(100, 2),
     ):
         with pytest.raises(sqlite3.ProgrammingError, match='closed'):
             read()
 
 
-@pytest.mark.parametrize('domain', ['metrics', 'private_state', 'meme', 'atom', 'style'])
+@pytest.mark.parametrize('domain', ['metrics', 'private_state', 'meme', 'atom', 'style', 'message', 'member', 'summary'])
 def test_repository_write_keeps_existing_shared_commit_boundary(tmp_path, domain):
     path = tmp_path / 'bot.sqlite3'
     store = MemoryStore(path)
@@ -58,6 +67,12 @@ def test_repository_write_keeps_existing_shared_commit_boundary(tmp_path, domain
             store.add_memory_atom(atom_type='fact', group_id=100, content='测试事实', source='manual')
         elif domain == 'style':
             store.add_style_rules(100, [('测试情境', '测试表达', '原话')])
+        elif domain == 'message':
+            store.add_message(100, 456, '成员', '测试消息', created_at=1)
+        elif domain == 'member':
+            store.upsert_group_info(group_id=100, group_name='测试群', member_count=1, max_member_count=500, last_synced_at=1)
+        elif domain == 'summary':
+            store.admin_add_memory_summary(group_id=100, summary='测试摘要', recall_cues=['测试'])
         else:
             store.upsert_meme_asset(
                 sha256='asset', source_group_id=100, source_user_id=456,

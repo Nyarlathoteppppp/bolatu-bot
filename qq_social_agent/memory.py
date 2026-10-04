@@ -1,10 +1,7 @@
 from __future__ import annotations
 
-import json
-import re
 import sqlite3
 import time
-from collections import Counter
 from collections.abc import Iterable
 from pathlib import Path
 
@@ -101,6 +98,37 @@ from .memory_style_repository import (
     _STYLE_RULE_SEMANTIC_MARKERS,
 )
 
+from .memory_corpus import _raw_corpus_tags, _is_low_value_raw_corpus_text
+from .memory_message_repository import (
+    MessageRepository,
+    _dedupe_recent_message_rows,
+    _bot_sent_from_row,
+    _recalled_feedback_from_row,
+    _approved_feedback_from_row,
+)
+from .memory_member_repository import (
+    MemberRepository,
+    _group_info_from_row,
+    _group_member_from_row,
+    _impression_keywords,
+    _counter_from_json,
+    _recent_texts_from_json,
+    _cap_counter,
+    _top_counter_items,
+    _profile_from_row,
+    _member_impression_from_row,
+    _member_profile_summary_from_row,
+    _dedupe_names,
+    _dedupe_ints,
+)
+from .memory_summary_repository import (
+    SummaryRepository,
+    _summary_from_row,
+)
+from .memory_schema import (
+    MemorySchema,
+)
+
 from .interaction_state import InteractionStateStore
 from .image_read_state import ImageReadStateStore
 
@@ -113,6 +141,13 @@ class MemoryStore:
         self.conn.row_factory = sqlite3.Row
         self._configure_connection()
         self._atom_repository = MemoryAtomRepository(self.conn)
+        self._member_repository = MemberRepository(self.conn)
+        self._schema = MemorySchema(
+            self.conn,
+            expire_due_memory_atoms=self.expire_due_memory_atoms,
+            upsert_member_profile=self._upsert_member_profile,
+            update_member_impression=self._update_member_impression,
+        )
         self._init_schema()
         self.interactions = InteractionStateStore(self.conn)
         self.images = ImageReadStateStore(self.conn)
@@ -121,6 +156,13 @@ class MemoryStore:
         self._private_state_repository = PrivateStateRepository(self.conn)
         self._meme_repository = MemeRepository(self.conn)
         self._style_repository = StyleRepository(self.conn)
+        self._summary_repository = SummaryRepository(self.conn)
+        self._message_repository = MessageRepository(
+            self.conn,
+            self.images,
+            upsert_member_profile=self._upsert_member_profile,
+            update_member_impression=self._update_member_impression,
+        )
 
     def _configure_connection(self) -> None:
         self.conn.execute("pragma busy_timeout = 5000")
@@ -129,764 +171,50 @@ class MemoryStore:
         self.conn.execute("pragma temp_store = MEMORY")
 
     def _init_schema(self) -> None:
-        self.conn.executescript(
-            """
-            create table if not exists messages (
-              id integer primary key autoincrement,
-              group_id integer not null,
-              user_id integer not null,
-              nickname text not null,
-              text text not null,
-              is_bot integer not null default 0,
-              created_at real not null,
-              source_message_id text,
-              source_kind text not null default 'live',
-              correlation_id text,
-              session_id text,
-              message_segments_json text,
-              raw_message_json text,
-              sender_json text
-            );
-
-            create index if not exists idx_messages_group_time
-              on messages(group_id, created_at);
-
-            create index if not exists idx_messages_time
-              on messages(created_at);
-
-            create index if not exists idx_messages_group_id
-              on messages(group_id, id);
-
-            create index if not exists idx_messages_group_bot_id
-              on messages(group_id, is_bot, id);
-
-            create index if not exists idx_messages_group_bot_text_id
-              on messages(group_id, is_bot, id)
-              where length(trim(text)) >= 2;
-
-            create index if not exists idx_messages_group_user_time
-              on messages(group_id, user_id, created_at);
-
-            create index if not exists idx_messages_group_user_id
-              on messages(group_id, user_id, id);
-
-            create table if not exists inbound_message_events (
-              group_id integer not null,
-              source_message_id text not null,
-              first_seen_at real not null,
-              correlation_id text,
-              primary key(group_id, source_message_id)
-            );
-
-            create table if not exists memory_summaries (
-              id integer primary key autoincrement,
-              group_id integer not null,
-              start_message_id integer not null,
-              end_message_id integer not null,
-              start_at real not null,
-              end_at real not null,
-              summary text not null,
-              recall_cues_json text not null,
-              created_at real not null,
-              updated_at real,
-              status text not null default 'active',
-              locked integer not null default 0
-            );
-
-            create index if not exists idx_memory_summaries_group_time
-              on memory_summaries(group_id, created_at);
-
-            create table if not exists private_conversation_states (
-              chat_id integer primary key,
-              user_id integer not null,
-              display_name text not null default '',
-              relationship_note text not null default '',
-              interaction_tone text not null default '',
-              current_topic text not null default '',
-              open_threads_json text not null default '[]',
-              frozen_fields_json text not null default '[]',
-              updated_at real not null
-            );
-
-            create index if not exists idx_private_conversation_states_updated
-              on private_conversation_states(updated_at desc);
-
-            create table if not exists memory_summary_state (
-              group_id integer primary key,
-              last_message_id integer not null default 0
-            );
-
-            create table if not exists app_kv (
-              key text primary key,
-              value text not null,
-              updated_at real not null
-            );
-
-            create table if not exists style_rules (
-              id integer primary key autoincrement,
-              group_id integer not null,
-              situation text not null,
-              style text not null,
-              source_text text not null,
-              created_at real not null
-            );
-
-            create index if not exists idx_style_rules_group_time
-              on style_rules(group_id, created_at);
-
-            create table if not exists group_state (
-              group_id integer primary key,
-              enabled integer not null default 1,
-              persona text,
-              muted_until real not null default 0
-            );
-
-            create table if not exists member_profiles (
-              group_id integer not null,
-              user_id integer not null,
-              display_name text not null,
-              aliases_json text not null,
-              last_seen_at real not null,
-              primary key(group_id, user_id)
-            );
-
-            create index if not exists idx_member_profiles_group_seen
-              on member_profiles(group_id, last_seen_at);
-
-            create table if not exists group_info (
-              group_id integer primary key,
-              group_name text not null,
-              member_count integer not null default 0,
-              max_member_count integer not null default 0,
-              last_synced_at real not null
-            );
-
-            create table if not exists group_members (
-              group_id integer not null,
-              user_id integer not null,
-              nickname text not null,
-              card text not null default '',
-              role text not null default '',
-              title text not null default '',
-              joined_at real not null default 0,
-              last_sent_at real not null default 0,
-              last_synced_at real not null,
-              active integer not null default 1,
-              primary key(group_id, user_id)
-            );
-
-            create index if not exists idx_group_members_group_active
-              on group_members(group_id, active, user_id);
-
-            create table if not exists member_impressions (
-              group_id integer not null,
-              user_id integer not null,
-              message_count integer not null default 0,
-              tag_counts_json text not null,
-              keyword_counts_json text not null,
-              recent_texts_json text not null,
-              updated_at real not null,
-              primary key(group_id, user_id)
-            );
-
-            create index if not exists idx_member_impressions_group_updated
-              on member_impressions(group_id, updated_at);
-
-            create table if not exists member_profile_summaries (
-              id integer primary key autoincrement,
-              group_id integer not null,
-              user_id integer not null,
-              profile_summary text not null,
-              interests_json text not null,
-              speaking_style text not null,
-              representative_texts_json text not null,
-              start_at real not null,
-              end_at real not null,
-              message_count integer not null,
-              created_at real not null
-            );
-
-            create index if not exists idx_member_profile_summaries_group_user_time
-              on member_profile_summaries(group_id, user_id, created_at);
-
-            create table if not exists bot_sent_messages (
-              group_id integer not null,
-              message_id integer not null,
-              bot_reply text not null,
-              trigger_user_id integer not null,
-              trigger_nickname text not null,
-              trigger_text text not null,
-              action text not null,
-              created_at real not null,
-              primary key(group_id, message_id)
-            );
-
-            create index if not exists idx_bot_sent_messages_time
-              on bot_sent_messages(created_at);
-
-            create index if not exists idx_bot_sent_messages_group_time
-              on bot_sent_messages(group_id, created_at);
-
-            create table if not exists recalled_reply_feedback (
-              id integer primary key autoincrement,
-              group_id integer not null,
-              message_id integer not null,
-              bot_reply text not null,
-              trigger_user_id integer not null,
-              trigger_nickname text not null,
-              trigger_text text not null,
-              action text not null,
-              owner_reason text not null,
-              scene_summary text not null,
-              bad_reply_problem text not null,
-              avoid_rule text not null,
-              better_direction text not null,
-              tags_json text not null,
-              operator_id integer not null,
-              reason_user_id integer not null,
-              recalled_at real not null,
-              reason_at real not null,
-              created_at real not null
-            );
-
-            create index if not exists idx_recalled_feedback_group_time
-              on recalled_reply_feedback(group_id, created_at);
-
-            create table if not exists approved_reply_feedback (
-              id integer primary key autoincrement,
-              group_id integer not null,
-              candidate_text text not null,
-              trigger_user_id integer not null,
-              trigger_nickname text not null,
-              trigger_text text not null,
-              action text not null,
-              style text not null,
-              tags_json text not null default '[]',
-              operator_id integer not null,
-              created_at real not null
-            );
-
-            create index if not exists idx_approved_feedback_group_time
-              on approved_reply_feedback(group_id, created_at);
-
-            create table if not exists bot_metric_events (
-              id integer primary key autoincrement,
-              event_type text not null,
-              group_id integer,
-              user_id integer,
-              stage text not null,
-              action text not null,
-              metadata_json text not null,
-              created_at real not null
-            );
-
-            create index if not exists idx_bot_metric_events_time
-              on bot_metric_events(created_at);
-
-            create index if not exists idx_bot_metric_events_group_time
-              on bot_metric_events(group_id, created_at);
-
-            create table if not exists memory_atoms (
-              id integer primary key autoincrement,
-              atom_type text not null,
-              group_id integer not null,
-              subject_user_id integer,
-              object_user_id integer,
-              content text not null,
-              source text not null,
-              evidence_type text not null default 'manual',
-              source_message_id text,
-              observed_at real,
-              valid_from real,
-              valid_to real,
-              confidence real not null default 0.7,
-              importance real not null default 0.5,
-              status text not null default 'active',
-              supersedes_id integer,
-              expires_at real,
-              created_at real not null,
-              updated_at real not null
-            );
-
-            create index if not exists idx_memory_atoms_group_type_time
-              on memory_atoms(group_id, atom_type, updated_at);
-
-            create index if not exists idx_memory_atoms_group_subject
-              on memory_atoms(group_id, subject_user_id, updated_at);
-
-            create table if not exists custom_jargon_entries (
-              id integer primary key autoincrement,
-              group_id integer not null,
-              term text not null,
-              explanation text not null,
-              created_by integer not null,
-              created_at real not null,
-              unique(group_id, term)
-            );
-
-            create index if not exists idx_custom_jargon_group_term
-              on custom_jargon_entries(group_id, term);
-
-            create table if not exists llm_usage_events (
-              id integer primary key autoincrement,
-              task text not null,
-              model text not null,
-              prompt_tokens integer,
-              completion_tokens integer,
-              total_tokens integer,
-              created_at real not null,
-              source_key text
-            );
-
-            create index if not exists idx_llm_usage_events_time
-              on llm_usage_events(created_at);
-
-            create table if not exists meme_assets (
-              id integer primary key autoincrement,
-              sha256 text not null unique,
-              source_group_id integer not null,
-              source_user_id integer not null,
-              source_message_id text not null,
-              file_path text not null,
-              mime_type text not null,
-              byte_size integer not null,
-              description text not null default '',
-              tags_json text not null default '[]',
-              enabled integer not null default 0,
-              created_at real not null,
-              updated_at real not null,
-              last_used_at real,
-              use_count integer not null default 0
-            );
-
-            create index if not exists idx_meme_assets_enabled_used
-              on meme_assets(enabled, last_used_at, id);
-
-            """
-        )
-        self._ensure_message_source_columns()
-        self._ensure_memory_summary_admin_columns()
-        self._ensure_group_directory_tables()
-        self._ensure_approved_feedback_tags()
-        self._ensure_llm_usage_source_key()
-        self._ensure_memory_atom_v2()
-        self._ensure_private_conversation_state_columns()
-        self._ensure_style_rule_v2()
-        self._ensure_meme_asset_columns()
-        self.expire_due_memory_atoms()
-        self._backfill_member_profiles()
-        self._backfill_member_impressions()
-        self._backfill_private_conversation_states()
-        self.conn.execute("pragma optimize")
-        self.conn.commit()
+        return self._schema._init_schema()
 
     def _ensure_private_conversation_state_columns(self) -> None:
         """Keep the private-state migration additive for old databases."""
 
-        columns = {
-            str(row["name"])
-            for row in self.conn.execute("pragma table_info(private_conversation_states)").fetchall()
-        }
-        if not columns:
-            return
-        additions = (
-            ("display_name", "text not null default ''"),
-            ("relationship_note", "text not null default ''"),
-            ("interaction_tone", "text not null default ''"),
-            ("current_topic", "text not null default ''"),
-            ("open_threads_json", "text not null default '[]'"),
-            ("frozen_fields_json", "text not null default '[]'"),
-            ("updated_at", "real not null default 0"),
-        )
-        for name, declaration in additions:
-            if name not in columns:
-                self.conn.execute(f"alter table private_conversation_states add column {name} {declaration}")
-        self.conn.execute(
-            "create index if not exists idx_private_conversation_states_updated "
-            "on private_conversation_states(updated_at desc)"
-        )
+        return self._schema._ensure_private_conversation_state_columns()
 
     def _backfill_private_conversation_states(self) -> None:
         """Create harmless shells for existing direct chats, without inferring facts."""
 
-        rows = self.conn.execute(
-            """
-            select message.group_id, message.user_id, message.nickname, message.created_at
-            from messages as message
-            join (
-              select group_id, max(id) as latest_id
-              from messages
-              where group_id >= ? and is_bot = 0
-              group by group_id
-            ) as latest on latest.latest_id = message.id
-            """,
-            (PRIVATE_CHAT_ID_OFFSET,),
-        ).fetchall()
-        now = time.time()
-        for row in rows:
-            self.conn.execute(
-                """
-                insert or ignore into private_conversation_states(
-                  chat_id, user_id, display_name, updated_at
-                ) values (?, ?, ?, ?)
-                """,
-                (int(row["group_id"]), int(row["user_id"]), str(row["nickname"] or ""), now),
-            )
+        return self._schema._backfill_private_conversation_states()
 
     def _ensure_meme_asset_columns(self) -> None:
-        columns = {
-            str(row["name"])
-            for row in self.conn.execute("pragma table_info(meme_assets)").fetchall()
-        }
-        if not columns:
-            return
-        if "enabled" not in columns:
-            self.conn.execute("alter table meme_assets add column enabled integer not null default 0")
-        if "last_used_at" not in columns:
-            self.conn.execute("alter table meme_assets add column last_used_at real")
-        if "use_count" not in columns:
-            self.conn.execute("alter table meme_assets add column use_count integer not null default 0")
+        return self._schema._ensure_meme_asset_columns()
 
     def _ensure_memory_summary_admin_columns(self) -> None:
-        columns = {
-            str(row["name"])
-            for row in self.conn.execute("pragma table_info(memory_summaries)").fetchall()
-        }
-        if "updated_at" not in columns:
-            self.conn.execute("alter table memory_summaries add column updated_at real")
-        if "status" not in columns:
-            self.conn.execute("alter table memory_summaries add column status text not null default 'active'")
-        if "locked" not in columns:
-            self.conn.execute("alter table memory_summaries add column locked integer not null default 0")
-        self.conn.execute(
-            """
-            update memory_summaries
-            set updated_at = coalesce(updated_at, created_at),
-                status = coalesce(nullif(status, ''), 'active'),
-                locked = coalesce(locked, 0)
-            """
-        )
-        self.conn.execute(
-            """
-            create index if not exists idx_memory_summaries_group_status_time
-              on memory_summaries(group_id, status, created_at)
-            """
-        )
+        return self._schema._ensure_memory_summary_admin_columns()
 
     def _ensure_approved_feedback_tags(self) -> None:
-        columns = {
-            str(row["name"])
-            for row in self.conn.execute("pragma table_info(approved_reply_feedback)").fetchall()
-        }
-        if "tags_json" not in columns:
-            self.conn.execute("alter table approved_reply_feedback add column tags_json text not null default '[]'")
+        return self._schema._ensure_approved_feedback_tags()
 
     def _ensure_message_source_columns(self) -> None:
-        columns = {
-            str(row["name"])
-            for row in self.conn.execute("pragma table_info(messages)").fetchall()
-        }
-        if "source_message_id" not in columns:
-            self.conn.execute("alter table messages add column source_message_id text")
-        if "source_kind" not in columns:
-            self.conn.execute("alter table messages add column source_kind text not null default 'live'")
-        if "correlation_id" not in columns:
-            self.conn.execute("alter table messages add column correlation_id text")
-        if "session_id" not in columns:
-            self.conn.execute("alter table messages add column session_id text")
-        if "message_segments_json" not in columns:
-            self.conn.execute("alter table messages add column message_segments_json text")
-        if "raw_message_json" not in columns:
-            self.conn.execute("alter table messages add column raw_message_json text")
-        if "sender_json" not in columns:
-            self.conn.execute("alter table messages add column sender_json text")
-        self.conn.execute(
-            """
-            create unique index if not exists idx_messages_group_source_message
-              on messages(group_id, source_message_id)
-              where source_message_id is not null and source_message_id != ''
-            """
-        )
-        self.conn.execute(
-            """
-            create table if not exists inbound_message_events (
-              group_id integer not null,
-              source_message_id text not null,
-              first_seen_at real not null,
-              correlation_id text,
-              primary key(group_id, source_message_id)
-            )
-            """
-        )
+        return self._schema._ensure_message_source_columns()
 
     def _ensure_group_directory_tables(self) -> None:
-        self.conn.executescript(
-            """
-            create table if not exists group_info (
-              group_id integer primary key,
-              group_name text not null,
-              member_count integer not null default 0,
-              max_member_count integer not null default 0,
-              last_synced_at real not null
-            );
-
-            create table if not exists group_members (
-              group_id integer not null,
-              user_id integer not null,
-              nickname text not null,
-              card text not null default '',
-              role text not null default '',
-              title text not null default '',
-              joined_at real not null default 0,
-              last_sent_at real not null default 0,
-              last_synced_at real not null,
-              active integer not null default 1,
-              primary key(group_id, user_id)
-            );
-
-            create index if not exists idx_group_members_group_active
-              on group_members(group_id, active, user_id);
-            """
-        )
+        return self._schema._ensure_group_directory_tables()
 
     def _ensure_llm_usage_source_key(self) -> None:
-        columns = {
-            str(row["name"])
-            for row in self.conn.execute("pragma table_info(llm_usage_events)").fetchall()
-        }
-        if "source_key" not in columns:
-            self.conn.execute("alter table llm_usage_events add column source_key text")
-        self.conn.execute(
-            """
-            create unique index if not exists idx_llm_usage_events_source_key
-              on llm_usage_events(source_key)
-              where source_key is not null
-            """
-        )
+        return self._schema._ensure_llm_usage_source_key()
 
     def _ensure_style_rule_v2(self) -> None:
-        columns = {
-            str(row["name"])
-            for row in self.conn.execute("pragma table_info(style_rules)").fetchall()
-        }
-        additions = (
-            ("scope", "text not null default 'legacy'"),
-            ("source_user_ids_json", "text not null default '[]'"),
-            ("source_message_ids_json", "text not null default '[]'"),
-            ("support_user_count", "integer not null default 1"),
-            ("evidence_count", "integer not null default 1"),
-            ("confidence", "real not null default 0.6"),
-            ("status", "text not null default 'active'"),
-            ("valid_to", "real"),
-            ("rule_fingerprint", "text not null default ''"),
-            ("last_seen_at", "real not null default 0"),
-            ("merged_count", "integer not null default 0"),
-        )
-        for name, declaration in additions:
-            if name not in columns:
-                self.conn.execute(f"alter table style_rules add column {name} {declaration}")
-        rows = self.conn.execute(
-            """
-            select id, situation, style, created_at, rule_fingerprint, last_seen_at
-            from style_rules
-            where coalesce(rule_fingerprint, '') = ''
-               or coalesce(last_seen_at, 0) = 0
-            """
-        ).fetchall()
-        for row in rows:
-            fingerprint = str(row["rule_fingerprint"] or "") or _style_rule_fingerprint(
-                str(row["situation"] or ""),
-                str(row["style"] or ""),
-            )
-            last_seen_at = float(row["last_seen_at"] or row["created_at"] or time.time())
-            self.conn.execute(
-                """
-                update style_rules
-                set rule_fingerprint = ?, last_seen_at = ?
-                where id = ?
-                """,
-                (fingerprint, last_seen_at, int(row["id"])),
-            )
-        self.conn.execute(
-            "create index if not exists idx_style_rules_scope_status on style_rules(group_id, scope, status, created_at)"
-        )
-        self.conn.execute(
-            "create index if not exists idx_style_rules_fingerprint on style_rules(group_id, status, scope, rule_fingerprint)"
-        )
+        return self._schema._ensure_style_rule_v2()
 
     def _ensure_memory_atom_v2(self) -> None:
-        savepoint = "memory_atom_v2_migration"
-        self.conn.execute(f"savepoint {savepoint}")
-        try:
-            self._ensure_memory_atom_v2_schema()
-            self.conn.execute(f"release savepoint {savepoint}")
-        except Exception:
-            self.conn.execute(f"rollback to savepoint {savepoint}")
-            self.conn.execute(f"release savepoint {savepoint}")
-            raise
+        return self._schema._ensure_memory_atom_v2()
 
     def _ensure_memory_atom_v2_schema(self) -> None:
-        columns = {
-            str(row["name"])
-            for row in self.conn.execute("pragma table_info(memory_atoms)").fetchall()
-        }
-        additions = (
-            ("evidence_type", "text not null default 'manual'"),
-            ("source_message_id", "text"),
-            ("observed_at", "real"),
-            ("valid_from", "real"),
-            ("valid_to", "real"),
-            ("status", "text not null default 'active'"),
-            ("supersedes_id", "integer"),
-        )
-        evidence_type_added = "evidence_type" not in columns
-        for name, declaration in additions:
-            if name not in columns:
-                self.conn.execute(f"alter table memory_atoms add column {name} {declaration}")
-
-        if evidence_type_added:
-            self.conn.execute(
-                """
-                update memory_atoms
-                set evidence_type = case
-                  when source_message_id is not null and source_message_id != '' then 'message'
-                  when source like 'message:%' then 'message'
-                  when source = 'manual'
-                    or source like 'manual:%'
-                    or source like 'manual_%'
-                    or source like 'builtin%'
-                    then 'manual'
-                  else 'event'
-                end
-                """
-            )
-        else:
-            self.conn.execute(
-                """
-                update memory_atoms
-                set evidence_type = 'manual'
-                where evidence_type not in ('message', 'event', 'manual')
-                   or evidence_type is null
-                   or evidence_type = ''
-                """
-            )
-        self.conn.execute(
-            """
-            update memory_atoms
-            set observed_at = coalesce(observed_at, created_at),
-                valid_from = coalesce(valid_from, created_at),
-                valid_to = coalesce(valid_to, expires_at),
-                status = case
-                  when status is null or status = '' then 'active'
-                  when status not in ('active', 'superseded', 'disputed', 'expired') then 'active'
-                  else status
-                end
-            where observed_at is null
-               or valid_from is null
-               or (valid_to is null and expires_at is not null)
-               or status not in ('active', 'superseded', 'disputed', 'expired')
-               or status is null
-            """
-        )
-        statements = (
-            """
-            create index if not exists idx_memory_atoms_group_status_validity
-              on memory_atoms(group_id, status, valid_from, valid_to, updated_at)
-            """,
-            """
-            create index if not exists idx_memory_atoms_source_message
-              on memory_atoms(group_id, source_message_id)
-              where source_message_id is not null and source_message_id != ''
-            """,
-            """
-            create index if not exists idx_memory_atoms_status_expiry
-              on memory_atoms(status, valid_to, expires_at)
-            """,
-            "create index if not exists idx_memory_atoms_supersedes on memory_atoms(supersedes_id)",
-            """
-            create table if not exists memory_atom_audit_events (
-              id integer primary key autoincrement,
-              atom_id integer not null,
-              action text not null,
-              evidence_type text not null,
-              source text not null,
-              source_message_id text,
-              actor_user_id integer,
-              detail text not null default '',
-              observed_at real not null,
-              created_at real not null,
-              metadata_json text not null default '{}'
-            )
-            """,
-            """
-            create index if not exists idx_memory_atom_audit_atom_time
-              on memory_atom_audit_events(atom_id, created_at, id)
-            """,
-            """
-            create index if not exists idx_memory_atom_audit_source_message
-              on memory_atom_audit_events(source_message_id)
-              where source_message_id is not null and source_message_id != ''
-            """,
-        )
-        for statement in statements:
-            self.conn.execute(statement)
-        self.conn.execute(
-            """
-            insert into memory_atom_audit_events(
-              atom_id, action, evidence_type, source, source_message_id,
-              actor_user_id, detail, observed_at, created_at, metadata_json
-            )
-            select atom.id, 'migrated', atom.evidence_type, atom.source,
-                   atom.source_message_id, null, 'legacy memory atom',
-                   coalesce(atom.observed_at, atom.created_at), atom.created_at, '{}'
-            from memory_atoms as atom
-            where not exists (
-              select 1 from memory_atom_audit_events as audit
-              where audit.atom_id = atom.id
-            )
-            """
-        )
+        return self._schema._ensure_memory_atom_v2_schema()
 
     def _backfill_member_profiles(self) -> None:
-        existing = self.conn.execute("select 1 from member_profiles limit 1").fetchone()
-        if existing:
-            return
-        rows = self.conn.execute(
-            """
-            select group_id, user_id, nickname, created_at
-            from messages
-            where is_bot = 0
-            order by created_at asc, id asc
-            """
-        ).fetchall()
-        for row in rows:
-            self._upsert_member_profile(
-                int(row["group_id"]),
-                int(row["user_id"]),
-                str(row["nickname"]),
-                last_seen_at=float(row["created_at"]),
-            )
+        return self._schema._backfill_member_profiles()
 
     def _backfill_member_impressions(self) -> None:
-        existing = self.conn.execute("select 1 from member_impressions limit 1").fetchone()
-        if existing:
-            return
-        rows = self.conn.execute(
-            """
-            select group_id, user_id, nickname, text, created_at
-            from messages
-            where is_bot = 0
-            order by created_at asc, id asc
-            """
-        ).fetchall()
-        for row in rows:
-            self._update_member_impression(
-                int(row["group_id"]),
-                int(row["user_id"]),
-                str(row["nickname"]),
-                str(row["text"]),
-                created_at=float(row["created_at"]),
-            )
+        return self._schema._backfill_member_impressions()
 
     def add_message(
         self,
@@ -905,114 +233,40 @@ class MemoryStore:
         raw_message_json: str | None = None,
         sender_json: str | None = None,
     ) -> bool:
-        created = created_at or time.time()
-        source_key = _source_message_key(source_message_id)
-        cursor = self.conn.execute(
-            """
-            insert or ignore into messages(
-              group_id, user_id, nickname, text, is_bot, created_at,
-              source_message_id, source_kind, correlation_id, session_id,
-              message_segments_json, raw_message_json, sender_json
-            )
-            values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                group_id,
-                user_id,
-                nickname,
-                text,
-                int(is_bot),
-                created,
-                source_key,
-                source_kind.strip()[:32] or "live",
-                correlation_id.strip()[:160] if correlation_id else None,
-                session_id.strip()[:160] if session_id else None,
-                message_segments_json if message_segments_json else None,
-                raw_message_json if raw_message_json else None,
-                sender_json if sender_json else None,
-            ),
+        return self._message_repository.add_message(
+            group_id,
+            user_id,
+            nickname,
+            text,
+            is_bot=is_bot,
+            created_at=created_at,
+            source_message_id=source_message_id,
+            source_kind=source_kind,
+            correlation_id=correlation_id,
+            session_id=session_id,
+            message_segments_json=message_segments_json,
+            raw_message_json=raw_message_json,
+            sender_json=sender_json,
         )
-        if cursor.rowcount <= 0:
-            self.conn.commit()
-            return False
-        if not is_bot and message_segments_json:
-            self.images.observe(int(cursor.lastrowid), message_segments_json)
-        if not is_bot:
-            self._upsert_member_profile(group_id, user_id, nickname, last_seen_at=created)
-            self._update_member_impression(
-                group_id,
-                user_id,
-                nickname,
-                text,
-                created_at=created,
-            )
-        self.conn.commit()
-        return True
 
     def admin_recent_messages(self, *, group_id: int | None = None, limit: int = 80) -> list[sqlite3.Row]:
-        bounded = max(1, min(300, int(limit)))
-        where = ""
-        params: list[object] = []
-        if group_id is not None:
-            where = "where group_id = ?"
-            params.append(int(group_id))
-        rows = self.conn.execute(
-            f"""
-            select id, group_id, user_id, nickname, text, is_bot, created_at,
-                   source_message_id, source_kind, correlation_id, session_id,
-                   message_segments_json, raw_message_json, sender_json
-            from messages
-            {where}
-            order by id desc
-            limit ?
-            """,
-            (*params, bounded),
-        ).fetchall()
-        return list(rows)
+        return self._message_repository.admin_recent_messages(group_id=group_id, limit=limit)
 
     def admin_message(self, message_id: int) -> sqlite3.Row | None:
-        return self.conn.execute(
-            """
-            select id, group_id, user_id, nickname, text, is_bot, created_at,
-                   source_message_id, source_kind, correlation_id, session_id,
-                   message_segments_json, raw_message_json, sender_json
-            from messages
-            where id = ?
-            """,
-            (int(message_id),),
-        ).fetchone()
+        return self._message_repository.admin_message(message_id)
 
     def update_message_context(self, message_id: int, text: str) -> None:
         """Enrich an existing message without moving its arrival time."""
-        self.conn.execute("update messages set text = ? where id = ?", (text, int(message_id)))
-        self.conn.commit()
+
+        return self._message_repository.update_message_context(message_id, text)
 
     def fill_message_segments(self, message_id: int, segments: str) -> None:
         """Restore media data omitted by older history imports, in place."""
-        cursor = self.conn.execute("""
-            update messages set message_segments_json = ?
-            where id = ? and (message_segments_json is null or message_segments_json = '')
-        """, (segments, int(message_id)))
-        if cursor.rowcount:
-            self.images.observe(int(message_id), segments)
-        self.conn.commit()
+
+        return self._message_repository.fill_message_segments(message_id, segments)
 
     def admin_message_by_source(self, group_id: int, source_message_id: int | str | None) -> sqlite3.Row | None:
-        source_key = _source_message_key(source_message_id)
-        if not source_key:
-            return None
-        return self.conn.execute(
-            """
-            select id, group_id, user_id, nickname, text, is_bot, created_at,
-                   source_message_id, source_kind, correlation_id, session_id,
-                   message_segments_json, raw_message_json, sender_json
-            from messages
-            where group_id = ? and source_message_id = ?
-            order by id desc
-            limit 1
-            """,
-            (int(group_id), source_key),
-        ).fetchone()
+        return self._message_repository.admin_message_by_source(group_id, source_message_id)
 
     def admin_recent_metric_events(
         self,
@@ -1077,18 +331,7 @@ class MemoryStore:
         )
 
     def message_source_exists(self, group_id: int, source_message_id: int | str | None) -> bool:
-        source_key = _source_message_key(source_message_id)
-        if not source_key:
-            return False
-        row = self.conn.execute(
-            """
-            select 1 from messages
-            where group_id = ? and source_message_id = ?
-            limit 1
-            """,
-            (group_id, source_key),
-        ).fetchone()
-        return row is not None
+        return self._message_repository.message_source_exists(group_id, source_message_id)
 
     def claim_inbound_message(
         self,
@@ -1098,27 +341,12 @@ class MemoryStore:
         correlation_id: str | None = None,
         created_at: float | None = None,
     ) -> bool:
-        source_key = _source_message_key(source_message_id)
-        if not source_key:
-            return True
-        if self.message_source_exists(group_id, source_key):
-            return False
-        cursor = self.conn.execute(
-            """
-            insert or ignore into inbound_message_events(
-              group_id, source_message_id, first_seen_at, correlation_id
-            )
-            values (?, ?, ?, ?)
-            """,
-            (
-                group_id,
-                source_key,
-                created_at or time.time(),
-                correlation_id.strip()[:160] if correlation_id else None,
-            ),
+        return self._message_repository.claim_inbound_message(
+            group_id,
+            source_message_id,
+            correlation_id=correlation_id,
+            created_at=created_at,
         )
-        self.conn.commit()
-        return cursor.rowcount > 0
 
     def upsert_group_info(
         self,
@@ -1129,31 +357,16 @@ class MemoryStore:
         max_member_count: int,
         last_synced_at: float | None = None,
     ) -> None:
-        synced = last_synced_at or time.time()
-        self.conn.execute(
-            """
-            insert into group_info(group_id, group_name, member_count, max_member_count, last_synced_at)
-            values (?, ?, ?, ?, ?)
-            on conflict(group_id) do update set
-              group_name = excluded.group_name,
-              member_count = excluded.member_count,
-              max_member_count = excluded.max_member_count,
-              last_synced_at = excluded.last_synced_at
-            """,
-            (group_id, group_name.strip()[:120], max(0, member_count), max(0, max_member_count), synced),
+        return self._member_repository.upsert_group_info(
+            group_id=group_id,
+            group_name=group_name,
+            member_count=member_count,
+            max_member_count=max_member_count,
+            last_synced_at=last_synced_at,
         )
-        self.conn.commit()
 
     def group_info(self, group_id: int) -> GroupInfo | None:
-        row = self.conn.execute(
-            """
-            select group_id, group_name, member_count, max_member_count, last_synced_at
-            from group_info
-            where group_id = ?
-            """,
-            (group_id,),
-        ).fetchone()
-        return _group_info_from_row(row) if row else None
+        return self._member_repository.group_info(group_id)
 
     def replace_group_members(
         self,
@@ -1162,63 +375,10 @@ class MemoryStore:
         *,
         synced_at: float | None = None,
     ) -> int:
-        synced = synced_at or time.time()
-        self.conn.execute(
-            "update group_members set active = 0, last_synced_at = ? where group_id = ?",
-            (synced, group_id),
-        )
-        clean_members: list[tuple[object, ...]] = []
-        for member in members:
-            user_id = int(member.get("user_id") or 0)
-            if user_id <= 0:
-                continue
-            clean_members.append(
-                (
-                    group_id,
-                    user_id,
-                    str(member.get("nickname") or user_id).strip()[:120],
-                    str(member.get("card") or "").strip()[:120],
-                    str(member.get("role") or "").strip()[:32],
-                    str(member.get("title") or "").strip()[:120],
-                    float(member.get("joined_at") or 0.0),
-                    float(member.get("last_sent_at") or 0.0),
-                    synced,
-                    1,
-                )
-            )
-        self.conn.executemany(
-            """
-            insert into group_members(
-              group_id, user_id, nickname, card, role, title,
-              joined_at, last_sent_at, last_synced_at, active
-            )
-            values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            on conflict(group_id, user_id) do update set
-              nickname = excluded.nickname,
-              card = excluded.card,
-              role = excluded.role,
-              title = excluded.title,
-              joined_at = excluded.joined_at,
-              last_sent_at = excluded.last_sent_at,
-              last_synced_at = excluded.last_synced_at,
-              active = excluded.active
-            """,
-            clean_members,
-        )
-        self.conn.commit()
-        return len(clean_members)
+        return self._member_repository.replace_group_members(group_id, members, synced_at=synced_at)
 
     def group_member(self, group_id: int, user_id: int) -> GroupMember | None:
-        row = self.conn.execute(
-            """
-            select group_id, user_id, nickname, card, role, title,
-                   joined_at, last_sent_at, last_synced_at, active
-            from group_members
-            where group_id = ? and user_id = ?
-            """,
-            (group_id, user_id),
-        ).fetchone()
-        return _group_member_from_row(row) if row else None
+        return self._member_repository.group_member(group_id, user_id)
 
     def _upsert_member_profile(
         self,
@@ -1228,100 +388,31 @@ class MemoryStore:
         *,
         last_seen_at: float,
     ) -> None:
-        clean_name = display_name.strip() or str(user_id)
-        row = self.conn.execute(
-            """
-            select aliases_json from member_profiles
-            where group_id = ? and user_id = ?
-            """,
-            (group_id, user_id),
-        ).fetchone()
-        aliases: list[str] = []
-        if row:
-            try:
-                raw_aliases = json.loads(str(row["aliases_json"]))
-            except json.JSONDecodeError:
-                raw_aliases = []
-            if isinstance(raw_aliases, list):
-                aliases = [str(alias).strip() for alias in raw_aliases if str(alias).strip()]
-        aliases = _dedupe_names([clean_name, *aliases])[:8]
-        self.conn.execute(
-            """
-            insert into member_profiles(group_id, user_id, display_name, aliases_json, last_seen_at)
-            values (?, ?, ?, ?, ?)
-            on conflict(group_id, user_id) do update set
-              display_name = excluded.display_name,
-              aliases_json = excluded.aliases_json,
-              last_seen_at = excluded.last_seen_at
-            """,
-            (group_id, user_id, clean_name, json.dumps(aliases, ensure_ascii=False), last_seen_at),
+        return self._member_repository._upsert_member_profile(
+            group_id,
+            user_id,
+            display_name,
+            last_seen_at=last_seen_at,
         )
 
     def recent_messages(self, group_id: int, limit: int) -> list[ChatMessage]:
-        safe_limit = max(0, int(limit))
-        if safe_limit <= 0:
-            return []
-        fetch_limit = max(safe_limit * 4, safe_limit + 20)
-        rows = self.conn.execute(
-            """
-            select id, group_id, user_id, nickname, text, is_bot, created_at, source_message_id, session_id, message_segments_json, raw_message_json, sender_json
-            from messages
-            where group_id = ?
-            order by created_at desc, id desc
-            limit ?
-            """,
-            (group_id, fetch_limit),
-        ).fetchall()
-        rows = _dedupe_recent_message_rows(rows, safe_limit)
-        return [_message_from_row(row) for row in reversed(rows)]
+        return self._message_repository.recent_messages(group_id, limit)
 
     def messages_since(self, group_id: int, *, since_at: float) -> list[ChatMessage]:
         """Read the short window excluded from RAG, without a message-count cutoff."""
-        rows = self.conn.execute(
-            """
-            select id, group_id, user_id, nickname, text, is_bot, created_at, source_message_id, session_id, message_segments_json, raw_message_json, sender_json
-            from messages
-            where group_id = ? and created_at >= ?
-            order by created_at desc, id desc
-            """,
-            (int(group_id), float(since_at)),
-        ).fetchall()
-        rows = _dedupe_recent_message_rows(rows, len(rows))
-        return [_message_from_row(row) for row in reversed(rows)]
+
+        return self._message_repository.messages_since(group_id, since_at=since_at)
 
     def current_session_messages(self, group_id: int, *, gap_seconds: float) -> list[ChatMessage]:
         """Read back to the last private-chat gap instead of a fixed message count."""
-        cursor = self.conn.execute(
-            """
-            select id, group_id, user_id, nickname, text, is_bot, created_at, source_message_id, session_id, message_segments_json, raw_message_json, sender_json
-            from messages where group_id = ? order by created_at desc, id desc
-            """,
-            (int(group_id),),
-        )
-        rows: list[sqlite3.Row] = []
-        newer_at: float | None = None
-        for row in cursor:
-            created_at = float(row["created_at"])
-            if newer_at is not None and newer_at - created_at >= gap_seconds:
-                break
-            rows.append(row)
-            newer_at = created_at
-        rows = _dedupe_recent_message_rows(rows, len(rows))
-        return [_message_from_row(row) for row in reversed(rows)]
+
+        return self._message_repository.current_session_messages(group_id, gap_seconds=gap_seconds)
 
     def message_by_source(self, group_id: int, source_message_id: int | str | None) -> ChatMessage | None:
-        row = self.admin_message_by_source(group_id, source_message_id)
-        return _message_from_row(row) if row is not None else None
+        return self._message_repository.message_by_source(group_id, source_message_id)
 
     def message_by_id(self, group_id: int, message_id: int) -> ChatMessage | None:
-        row = self.conn.execute(
-            """
-            select id, group_id, user_id, nickname, text, is_bot, created_at, source_message_id, session_id, message_segments_json, raw_message_json, sender_json
-            from messages where group_id = ? and id = ?
-            """,
-            (int(group_id), int(message_id)),
-        ).fetchone()
-        return _message_from_row(row) if row is not None else None
+        return self._message_repository.message_by_id(group_id, message_id)
 
     def messages_between(
         self,
@@ -1331,30 +422,10 @@ class MemoryStore:
         end_at: float,
         limit: int,
     ) -> list[ChatMessage]:
-        rows = self.conn.execute(
-            """
-            select id, group_id, user_id, nickname, text, is_bot, created_at, source_message_id, session_id, message_segments_json, raw_message_json, sender_json
-            from messages
-            where group_id = ? and created_at >= ? and created_at < ?
-            order by created_at desc, id desc
-            limit ?
-            """,
-            (group_id, start_at, end_at, limit),
-        ).fetchall()
-        return [_message_from_row(row) for row in reversed(rows)]
+        return self._message_repository.messages_between(group_id, start_at=start_at, end_at=end_at, limit=limit)
 
     def messages_before(self, group_id: int, *, before_at: float, limit: int) -> list[ChatMessage]:
-        rows = self.conn.execute(
-            """
-            select id, group_id, user_id, nickname, text, is_bot, created_at, source_message_id, session_id, message_segments_json, raw_message_json, sender_json
-            from messages
-            where group_id = ? and created_at < ?
-            order by created_at desc, id desc
-            limit ?
-            """,
-            (group_id, before_at, limit),
-        ).fetchall()
-        return [_message_from_row(row) for row in reversed(rows)]
+        return self._message_repository.messages_before(group_id, before_at=before_at, limit=limit)
 
     def relevant_raw_corpus_examples(
         self,
@@ -1372,73 +443,20 @@ class MemoryStore:
         preferred_score_bonus: float = 0.0,
         per_user_limit: int = 1,
     ) -> list[RawCorpusExample]:
-        rows = self.conn.execute(
-            """
-            select id, group_id, user_id, nickname, text, is_bot, created_at, source_message_id, session_id, message_segments_json, raw_message_json, sender_json
-            from messages
-            where group_id = ? and is_bot = 0 and length(trim(text)) >= 2
-            order by id desc
-            limit ?
-            """,
-            (group_id, candidate_limit),
-        ).fetchall()
-        scored: list[tuple[float, float, int, ChatMessage, tuple[str, ...]]] = []
-        excluded_text_key = _compact_text(exclude_text)
-        for row in rows:
-            message = _message_from_row(row)
-            if exclude_user_id is not None and message.user_id == exclude_user_id:
-                if excluded_text_key and _compact_text(message.text) == excluded_text_key:
-                    continue
-            if _is_low_value_raw_corpus_text(message.text):
-                continue
-            tags = _raw_corpus_tags(message.text)
-            haystack = f"{message.nickname} {message.text} {' '.join(tags)}"
-            score = _text_relevance_score(query, haystack)
-            if score <= 0:
-                continue
-            if preferred_user_id is not None and message.user_id == preferred_user_id:
-                score = score * preferred_score_multiplier + preferred_score_bonus
-            scored.append((score, message.created_at, message.id, message, tags))
-        scored.sort(key=lambda item: (item[0], item[1], item[2]), reverse=True)
-
-        preferred_examples: list[RawCorpusExample] = []
-        regular_examples: list[RawCorpusExample] = []
-        seen_texts: set[str] = set()
-        user_counts: dict[int, int] = {}
-        for score, _, _, message, tags in scored:
-            text_key = _compact_text(message.text)
-            if text_key in seen_texts:
-                continue
-            allowed_for_user = preferred_limit if message.user_id == preferred_user_id else per_user_limit
-            if allowed_for_user > 0 and user_counts.get(message.user_id, 0) >= allowed_for_user:
-                continue
-            seen_texts.add(text_key)
-            user_counts[message.user_id] = user_counts.get(message.user_id, 0) + 1
-            before, after = self._message_neighbors(
-                group_id,
-                message.id,
-                radius=context_radius,
-            )
-            example = RawCorpusExample(
-                message=message,
-                before=tuple(before),
-                after=tuple(after),
-                tags=tags,
-                score=score,
-            )
-            if (
-                preferred_user_id is not None
-                and message.user_id == preferred_user_id
-                and preferred_limit > 0
-            ):
-                if len(preferred_examples) < preferred_limit:
-                    preferred_examples.append(example)
-                continue
-            else:
-                regular_examples.append(example)
-            if len(regular_examples) >= limit and len(preferred_examples) >= preferred_limit:
-                break
-        return (preferred_examples + regular_examples)[:limit]
+        return self._message_repository.relevant_raw_corpus_examples(
+            group_id,
+            query,
+            limit=limit,
+            candidate_limit=candidate_limit,
+            context_radius=context_radius,
+            exclude_user_id=exclude_user_id,
+            exclude_text=exclude_text,
+            preferred_user_id=preferred_user_id,
+            preferred_limit=preferred_limit,
+            preferred_score_multiplier=preferred_score_multiplier,
+            preferred_score_bonus=preferred_score_bonus,
+            per_user_limit=per_user_limit,
+        )
 
     def _message_neighbors(
         self,
@@ -1447,46 +465,10 @@ class MemoryStore:
         *,
         radius: int,
     ) -> tuple[list[ChatMessage], list[ChatMessage]]:
-        if radius <= 0:
-            return [], []
-        before_rows = self.conn.execute(
-            """
-            select id, group_id, user_id, nickname, text, is_bot, created_at, source_message_id, session_id, message_segments_json, raw_message_json, sender_json
-            from messages
-            where group_id = ? and id < ?
-            order by id desc
-            limit ?
-            """,
-            (group_id, message_id, radius),
-        ).fetchall()
-        after_rows = self.conn.execute(
-            """
-            select id, group_id, user_id, nickname, text, is_bot, created_at, source_message_id, session_id, message_segments_json, raw_message_json, sender_json
-            from messages
-            where group_id = ? and id > ?
-            order by id asc
-            limit ?
-            """,
-            (group_id, message_id, radius),
-        ).fetchall()
-        return (
-            [_message_from_row(row) for row in reversed(before_rows)],
-            [_message_from_row(row) for row in after_rows],
-        )
+        return self._message_repository._message_neighbors(group_id, message_id, radius=radius)
 
     def recent_bot_replies(self, group_id: int, seconds: int) -> list[ChatMessage]:
-        since = time.time() - seconds
-        rows = self.conn.execute(
-            """
-            select id, group_id, user_id, nickname, text, is_bot, created_at, source_message_id, session_id, message_segments_json, raw_message_json, sender_json
-            from messages
-            where group_id = ? and is_bot = 1 and created_at >= ?
-            order by created_at desc, id desc
-            """,
-            (group_id, since),
-        ).fetchall()
-        rows = _dedupe_recent_message_rows(rows, len(rows))
-        return [_message_from_row(row) for row in rows]
+        return self._message_repository.recent_bot_replies(group_id, seconds)
 
     def messages_for_mid_summary(
         self,
@@ -1496,35 +478,12 @@ class MemoryStore:
         batch_size: int,
         include_bot: bool = True,
     ) -> list[ChatMessage]:
-        cutoff = self.conn.execute(
-            """
-            select id from messages
-            where group_id = ?
-            order by id desc
-            limit 1 offset ?
-            """,
-            (group_id, keep_recent),
-        ).fetchone()
-        if not cutoff:
-            return []
-
-        state = self.conn.execute(
-            "select last_message_id from memory_summary_state where group_id = ?",
-            (group_id,),
-        ).fetchone()
-        last_message_id = int(state["last_message_id"]) if state else 0
-        bot_filter = "" if include_bot else "and is_bot = 0"
-        rows = self.conn.execute(
-            f"""
-            select id, group_id, user_id, nickname, text, is_bot, created_at, source_message_id, session_id, message_segments_json, raw_message_json, sender_json
-            from messages
-            where group_id = ? and id > ? and id <= ? {bot_filter}
-            order by id asc
-            limit ?
-            """,
-            (group_id, last_message_id, int(cutoff["id"]), batch_size),
-        ).fetchall()
-        return [_message_from_row(row) for row in rows]
+        return self._message_repository.messages_for_mid_summary(
+            group_id,
+            keep_recent=keep_recent,
+            batch_size=batch_size,
+            include_bot=include_bot,
+        )
 
     def add_memory_summary(
         self,
@@ -1534,77 +493,15 @@ class MemoryStore:
         summary: str,
         recall_cues: list[str],
     ) -> None:
-        if not messages or not summary.strip():
-            return
-        start = messages[0]
-        end = messages[-1]
-        import json
-
-        now = time.time()
-        self.conn.execute(
-            """
-            insert into memory_summaries(
-              group_id, start_message_id, end_message_id, start_at, end_at,
-              summary, recall_cues_json, created_at, updated_at, status, locked
-            )
-            values (?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', 0)
-            """,
-            (
-                group_id,
-                start.id,
-                end.id,
-                start.created_at,
-                end.created_at,
-                summary.strip(),
-                json.dumps(recall_cues[:5], ensure_ascii=False),
-                now,
-                now,
-            ),
-        )
-        self.conn.execute(
-            """
-            insert into memory_summary_state(group_id, last_message_id)
-            values (?, ?)
-            on conflict(group_id) do update set last_message_id = excluded.last_message_id
-            """,
-            (group_id, end.id),
-        )
-        self.conn.commit()
+        return self._summary_repository.add_memory_summary(group_id, messages, summary=summary, recall_cues=recall_cues)
 
     def advance_memory_summary_cursor(self, group_id: int, last_message_id: int) -> None:
         """Move the mid-memory window forward without writing a summary."""
 
-        cursor = max(0, int(last_message_id))
-        if cursor <= 0:
-            return
-        self.conn.execute(
-            """
-            insert into memory_summary_state(group_id, last_message_id)
-            values (?, ?)
-            on conflict(group_id) do update set last_message_id = max(
-              memory_summary_state.last_message_id,
-              excluded.last_message_id
-            )
-            """,
-            (int(group_id), cursor),
-        )
-        self.conn.commit()
+        return self._summary_repository.advance_memory_summary_cursor(group_id, last_message_id)
 
     def recent_memory_summaries(self, group_id: int, limit: int) -> list[MemorySummary]:
-        rows = self.conn.execute(
-            """
-            select id, group_id, start_at, end_at, summary, recall_cues_json, created_at,
-                   coalesce(updated_at, created_at) as updated_at,
-                   coalesce(status, 'active') as status,
-                   coalesce(locked, 0) as locked
-            from memory_summaries
-            where group_id = ? and coalesce(status, 'active') = 'active'
-            order by created_at desc
-            limit ?
-            """,
-            (group_id, limit),
-        ).fetchall()
-        return [_summary_from_row(row) for row in reversed(rows)]
+        return self._summary_repository.recent_memory_summaries(group_id, limit)
 
     def relevant_memory_summaries(
         self,
@@ -1614,30 +511,12 @@ class MemoryStore:
         limit: int,
         candidate_limit: int = 80,
     ) -> list[MemorySummary]:
-        rows = self.conn.execute(
-            """
-            select id, group_id, start_at, end_at, summary, recall_cues_json, created_at,
-                   coalesce(updated_at, created_at) as updated_at,
-                   coalesce(status, 'active') as status,
-                   coalesce(locked, 0) as locked
-            from memory_summaries
-            where group_id = ? and coalesce(status, 'active') = 'active'
-            order by created_at desc
-            limit ?
-            """,
-            (group_id, candidate_limit),
-        ).fetchall()
-        scored: list[tuple[int, float, sqlite3.Row]] = []
-        for row in rows:
-            haystack = f"{row['summary']} {row['recall_cues_json']}"
-            score = _text_relevance_score(query, haystack)
-            if score > 0:
-                scored.append((score, float(row["created_at"]), row))
-        scored.sort(key=lambda item: (item[0], item[1]), reverse=True)
-        if scored:
-            return [_summary_from_row(row) for _, _, row in scored[:limit]]
-        fallback_limit = min(max(0, int(limit)), 2)
-        return [_summary_from_row(row) for row in rows[:fallback_limit]]
+        return self._summary_repository.relevant_memory_summaries(
+            group_id,
+            query,
+            limit=limit,
+            candidate_limit=candidate_limit,
+        )
 
     def admin_recent_memory_summaries(
         self,
@@ -1647,50 +526,15 @@ class MemoryStore:
         limit: int = 80,
         query: str = "",
     ) -> list[MemorySummary]:
-        bounded = max(1, min(500, int(limit)))
-        clauses: list[str] = []
-        params: list[object] = []
-        if group_id is not None:
-            clauses.append("group_id = ?")
-            params.append(int(group_id))
-        clean_status = status.strip().casefold()
-        if clean_status and clean_status != "all":
-            clauses.append("coalesce(status, 'active') = ?")
-            params.append(clean_status)
-        clean_query = re.sub(r"\s+", " ", query).strip()
-        if clean_query:
-            like = f"%{clean_query[:160]}%"
-            clauses.append("(summary like ? or recall_cues_json like ? or cast(id as text) = ?)")
-            params.extend((like, like, clean_query))
-        where = "where " + " and ".join(clauses) if clauses else ""
-        rows = self.conn.execute(
-            f"""
-            select id, group_id, start_at, end_at, summary, recall_cues_json, created_at,
-                   coalesce(updated_at, created_at) as updated_at,
-                   coalesce(status, 'active') as status,
-                   coalesce(locked, 0) as locked
-            from memory_summaries
-            {where}
-            order by coalesce(status, 'active') = 'active' desc, locked desc, updated_at desc, id desc
-            limit ?
-            """,
-            (*params, bounded),
-        ).fetchall()
-        return [_summary_from_row(row) for row in rows]
+        return self._summary_repository.admin_recent_memory_summaries(
+            group_id=group_id,
+            status=status,
+            limit=limit,
+            query=query,
+        )
 
     def memory_summary(self, summary_id: int) -> MemorySummary | None:
-        row = self.conn.execute(
-            """
-            select id, group_id, start_at, end_at, summary, recall_cues_json, created_at,
-                   coalesce(updated_at, created_at) as updated_at,
-                   coalesce(status, 'active') as status,
-                   coalesce(locked, 0) as locked
-            from memory_summaries
-            where id = ?
-            """,
-            (int(summary_id),),
-        ).fetchone()
-        return _summary_from_row(row) if row is not None else None
+        return self._summary_repository.memory_summary(summary_id)
 
     def admin_update_memory_summary(
         self,
@@ -1701,59 +545,16 @@ class MemoryStore:
         status: str = "active",
         locked: bool | None = None,
     ) -> bool:
-        clean_summary = re.sub(r"\s+", " ", summary).strip()
-        if not clean_summary:
-            return False
-        clean_status = status.strip().casefold() or "active"
-        if clean_status not in {"active", "archived", "expired"}:
-            clean_status = "active"
-        cues = [re.sub(r"\s+", " ", str(cue)).strip() for cue in recall_cues]
-        cues = [cue for cue in cues if cue][:12]
-        row = self.conn.execute("select locked from memory_summaries where id = ?", (int(summary_id),)).fetchone()
-        if row is None:
-            return False
-        locked_value = int(bool(locked)) if locked is not None else int(row["locked"] or 0)
-        self.conn.execute(
-            """
-            update memory_summaries
-            set summary = ?, recall_cues_json = ?, status = ?, locked = ?, updated_at = ?
-            where id = ?
-            """,
-            (clean_summary, json.dumps(cues, ensure_ascii=False), clean_status, locked_value, time.time(), int(summary_id)),
+        return self._summary_repository.admin_update_memory_summary(
+            summary_id,
+            summary=summary,
+            recall_cues=recall_cues,
+            status=status,
+            locked=locked,
         )
-        self.conn.commit()
-        return True
 
     def admin_set_memory_summary_state(self, summary_id: int, *, action: str) -> bool:
-        clean_action = action.strip().casefold()
-        row = self.conn.execute("select id, locked, status from memory_summaries where id = ?", (int(summary_id),)).fetchone()
-        if row is None:
-            return False
-        status = str(row["status"] or "active")
-        locked = int(row["locked"] or 0)
-        if clean_action in {"lock", "freeze", "pin"}:
-            locked = 1
-            status = "active"
-        elif clean_action in {"unlock", "unfreeze"}:
-            locked = 0
-        elif clean_action in {"archive", "archived"}:
-            status = "archived"
-        elif clean_action in {"expire", "expired", "delete"}:
-            status = "expired"
-        elif clean_action in {"active", "restore", "keep"}:
-            status = "active"
-        else:
-            return False
-        self.conn.execute(
-            """
-            update memory_summaries
-            set status = ?, locked = ?, updated_at = ?
-            where id = ?
-            """,
-            (status, locked, time.time(), int(summary_id)),
-        )
-        self.conn.commit()
-        return True
+        return self._summary_repository.admin_set_memory_summary_state(summary_id, action=action)
 
     def admin_add_memory_summary(
         self,
@@ -1763,47 +564,12 @@ class MemoryStore:
         recall_cues: list[str],
         locked: bool = True,
     ) -> int:
-        clean_summary = re.sub(r"\s+", " ", summary).strip()
-        if not clean_summary:
-            return 0
-        row = self.conn.execute(
-            """
-            select id, created_at
-            from messages
-            where group_id = ?
-            order by id desc
-            limit 1
-            """,
-            (int(group_id),),
-        ).fetchone()
-        message_id = int(row["id"] or 0) if row is not None else 0
-        observed_at = float(row["created_at"] or time.time()) if row is not None else time.time()
-        cues = [re.sub(r"\s+", " ", str(cue)).strip() for cue in recall_cues]
-        cues = [cue for cue in cues if cue][:12]
-        now = time.time()
-        cursor = self.conn.execute(
-            """
-            insert into memory_summaries(
-              group_id, start_message_id, end_message_id, start_at, end_at,
-              summary, recall_cues_json, created_at, updated_at, status, locked
-            )
-            values (?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?)
-            """,
-            (
-                int(group_id),
-                message_id,
-                message_id,
-                observed_at,
-                observed_at,
-                clean_summary,
-                json.dumps(cues, ensure_ascii=False),
-                now,
-                now,
-                int(bool(locked)),
-            ),
+        return self._summary_repository.admin_add_memory_summary(
+            group_id=group_id,
+            summary=summary,
+            recall_cues=recall_cues,
+            locked=locked,
         )
-        self.conn.commit()
-        return int(cursor.lastrowid or 0)
 
     def messages_for_style_learning(
         self,
@@ -1902,27 +668,7 @@ class MemoryStore:
         *,
         limit: int,
     ) -> list[MemberProfile]:
-        ordered_user_ids = _dedupe_ints(user_ids)[:limit]
-        if not ordered_user_ids:
-            return []
-        placeholders = ",".join("?" for _ in ordered_user_ids)
-        rows = self.conn.execute(
-            f"""
-            select
-              p.group_id,
-              p.user_id,
-              coalesce(nullif(g.card, ''), nullif(g.nickname, ''), p.display_name) as display_name,
-              p.aliases_json,
-              coalesce(nullif(g.last_synced_at, 0), p.last_seen_at) as last_seen_at
-            from member_profiles p
-            left join group_members g
-              on g.group_id = p.group_id and g.user_id = p.user_id and g.active = 1
-            where p.group_id = ? and p.user_id in ({placeholders})
-            """,
-            (group_id, *ordered_user_ids),
-        ).fetchall()
-        by_user_id = {int(row["user_id"]): _profile_from_row(row) for row in rows}
-        return [by_user_id[user_id] for user_id in ordered_user_ids if user_id in by_user_id]
+        return self._member_repository.member_profiles_for_context(group_id, user_ids, limit=limit)
 
     def member_impressions_for_context(
         self,
@@ -1931,87 +677,10 @@ class MemoryStore:
         *,
         limit: int,
     ) -> list[MemberImpression]:
-        ordered_user_ids = _dedupe_ints(user_ids)[:limit]
-        if not ordered_user_ids:
-            return []
-        placeholders = ",".join("?" for _ in ordered_user_ids)
-        rows = self.conn.execute(
-            f"""
-            select
-              p.group_id,
-              p.user_id,
-              coalesce(nullif(g.card, ''), nullif(g.nickname, ''), p.display_name) as display_name,
-              p.aliases_json,
-              coalesce(nullif(g.last_synced_at, 0), p.last_seen_at) as last_seen_at,
-              coalesce(i.message_count, 0) as message_count,
-              coalesce(i.tag_counts_json, '{{}}') as tag_counts_json,
-              coalesce(i.keyword_counts_json, '{{}}') as keyword_counts_json,
-              coalesce(i.recent_texts_json, '[]') as recent_texts_json,
-              coalesce(i.updated_at, p.last_seen_at) as updated_at,
-              coalesce(s.profile_summary, '') as ai_summary,
-              coalesce(s.interests_json, '[]') as ai_interests_json,
-              coalesce(s.speaking_style, '') as ai_speaking_style,
-              coalesce(s.representative_texts_json, '[]') as ai_representative_texts_json,
-              coalesce(s.created_at, 0) as ai_summary_at
-            from member_profiles p
-            left join group_members g
-              on g.group_id = p.group_id and g.user_id = p.user_id and g.active = 1
-            left join member_impressions i
-              on i.group_id = p.group_id and i.user_id = p.user_id
-            left join member_profile_summaries s
-              on s.id = (
-                select latest.id
-                from member_profile_summaries latest
-                where latest.group_id = p.group_id and latest.user_id = p.user_id
-                order by latest.created_at desc, latest.id desc
-                limit 1
-              )
-            where p.group_id = ? and p.user_id in ({placeholders})
-            """,
-            (group_id, *ordered_user_ids),
-        ).fetchall()
-        by_user_id = {int(row["user_id"]): _member_impression_from_row(row) for row in rows}
-        return [by_user_id[user_id] for user_id in ordered_user_ids if user_id in by_user_id]
+        return self._member_repository.member_impressions_for_context(group_id, user_ids, limit=limit)
 
     def recent_member_impressions(self, group_id: int, limit: int) -> list[MemberImpression]:
-        rows = self.conn.execute(
-            """
-            select
-              p.group_id,
-              p.user_id,
-              coalesce(nullif(g.card, ''), nullif(g.nickname, ''), p.display_name) as display_name,
-              p.aliases_json,
-              coalesce(nullif(g.last_synced_at, 0), p.last_seen_at) as last_seen_at,
-              coalesce(i.message_count, 0) as message_count,
-              coalesce(i.tag_counts_json, '{}') as tag_counts_json,
-              coalesce(i.keyword_counts_json, '{}') as keyword_counts_json,
-              coalesce(i.recent_texts_json, '[]') as recent_texts_json,
-              coalesce(i.updated_at, p.last_seen_at) as updated_at,
-              coalesce(s.profile_summary, '') as ai_summary,
-              coalesce(s.interests_json, '[]') as ai_interests_json,
-              coalesce(s.speaking_style, '') as ai_speaking_style,
-              coalesce(s.representative_texts_json, '[]') as ai_representative_texts_json,
-              coalesce(s.created_at, 0) as ai_summary_at
-            from member_profiles p
-            left join group_members g
-              on g.group_id = p.group_id and g.user_id = p.user_id and g.active = 1
-            left join member_impressions i
-              on i.group_id = p.group_id and i.user_id = p.user_id
-            left join member_profile_summaries s
-              on s.id = (
-                select latest.id
-                from member_profile_summaries latest
-                where latest.group_id = p.group_id and latest.user_id = p.user_id
-                order by latest.created_at desc, latest.id desc
-                limit 1
-              )
-            where p.group_id = ?
-            order by p.last_seen_at desc
-            limit ?
-            """,
-            (group_id, limit),
-        ).fetchall()
-        return [_member_impression_from_row(row) for row in rows]
+        return self._member_repository.recent_member_impressions(group_id, limit)
 
     def active_member_ids_since(
         self,
@@ -2021,19 +690,12 @@ class MemoryStore:
         limit: int,
         min_messages: int,
     ) -> list[int]:
-        rows = self.conn.execute(
-            """
-            select user_id, count(*) as message_count, max(created_at) as last_seen_at
-            from messages
-            where group_id = ? and is_bot = 0 and created_at >= ? and length(trim(text)) >= 2
-            group by user_id
-            having count(*) >= ?
-            order by message_count desc, last_seen_at desc
-            limit ?
-            """,
-            (group_id, since_at, min_messages, limit),
-        ).fetchall()
-        return [int(row["user_id"]) for row in rows]
+        return self._member_repository.active_member_ids_since(
+            group_id,
+            since_at=since_at,
+            limit=limit,
+            min_messages=min_messages,
+        )
 
     def member_messages_between(
         self,
@@ -2044,41 +706,23 @@ class MemoryStore:
         end_at: float,
         limit: int,
     ) -> list[ChatMessage]:
-        rows = self.conn.execute(
-            """
-            select id, group_id, user_id, nickname, text, is_bot, created_at, source_message_id, session_id, message_segments_json, raw_message_json, sender_json
-            from messages
-            where group_id = ?
-              and user_id = ?
-              and is_bot = 0
-              and created_at >= ?
-              and created_at < ?
-              and length(trim(text)) >= 2
-            order by created_at desc, id desc
-            limit ?
-            """,
-            (group_id, user_id, start_at, end_at, limit),
-        ).fetchall()
-        return [_message_from_row(row) for row in reversed(rows)]
+        return self._member_repository.member_messages_between(
+            group_id,
+            user_id,
+            start_at=start_at,
+            end_at=end_at,
+            limit=limit,
+        )
 
     def last_member_profile_summary_at(self, group_id: int, user_id: int) -> float:
-        row = self.conn.execute(
-            """
-            select max(created_at) as ts
-            from member_profile_summaries
-            where group_id = ? and user_id = ?
-            """,
-            (group_id, user_id),
-        ).fetchone()
-        return float(row["ts"] or 0.0) if row else 0.0
+        return self._member_repository.last_member_profile_summary_at(group_id, user_id)
 
     def latest_member_profile_summary(
         self,
         group_id: int,
         user_id: int,
     ) -> MemberProfileSummary | None:
-        summaries = self.recent_member_profile_summaries(group_id, user_id, limit=1)
-        return summaries[0] if summaries else None
+        return self._member_repository.latest_member_profile_summary(group_id, user_id)
 
     def add_member_profile_summary(
         self,
@@ -2094,69 +738,21 @@ class MemoryStore:
         message_count: int,
         keep_per_member: int = 3,
     ) -> None:
-        summary = profile_summary.strip()
-        if not summary:
-            return
-        now = time.time()
-        self.conn.execute(
-            """
-            insert into member_profile_summaries(
-              group_id, user_id, profile_summary, interests_json, speaking_style,
-              representative_texts_json, start_at, end_at, message_count, created_at
-            )
-            values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                group_id,
-                user_id,
-                summary[:420],
-                json.dumps(_clean_text_list(interests, limit=8, item_limit=32), ensure_ascii=False),
-                speaking_style.strip()[:260],
-                json.dumps(_clean_text_list(representative_texts, limit=5, item_limit=140), ensure_ascii=False),
-                start_at,
-                end_at,
-                max(0, int(message_count)),
-                now,
-            ),
+        return self._member_repository.add_member_profile_summary(
+            group_id=group_id,
+            user_id=user_id,
+            profile_summary=profile_summary,
+            interests=interests,
+            speaking_style=speaking_style,
+            representative_texts=representative_texts,
+            start_at=start_at,
+            end_at=end_at,
+            message_count=message_count,
+            keep_per_member=keep_per_member,
         )
-        self.conn.execute(
-            """
-            delete from member_profile_summaries
-            where group_id = ? and user_id = ?
-              and id not in (
-                select id from member_profile_summaries
-                where group_id = ? and user_id = ?
-                order by created_at desc, id desc
-                limit ?
-              )
-            """,
-            (group_id, user_id, group_id, user_id, keep_per_member),
-        )
-        self.conn.commit()
 
     def prune_member_profile_summaries(self, *, keep_per_member: int = 3) -> int:
-        keep = max(1, int(keep_per_member))
-        pairs = self.conn.execute(
-            "select distinct group_id, user_id from member_profile_summaries"
-        ).fetchall()
-        deleted = 0
-        for row in pairs:
-            cursor = self.conn.execute(
-                """
-                delete from member_profile_summaries
-                where group_id = ? and user_id = ?
-                  and id not in (
-                    select id from member_profile_summaries
-                    where group_id = ? and user_id = ?
-                    order by created_at desc, id desc
-                    limit ?
-                  )
-                """,
-                (row["group_id"], row["user_id"], row["group_id"], row["user_id"], keep),
-            )
-            deleted += int(cursor.rowcount or 0)
-        self.conn.commit()
-        return deleted
+        return self._member_repository.prune_member_profile_summaries(keep_per_member=keep_per_member)
 
     def recent_member_profile_summaries(
         self,
@@ -2164,18 +760,7 @@ class MemoryStore:
         user_id: int,
         limit: int,
     ) -> list[MemberProfileSummary]:
-        rows = self.conn.execute(
-            """
-            select group_id, user_id, profile_summary, interests_json, speaking_style,
-                   representative_texts_json, start_at, end_at, message_count, created_at
-            from member_profile_summaries
-            where group_id = ? and user_id = ?
-            order by created_at desc, id desc
-            limit ?
-            """,
-            (group_id, user_id, limit),
-        ).fetchall()
-        return [_member_profile_summary_from_row(row) for row in rows]
+        return self._member_repository.recent_member_profile_summaries(group_id, user_id, limit)
 
     def _update_member_impression(
         self,
@@ -2186,64 +771,12 @@ class MemoryStore:
         *,
         created_at: float,
     ) -> None:
-        clean_text = text.strip()
-        row = self.conn.execute(
-            """
-            select message_count, tag_counts_json, keyword_counts_json, recent_texts_json
-            from member_impressions
-            where group_id = ? and user_id = ?
-            """,
-            (group_id, user_id),
-        ).fetchone()
-        if row:
-            message_count = int(row["message_count"]) + 1
-            tag_counts = _counter_from_json(row["tag_counts_json"])
-            keyword_counts = _counter_from_json(row["keyword_counts_json"])
-            recent_texts = _recent_texts_from_json(row["recent_texts_json"])
-        else:
-            message_count = 1
-            tag_counts = Counter()
-            keyword_counts = Counter()
-            recent_texts = []
-
-        tags = _raw_corpus_tags(clean_text)
-        tag_counts.update(tags)
-        keyword_counts.update(_impression_keywords(clean_text))
-        tag_counts = _cap_counter(tag_counts, 60)
-        keyword_counts = _cap_counter(keyword_counts, 80)
-        if clean_text and not _is_low_value_raw_corpus_text(clean_text):
-            recent_texts.append(
-                {
-                    "text": clean_text[:140],
-                    "tags": list(tags[:4]),
-                    "at": created_at,
-                }
-            )
-            recent_texts = recent_texts[-16:]
-
-        self.conn.execute(
-            """
-            insert into member_impressions(
-              group_id, user_id, message_count, tag_counts_json,
-              keyword_counts_json, recent_texts_json, updated_at
-            )
-            values (?, ?, ?, ?, ?, ?, ?)
-            on conflict(group_id, user_id) do update set
-              message_count = excluded.message_count,
-              tag_counts_json = excluded.tag_counts_json,
-              keyword_counts_json = excluded.keyword_counts_json,
-              recent_texts_json = excluded.recent_texts_json,
-              updated_at = excluded.updated_at
-            """,
-            (
-                group_id,
-                user_id,
-                message_count,
-                json.dumps(dict(tag_counts), ensure_ascii=False, sort_keys=True),
-                json.dumps(dict(keyword_counts), ensure_ascii=False, sort_keys=True),
-                json.dumps(recent_texts, ensure_ascii=False),
-                created_at,
-            ),
+        return self._member_repository._update_member_impression(
+            group_id,
+            user_id,
+            nickname,
+            text,
+            created_at=created_at,
         )
 
     def add_bot_sent_message(
@@ -2258,40 +791,19 @@ class MemoryStore:
         action: str,
         created_at: float | None = None,
     ) -> None:
-        self.conn.execute(
-            """
-            insert or replace into bot_sent_messages(
-              group_id, message_id, bot_reply, trigger_user_id, trigger_nickname,
-              trigger_text, action, created_at
-            )
-            values (?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                group_id,
-                message_id,
-                bot_reply,
-                trigger_user_id,
-                trigger_nickname,
-                trigger_text,
-                action,
-                created_at or time.time(),
-            ),
+        return self._message_repository.add_bot_sent_message(
+            group_id=group_id,
+            message_id=message_id,
+            bot_reply=bot_reply,
+            trigger_user_id=trigger_user_id,
+            trigger_nickname=trigger_nickname,
+            trigger_text=trigger_text,
+            action=action,
+            created_at=created_at,
         )
-        self.conn.commit()
 
     def bot_sent_message(self, group_id: int, message_id: int) -> BotSentMessage | None:
-        row = self.conn.execute(
-            """
-            select group_id, message_id, bot_reply, trigger_user_id, trigger_nickname,
-                   trigger_text, action, created_at
-            from bot_sent_messages
-            where group_id = ? and message_id = ?
-            """,
-            (group_id, message_id),
-        ).fetchone()
-        if not row:
-            return None
-        return _bot_sent_from_row(row)
+        return self._message_repository.bot_sent_message(group_id, message_id)
 
     def add_recalled_reply_feedback(
         self,
@@ -2314,59 +826,32 @@ class MemoryStore:
         recalled_at: float,
         reason_at: float,
     ) -> None:
-        now = time.time()
-        self.conn.execute(
-            """
-            insert into recalled_reply_feedback(
-              group_id, message_id, bot_reply, trigger_user_id, trigger_nickname,
-              trigger_text, action, owner_reason, scene_summary, bad_reply_problem,
-              avoid_rule, better_direction, tags_json, operator_id, reason_user_id,
-              recalled_at, reason_at, created_at
-            )
-            values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                group_id,
-                message_id,
-                bot_reply,
-                trigger_user_id,
-                trigger_nickname,
-                trigger_text,
-                action,
-                owner_reason,
-                scene_summary,
-                bad_reply_problem,
-                avoid_rule,
-                better_direction,
-                json.dumps(tags[:8], ensure_ascii=False),
-                operator_id,
-                reason_user_id,
-                recalled_at,
-                reason_at,
-                now,
-            ),
+        return self._message_repository.add_recalled_reply_feedback(
+            group_id=group_id,
+            message_id=message_id,
+            bot_reply=bot_reply,
+            trigger_user_id=trigger_user_id,
+            trigger_nickname=trigger_nickname,
+            trigger_text=trigger_text,
+            action=action,
+            owner_reason=owner_reason,
+            scene_summary=scene_summary,
+            bad_reply_problem=bad_reply_problem,
+            avoid_rule=avoid_rule,
+            better_direction=better_direction,
+            tags=tags,
+            operator_id=operator_id,
+            reason_user_id=reason_user_id,
+            recalled_at=recalled_at,
+            reason_at=reason_at,
         )
-        self.conn.commit()
 
     def recent_recalled_reply_feedback(
         self,
         group_id: int,
         limit: int,
     ) -> list[RecalledReplyFeedback]:
-        rows = self.conn.execute(
-            """
-            select group_id, message_id, bot_reply, trigger_user_id, trigger_nickname,
-                   trigger_text, action, owner_reason, scene_summary, bad_reply_problem,
-                   avoid_rule, better_direction, tags_json, operator_id, reason_user_id,
-                   recalled_at, reason_at
-            from recalled_reply_feedback
-            where group_id = ?
-            order by created_at desc, id desc
-            limit ?
-            """,
-            (group_id, limit),
-        ).fetchall()
-        return [_recalled_feedback_from_row(row) for row in reversed(rows)]
+        return self._message_repository.recent_recalled_reply_feedback(group_id, limit)
 
     def add_approved_reply_feedback(
         self,
@@ -2382,46 +867,25 @@ class MemoryStore:
         operator_id: int,
         created_at: float | None = None,
     ) -> None:
-        self.conn.execute(
-            """
-            insert into approved_reply_feedback(
-              group_id, candidate_text, trigger_user_id, trigger_nickname,
-              trigger_text, action, style, tags_json, operator_id, created_at
-            )
-            values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                group_id,
-                candidate_text.strip(),
-                trigger_user_id,
-                trigger_nickname,
-                trigger_text,
-                action,
-                style.strip(),
-                json.dumps((tags or [])[:8], ensure_ascii=False),
-                operator_id,
-                created_at or time.time(),
-            ),
+        return self._message_repository.add_approved_reply_feedback(
+            group_id=group_id,
+            candidate_text=candidate_text,
+            trigger_user_id=trigger_user_id,
+            trigger_nickname=trigger_nickname,
+            trigger_text=trigger_text,
+            action=action,
+            style=style,
+            tags=tags,
+            operator_id=operator_id,
+            created_at=created_at,
         )
-        self.conn.commit()
 
     def recent_approved_reply_feedback(
         self,
         group_id: int,
         limit: int,
     ) -> list[ApprovedReplyFeedback]:
-        rows = self.conn.execute(
-            """
-            select group_id, candidate_text, trigger_user_id, trigger_nickname,
-                   trigger_text, action, style, tags_json, operator_id, created_at
-            from approved_reply_feedback
-            where group_id = ?
-            order by created_at desc, id desc
-            limit ?
-            """,
-            (group_id, limit),
-        ).fetchall()
-        return [_approved_feedback_from_row(row) for row in reversed(rows)]
+        return self._message_repository.recent_approved_reply_feedback(group_id, limit)
 
     def add_metric_event(
         self,
@@ -3061,332 +1525,6 @@ class MemoryStore:
         return self._meme_repository.meme_asset(meme_id)
 
 
-def _dedupe_recent_message_rows(rows: list[sqlite3.Row], limit: int) -> list[sqlite3.Row]:
-    selected: list[sqlite3.Row] = []
-    seen_bot_rows: list[tuple[tuple[int, int, str], float]] = []
-    for row in rows:
-        if bool(row["is_bot"]):
-            text_key = _compact_text(str(row["text"]))
-            if text_key:
-                key = (int(row["group_id"]), int(row["user_id"]), text_key)
-                created_at = float(row["created_at"])
-                if any(
-                    seen_key == key and abs(created_at - seen_at) <= 3.0
-                    for seen_key, seen_at in seen_bot_rows
-                ):
-                    continue
-                seen_bot_rows.append((key, created_at))
-        selected.append(row)
-        if len(selected) >= limit:
-            break
-    return selected
-
-
-def _group_info_from_row(row: sqlite3.Row) -> GroupInfo:
-    return GroupInfo(
-        group_id=int(row["group_id"]),
-        group_name=str(row["group_name"]),
-        member_count=int(row["member_count"] or 0),
-        max_member_count=int(row["max_member_count"] or 0),
-        last_synced_at=float(row["last_synced_at"] or 0.0),
-    )
-
-
-def _group_member_from_row(row: sqlite3.Row) -> GroupMember:
-    return GroupMember(
-        group_id=int(row["group_id"]),
-        user_id=int(row["user_id"]),
-        nickname=str(row["nickname"]),
-        card=str(row["card"] or ""),
-        role=str(row["role"] or ""),
-        title=str(row["title"] or ""),
-        joined_at=float(row["joined_at"] or 0.0),
-        last_sent_at=float(row["last_sent_at"] or 0.0),
-        last_synced_at=float(row["last_synced_at"] or 0.0),
-        active=bool(row["active"]),
-    )
-
-
-def _summary_from_row(row: sqlite3.Row) -> MemorySummary:
-    try:
-        raw_cues = json.loads(str(row["recall_cues_json"]))
-    except json.JSONDecodeError:
-        raw_cues = []
-    cues = tuple(str(cue).strip() for cue in raw_cues if str(cue).strip())
-    columns = set(row.keys())
-    updated_at = row["updated_at"] if "updated_at" in columns else row["created_at"]
-    status = row["status"] if "status" in columns else "active"
-    locked = row["locked"] if "locked" in columns else 0
-    summary_id = row["id"] if "id" in columns else 0
-    return MemorySummary(
-        group_id=int(row["group_id"]),
-        summary=str(row["summary"]),
-        recall_cues=cues,
-        start_at=float(row["start_at"]),
-        end_at=float(row["end_at"]),
-        created_at=float(row["created_at"]),
-        id=int(summary_id or 0),
-        status=str(status or "active"),
-        locked=bool(locked),
-        updated_at=float(updated_at or row["created_at"]),
-    )
-
-
-def _raw_corpus_tags(text: str) -> tuple[str, ...]:
-    compact = _compact_text(text)
-    tag_patterns = (
-        ("玩梗", ("草", "哈哈", "笑死", "绷", "典", "麻了", "乐", "抽象", "梗", "开宰")),
-        ("互损", ("傻逼", "弱智", "废物", "滚", "爹", "别学", "不如", "唐")),
-        ("安慰", ("难受", "不开心", "顶不住", "撑不住", "压力", "破防", "烦死", "累")),
-        ("反串", ("建议", "支持", "感觉不如", "这下", "赢", "什么成分")),
-        ("政治", ("政治", "资本", "无产", "阶级", "粉红", "神友", "咱妈", "霓虹", "美国", "日本")),
-        ("代码", ("代码", "bug", "报错", "炸了", "python", "java", "ai", "模型", "api")),
-        ("倒霉", ("亏", "完蛋", "坏了", "炸了", "寄", "崩", "没人理")),
-        ("恋爱", ("老婆", "喜欢", "暧昧", "女友", "男朋友", "宝宝")),
-        ("行情", ("股票", "美股", "比特币", "btc", "eth", "亏钱", "涨", "跌")),
-    )
-    tags: list[str] = []
-    for tag, patterns in tag_patterns:
-        if any(pattern in compact for pattern in patterns):
-            tags.append(tag)
-    return tuple(tags)
-
-
-def _impression_keywords(text: str) -> list[str]:
-    compact = _compact_text(text)
-    if not compact or _is_low_value_raw_corpus_text(compact):
-        return []
-    stop_terms = {
-        "真的",
-        "现在",
-        "今天",
-        "这个",
-        "那个",
-        "还是",
-        "感觉",
-        "不是",
-        "没有",
-        "怎么",
-        "什么",
-        "因为",
-        "所以",
-        "但是",
-        "然后",
-        "自己",
-        "他们",
-        "我们",
-        "你们",
-        "一样",
-        "直接",
-    }
-    terms = [
-        term
-        for term in _relevance_terms(text)
-        if 2 <= len(term) <= 12 and term not in stop_terms and not term.isdigit()
-    ]
-    terms.sort(key=lambda term: (len(term), term), reverse=True)
-    return terms[:12]
-
-
-def _is_low_value_raw_corpus_text(text: str) -> bool:
-    compact = _compact_text(text)
-    if not compact:
-        return True
-    if len(compact) <= 1:
-        return True
-    return compact in {
-        "6",
-        "66",
-        "666",
-        "草",
-        "哈哈",
-        "哈哈哈",
-        "嗯",
-        "哦",
-        "好",
-        "好的",
-        "可以",
-        "绷",
-    }
-
-
-def _counter_from_json(value: object) -> Counter[str]:
-    try:
-        raw = json.loads(str(value))
-    except json.JSONDecodeError:
-        raw = {}
-    counter: Counter[str] = Counter()
-    if not isinstance(raw, dict):
-        return counter
-    for key, count in raw.items():
-        text = str(key).strip()
-        if not text:
-            continue
-        try:
-            counter[text] = max(0, int(count))
-        except (TypeError, ValueError):
-            continue
-    return counter
-
-
-def _recent_texts_from_json(value: object) -> list[dict[str, object]]:
-    try:
-        raw = json.loads(str(value))
-    except json.JSONDecodeError:
-        raw = []
-    if not isinstance(raw, list):
-        return []
-    result: list[dict[str, object]] = []
-    for item in raw:
-        if not isinstance(item, dict):
-            continue
-        text = str(item.get("text", "")).strip()
-        if not text:
-            continue
-        tags_raw = item.get("tags", [])
-        tags = (
-            [str(tag).strip() for tag in tags_raw if str(tag).strip()]
-            if isinstance(tags_raw, list)
-            else []
-        )
-        try:
-            created_at = float(item.get("at", 0.0) or 0.0)
-        except (TypeError, ValueError):
-            created_at = 0.0
-        result.append({"text": text[:140], "tags": tags[:4], "at": created_at})
-    return result
-
-
-def _cap_counter(counter: Counter[str], limit: int) -> Counter[str]:
-    return Counter(dict(counter.most_common(limit)))
-
-
-def _top_counter_items(counter: Counter[str], limit: int) -> tuple[tuple[str, int], ...]:
-    return tuple((key, int(count)) for key, count in counter.most_common(limit) if count > 0)
-
-
-def _profile_from_row(row: sqlite3.Row) -> MemberProfile:
-    try:
-        raw_aliases = json.loads(str(row["aliases_json"]))
-    except json.JSONDecodeError:
-        raw_aliases = []
-    aliases = ()
-    if isinstance(raw_aliases, list):
-        aliases = tuple(_dedupe_names(str(alias).strip() for alias in raw_aliases if str(alias).strip()))
-    return MemberProfile(
-        group_id=int(row["group_id"]),
-        user_id=int(row["user_id"]),
-        display_name=str(row["display_name"]),
-        aliases=aliases,
-        last_seen_at=float(row["last_seen_at"]),
-    )
-
-
-def _member_impression_from_row(row: sqlite3.Row) -> MemberImpression:
-    profile = _profile_from_row(row)
-    recent_texts = _recent_texts_from_json(row["recent_texts_json"])
-    return MemberImpression(
-        group_id=profile.group_id,
-        user_id=profile.user_id,
-        display_name=profile.display_name,
-        aliases=profile.aliases,
-        message_count=int(row["message_count"] or 0),
-        top_tags=_top_counter_items(_counter_from_json(row["tag_counts_json"]), limit=6),
-        top_keywords=_top_counter_items(_counter_from_json(row["keyword_counts_json"]), limit=8),
-        recent_texts=tuple(
-            str(item["text"])
-            for item in recent_texts[-5:]
-            if str(item.get("text", "")).strip()
-        ),
-        ai_summary=str(row["ai_summary"] or "").strip(),
-        ai_interests=tuple(_json_text_list(row["ai_interests_json"], limit=8)),
-        ai_speaking_style=str(row["ai_speaking_style"] or "").strip(),
-        ai_representative_texts=tuple(_json_text_list(row["ai_representative_texts_json"], limit=5)),
-        ai_summary_at=float(row["ai_summary_at"] or 0.0),
-        last_seen_at=profile.last_seen_at,
-        updated_at=float(row["updated_at"] or profile.last_seen_at),
-    )
-
-
-def _member_profile_summary_from_row(row: sqlite3.Row) -> MemberProfileSummary:
-    return MemberProfileSummary(
-        group_id=int(row["group_id"]),
-        user_id=int(row["user_id"]),
-        profile_summary=str(row["profile_summary"]),
-        interests=tuple(_json_text_list(row["interests_json"], limit=8)),
-        speaking_style=str(row["speaking_style"]),
-        representative_texts=tuple(_json_text_list(row["representative_texts_json"], limit=5)),
-        start_at=float(row["start_at"]),
-        end_at=float(row["end_at"]),
-        message_count=int(row["message_count"]),
-        created_at=float(row["created_at"]),
-    )
-
-
-def _bot_sent_from_row(row: sqlite3.Row) -> BotSentMessage:
-    return BotSentMessage(
-        group_id=int(row["group_id"]),
-        message_id=int(row["message_id"]),
-        bot_reply=str(row["bot_reply"]),
-        trigger_user_id=int(row["trigger_user_id"]),
-        trigger_nickname=str(row["trigger_nickname"]),
-        trigger_text=str(row["trigger_text"]),
-        action=str(row["action"]),
-        created_at=float(row["created_at"]),
-    )
-
-
-def _recalled_feedback_from_row(row: sqlite3.Row) -> RecalledReplyFeedback:
-    try:
-        raw_tags = json.loads(str(row["tags_json"]))
-    except json.JSONDecodeError:
-        raw_tags = []
-    tags = ()
-    if isinstance(raw_tags, list):
-        tags = tuple(str(tag).strip() for tag in raw_tags if str(tag).strip())
-    return RecalledReplyFeedback(
-        group_id=int(row["group_id"]),
-        message_id=int(row["message_id"]),
-        bot_reply=str(row["bot_reply"]),
-        trigger_user_id=int(row["trigger_user_id"]),
-        trigger_nickname=str(row["trigger_nickname"]),
-        trigger_text=str(row["trigger_text"]),
-        action=str(row["action"]),
-        owner_reason=str(row["owner_reason"]),
-        scene_summary=str(row["scene_summary"]),
-        bad_reply_problem=str(row["bad_reply_problem"]),
-        avoid_rule=str(row["avoid_rule"]),
-        better_direction=str(row["better_direction"]),
-        tags=tags,
-        operator_id=int(row["operator_id"]),
-        reason_user_id=int(row["reason_user_id"]),
-        recalled_at=float(row["recalled_at"]),
-        reason_at=float(row["reason_at"]),
-    )
-
-
-def _approved_feedback_from_row(row: sqlite3.Row) -> ApprovedReplyFeedback:
-    try:
-        raw_tags = json.loads(str(row["tags_json"]))
-    except (KeyError, json.JSONDecodeError):
-        raw_tags = []
-    tags = ()
-    if isinstance(raw_tags, list):
-        tags = tuple(str(tag).strip() for tag in raw_tags if str(tag).strip())
-    return ApprovedReplyFeedback(
-        group_id=int(row["group_id"]),
-        candidate_text=str(row["candidate_text"]),
-        trigger_user_id=int(row["trigger_user_id"]),
-        trigger_nickname=str(row["trigger_nickname"]),
-        trigger_text=str(row["trigger_text"]),
-        action=str(row["action"]),
-        style=str(row["style"]),
-        tags=tags,
-        operator_id=int(row["operator_id"]),
-        created_at=float(row["created_at"]),
-    )
-
-
 def _custom_jargon_from_row(row: sqlite3.Row) -> CustomJargonEntry:
     return CustomJargonEntry(
         group_id=int(row["group_id"]),
@@ -3395,27 +1533,3 @@ def _custom_jargon_from_row(row: sqlite3.Row) -> CustomJargonEntry:
         created_by=int(row["created_by"]),
         created_at=float(row["created_at"]),
     )
-
-
-def _dedupe_names(names: object) -> list[str]:
-    result: list[str] = []
-    seen: set[str] = set()
-    for name in names:
-        clean = str(name).strip()
-        key = clean.casefold()
-        if not clean or key in seen:
-            continue
-        seen.add(key)
-        result.append(clean)
-    return result
-
-
-def _dedupe_ints(values: list[int]) -> list[int]:
-    result: list[int] = []
-    seen: set[int] = set()
-    for value in values:
-        if value in seen:
-            continue
-        seen.add(value)
-        result.append(value)
-    return result
