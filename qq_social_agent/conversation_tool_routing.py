@@ -11,7 +11,7 @@ from .memory_models import ChatMessage
 from .pipeline_types import ToolKind, ToolRequest
 from .speaker_context import _short_notice_text
 from .tool_router import ToolRoutePlan
-from .tools.fresh_context import _compact_search_query
+from .tools.fresh_intent import _compact_search_query
 from .tools.market_intent import MarketIntent
 
 

@@ -10,7 +10,7 @@ from .pipeline_types import PipelineState, ToolKind, ToolRequest, ToolResult
 from .speaker_context import _short_notice_text
 from .tool_router import ToolRoutePlan
 from .tool_registry import ToolRegistry
-from .tools.fresh_context import _compact_search_query
+from .tools.fresh_intent import _compact_search_query
 from .tools.market_intent import MarketIntent
 
 

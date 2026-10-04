@@ -6,7 +6,8 @@ from typing import Iterable
 
 from .llm_task_types import ReplyDecision, ToolSymbol
 from .pipeline_types import PipelineMode, ToolKind, ToolRequest
-from .tools.fresh_context import FreshIntent, _compact_search_query, detect_fresh_intent
+from .tools.fresh_types import FreshIntent
+from .tools.fresh_intent import _compact_search_query, detect_fresh_intent
 from .tools.market_intent import MarketIntent
 
 

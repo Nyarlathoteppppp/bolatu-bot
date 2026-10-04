@@ -72,7 +72,10 @@ entrypoint/plugin -> orchestration -> domain/storage/tools -> provider adapters
 | 定时群消息 | `daily_review_service.py`、`proactive_group_message_service.py` | daily review 与 proactive 群消息生成、投递、成功后状态/记忆回写 | scheduler 生命周期；私聊小时任务共用的话题选择入口仍由 `plugin.py` 适配 |
 | 后台记忆维护 | `background_learning.py`、`memory_maintenance_service.py`、`memory_learning.py` | 单 worker 协调与记忆/风格/画像维护；attempt/streak 状态归 service 所有 | OneBot 事件适配和群聊热路径 |
 | 管理 HTTP | `admin_controller.py`、`admin_tools_controller.py`、`admin_edit_controller.py`、`admin_summaries_controller.py`、`admin_memory_controller.py`、`admin_http.py` | 本地管理路由、鉴权委托、表单适配、资源操作和重定向；编辑服务保留路径白名单、内容校验、备份与原子替换 | 群聊/私聊热路径，页面 HTML 拼装 |
-| 管理页面与观测 | `admin_ui.py`、`observability.py`、`approval_rules.py` | HTML 渲染、Trace、工具单 | HTTP request parsing、管理业务规则、聊天热路径判断 |
+| 运行观测 | `observability.py` | correlation scope、OneBot 连接与发送健康；保留共享状态和旧 Trace 导入入口 | Trace 事件归一化和 HTML 拼装 |
+| Trace 数据与展示 | `trace_snapshot.py`、`trace_render.py` | 事件归一化、分阶段聚合、元数据脱敏、JSON 快照与 HTML 转义 | QQ 连接状态、运行时单例、聊天策略 |
+| 搜索 | `tools/fresh_context.py`、`fresh_intent.py`、`fresh_providers.py`、`fresh_types.py`、`fresh_text.py` | 编排与缓存、意图/查询解析、Provider HTTP 和结果解析、共享记录与文本辅助 | 人格和开口策略；Provider 不能反向导入编排器 |
+| 管理页面 | `admin_ui.py`、`approval_rules.py` | 管理页面渲染、工具单 | HTTP request parsing、管理业务规则、聊天热路径判断 |
 | 安全输出 | `political_guard.py` | 输出脱敏和明确语义拦截 | 裸匹配消息 ID/QQ/时间戳 |
 
 ## 4. 插件化现状
@@ -117,6 +120,9 @@ entrypoint/plugin -> orchestration -> domain/storage/tools -> provider adapters
 7. **群回复发送后处理（2026-10-03 完成）**：`GroupPostSendService` 接管机器人发送记录、续聊窗口、群表情包和审批后的附加反应。`approved_reply_delivery.py` 继续管理正文投递及原调用顺序；入口保留旧函数适配，按调用装配当前客户端、发送器、指标和共享窗口。表情包只有发送成功后才写入素材冷却、消息记录和互动回执；ActionFailed 与其他异常保留各自原分支，40 秒窗口内不滑动刷新；默认阈值和文案均未改。群聊会话与发送后处理拆分后，`plugin.py` 为 9,505 行。
 
 8. **共享类型与导入依赖（2026-10-04 完成）**：从 `deepseek_client.py` 提取 11 个模型任务 DTO 到 `llm_task_types.py`，从 `memory.py` 提取 21 个记录类型到 `memory_models.py`；两个类型模块只依赖标准库。使用方直接导入类型，真正需要客户端/存储的模块仍依赖原实现。旧模块显式再导出同一类对象，保持原调用方和测试的公开导入兼容；字段、顺序、默认值、frozen 声明及 `MemoryAtom.evidence_source` 属性不变。决策门、工具路由与私聊消息类型的独立导入不再加载数据库或模型网关。动作集合、SQL、模型请求/解析和 Prompt 未改。`memory.py` 为 5,188 行，`deepseek_client.py` 为 2,494 行。
+
+9. **搜索边界（2026-10-04 完成）**：`fresh_intent.py` 负责现有意图识别与查询整理，`fresh_providers.py` 负责各搜索 Provider 的 HTTP 请求、响应解析和结果质量/排序辅助，`fresh_types.py` 保存共享记录，`fresh_text.py` 保存共享清洗、URL host 和超时构造函数。`fresh_context.py` 保留多轮搜索编排、缓存、总 deadline、Provider dispatcher、正文跟读及 factpack 格式化；仍显式再导出原符号，原 dispatcher 的 fetch monkeypatch 入口可继续使用。纯查询消费者改为直接导入意图/类型模块，不再加载搜索编排器和 Provider 适配器。原搜索请求、Prompt、排序、缓存和回退逻辑未改。`fresh_context.py` 从 2,711 行降到 1,738 行。
+10. **Trace 数据与展示（2026-10-04 完成）**：`trace_snapshot.py` 负责原事件归一化、关联分组、阶段聚合、脱敏和 JSON 快照；`trace_render.py` 只依赖快照层，负责原 HTML 渲染与转义。`observability.py` 从 1,157 行降到 306 行，继续拥有唯一的 ContextVar、连接集合与连接健康字典，以及所有运行时操作，显式再导出旧 Trace 符号。直接替换原状态字典的传输测试语义保持不变；未引入模块代理或状态副本。Trace schema、阶段顺序、限制值、脱敏规则及页面内容未改。
 
 不要优先拆 `memory.py` 或 `deepseek_client.py`。先补 repository/service 边界和表级测试，再动内部结构。
 

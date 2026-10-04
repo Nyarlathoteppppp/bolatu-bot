@@ -1,63 +1,80 @@
 from __future__ import annotations
 
 import asyncio
-import html
 import inspect
 import os
 import re
 import time
 from collections import OrderedDict
-from dataclasses import dataclass
-from email.utils import parsedate_to_datetime
-from urllib.parse import quote_plus, unquote, urlparse
-from xml.etree import ElementTree
+from urllib.parse import unquote, urlparse
 
 import httpx
 
 from .safe_url_reader import SafeUrlReader, UrlReadResult
 
-
-@dataclass(frozen=True)
-class FreshItem:
-    title: str
-    source: str
-    published_at: str
-    summary: str = ""
-    url: str = ""
-    score: float | None = None
-
-    def to_prompt_line(self) -> str:
-        parts = [self.title]
-        if self.source:
-            parts.append(f"来源 {self.source}")
-        if self.published_at:
-            parts.append(f"时间 {self.published_at}")
-        if self.summary:
-            parts.append(f"摘要 {self.summary}")
-        return "- " + "，".join(parts)
-
-
-@dataclass(frozen=True)
-class FreshLookup:
-    query: str
-    kind: str
-    items: tuple[FreshItem, ...]
-    status: str
-    provider: str = "google_news"
-    answer: str = ""
-    cached: bool = False
-    attempted_providers: tuple[str, ...] = ()
-    latency_ms: int = 0
-    error: str = ""
-    page_url: str = ""
-    page_title: str = ""
-    page_text: str = ""
-    page_status: str = ""
-    page_error: str = ""
-    page_urls: tuple[str, ...] = ()
-    page_texts: tuple[str, ...] = ()
-    research_queries: tuple[str, ...] = ()
-    research_rounds: int = 1
+# Preserve existing imports while implementations live in their owning modules.
+from .fresh_intent import (
+    fresh_kind_from_text,
+    detect_fresh_intent,
+    should_use_fresh_context,
+    _normalize_query,
+    _explicit_search_candidate_texts,
+    _clean_explicit_search_query,
+    _fresh_query_from_text,
+    _QUERY_STOPWORDS,
+    _QUERY_TITLE_HINT_RE,
+    _compact_search_query,
+    _current_reply_text,
+    _is_low_value_fresh_query,
+    _is_weak_search_object,
+    _EXPLICIT_SEARCH_RE,
+    _explicit_search_query,
+    _embedded_explicit_search_query,
+    _classify_fresh_kind,
+    _requires_fresh_verification,
+    _safe_external_query,
+    _looks_like_bad_external_query,
+    _has_external_lookup_signal,
+)
+from .fresh_providers import (
+    _fetch_sadai_web_lookup,
+    _plain_cited_text,
+    _fetch_tavily_lookup,
+    _fetch_searxng_items,
+    _tavily_query,
+    _parse_tavily_results,
+    _parse_searxng_results,
+    _parse_tavily_answer,
+    _fetch_google_news_items,
+    _fetch_bing_web_items,
+    _parse_google_news_rss,
+    _parse_bing_rss,
+    _text,
+    _split_title_source,
+    _format_pub_date,
+    _fresh_result_key,
+    _fresh_item_sort_key,
+    _host_priority,
+    _looks_like_low_quality_result,
+    _PREFERRED_NEWS_HOSTS,
+)
+from .fresh_text import (
+    _clean_html,
+    _clean_text,
+    _as_float,
+    _source_from_url,
+    _httpx_timeout,
+    _wikipedia_host,
+    _WIKIPEDIA_HOST_SUFFIXES,
+    _normalized_host,
+)
+from .fresh_types import (
+    FreshItem,
+    FreshLookup,
+    FreshFactPack,
+    FreshIntent,
+    SearchProviderError,
+)
 
 
 def fresh_lookup_status(lookup: FreshLookup, *, started: float | None = None) -> dict[str, object]:
@@ -81,40 +98,6 @@ def fresh_lookup_status(lookup: FreshLookup, *, started: float | None = None) ->
         "page_status": lookup.page_status,
         "page_url": lookup.page_url[:180],
     }
-
-
-@dataclass(frozen=True)
-class FreshFactPack:
-    topic: str
-    kind: str
-    provider: str
-    status: str
-    freshness: str
-    facts: tuple[str, ...]
-    uncertain: tuple[str, ...]
-    sources: tuple[str, ...]
-    cached: bool = False
-    source_refs: tuple[str, ...] = ()
-    page_text: str = ""
-    page_url: str = ""
-    page_texts: tuple[str, ...] = ()
-    page_urls: tuple[str, ...] = ()
-    research_queries: tuple[str, ...] = ()
-    research_rounds: int = 1
-
-
-@dataclass(frozen=True)
-class FreshIntent:
-    query: str
-    kind: str
-    explicit: bool = False
-    required: bool = False
-
-
-class SearchProviderError(RuntimeError):
-    def __init__(self, code: str):
-        super().__init__(code)
-        self.code = code
 
 
 class FreshContextTool:
@@ -1178,445 +1161,6 @@ def _dedupe_strings(items: list[str]) -> list[str]:
     return result
 
 
-async def _fetch_sadai_web_lookup(
-    query: str,
-    *,
-    kind: str,
-    api_key: str,
-    model: str = "gpt-6.1-sol",
-    timeout_seconds: float = 30.0,
-    max_results: int = 5,
-) -> tuple[str, tuple[FreshItem, ...]]:
-    """VerySadai Responses with the built-in web_search tool.
-
-    The answer is taken from the last message only: the provider prepends a
-    Codex-style "我会先核实…" message before the search call.
-    """
-    focus = "最新新闻" if kind == "news" else "赛程比分" if kind == "sports" else "资料"
-    payload = {
-        "model": model,
-        "store": False,
-        "max_output_tokens": 1200,
-        "reasoning": {"effort": "low"},
-        "tools": [{"type": "web_search"}],
-        "input": [{"role": "user", "content": (
-            f"联网检索{focus}并用中文回答：{query}\n"
-            "给出关键事实、数字和日期，3 到 6 句；只写查到的内容，查不到就直说。"
-        )}],
-    }
-    async with httpx.AsyncClient(timeout=timeout_seconds) as client:
-        response = await client.post(
-            "https://verysadai.com/v1/responses",
-            headers={"Authorization": f"Bearer {api_key}", "Accept-Encoding": "identity"},
-            json=payload,
-        )
-    if response.status_code == 429:
-        raise SearchProviderError("rate_limited")
-    if response.status_code >= 400:
-        raise SearchProviderError(f"http_{response.status_code}")
-    data = response.json()
-    messages = [item for item in data.get("output") or () if isinstance(item, dict) and item.get("type") == "message"]
-    searched = any(isinstance(item, dict) and item.get("type") == "web_search_call" for item in data.get("output") or ())
-    if not messages or not searched:
-        raise SearchProviderError("no_web_search")
-    answer_parts: list[str] = []
-    items: list[FreshItem] = []
-    seen: set[str] = set()
-    for part in messages[-1].get("content") or ():
-        if not isinstance(part, dict) or part.get("type") != "output_text":
-            continue
-        answer_parts.append(str(part.get("text") or ""))
-        for note in part.get("annotations") or ():
-            url = str((note or {}).get("url") or "").strip()
-            if not url or url in seen:
-                continue
-            seen.add(url)
-            items.append(FreshItem(
-                title=str(note.get("title") or url)[:160],
-                source=urlparse(url).netloc,
-                published_at="",
-                url=url,
-            ))
-    answer = _plain_cited_text("".join(answer_parts))
-    if not answer:
-        raise SearchProviderError("empty_answer")
-    return answer, tuple(items[: max(1, max_results)])
-
-
-def _plain_cited_text(text: str) -> str:
-    """Markdown citations -> plain source names, so QQ replies never paste raw links."""
-    text = re.sub(r"\(\[([^\]]+)\]\((?:https?://)[^)]+\)\)", r"（\1）", str(text or ""))
-    text = re.sub(r"\[([^\]]+)\]\((?:https?://)[^)]+\)", r"\1", text)
-    text = text.replace("**", "")
-    return re.sub(r"[ \t]+", " ", text).strip()
-
-
-async def _fetch_tavily_lookup(
-    query: str,
-    *,
-    kind: str,
-    api_key: str,
-    timeout_seconds: float = 12.0,
-    max_results: int = 4,
-) -> tuple[str, tuple[FreshItem, ...]]:
-    if not api_key:
-        raise SearchProviderError("missing_api_key")
-    topic = "news" if kind in {"news", "sports"} else "general"
-    payload: dict[str, object] = {
-        "query": _tavily_query(query, kind=kind),
-        "search_depth": "basic",
-        "topic": topic,
-        "max_results": max(1, min(10, int(max_results))),
-        "include_answer": True,
-        "include_raw_content": False,
-        "include_images": False,
-    }
-    if kind in {"news", "sports"}:
-        payload["time_range"] = "week"
-    try:
-        async with httpx.AsyncClient(timeout=_httpx_timeout(timeout_seconds), follow_redirects=True) as client:
-            response = await client.post(
-                "https://api.tavily.com/search",
-                headers={
-                    "Authorization": f"Bearer {api_key}",
-                    "Content-Type": "application/json",
-                },
-                json=payload,
-            )
-            response.raise_for_status()
-            data = response.json()
-    except httpx.TimeoutException as exc:
-        raise SearchProviderError("timeout") from exc
-    except httpx.HTTPStatusError as exc:
-        raise SearchProviderError(f"http_{exc.response.status_code}") from exc
-    except (httpx.HTTPError, ValueError) as exc:
-        raise SearchProviderError(type(exc).__name__.lower()) from exc
-    return _parse_tavily_answer(data), _parse_tavily_results(data)
-
-
-async def _fetch_searxng_items(
-    query: str,
-    *,
-    kind: str,
-    base_url: str,
-    timeout_seconds: float = 10.0,
-    max_results: int = 5,
-) -> tuple[FreshItem, ...]:
-    """Use an operator-owned SearXNG JSON endpoint, never a public instance."""
-    root = str(base_url or "").strip().rstrip("/")
-    if not root.startswith(("http://", "https://")):
-        raise SearchProviderError("invalid_base_url")
-    params: dict[str, str] = {
-        "q": _tavily_query(query, kind=kind),
-        "format": "json",
-        "language": "zh-CN",
-        "safesearch": "0",
-    }
-    if kind in {"news", "sports"}:
-        params["categories"] = "news"
-        params["time_range"] = "month"
-    try:
-        async with httpx.AsyncClient(timeout=_httpx_timeout(timeout_seconds), follow_redirects=True) as client:
-            response = await client.get(
-                f"{root}/search",
-                params=params,
-                headers={"Accept": "application/json", "User-Agent": "qq-social-agent/0.1"},
-            )
-            response.raise_for_status()
-            data = response.json()
-    except httpx.TimeoutException as exc:
-        raise SearchProviderError("timeout") from exc
-    except httpx.HTTPStatusError as exc:
-        raise SearchProviderError(f"http_{exc.response.status_code}") from exc
-    except (httpx.HTTPError, ValueError) as exc:
-        raise SearchProviderError(type(exc).__name__.lower()) from exc
-    return _parse_searxng_results(data)[:max_results]
-
-
-def _tavily_query(query: str, *, kind: str) -> str:
-    if kind == "sports":
-        return f"{query} 最新赛果 比分"
-    if kind == "news":
-        return f"{query} 最新消息"
-    return query
-
-
-def _parse_tavily_results(data: object) -> tuple[FreshItem, ...]:
-    if not isinstance(data, dict):
-        return ()
-    raw_results = data.get("results")
-    if not isinstance(raw_results, list):
-        return ()
-    items: list[FreshItem] = []
-    seen: set[str] = set()
-    for raw in raw_results:
-        if not isinstance(raw, dict):
-            continue
-        title = str(raw.get("title") or "").strip()
-        url = str(raw.get("url") or "").strip()
-        content = str(raw.get("content") or "").strip()
-        if not title or _looks_like_low_quality_result(title, url):
-            continue
-        key = _fresh_result_key(title, url)
-        if key in seen:
-            continue
-        seen.add(key)
-        items.append(
-            FreshItem(
-                title=title[:120],
-                source=_source_from_url(url)[:40],
-                published_at=str(raw.get("published_date") or "")[:40],
-                summary=_clean_text(content)[:180],
-                url=url[:240],
-                score=_as_float(raw.get("score")),
-            )
-        )
-    return tuple(sorted(items, key=_fresh_item_sort_key)[:10])
-
-
-def _parse_searxng_results(data: object) -> tuple[FreshItem, ...]:
-    if not isinstance(data, dict):
-        return ()
-    raw_results = data.get("results")
-    if not isinstance(raw_results, list):
-        return ()
-    items: list[FreshItem] = []
-    seen: set[str] = set()
-    for raw in raw_results:
-        if not isinstance(raw, dict):
-            continue
-        title = _clean_text(str(raw.get("title") or ""))
-        url = str(raw.get("url") or "").strip()
-        if not title or not url or _looks_like_low_quality_result(title, url):
-            continue
-        key = _fresh_result_key(title, url)
-        if key in seen:
-            continue
-        seen.add(key)
-        source = _clean_text(str(raw.get("engine") or "")) or _source_from_url(url)
-        published_at = _clean_text(str(raw.get("publishedDate") or raw.get("published_at") or ""))[:40]
-        items.append(
-            FreshItem(
-                title=title[:120],
-                source=source[:40],
-                published_at=published_at,
-                summary=_clean_html(str(raw.get("content") or raw.get("snippet") or ""))[:180],
-                url=url[:500],
-                score=_as_float(raw.get("score")),
-            )
-        )
-    return tuple(sorted(items, key=_fresh_item_sort_key)[:10])
-
-
-def _parse_tavily_answer(data: object) -> str:
-    if not isinstance(data, dict):
-        return ""
-    answer = str(data.get("answer") or "").strip()
-    if not answer:
-        return ""
-    return _clean_text(answer)[:480]
-
-
-async def _fetch_google_news_items(
-    query: str,
-    *,
-    kind: str,
-    timeout_seconds: float = 10.0,
-    max_results: int = 5,
-) -> tuple[FreshItem, ...]:
-    search_query = query
-    if kind == "sports":
-        search_query = f"{query} 比赛 赛果"
-    window = "30d" if kind == "sports" else "14d"
-    if "when:" not in search_query:
-        search_query = f"{search_query} when:{window}"
-    url = (
-        "https://news.google.com/rss/search?"
-        f"q={quote_plus(search_query)}&hl=zh-CN&gl=CN&ceid=CN:zh-Hans"
-    )
-    try:
-        async with httpx.AsyncClient(timeout=_httpx_timeout(timeout_seconds), follow_redirects=True) as client:
-            response = await client.get(
-                url,
-                headers={"User-Agent": "Mozilla/5.0 qq-social-agent/0.1"},
-            )
-            response.raise_for_status()
-    except httpx.TimeoutException as exc:
-        raise SearchProviderError("timeout") from exc
-    except httpx.HTTPStatusError as exc:
-        raise SearchProviderError(f"http_{exc.response.status_code}") from exc
-    except httpx.HTTPError as exc:
-        raise SearchProviderError(type(exc).__name__.lower()) from exc
-    return _parse_google_news_rss(response.text)[:max_results]
-
-
-async def _fetch_bing_web_items(
-    query: str,
-    *,
-    timeout_seconds: float = 10.0,
-    max_results: int = 5,
-) -> tuple[FreshItem, ...]:
-    url = f"https://www.bing.com/search?format=rss&q={quote_plus(query)}"
-    try:
-        async with httpx.AsyncClient(timeout=_httpx_timeout(timeout_seconds), follow_redirects=True) as client:
-            response = await client.get(
-                url,
-                headers={"User-Agent": "Mozilla/5.0 qq-social-agent/0.1"},
-            )
-            response.raise_for_status()
-    except httpx.TimeoutException as exc:
-        raise SearchProviderError("timeout") from exc
-    except httpx.HTTPStatusError as exc:
-        raise SearchProviderError(f"http_{exc.response.status_code}") from exc
-    except httpx.HTTPError as exc:
-        raise SearchProviderError(type(exc).__name__.lower()) from exc
-    return _parse_bing_rss(response.text)[:max_results]
-
-
-def _parse_google_news_rss(xml_text: str) -> tuple[FreshItem, ...]:
-    try:
-        root = ElementTree.fromstring(xml_text)
-    except ElementTree.ParseError:
-        return ()
-
-    items: list[FreshItem] = []
-    for item in root.findall("./channel/item"):
-        raw_title = _text(item.find("title"))
-        if not raw_title:
-            continue
-        title, source_from_title = _split_title_source(raw_title)
-        source = _text(item.find("source")) or source_from_title
-        if _looks_like_low_quality_result(title, source):
-            continue
-        published_at = _format_pub_date(_text(item.find("pubDate")))
-        summary = _clean_html(_text(item.find("description")))
-        url = _text(item.find("link"))
-        items.append(
-            FreshItem(
-                title=title[:120],
-                source=source[:40],
-                published_at=published_at,
-                summary=summary[:160],
-                url=url[:500],
-            )
-        )
-        if len(items) >= 10:
-            break
-    return tuple(items)
-
-
-def _parse_bing_rss(xml_text: str) -> tuple[FreshItem, ...]:
-    try:
-        root = ElementTree.fromstring(xml_text)
-    except ElementTree.ParseError:
-        return ()
-
-    items: list[FreshItem] = []
-    seen: set[str] = set()
-    for item in root.findall(".//item"):
-        title = _text(item.find("title"))
-        url = _text(item.find("link"))
-        if not title or _looks_like_low_quality_result(title, url):
-            continue
-        key = _fresh_result_key(title, url)
-        if key in seen:
-            continue
-        seen.add(key)
-        items.append(
-            FreshItem(
-                title=title[:120],
-                source=_source_from_url(url)[:40],
-                published_at=_format_pub_date(_text(item.find("pubDate"))),
-                summary=_clean_html(_text(item.find("description")))[:180],
-                url=url[:500],
-            )
-        )
-        if len(items) >= 10:
-            break
-    return tuple(items)
-
-
-def _text(node: ElementTree.Element[str] | None) -> str:
-    if node is None or node.text is None:
-        return ""
-    return html.unescape(node.text).strip()
-
-
-def _split_title_source(title: str) -> tuple[str, str]:
-    if " - " not in title:
-        return title.strip(), ""
-    article_title, source = title.rsplit(" - ", 1)
-    return article_title.strip(), source.strip()
-
-
-def _format_pub_date(value: str) -> str:
-    if not value:
-        return ""
-    try:
-        parsed = parsedate_to_datetime(value)
-    except (TypeError, ValueError):
-        return value[:40]
-    return parsed.strftime("%Y-%m-%d %H:%M")
-
-
-def _clean_html(value: str) -> str:
-    text = re.sub(r"<[^>]+>", " ", value)
-    text = html.unescape(text)
-    return _clean_text(text)
-
-
-def _clean_text(value: str) -> str:
-    text = html.unescape(value)
-    text = re.sub(r"\s+", " ", text).strip()
-    return text
-
-
-def _as_float(value: object) -> float | None:
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return None
-
-
-def _source_from_url(url: str) -> str:
-    try:
-        host = urlparse(url).netloc
-    except ValueError:
-        return ""
-    return host.removeprefix("www.")
-
-
-def _fresh_result_key(title: str, url: str) -> str:
-    host = _source_from_url(url).casefold()
-    title_key = re.sub(r"\W+", "", title.casefold())[:80]
-    return f"{host}:{title_key}"
-
-
-def _fresh_item_sort_key(item: FreshItem) -> tuple[int, int, int, int, float]:
-    host_score = _host_priority(item.url)
-    has_date = 1 if item.published_at else 0
-    has_summary = 1 if item.summary else 0
-    score = item.score if item.score is not None else 0.0
-    return (-host_score, 0, -has_date, -has_summary, -score)
-
-
-def _host_priority(url: str) -> int:
-    host = _normalized_host(_source_from_url(url))
-    if not host:
-        return 0
-    if _wikipedia_host(host):
-        return 6
-    if host == "github.com" or host.endswith(".github.io"):
-        return 5
-    if host.endswith(".gov.cn") or host.endswith(".edu.cn"):
-        return 4
-    if any(host == item or host.endswith("." + item) for item in _PREFERRED_NEWS_HOSTS):
-        return 3
-    if any(marker in host for marker in ("notes.", "zhihu.com", "bilibili.com", "hupu.com")):
-        return 2
-    return 0
-
-
 def _query_overlap_score(item: FreshItem, query: str) -> int:
     terms = _query_overlap_terms(query)
     if not terms:
@@ -1680,7 +1224,6 @@ def _merge_fresh_items(*groups: tuple[FreshItem, ...]) -> tuple[FreshItem, ...]:
             seen.add(key)
             merged.append(item)
     return tuple(merged[:10])
-
 
 
 def _should_run_followup_research_round(
@@ -1781,7 +1324,6 @@ def _second_hop_query(query: str) -> str:
     if any(marker in compact for marker in ("是什么", "是谁", "什么是", "简介", "定义")):
         return f"{clean} 维基百科"
     return ""
-
 
 
 def _planned_research_queries(
@@ -1929,486 +1471,6 @@ def _synthesize_research_answer(
     return ""
 
 
-def _looks_like_low_quality_result(title: str, source: str) -> bool:
-    host = _normalized_host(_source_from_url(source) or source)
-    title_blob = f"{title} {source}".casefold()
-    if host in {"x.com", "twitter.com", "t.co"} or host.endswith(".x.com") or host.endswith(".twitter.com"):
-        return True
-    if "x.com/" in title_blob or "twitter.com/" in title_blob:
-        return True
-    blocked_title = (
-        "网址",
-        "直播地址",
-        "results on x",
-        "live posts & updates",
-        "博彩",
-        "下注",
-        "赔率",
-        "胜平负",
-        "prediction",
-        "odds",
-    )
-    if any(token in title_blob for token in blocked_title):
-        return True
-    return False
-
-
-def fresh_kind_from_text(text: str) -> str | None:
-    intent = detect_fresh_intent(text)
-    return intent.kind if intent else None
-
-
-def detect_fresh_intent(text: str) -> FreshIntent | None:
-    raw_text = str(text or "")
-    full_text = re.sub(r"\s+", " ", raw_text).strip()
-    normalized = _normalize_query(full_text)
-    compact = re.sub(r"\s+", "", full_text.casefold())
-    if not compact or _is_low_value_fresh_query(compact):
-        return None
-
-    explicit_query = None
-    explicit_source = full_text
-    for candidate in _explicit_search_candidate_texts(raw_text):
-        explicit_query = _explicit_search_query(candidate)
-        if explicit_query is None:
-            explicit_query = _embedded_explicit_search_query(candidate)
-        if explicit_query is not None:
-            explicit_source = candidate
-            break
-    explicit = explicit_query is not None
-    kind = _classify_fresh_kind(explicit_source if explicit else full_text, explicit=explicit)
-    if kind is None:
-        return None
-    if explicit_query is not None and _is_weak_search_object(explicit_query):
-        explicit_query = None
-        explicit = False
-        kind = _classify_fresh_kind(full_text, explicit=False)
-        if kind is None:
-            return None
-    query = (
-        _clean_explicit_search_query(explicit_query or "")
-        if explicit_query is not None
-        else _fresh_query_from_text(_current_reply_text(full_text) or normalized)
-    )
-    query = _compact_search_query(query)
-    if _is_low_value_fresh_query(query) or _is_weak_search_object(query):
-        return None
-    return FreshIntent(
-        query=query,
-        kind=kind,
-        explicit=explicit,
-        required=explicit or _requires_fresh_verification(full_text),
-    )
-
-
-def should_use_fresh_context(query: str, fallback_text: str = "") -> bool:
-    query = _normalize_query(query)
-    if not query or _is_low_value_fresh_query(query):
-        return False
-    return detect_fresh_intent(f"{query} {fallback_text}") is not None
-
-
-def _normalize_query(query: str) -> str:
-    query = re.sub(r"\s+", " ", query).strip()
-    return query[:120]
-
-
-def _explicit_search_candidate_texts(text: str) -> tuple[str, ...]:
-    candidates: list[str] = []
-    current = _current_reply_text(re.sub(r"\s+", " ", str(text or "")).strip())
-    if current:
-        candidates.append(current)
-    for raw_line in str(text or "").splitlines():
-        line = re.sub(r"\s+", " ", raw_line).strip()
-        if not line:
-            continue
-        line = re.sub(r"^\s*\d+[.、)）]\s*", "", line)
-        for separator in ("说：", "说:", "：", ":"):
-            if separator in line:
-                tail = line.split(separator, 1)[-1].strip()
-                if tail:
-                    candidates.append(tail)
-                    break
-        candidates.append(line)
-    candidates.append(str(text or ""))
-    output: list[str] = []
-    seen: set[str] = set()
-    for item in candidates:
-        clean = re.sub(r"\s+", " ", item).strip()
-        if not clean:
-            continue
-        key = clean.casefold()
-        if key in seen:
-            continue
-        seen.add(key)
-        output.append(clean)
-    return tuple(output)
-
-
-def _clean_explicit_search_query(query: str) -> str:
-    clean = _normalize_query(query)
-    clean = re.sub(
-        r"^(?:讲讲|讲一下|说说|说一下|聊聊|介绍一下|看看|看一下|分析一下|讲一讲|说一说|关于)\s*",
-        "",
-        clean,
-    ).strip(" ，,：:")
-    clean = re.sub(r"^(?:一下|下|这个|这件事|这东西)\s*", "", clean).strip(" ，,：:")
-    return _compact_search_query(clean or query)
-
-
-def _fresh_query_from_text(text: str) -> str:
-    query = _normalize_query(text)
-    explicit_query = _explicit_search_query(query)
-    if explicit_query is not None:
-        return _normalize_query(explicit_query)
-    query = re.sub(r"(现在|今天)?(怎么样了|怎么了|是什么情况|咋了|如何了)$", "", query).strip()
-    query = re.sub(r"(最新消息|最新新闻|新闻|赛果|比分|结果)$", "", query).strip()
-    return _compact_search_query(query or text)
-
-
-_QUERY_STOPWORDS = {
-    "让",
-    "使",
-    "把",
-    "将",
-    "被",
-    "给",
-    "对",
-    "向",
-    "与",
-    "和",
-    "及",
-    "以及",
-    "的",
-    "了",
-    "着",
-    "过",
-    "是",
-    "在",
-    "有",
-    "如何",
-    "怎样",
-    "怎么",
-    "什么",
-    "哪些",
-    "哪个",
-    "这个",
-    "那个",
-    "成为",
-    "一下",
-    "讲讲",
-    "看看",
-    "说说",
-}
-_QUERY_TITLE_HINT_RE = re.compile(r"[：:]|如何成为|怎样成为|关键能力|一文看懂|深度解析")
-
-
-def _compact_search_query(query: str) -> str:
-    clean = _normalize_query(query)
-    if not clean:
-        return ""
-    compact = re.sub(r"[\s，。！？,.!?]+", "", clean)
-    looks_like_title = (
-        len(compact) > 40
-        or bool(_QUERY_TITLE_HINT_RE.search(clean))
-        or ("\"" in clean or "“" in clean or "”" in clean)
-    )
-    if not looks_like_title:
-        return clean
-    split_source = clean
-    for stopword in sorted(_QUERY_STOPWORDS, key=len, reverse=True):
-        split_source = split_source.replace(stopword, " ")
-    raw_tokens = re.findall(
-        r"[A-Za-z0-9][A-Za-z0-9._+-]*|[\u4e00-\u9fff]{2,}",
-        split_source,
-    )
-    tokens: list[str] = []
-    seen: set[str] = set()
-    for token in raw_tokens:
-        normalized = token.strip()
-        if not normalized or normalized in _QUERY_STOPWORDS:
-            continue
-        key = normalized.casefold()
-        if key in seen:
-            continue
-        seen.add(key)
-        tokens.append(normalized)
-        if len(tokens) >= 6:
-            break
-    compacted = " ".join(tokens[:6]).strip()
-    compacted_len = len(re.sub(r"\s+", "", compacted))
-    if compacted_len <= 2:
-        return clean
-    return compacted[:120]
-
-
-def _current_reply_text(text: str) -> str:
-    """Extract the current speaker's part from the enriched QQ reply wrapper."""
-
-    if "回复" not in text or "消息【" not in text or not text.endswith("】"):
-        return ""
-    for separator in ("：", ":"):
-        if separator not in text:
-            continue
-        current = text.rsplit(separator, 1)[-1].removesuffix("】").strip()
-        if current:
-            return current
-    return ""
-
-
-def _is_low_value_fresh_query(text: str) -> bool:
-    compact = re.sub(r"[\s，。！？,.!?]+", "", text.lower())
-    if not compact:
-        return True
-    low_value_tokens = (
-        "你好",
-        "美好",
-        "测试",
-        "周几",
-        "星期几",
-        "几点",
-        "日期",
-        "乱码",
-        "随便搜搜",
-        "你能搜什么",
-        "搜索功能",
-        "联网功能",
-    )
-    if any(token in compact for token in low_value_tokens):
-        return True
-    return len(compact) <= 2
-
-
-def _is_weak_search_object(text: str) -> bool:
-    compact = re.sub(r"[\s，。！？,.!?]+", "", str(text or "").casefold())
-    if not compact or len(compact) <= 2:
-        return True
-    weak_exact = {
-        "然后",
-        "开始",
-        "思路",
-        "看看",
-        "说说",
-        "这个",
-        "那个",
-        "一下",
-        "东西",
-        "然后开始",
-        "想个思路",
-        "然后开始想个思路",
-        "随便",
-        "那个东西",
-        "这件事",
-    }
-    if compact in weak_exact:
-        return True
-    if compact.startswith("然后开始") and len(compact) <= 12:
-        return True
-    return False
-
-
-_EXPLICIT_SEARCH_RE = re.compile(
-    r"^\s*"
-    r"(?:(?:张风雪|风雪)[，,：:\s]*)?"
-    r"(?:(?:请|麻烦|你能不能|你可以|能不能|可以)\s*)?"
-    r"(?:"
-    r"帮我\s*找(?:一下)?|"
-    r"(?:帮我|你)?\s*(?:去|来)?\s*(?:"
-    r"联网(?:搜索|搜|查|看)(?:一下)?|"
-    r"网上(?:搜索|搜|查|找|看)(?:一下)?|"
-    r"上网(?:搜索|搜|查|找|看)(?:一下)?|"
-    r"搜索(?:一下)?|搜一下|搜搜|搜|查一下|查查|查"
-    r")"
-    r")"
-    r"[，,：:\s]*(?P<query>.+?)\s*$",
-    flags=re.IGNORECASE,
-)
-
-
-def _explicit_search_query(text: str) -> str | None:
-    match = _EXPLICIT_SEARCH_RE.match(text)
-    if match is None:
-        return None
-    query = _normalize_query(match.group("query"))
-    return query or None
-
-
-def _embedded_explicit_search_query(text: str) -> str | None:
-    value = re.sub(r"\s+", " ", str(text or "")).strip()
-    if not value or any(token in value for token in ("搜索功能", "联网功能", "搜搜功能")):
-        return None
-    pattern = (
-        r"(?:称|说|让|叫|要|想|在)?\s*(?:你)?\s*"
-        r"(?:联网(?:搜索|搜|查|看)(?:一下)?|网上(?:搜索|搜|查|找|看)(?:一下)?|"
-        r"上网(?:搜索|搜|查|找|看)(?:一下)?|搜索(?:一下)?(?!功能)|搜一下|搜搜|查一下|查查)"
-        r"[，,：:\s]*(?P<query>[^。！？!；;\n]{2,80})"
-    )
-    match = re.search(pattern, value, flags=re.IGNORECASE)
-    if match is None:
-        return None
-    query = _normalize_query(match.group("query"))
-    return query or None
-
-
-def _classify_fresh_kind(text: str, *, explicit: bool) -> str | None:
-    lowered = text.casefold()
-    sports_terms = (
-        "赛果",
-        "比分",
-        "赛程",
-        "世界杯",
-        "msi",
-        "nba",
-        "欧冠",
-        "英超",
-        "比赛",
-        "赛事",
-        "战绩",
-    )
-    news_terms = (
-        "新闻",
-        "消息",
-        "热点",
-        "局势",
-        "冲突",
-        "战争",
-        "政策",
-        "发布会",
-        "通报",
-        "事故",
-        "地震",
-        "台风",
-        "选举",
-        "进展",
-    )
-    news_subject_terms = news_terms + (
-        "美国",
-        "伊朗",
-        "以色列",
-        "乌克兰",
-        "俄罗斯",
-        "政府",
-        "公司",
-        "游戏",
-    )
-    fresh_terms = (
-        "最新",
-        "刚刚",
-        "刚才",
-        "今天",
-        "今年",
-        "本届",
-        "现在",
-        "目前",
-        "发生什么",
-        "怎么了",
-        "怎么样了",
-        "结果",
-    )
-    has_sports = any(term in lowered for term in sports_terms)
-    has_news = any(term in lowered for term in news_terms)
-    has_freshness = any(term in lowered for term in fresh_terms)
-
-    if has_sports and (explicit or has_freshness):
-        return "sports"
-    if explicit:
-        return "news" if has_news else "web"
-    if _requires_fresh_verification(text):
-        academic_terms = ("菲奖", "菲尔兹", "学术", "论文", "猜想", "定理", "期刊", "大学")
-        return "web" if any(term in lowered for term in academic_terms) else "news"
-    if has_freshness and any(term in lowered for term in news_subject_terms):
-        return "news"
-    if has_freshness and any(term in lowered for term in ("版本", "文档", "官网", "更新", "发布")):
-        return "web"
-    return None
-
-
-def _requires_fresh_verification(text: str) -> bool:
-    """Identify concrete current outcomes that should never rely on stale model memory."""
-
-    lowered = text.casefold()
-    time_terms = (
-        "今天",
-        "今年",
-        "本届",
-        "刚刚",
-        "刚才",
-        "最新",
-        "目前",
-        "现在已经",
-        "已经确定",
-        "已经公布",
-    )
-    outcome_terms = (
-        "得主",
-        "获奖",
-        "拿到",
-        "名单",
-        "颁奖",
-        "当选",
-        "夺冠",
-        "冠军",
-        "排名",
-        "入选",
-        "官宣",
-        "公布",
-        "发布",
-        "实锤",
-        "确定",
-        "解决了",
-        "证明了",
-    )
-    return any(term in lowered for term in time_terms) and any(
-        term in lowered for term in outcome_terms
-    )
-
-
-def _safe_external_query(query: str, *, max_chars: int = 120) -> str:
-    clean = _clean_text(str(query or ""))
-    clean = re.sub(
-        r"(?i)\b(?:authorization\s*:\s*)?bearer\s+[A-Za-z0-9._~+/=-]{8,}",
-        "[已隐藏令牌]",
-        clean,
-    )
-    clean = re.sub(
-        r"(?i)\b(?:api[_\s-]?key|access[_\s-]?token|refresh[_\s-]?token|token|secret|password)"
-        r"\s*[:=：]\s*[^\s，,;；]{6,}",
-        "[已隐藏密钥]",
-        clean,
-    )
-    clean = re.sub(r"(?i)\b(?:sk|pk)[-_][A-Za-z0-9_-]{12,}\b", "[已隐藏密钥]", clean)
-    clean = re.sub(
-        r"(?i)([?&](?:api[_-]?key|access[_-]?token|token|secret|password)=)[^&#\s]+",
-        r"\1[已隐藏]",
-        clean,
-    )
-    clean = re.sub(r"(?<!\d)\d{7,12}(?!\d)", "[QQ号]", clean)
-    clean = re.sub(r"[\x00-\x1f\x7f]+", " ", clean)
-    clean = re.sub(r"\s+", " ", clean).strip()
-    if _looks_like_bad_external_query(clean):
-        return ""
-    return clean[: max(1, int(max_chars))].rstrip()
-
-
-def _looks_like_bad_external_query(query: str) -> bool:
-    compact = re.sub(r"[\s，。！？,.!?~～]+", "", query.casefold())
-    if not compact:
-        return True
-    if _has_external_lookup_signal(compact):
-        return False
-    abstract_tokens = ("平行宇宙", "美少女权", "被踢", "踢了", "踢出去", "给踢", "被骂", "骂了")
-    if any(token in compact for token in abstract_tokens):
-        return True
-    if len(compact) <= 28 and re.search(r"^[你我他她它].{0,16}(?:被|给|把).{0,16}(?:踢|骂|打|杀|大肆|达斯|火宅)", compact):
-        return True
-    return False
-
-
-def _has_external_lookup_signal(compact: str) -> bool:
-    signal_terms = ("搜", "查", "最新", "现在", "今天", "今年", "新闻", "发生什么", "怎么了", "官网", "文档", "发布", "官宣", "赛程", "比分", "价格", "行情", "股票", "美股", "币价", "比特币", "以太坊")
-    return any(term in compact for term in signal_terms)
-
-
 def _query_similarity_terms(query_key: str) -> set[str]:
     compact = re.sub(r"\s+", "", query_key.casefold())
     terms = set(re.findall(r"[a-z0-9]{2,}", query_key.casefold()))
@@ -2473,17 +1535,6 @@ def _config_float(config: dict[str, object], *keys: str, default: float) -> floa
         except (TypeError, ValueError):
             break
     return default
-
-
-def _httpx_timeout(timeout_seconds: float) -> httpx.Timeout:
-    total = max(0.1, float(timeout_seconds))
-    connect = min(1.5, max(0.4, total * 0.3))
-    return httpx.Timeout(timeout=total, connect=connect)
-
-
-def _wikipedia_host(host: str) -> bool:
-    host = _normalized_host(host)
-    return any(host == suffix or host.endswith("." + suffix) for suffix in _WIKIPEDIA_HOST_SUFFIXES)
 
 
 def _wikipedia_title_from_url(url: str) -> tuple[str, str] | None:
@@ -2614,23 +1665,6 @@ _FOLLOWUP_SKIP_HOSTS = (
     "mp.weixin.qq.com",
     "searx.space",
 )
-_PREFERRED_NEWS_HOSTS = (
-    "thepaper.cn",
-    "cls.cn",
-    "stcn.com",
-    "eastmoney.com",
-    "sina.com.cn",
-    "163.com",
-    "qq.com",
-    "people.com.cn",
-    "xinhuanet.com",
-    "gov.cn",
-)
-_WIKIPEDIA_HOST_SUFFIXES = (
-    "wikipedia.org",
-    "wikimedia.org",
-    "m.wikipedia.org",
-)
 _ZHIHU_HUB_PATHS = (
     "/",
     "/topics",
@@ -2657,13 +1691,6 @@ _RELATED_SCOPE_MARKERS = (
     "别的网站",
     "不要知乎",
 )
-
-
-def _normalized_host(host: str) -> str:
-    host = (host or "").lower().split(":", 1)[0]
-    if host.startswith("www."):
-        host = host[4:]
-    return host
 
 
 def _host_matches(host: str, pattern: str) -> bool:
