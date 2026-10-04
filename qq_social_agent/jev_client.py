@@ -11,9 +11,9 @@ from nonebot import logger
 
 from typing import TYPE_CHECKING
 if TYPE_CHECKING:
-    from .deepseek_client import ReplyDecision, ToolRoutingDecision
+    from .llm_task_types import ReplyDecision, ToolRoutingDecision
     from .discourse_state import DiscourseState
-from .memory import ChatMessage
+from .memory_models import ChatMessage
 from .persona import Persona
 from .resolver_result import RESOLVED
 
@@ -402,7 +402,7 @@ class JevClient:
         else:
             should_reply = action_choice != "ignore" and noul_score >= 0.45
 
-        from .deepseek_client import ReplyDecision
+        from .llm_task_types import ReplyDecision
         if not should_reply:
             return ReplyDecision(
                 should_reply=False,
@@ -451,7 +451,7 @@ class JevClient:
         if confidence is None or confidence < JEV_TOOL_CHOICE_CONFIDENCE_MIN or tool_choice == "other":
             raise ValueError("Uncertain Jev tool choice; use LLM routing")
 
-        from .deepseek_client import ToolRoutingDecision
+        from .llm_task_types import ToolRoutingDecision
         allowed = {"probability", "fresh_search", "market", "deep_url", "image_generation"}
         if tool_choice not in allowed or need_tool_score < JEV_TOOL_NOUL_MIN:
             return ToolRoutingDecision(
@@ -626,7 +626,7 @@ class JevClient:
         reply_text: str,
         candidates: str,
     ):
-        from .deepseek_client import MemeSelectionDecision
+        from .llm_task_types import MemeSelectionDecision
 
         ids: list[str] = []
         for line in str(candidates or "").splitlines():

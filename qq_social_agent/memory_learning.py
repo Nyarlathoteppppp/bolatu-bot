@@ -5,8 +5,9 @@ import time
 from dataclasses import asdict
 from typing import Iterable
 
-from .deepseek_client import DailyReviewDraft, MemoryFactDraft, MidMemoryDraft
-from .memory import ChatMessage, MemoryStore
+from .llm_task_types import DailyReviewDraft, MemoryFactDraft, MidMemoryDraft
+from .memory import MemoryStore
+from .memory_models import ChatMessage
 
 
 _PROTECTED_IDENTITY_KINDS = frozenset({"identity"})

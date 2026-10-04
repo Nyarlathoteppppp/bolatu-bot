@@ -4,7 +4,7 @@ import re
 from dataclasses import dataclass, replace
 from typing import Iterable
 
-from .deepseek_client import ReplyDecision, ToolSymbol
+from .llm_task_types import ReplyDecision, ToolSymbol
 from .pipeline_types import PipelineMode, ToolKind, ToolRequest
 from .tools.fresh_context import FreshIntent, _compact_search_query, detect_fresh_intent
 from .tools.market_intent import MarketIntent

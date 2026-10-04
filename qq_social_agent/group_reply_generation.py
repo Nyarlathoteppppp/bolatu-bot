@@ -5,12 +5,13 @@ from dataclasses import dataclass, replace
 from typing import Any, Callable
 
 from .approval_models import PendingApprovalCandidate
-from .deepseek_client import DeepSeekClient, ReplyDecision
+from .deepseek_client import DeepSeekClient
+from .llm_task_types import ReplyDecision
 from .discourse_effects import RepairResolution
 from .discourse_state import DiscourseState, draft_violates_media_gate
 from .ellipsis_resolver import EllipsisResolution
 from .jev_policy import GroupReplyBudget
-from .memory import ChatMessage
+from .memory_models import ChatMessage
 from .pipeline_types import ContextPacket, PipelineMode
 from .pre_send_critic import (
     CriticResult,

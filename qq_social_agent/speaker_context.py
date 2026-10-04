@@ -12,7 +12,7 @@ from .discourse_effects import (
 from .discourse_state import DiscourseState, format_discourse_prompt_block
 from .ellipsis_resolver import EllipsisResolution, format_ellipsis_prompt_block
 from .member_context import member_label as _member_label
-from .memory import ChatMessage
+from .memory_models import ChatMessage
 from .reference_resolver import (
     ReferenceResolution,
     format_referent_prompt_block,

@@ -7,7 +7,8 @@ from dataclasses import asdict, is_dataclass
 from typing import Any
 from urllib.parse import urlencode
 
-from .memory import MemoryAtom, MemoryStore, MemorySummary, PrivateConversationState
+from .memory import MemoryStore
+from .memory_models import MemoryAtom, MemorySummary, PrivateConversationState
 
 
 def render_admin_dashboard(

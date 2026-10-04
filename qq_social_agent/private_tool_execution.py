@@ -4,8 +4,9 @@ import asyncio
 from dataclasses import dataclass, replace
 from typing import Any, Awaitable, Callable
 
-from .deepseek_client import ReplyDecision
-from .memory import ChatMessage, MemoryStore
+from .llm_task_types import ReplyDecision
+from .memory import MemoryStore
+from .memory_models import ChatMessage
 from .pipeline_types import ToolKind, ToolRequest
 from .rag_retriever import RAGRetrievalResult, RAGService
 from .rate_limiter import RateLimiter

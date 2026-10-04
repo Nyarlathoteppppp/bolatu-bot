@@ -17,7 +17,7 @@ from .jev_policy import (
 from .pipeline_types import OutputChannel, SocialIntent
 
 if TYPE_CHECKING:
-    from .deepseek_client import ReplyDecision
+    from .llm_task_types import ReplyDecision
 
 
 INTENT_TO_ACTION = {
@@ -40,7 +40,7 @@ class TimingDecision:
     reply_angle: str = ""
 
     def to_reply_decision(self) -> ReplyDecision:
-        from .deepseek_client import ReplyDecision
+        from .llm_task_types import ReplyDecision
 
         if self.channel == OutputChannel.SILENT:
             return ReplyDecision(False, self.confidence, self.reason, action="ignore")

@@ -5,7 +5,7 @@ from dataclasses import dataclass, replace
 from typing import Any, Awaitable, Callable
 
 from .approval_models import PendingApprovalCandidate
-from .deepseek_client import ReplyDecision
+from .llm_task_types import ReplyDecision
 from .pipeline_types import PipelineState, ToolKind, ToolRequest, ToolResult
 from .speaker_context import _short_notice_text
 from .tool_router import ToolRoutePlan

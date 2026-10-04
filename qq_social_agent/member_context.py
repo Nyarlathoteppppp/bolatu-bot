@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import re
 
-from .memory import ChatMessage, MemberImpression, MemberProfile, linked_account_note
+from .memory import linked_account_note
+from .memory_models import ChatMessage, MemberImpression, MemberProfile
 
 
 SELF_MEMORY_QUERY_RE = re.compile(

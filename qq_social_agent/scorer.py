@@ -4,7 +4,7 @@ import random
 import time
 from dataclasses import dataclass
 
-from .memory import ChatMessage
+from .memory_models import ChatMessage
 from .persona import Persona
 
 

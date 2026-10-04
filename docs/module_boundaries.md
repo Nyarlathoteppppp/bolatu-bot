@@ -32,6 +32,7 @@ NapCat / OneBot Event
 
 ```text
 entrypoint/plugin -> orchestration -> domain/storage/tools -> provider adapters
+                         -> shared record types (llm_task_types / memory_models)
 ```
 
 `memory.py`、`onebot_gateway.py`、`deepseek_client.py` 和工具实现都不能反向导入 `plugin.py`。固定人格 Prompt 放在 `prompts/zhangfengxue.yaml`；基于解析结果生成的上下文提示由所属模块格式化。
@@ -59,6 +60,7 @@ entrypoint/plugin -> orchestration -> domain/storage/tools -> provider adapters
 | 审批状态与请求 | `approval_state_service.py`、`approval_request_service.py`、`approval_models.py` | 待审批单集合、串行候选选择、取消反馈、stale choice 冷却、审批请求和自动发送决策 | 群消息发送与 delivery progress 写回 |
 | 群回复发送后处理 | `group_post_send_service.py` | 机器人发送回执索引、续聊窗口、成功正文后的表情包与附加反应；显式共享窗口和当前运行时依赖 | 改变审批投递顺序、正文分段、开口概率或 Prompt |
 | 审批发送 | `approved_reply_delivery.py`、`delivery.py`、`approval_models.py` | 已批准消息发送、分段进度和数据库/Trace 回写；未知结果标记后阻止盲目重试 | 审批命令解析与工具权限 |
+| 共享数据契约 | `llm_task_types.py`、`memory_models.py` | 模型任务 DTO 与消息/记忆/画像/回执记录，仅依赖标准库；原 owner 显式再导出同一类对象 | 模型请求、数据库读写、运行时配置、Prompt 和策略 |
 | 文本模型 | `llm_gateway.py`、`deepseek_client.py`、`prompts.py` | gateway 统一 provider、任务路由、超时、回退和用量；task client 负责提示词与结果解析 | QQ 发送与审批状态 |
 | 模型管理 | `model_route_service.py` | 模型目录/编号、覆盖持久化与启动应用、状态、探测、切换和重置；QQ 命令与管理台共享操作。`BackgroundModelSettings` 仅依赖后台配置与 KV | 改变生成路由算法、模型请求协议、聊天 Prompt、后台任务生命周期 |
 | 专用模型接口 | `jev_client.py`、`embedding_client.py`、`siliconflow_ocr.py`、语音客户端 | 各自协议和模态的请求 | 文本聊天路由 |
@@ -99,7 +101,7 @@ entrypoint/plugin -> orchestration -> domain/storage/tools -> provider adapters
 主要技术债：
 
 - `plugin.py` 仍承载生命周期、群聊编排和私聊阶段依赖装配；26 条 `/admin` 路由已迁入资源 controller，`plugin.py` 只保留本地鉴权策略、运行时依赖组装和 `/status`、`/healthz`、`/readyz`、`/trace(s)` 观测路由。
-- `memory.py`、`deepseek_client.py`、`rag_store.py` 仍大，但数据契约密集，暂不宜粗暴拆分。
+- `memory.py`、`deepseek_client.py`、`rag_store.py` 仍大；消息/记忆记录与模型任务 DTO 已移入独立类型模块，数据库方法、请求与解析代码暂不宜粗暴拆分。
 - manifest 能声明能力，但实际 handler 注册仍集中在主文件。
 
 ## 6. 下一步拆分顺序
@@ -113,6 +115,8 @@ entrypoint/plugin -> orchestration -> domain/storage/tools -> provider adapters
 5. **模型管理与输入内容（2026-10-03 完成）**：`ModelRouteService` 统一 QQ 命令与管理台的模型选择、切换、重置及覆盖存储；`BackgroundModelSettings` 独立读取后台配置和 KV，查询 batch 模式不要求 LLM 客户端或完整 LLM 配置。`ForwardContextService` 保留转发原发言人、时间和逐条图片归属；`MessageSummaryService` 只处理内容摘要。入口按调用装配当前依赖，避免持有过期客户端或额外覆盖副本。原命令文案、目录顺序、探测并发、摘要参数和失败分支沿用原实现，Prompt/config 文件未改。`plugin.py` 本轮从 10,505 行降到 9,837 行。
 6. **群聊会话（2026-10-03 完成）**：`GroupSessionState` 保存共享 registry；`GroupSessionService` 统一缓冲、锁、任务去重、等待计数、接收序号与 flush。入口只构造 OneBot 对应的 `BufferedGroupMessage` 并装配当前处理/调度/指标回调。旧 registry 名称是同一状态对象的适配别名，scheduler/admin/shutdown 仍共享原对象；工厂以当前 registry 引用创建服务视图，不复制队列。普通消息立即 flush、生成中的 1 秒等待、多用户点名 FIFO、同人连续消息、原消息/关联 ID 以及异常取消后的清理沿用现有逻辑。群缓冲文本格式迁入 `group_message_types.py`，措辞未改。
 7. **群回复发送后处理（2026-10-03 完成）**：`GroupPostSendService` 接管机器人发送记录、续聊窗口、群表情包和审批后的附加反应。`approved_reply_delivery.py` 继续管理正文投递及原调用顺序；入口保留旧函数适配，按调用装配当前客户端、发送器、指标和共享窗口。表情包只有发送成功后才写入素材冷却、消息记录和互动回执；ActionFailed 与其他异常保留各自原分支，40 秒窗口内不滑动刷新；默认阈值和文案均未改。群聊会话与发送后处理拆分后，`plugin.py` 为 9,505 行。
+
+8. **共享类型与导入依赖（2026-10-04 完成）**：从 `deepseek_client.py` 提取 11 个模型任务 DTO 到 `llm_task_types.py`，从 `memory.py` 提取 21 个记录类型到 `memory_models.py`；两个类型模块只依赖标准库。使用方直接导入类型，真正需要客户端/存储的模块仍依赖原实现。旧模块显式再导出同一类对象，保持原调用方和测试的公开导入兼容；字段、顺序、默认值、frozen 声明及 `MemoryAtom.evidence_source` 属性不变。决策门、工具路由与私聊消息类型的独立导入不再加载数据库或模型网关。动作集合、SQL、模型请求/解析和 Prompt 未改。`memory.py` 为 5,188 行，`deepseek_client.py` 为 2,494 行。
 
 不要优先拆 `memory.py` 或 `deepseek_client.py`。先补 repository/service 边界和表级测试，再动内部结构。
 

@@ -134,12 +134,8 @@ from .decision_gate import (
     is_low_value_group_text as _is_low_value_group_text,
     pre_decision_gate as _pre_decision_gate,
 )
-from .deepseek_client import (
-    LLMTaskClient,
-    MemberProfileDraft,
-    ReplyDecision,
-    ToolSymbol,
-)
+from .deepseek_client import LLMTaskClient
+from .llm_task_types import MemberProfileDraft, ReplyDecision, ToolSymbol
 from .llm_gateway import set_usage_recorder
 from .openrouter_batch import OpenRouterBatchService
 from .jev_client import set_jev_telemetry_recorder
@@ -196,7 +192,8 @@ from .message_segments import (
     segment_type_and_data,
 )
 from .notice_events import notice_snapshot
-from .memory import (
+from .memory import MemoryStore
+from .memory_models import (
     ApprovedReplyFeedback,
     BotMetricEvent,
     BotMetricSummary,
@@ -207,7 +204,6 @@ from .memory import (
     MemoryAtom,
     MemberImpression,
     MemberProfile,
-    MemoryStore,
     MemorySummary,
     RawCorpusExample,
     RecalledReplyFeedback,

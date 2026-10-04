@@ -17,7 +17,7 @@ from .resolver_result import RESOLVED
 
 if TYPE_CHECKING:
     from .ellipsis_resolver import EllipsisResolution
-    from .memory import ChatMessage
+    from .memory_models import ChatMessage
 
 
 def stored_image_segments(segments: str | None) -> list[dict[str, Any]]:

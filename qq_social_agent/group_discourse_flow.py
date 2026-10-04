@@ -18,7 +18,8 @@ from .discourse_state import (
     resolve_group_discourse,
 )
 from .member_context import related_member_user_ids as _related_member_user_ids
-from .memory import ChatMessage, MemoryStore
+from .memory import MemoryStore
+from .memory_models import ChatMessage
 from .rag_retriever import RAGService
 from .reference_resolver import ReplyHint
 from .resolver_result import AMBIGUOUS, ERROR, NOT_APPLICABLE, RESOLVED, UNAVAILABLE

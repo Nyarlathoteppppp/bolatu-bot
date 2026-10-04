@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from .memory import ChatMessage
+from .memory_models import ChatMessage
 
 
 PRIVATE_SESSION_GAP_SECONDS = 12 * 60 * 60

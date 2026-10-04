@@ -9,7 +9,8 @@ from typing import Any, Awaitable, Callable, Mapping
 from nonebot.adapters.onebot.v11 import Bot, Message, PrivateMessageEvent
 
 from .history_sync import event_message_source_id
-from .memory import ChatMessage, MemoryStore
+from .memory import MemoryStore
+from .memory_models import ChatMessage
 from .private_context_window import current_private_session_messages
 from .private_message_types import BufferedPrivateMessage
 from .persona import PersonaRegistry

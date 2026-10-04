@@ -4,8 +4,8 @@ import re
 from dataclasses import dataclass, replace
 
 from .cue_patterns import CueRepeatState
-from .deepseek_client import ReplyDecision, ToolSymbol
-from .memory import ChatMessage
+from .llm_task_types import ReplyDecision, ToolSymbol
+from .memory_models import ChatMessage
 from .persona import Persona
 from .tools.fresh_context import FreshIntent
 from .tools.market_intent import MarketIntent

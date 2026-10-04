@@ -10,7 +10,8 @@ from typing import Any, Callable
 
 from nonebot import logger
 
-from .memory import ChatMessage, MemberProfileSummary, MemoryStore
+from .memory import MemoryStore
+from .memory_models import ChatMessage, MemberProfileSummary
 from .memory_learning import persist_mid_memory_learning, persist_private_mid_memory
 
 

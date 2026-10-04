@@ -25,7 +25,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from qq_social_agent.discourse_state import resolve_group_discourse
 from qq_social_agent.jev_client import JevClient
-from qq_social_agent.memory import ChatMessage
+from qq_social_agent.memory_models import ChatMessage
 from qq_social_agent.reference_resolver import ReplyHint
 
 

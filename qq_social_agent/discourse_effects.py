@@ -5,7 +5,8 @@ from dataclasses import dataclass, replace
 from typing import Callable, Iterable
 
 from .ellipsis_resolver import EllipsisResolution
-from .memory import MemoryAtom, MemoryStore
+from .memory import MemoryStore
+from .memory_models import MemoryAtom
 from .reference_resolver import ReferenceResolution, ReplyHint
 from .resolver_result import (
     AMBIGUOUS,

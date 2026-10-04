@@ -13,7 +13,8 @@ from zoneinfo import ZoneInfo
 from nonebot.adapters.onebot.v11 import Bot, Message
 from nonebot.adapters.onebot.v11.exception import ActionFailed
 
-from .memory import ChatMessage, MemoryStore
+from .memory import MemoryStore
+from .memory_models import ChatMessage
 
 
 _PENDING_REVIEW_BATCHES_KEY = "daily_review_batch_pending_keys"

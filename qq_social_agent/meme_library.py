@@ -7,7 +7,8 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
-from .memory import MemeAsset, MemoryStore
+from .memory import MemoryStore
+from .memory_models import MemeAsset
 
 
 @dataclass(frozen=True)

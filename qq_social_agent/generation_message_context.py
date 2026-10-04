@@ -5,7 +5,7 @@ from __future__ import annotations
 import re
 from collections.abc import Sequence
 
-from .memory import ChatMessage
+from .memory_models import ChatMessage
 
 
 _TERMS = re.compile(r"[a-z0-9_]{2,}|[\u4e00-\u9fff]+", re.IGNORECASE)

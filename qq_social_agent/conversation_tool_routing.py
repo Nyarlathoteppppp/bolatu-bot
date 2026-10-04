@@ -4,9 +4,10 @@ import re
 from dataclasses import replace
 from typing import Any, Callable
 
-from .deepseek_client import DeepSeekClient, ReplyDecision, ToolSymbol
+from .deepseek_client import DeepSeekClient
+from .llm_task_types import ReplyDecision, ToolSymbol
 from .member_context import member_label as _member_label
-from .memory import ChatMessage
+from .memory_models import ChatMessage
 from .pipeline_types import ToolKind, ToolRequest
 from .speaker_context import _short_notice_text
 from .tool_router import ToolRoutePlan

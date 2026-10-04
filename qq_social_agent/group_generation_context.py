@@ -10,7 +10,8 @@ from .member_context import (
     is_self_memory_query,
     member_memory_user_ids,
 )
-from .memory import ChatMessage, MemoryStore
+from .memory import MemoryStore
+from .memory_models import ChatMessage
 from .pipeline_types import ContextPacket, PipelineMode
 from .rag_retriever import RAGRetrievalResult, RAGService
 from .reference_resolver import ReferenceResolution

@@ -3,7 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable
 
-from .memory import ChatMessage, MemoryStore
+from .memory import MemoryStore
+from .memory_models import ChatMessage
 from .private_context_window import PRIVATE_SESSION_GAP_SECONDS
 from .private_message_types import PrivateGenerationContext, PrivateToolStage, PrivateTurn
 

@@ -5,7 +5,8 @@ from dataclasses import dataclass
 from datetime import datetime
 
 from .config import RateConfig
-from .memory import ChatMessage, MemoryStore
+from .memory import MemoryStore
+from .memory_models import ChatMessage
 
 
 @dataclass(frozen=True)

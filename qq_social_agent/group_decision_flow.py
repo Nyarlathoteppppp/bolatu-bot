@@ -11,11 +11,12 @@ from .decision_gate import (
     PreDecisionGateResult,
     apply_backend_tool_decision as _apply_backend_tool_decision,
 )
-from .deepseek_client import DeepSeekClient, ReplyDecision
+from .deepseek_client import DeepSeekClient
+from .llm_task_types import ReplyDecision
 from .discourse_state import DiscourseState
 from .jev_policy import GroupReplyBudget
 from .member_context import member_label as _member_label
-from .memory import ChatMessage
+from .memory_models import ChatMessage
 from .pipeline_stages import apply_decision as _pipeline_apply_decision, mark_gated as _pipeline_mark_gated
 from .pipeline_types import PipelineState
 from .resolver_result import RESOLVED

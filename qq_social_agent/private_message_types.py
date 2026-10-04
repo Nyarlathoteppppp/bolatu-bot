@@ -5,8 +5,8 @@ from dataclasses import dataclass
 
 from nonebot.adapters.onebot.v11 import Bot, PrivateMessageEvent
 
-from .deepseek_client import ReplyDecision
-from .memory import ChatMessage
+from .llm_task_types import ReplyDecision
+from .memory_models import ChatMessage
 from .persona import Persona
 from .rag_retriever import RAGRetrievalResult
 from .tool_router import ToolRoutePlan
