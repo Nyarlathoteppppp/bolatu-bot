@@ -8,6 +8,16 @@ from collections import Counter
 from collections.abc import Iterable
 from pathlib import Path
 
+from .memory_identity import (
+    PRIVATE_CHAT_ID_OFFSET,
+    KEDAI_PRIMARY_USER_ID,
+    KEDAI_ALT_USER_ID,
+    LINKED_ACCOUNT_GROUPS,
+    linked_account_ids,
+    expand_linked_account_ids,
+    linked_account_note,
+)
+
 # Re-export the shared records for existing callers of this module.
 from .memory_models import (
     ChatMessage,
@@ -32,57 +42,67 @@ from .memory_models import (
     MemoryAtom,
     MemoryAtomAuditEvent,
 )
-from .interaction_state import InteractionStateStore
-from .image_read_state import ImageReadStateStore
-
-
-MEMORY_ATOM_EVIDENCE_TYPES = frozenset({"message", "event", "manual"})
-MEMORY_ATOM_STATUSES = frozenset({"active", "superseded", "disputed", "expired"})
-PRIVATE_CHAT_ID_OFFSET = 10_000_000_000_000
-KEDAI_PRIMARY_USER_ID = 3066256514
-KEDAI_ALT_USER_ID = 2947279300
-LINKED_ACCOUNT_GROUPS: tuple[frozenset[int], ...] = (
-    frozenset({KEDAI_PRIMARY_USER_ID, KEDAI_ALT_USER_ID}),
+from .memory_text import _compact_text, _json_text_list, _clean_text_list
+from .memory_metrics_repository import (
+    MetricsRepository,
+    _metric_event_from_row,
+    _metric_where,
+    _usage_time_where,
+    _llm_usage_summary_from_row,
+    _llm_usage_event_from_row,
+)
+from .memory_private_state_repository import (
+    PrivateStateRepository,
+    _clean_private_state_text,
+    _clean_private_threads,
+    _clean_private_state_fields,
+    _private_conversation_state_from_row,
+)
+from .memory_meme_repository import (
+    MemeRepository,
+    _meme_asset_from_row,
+    _meme_query_terms,
+    _meme_relevance_score,
 )
 
+from .memory_repository_utils import (
+    _message_from_row,
+    _clamp_float,
+    _unique_recent_ints,
+    _text_relevance_score,
+    _relevance_terms,
+    _loads_int_list,
+    _source_message_key,
+)
+from .memory_atom_repository import (
+    MemoryAtomRepository,
+    _memory_atom_from_row,
+    _memory_atom_audit_event_from_row,
+    _normalize_memory_evidence_type,
+    _infer_memory_evidence_type,
+    _normalize_memory_atom_status,
+    _memory_atom_recency_score,
+    _memory_atom_feedback_score,
+    MEMORY_ATOM_EVIDENCE_TYPES,
+    MEMORY_ATOM_STATUSES,
+    _MEMORY_ATOM_SELECT_COLUMNS,
+)
+from .memory_style_repository import (
+    StyleRepository,
+    _style_rule_fingerprint,
+    _normalize_style_rule_text,
+    _style_rule_semantic_markers,
+    _style_rules_are_semantically_mergeable,
+    _style_rule_confidence,
+    _prefer_specific_style_text,
+    _style_text_specificity,
+    _style_rule_value,
+    _STYLE_RULE_CANONICAL_REPLACEMENTS,
+    _STYLE_RULE_SEMANTIC_MARKERS,
+)
 
-def linked_account_ids(user_id: int | None) -> frozenset[int]:
-    if user_id is None:
-        return frozenset()
-    try:
-        uid = int(user_id)
-    except (TypeError, ValueError):
-        return frozenset()
-    if uid <= 0:
-        return frozenset()
-    for group in LINKED_ACCOUNT_GROUPS:
-        if uid in group:
-            return group
-    return frozenset({uid})
-
-
-def expand_linked_account_ids(user_ids: Iterable[int | None]) -> set[int]:
-    expanded: set[int] = set()
-    for user_id in user_ids:
-        expanded.update(linked_account_ids(user_id))
-    return {uid for uid in expanded if uid > 0}
-
-
-def linked_account_note(user_id: int | None) -> str:
-    uid = int(user_id or 0)
-    if uid == KEDAI_PRIMARY_USER_ID:
-        return "与 2947279300（纯真代代/科无代）是同一人的主号"
-    if uid == KEDAI_ALT_USER_ID:
-        return "与 3066256514（邪恶代代/科有代）是同一人的小号"
-    return ""
-
-
-_MEMORY_ATOM_SELECT_COLUMNS = """
-    id, atom_type, group_id, subject_user_id, object_user_id, content,
-    source, evidence_type, source_message_id, observed_at,
-    valid_from, valid_to, confidence, importance, status,
-    supersedes_id, expires_at, created_at, updated_at
-"""
+from .interaction_state import InteractionStateStore
+from .image_read_state import ImageReadStateStore
 
 
 class MemoryStore:
@@ -92,9 +112,15 @@ class MemoryStore:
         self.conn = sqlite3.connect(self.db_path)
         self.conn.row_factory = sqlite3.Row
         self._configure_connection()
+        self._atom_repository = MemoryAtomRepository(self.conn)
         self._init_schema()
         self.interactions = InteractionStateStore(self.conn)
         self.images = ImageReadStateStore(self.conn)
+
+        self._metrics_repository = MetricsRepository(self.conn)
+        self._private_state_repository = PrivateStateRepository(self.conn)
+        self._meme_repository = MemeRepository(self.conn)
+        self._style_repository = StyleRepository(self.conn)
 
     def _configure_connection(self) -> None:
         self.conn.execute("pragma busy_timeout = 5000")
@@ -995,28 +1021,11 @@ class MemoryStore:
         group_id: int | None = None,
         limit: int = 80,
     ) -> list[sqlite3.Row]:
-        bounded = max(1, min(300, int(limit)))
-        clauses: list[str] = []
-        params: list[object] = []
-        if event_types:
-            placeholders = ",".join("?" for _ in event_types)
-            clauses.append(f"event_type in ({placeholders})")
-            params.extend(event_types)
-        if group_id is not None:
-            clauses.append("group_id = ?")
-            params.append(int(group_id))
-        where = "where " + " and ".join(clauses) if clauses else ""
-        rows = self.conn.execute(
-            f"""
-            select id, event_type, group_id, user_id, stage, action, metadata_json, created_at
-            from bot_metric_events
-            {where}
-            order by id desc
-            limit ?
-            """,
-            (*params, bounded),
-        ).fetchall()
-        return list(rows)
+        return self._metrics_repository.admin_recent_metric_events(
+            event_types=event_types,
+            group_id=group_id,
+            limit=limit,
+        )
 
     def admin_recent_memory_atoms(
         self,
@@ -1028,42 +1037,14 @@ class MemoryStore:
         atom_type: str = "",
         query: str = "",
     ) -> list[MemoryAtom]:
-        bounded = max(1, min(500, int(limit)))
-        clauses: list[str] = []
-        params: list[object] = []
-        clean_status = status.strip().casefold()
-        if group_id is not None:
-            clauses.append("group_id = ?")
-            params.append(int(group_id))
-        if clean_status and clean_status != "all":
-            clauses.append("status = ?")
-            params.append(_normalize_memory_atom_status(clean_status))
-        if user_id is not None:
-            clauses.append("(subject_user_id = ? or object_user_id = ?)")
-            params.extend((int(user_id), int(user_id)))
-        clean_type = atom_type.strip()
-        if clean_type and clean_type.casefold() != "all":
-            clauses.append("atom_type = ?")
-            params.append(clean_type[:32])
-        clean_query = re.sub(r"\s+", " ", query).strip()
-        if clean_query:
-            like = f"%{clean_query[:120]}%"
-            clauses.append(
-                "(content like ? or source like ? or coalesce(source_message_id, '') like ? or cast(id as text) = ?)"
-            )
-            params.extend((like, like, like, clean_query))
-        where = "where " + " and ".join(clauses) if clauses else ""
-        rows = self.conn.execute(
-            f"""
-            select {_MEMORY_ATOM_SELECT_COLUMNS}
-            from memory_atoms
-            {where}
-            order by status = 'active' desc, importance desc, updated_at desc, id desc
-            limit ?
-            """,
-            (*params, bounded),
-        ).fetchall()
-        return [_memory_atom_from_row(row) for row in rows]
+        return self._atom_repository.admin_recent_memory_atoms(
+            group_id=group_id,
+            status=status,
+            limit=limit,
+            user_id=user_id,
+            atom_type=atom_type,
+            query=query,
+        )
 
     def admin_review_memory_atom(
         self,
@@ -1073,77 +1054,12 @@ class MemoryStore:
         actor_user_id: int | None = None,
         note: str = "",
     ) -> bool:
-        atom = self.memory_atom(atom_id)
-        if atom is None:
-            return False
-        clean_action = action.strip().casefold()
-        now = time.time()
-        detail = note.strip()[:420]
-        try:
-            if clean_action in {"expire", "expired", "delete"}:
-                return self.expire_memory_atom(
-                    atom_id,
-                    reason=detail or "admin memory audit expired",
-                    source="admin_ui",
-                    actor_user_id=actor_user_id,
-                )
-            if clean_action in {"wrong_person", "dispute", "disputed"}:
-                self.conn.execute(
-                    "update memory_atoms set status = 'disputed', updated_at = ? where id = ?",
-                    (now, atom_id),
-                )
-                audit_action = "marked_wrong_person" if clean_action == "wrong_person" else "disputed"
-            elif clean_action in {"keep", "preserve", "active"}:
-                self.conn.execute(
-                    """
-                    update memory_atoms
-                    set status = 'active', expires_at = null, valid_to = null, updated_at = ?
-                    where id = ?
-                    """,
-                    (now, atom_id),
-                )
-                audit_action = "review_preserved"
-            elif clean_action in {"boost", "important", "high"}:
-                self.conn.execute(
-                    """
-                    update memory_atoms
-                    set importance = min(1.0, importance + 0.15),
-                        confidence = max(confidence, 0.82),
-                        updated_at = ?
-                    where id = ?
-                    """,
-                    (now, atom_id),
-                )
-                audit_action = "importance_boosted"
-            elif clean_action in {"freeze", "pin"}:
-                self.conn.execute(
-                    """
-                    update memory_atoms
-                    set status = 'active', expires_at = null, valid_to = null,
-                        importance = max(importance, 0.86), confidence = max(confidence, 0.84),
-                        updated_at = ?
-                    where id = ?
-                    """,
-                    (now, atom_id),
-                )
-                audit_action = "pinned"
-            else:
-                return False
-            self._insert_memory_atom_audit_event(
-                atom_id=atom_id,
-                action=audit_action,
-                evidence_type="manual",
-                source="admin_ui",
-                source_message_id=None,
-                actor_user_id=actor_user_id,
-                detail=detail or audit_action,
-                observed_at=now,
-            )
-            self.conn.commit()
-            return True
-        except Exception:
-            self.conn.rollback()
-            raise
+        return self._atom_repository.admin_review_memory_atom(
+            atom_id,
+            action=action,
+            actor_user_id=actor_user_id,
+            note=note,
+        )
 
     def admin_merge_memory_atoms(
         self,
@@ -1153,60 +1069,12 @@ class MemoryStore:
         actor_user_id: int | None = None,
         note: str = "",
     ) -> bool:
-        source = self.memory_atom(source_atom_id)
-        target = self.memory_atom(target_atom_id)
-        if source is None or target is None or source.id == target.id:
-            return False
-        if source.group_id != target.group_id:
-            return False
-        if source.status not in {"active", "disputed"} or target.status not in {"active", "disputed"}:
-            return False
-        now = time.time()
-        detail = note.strip()[:420] or f"merged #{source.id} into #{target.id}"
-        try:
-            self.conn.execute(
-                """
-                update memory_atoms
-                set status = 'superseded', valid_to = ?, expires_at = ?, supersedes_id = ?, updated_at = ?
-                where id = ?
-                """,
-                (now, now, target.id, now, source.id),
-            )
-            self.conn.execute(
-                """
-                update memory_atoms
-                set importance = max(importance, ?), confidence = max(confidence, ?), updated_at = ?
-                where id = ?
-                """,
-                (min(1.0, max(target.importance, source.importance)), min(1.0, max(target.confidence, source.confidence)), now, target.id),
-            )
-            self._insert_memory_atom_audit_event(
-                atom_id=source.id,
-                action="merged_into",
-                evidence_type="manual",
-                source="admin_ui",
-                source_message_id=None,
-                actor_user_id=actor_user_id,
-                detail=detail,
-                observed_at=now,
-                metadata={"target_atom_id": target.id},
-            )
-            self._insert_memory_atom_audit_event(
-                atom_id=target.id,
-                action="merged_from",
-                evidence_type="manual",
-                source="admin_ui",
-                source_message_id=None,
-                actor_user_id=actor_user_id,
-                detail=detail,
-                observed_at=now,
-                metadata={"source_atom_id": source.id},
-            )
-            self.conn.commit()
-            return True
-        except Exception:
-            self.conn.rollback()
-            raise
+        return self._atom_repository.admin_merge_memory_atoms(
+            source_atom_id,
+            target_atom_id,
+            actor_user_id=actor_user_id,
+            note=note,
+        )
 
     def message_source_exists(self, group_id: int, source_message_id: int | str | None) -> bool:
         source_key = _source_message_key(source_message_id)
@@ -1943,24 +1811,10 @@ class MemoryStore:
         *,
         limit: int,
     ) -> list[ChatMessage]:
-        rows = self.conn.execute(
-            """
-            select id, group_id, user_id, nickname, text, is_bot, created_at, source_message_id, session_id, message_segments_json, raw_message_json, sender_json
-            from messages
-            where group_id = ? and is_bot = 0 and length(trim(text)) >= 2
-            order by id desc
-            limit ?
-            """,
-            (group_id, limit),
-        ).fetchall()
-        return [_message_from_row(row) for row in reversed(rows)]
+        return self._style_repository.messages_for_style_learning(group_id, limit=limit)
 
     def last_style_rule_at(self, group_id: int) -> float:
-        row = self.conn.execute(
-            "select max(created_at) as ts from style_rules where group_id = ?",
-            (group_id,),
-        ).fetchone()
-        return float(row["ts"] or 0.0) if row else 0.0
+        return self._style_repository.last_style_rule_at(group_id)
 
     def add_style_rules(
         self,
@@ -1969,77 +1823,7 @@ class MemoryStore:
         *,
         keep: int = 45,
     ) -> dict[str, int]:
-        now = time.time()
-        clean_rules: list[tuple[str, str, str, tuple[int, ...], tuple[int, ...], str, str]] = []
-        for raw_rule in rules:
-            if len(raw_rule) < 3:
-                continue
-            situation, style, source_text = (str(raw_rule[0]), str(raw_rule[1]), str(raw_rule[2]))
-            source_user_ids = tuple(int(value) for value in (raw_rule[3] if len(raw_rule) > 3 else ()) if int(value) > 0)
-            source_message_ids = tuple(int(value) for value in (raw_rule[4] if len(raw_rule) > 4 else ()) if int(value) > 0)
-            situation = situation.strip()
-            style = style.strip()
-            if situation and style:
-                fingerprint = _style_rule_fingerprint(situation, style)
-                if not fingerprint:
-                    continue
-                scope = "group" if not source_user_ids or len(set(source_user_ids)) >= 2 else "personal"
-                clean_rules.append((situation, style, source_text.strip(), source_user_ids, source_message_ids, scope, fingerprint))
-        if not clean_rules:
-            return {"new": 0, "merged": 0, "expired": 0, "skipped": 0}
-        stats = {"new": 0, "merged": 0, "expired": 0, "skipped": 0}
-        for situation, style, source_text, user_ids, message_ids, scope, fingerprint in clean_rules:
-            existing = self._find_mergeable_style_rule(
-                group_id,
-                fingerprint,
-                situation=situation,
-                style=style,
-                scope=scope,
-                source_user_ids=user_ids,
-                now=now,
-            )
-            if existing is not None:
-                self._merge_style_rule(
-                    existing,
-                    situation=situation,
-                    style=style,
-                    source_text=source_text,
-                    source_user_ids=user_ids,
-                    source_message_ids=message_ids,
-                    now=now,
-                )
-                stats["merged"] += 1
-                continue
-            support_user_count = max(1, len(set(user_ids)))
-            evidence_count = max(1, len(set(message_ids)))
-            confidence = _style_rule_confidence(
-                support_user_count=support_user_count,
-                evidence_count=evidence_count,
-                merged_count=0,
-                has_user_ids=bool(user_ids),
-            )
-            self.conn.execute(
-                """
-                insert into style_rules(
-                  group_id, situation, style, source_text, created_at, scope,
-                  source_user_ids_json, source_message_ids_json, support_user_count,
-                  evidence_count, confidence, status, valid_to,
-                  rule_fingerprint, last_seen_at, merged_count
-                ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, 0)
-                """,
-                (
-                    group_id, situation[:60], style[:80], source_text[:200], now, scope,
-                    json.dumps(_unique_recent_ints(user_ids), ensure_ascii=False),
-                    json.dumps(_unique_recent_ints(message_ids, limit=20), ensure_ascii=False),
-                    support_user_count, evidence_count, confidence,
-                    now + (90 if scope == "group" else 30) * 24 * 60 * 60,
-                    fingerprint, now,
-                ),
-            )
-            stats["new"] += 1
-        stats["expired"] = self._expire_low_value_style_rules(group_id, keep=keep, now=now)
-        self.conn.commit()
-        return stats
+        return self._style_repository.add_style_rules(group_id, rules, keep=keep)
 
     def _find_mergeable_style_rule(
         self,
@@ -2052,42 +1836,15 @@ class MemoryStore:
         source_user_ids: tuple[int, ...],
         now: float,
     ) -> sqlite3.Row | None:
-        rows = self.conn.execute(
-            """
-            select id, group_id, situation, style, source_text, created_at, scope,
-                   source_user_ids_json, source_message_ids_json, support_user_count,
-                   evidence_count, confidence, status, valid_to,
-                   rule_fingerprint, last_seen_at, merged_count
-            from style_rules
-            where group_id = ?
-              and status = 'active'
-              and scope = ?
-              and (valid_to is null or valid_to > ?)
-            order by support_user_count desc, evidence_count desc, confidence desc, last_seen_at desc, id desc
-            limit 80
-            """,
-            (group_id, scope, now),
-        ).fetchall()
-        for row in rows:
-            existing_fingerprint = str(row["rule_fingerprint"] or "")
-            if existing_fingerprint == fingerprint:
-                if scope != "personal":
-                    return row
-                incoming_users = set(source_user_ids)
-                existing_users = set(_loads_int_list(row["source_user_ids_json"]))
-                if not incoming_users or not existing_users or incoming_users & existing_users:
-                    return row
-        if scope != "group":
-            return None
-        for row in rows:
-            if _style_rules_are_semantically_mergeable(
-                str(row["situation"] or ""),
-                str(row["style"] or ""),
-                incoming_situation=situation,
-                incoming_style=style,
-            ):
-                return row
-        return None
+        return self._style_repository._find_mergeable_style_rule(
+            group_id,
+            fingerprint,
+            situation=situation,
+            style=style,
+            scope=scope,
+            source_user_ids=source_user_ids,
+            now=now,
+        )
 
     def _merge_style_rule(
         self,
@@ -2100,122 +1857,21 @@ class MemoryStore:
         source_message_ids: tuple[int, ...],
         now: float,
     ) -> None:
-        old_user_ids = _loads_int_list(row["source_user_ids_json"])
-        old_message_ids = _loads_int_list(row["source_message_ids_json"])
-        merged_user_ids = _unique_recent_ints([*old_user_ids, *source_user_ids])
-        merged_message_ids = _unique_recent_ints([*old_message_ids, *source_message_ids], limit=20)
-        old_evidence_count = max(1, int(row["evidence_count"] or 1))
-        incoming_evidence = max(1, len(set(source_message_ids)))
-        evidence_count = old_evidence_count + incoming_evidence
-        support_user_count = max(1, len(set(merged_user_ids)))
-        merged_count = max(0, int(row["merged_count"] or 0)) + 1
-        confidence = _style_rule_confidence(
-            support_user_count=support_user_count,
-            evidence_count=evidence_count,
-            merged_count=merged_count,
-            has_user_ids=bool(merged_user_ids),
-        )
-        scope = str(row["scope"] or "group")
-        self.conn.execute(
-            """
-            update style_rules
-            set situation = ?, style = ?, source_text = ?,
-                source_user_ids_json = ?, source_message_ids_json = ?,
-                support_user_count = ?, evidence_count = ?, confidence = ?,
-                valid_to = ?, last_seen_at = ?, merged_count = ?
-            where id = ?
-            """,
-            (
-                _prefer_specific_style_text(str(row["situation"] or ""), situation, limit=60),
-                _prefer_specific_style_text(str(row["style"] or ""), style, limit=80),
-                (source_text or str(row["source_text"] or ""))[:200],
-                json.dumps(merged_user_ids, ensure_ascii=False),
-                json.dumps(merged_message_ids, ensure_ascii=False),
-                support_user_count,
-                evidence_count,
-                confidence,
-                now + (90 if scope == "group" else 30) * 24 * 60 * 60,
-                now,
-                merged_count,
-                int(row["id"]),
-            ),
+        return self._style_repository._merge_style_rule(
+            row,
+            situation=situation,
+            style=style,
+            source_text=source_text,
+            source_user_ids=source_user_ids,
+            source_message_ids=source_message_ids,
+            now=now,
         )
 
     def _expire_low_value_style_rules(self, group_id: int, *, keep: int, now: float) -> int:
-        if keep <= 0:
-            return 0
-        rows = self.conn.execute(
-            """
-            select id, situation, style, source_text, created_at, scope,
-                   source_user_ids_json, source_message_ids_json, support_user_count,
-                   evidence_count, confidence, status, valid_to,
-                   rule_fingerprint, last_seen_at, merged_count
-            from style_rules
-            where group_id = ?
-              and status = 'active'
-              and (valid_to is null or valid_to > ?)
-            """,
-            (group_id, now),
-        ).fetchall()
-        if len(rows) <= keep:
-            return 0
-        ranked = sorted(
-            rows,
-            key=lambda row: (
-                _style_rule_value(row, now=now),
-                float(row["last_seen_at"] or row["created_at"] or 0.0),
-                int(row["id"]),
-            ),
-            reverse=True,
-        )
-        expire_ids = [int(row["id"]) for row in ranked[keep:]]
-        if not expire_ids:
-            return 0
-        self.conn.execute(
-            f"""
-            update style_rules
-            set status = 'expired', valid_to = ?
-            where id in ({','.join('?' for _ in expire_ids)})
-            """,
-            [now, *expire_ids],
-        )
-        return len(expire_ids)
+        return self._style_repository._expire_low_value_style_rules(group_id, keep=keep, now=now)
 
     def recent_style_rules(self, group_id: int, limit: int) -> list[StyleRule]:
-        rows = self.conn.execute(
-            """
-            select group_id, situation, style, source_text, created_at, scope,
-                   source_user_ids_json, source_message_ids_json, support_user_count,
-                   evidence_count, confidence, status, valid_to,
-                   rule_fingerprint, last_seen_at, merged_count
-            from style_rules
-            where group_id = ? and status = 'active' and (valid_to is null or valid_to > ?)
-            order by created_at desc, id desc
-            limit ?
-            """,
-            (group_id, time.time(), limit),
-        ).fetchall()
-        return [
-            StyleRule(
-                group_id=int(row["group_id"]),
-                situation=str(row["situation"]),
-                style=str(row["style"]),
-                source_text=str(row["source_text"]),
-                created_at=float(row["created_at"]),
-                scope=str(row["scope"]),
-                source_user_ids=tuple(_loads_int_list(row["source_user_ids_json"])),
-                source_message_ids=tuple(_loads_int_list(row["source_message_ids_json"])),
-                support_user_count=int(row["support_user_count"]),
-                evidence_count=int(row["evidence_count"]),
-                confidence=float(row["confidence"]),
-                status=str(row["status"]),
-                valid_to=float(row["valid_to"]) if row["valid_to"] is not None else None,
-                rule_fingerprint=str(row["rule_fingerprint"] or ""),
-                last_seen_at=float(row["last_seen_at"] or row["created_at"] or 0.0),
-                merged_count=int(row["merged_count"] or 0),
-            )
-            for row in reversed(rows)
-        ]
+        return self._style_repository.recent_style_rules(group_id, limit)
 
     def relevant_style_rules(
         self,
@@ -2226,133 +1882,18 @@ class MemoryStore:
         candidate_limit: int = 80,
         speaker_user_id: int | None = None,
     ) -> list[StyleRule]:
-        rows = self.conn.execute(
-            """
-            select group_id, situation, style, source_text, created_at, scope,
-                   source_user_ids_json, source_message_ids_json, support_user_count,
-                   evidence_count, confidence, status, valid_to,
-                   rule_fingerprint, last_seen_at, merged_count
-            from style_rules
-            where group_id = ? and status = 'active' and (valid_to is null or valid_to > ?)
-            order by created_at desc, id desc
-            limit ?
-            """,
-            (group_id, time.time(), candidate_limit),
-        ).fetchall()
-        scored: list[tuple[float, float, sqlite3.Row]] = []
-        for row in rows:
-            source_user_ids = tuple(_loads_int_list(row["source_user_ids_json"]))
-            if str(row["scope"]) == "personal" and speaker_user_id not in source_user_ids:
-                continue
-            haystack = f"{row['situation']} {row['style']} {row['source_text']}"
-            score = _text_relevance_score(query, haystack)
-            if score > 0:
-                confidence = max(0.1, min(1.0, float(row["confidence"])))
-                score = score * (0.5 + 0.5 * confidence) + min(2, max(0, int(row["support_user_count"]) - 1)) * 0.5
-                last_seen = float(row["last_seen_at"] or row["created_at"] or 0.0)
-                scored.append((score, last_seen, row))
-        scored.sort(key=lambda item: (item[0], item[1]), reverse=True)
-        return [
-            StyleRule(
-                group_id=int(row["group_id"]),
-                situation=str(row["situation"]),
-                style=str(row["style"]),
-                source_text=str(row["source_text"]),
-                created_at=float(row["created_at"]),
-                scope=str(row["scope"]),
-                source_user_ids=tuple(_loads_int_list(row["source_user_ids_json"])),
-                source_message_ids=tuple(_loads_int_list(row["source_message_ids_json"])),
-                support_user_count=int(row["support_user_count"]),
-                evidence_count=int(row["evidence_count"]),
-                confidence=float(row["confidence"]),
-                status=str(row["status"]),
-                valid_to=float(row["valid_to"]) if row["valid_to"] is not None else None,
-                rule_fingerprint=str(row["rule_fingerprint"] or ""),
-                last_seen_at=float(row["last_seen_at"] or row["created_at"] or 0.0),
-                merged_count=int(row["merged_count"] or 0),
-            )
-            for _, _, row in scored[:limit]
-        ]
+        return self._style_repository.relevant_style_rules(
+            group_id,
+            query,
+            limit=limit,
+            candidate_limit=candidate_limit,
+            speaker_user_id=speaker_user_id,
+        )
 
     def migrate_focused_style_rules(self, group_id: int, focused_user_id: int) -> dict[str, int]:
         """Conservatively scope legacy rules from one prolific speaker without deleting useful group style."""
-        rows = self.conn.execute(
-            """
-            select id, situation, style, source_text
-            from style_rules
-            where group_id = ? and scope = 'legacy' and status = 'active'
-            order by id desc
-            """,
-            (group_id,),
-        ).fetchall()
-        personal = kept_group = expired_duplicates = expired_literal = 0
-        seen_focused: set[tuple[str, str]] = set()
-        marker = f"[#{str(focused_user_id)[-5:]}]"
-        for row in rows:
-            source_text = str(row["source_text"])
-            exact = self.conn.execute(
-                """
-                select id, user_id from messages
-                where group_id = ? and is_bot = 0 and text = ?
-                order by id desc limit 1
-                """,
-                (group_id, source_text),
-            ).fetchone()
-            is_focused = bool(exact and int(exact["user_id"]) == focused_user_id) or source_text.startswith(marker) or marker in source_text[:80]
-            if not is_focused:
-                continue
-            message_ids = [int(exact["id"])] if exact else []
-            key = (_compact_text(str(row["situation"])), _compact_text(str(row["style"])))
-            preserve_as_group = "目移" in f"{row['situation']} {row['style']} {source_text}"
-            if preserve_as_group:
-                self.conn.execute(
-                    """
-                    update style_rules
-                    set scope = 'group', source_user_ids_json = ?, source_message_ids_json = ?,
-                        confidence = 0.78, support_user_count = 1, evidence_count = 1
-                    where id = ?
-                    """,
-                    (json.dumps([focused_user_id]), json.dumps(message_ids), int(row["id"])),
-                )
-                kept_group += 1
-                continue
-            literal_personal = any(token in str(row["style"]).casefold() for token in ("xhn", "扶她"))
-            if literal_personal:
-                self.conn.execute(
-                    "update style_rules set status = 'expired', valid_to = ? where id = ?",
-                    (time.time(), int(row["id"])),
-                )
-                expired_literal += 1
-                continue
-            if key in seen_focused:
-                self.conn.execute(
-                    "update style_rules set status = 'expired', valid_to = ? where id = ?",
-                    (time.time(), int(row["id"])),
-                )
-                expired_duplicates += 1
-                continue
-            seen_focused.add(key)
-            self.conn.execute(
-                """
-                    update style_rules
-                    set scope = 'personal', source_user_ids_json = ?, source_message_ids_json = ?,
-                    confidence = 0.55, support_user_count = 1, evidence_count = 1,
-                    valid_to = ?
-                    where id = ?
-                """,
-                (
-                    json.dumps([focused_user_id]), json.dumps(message_ids),
-                    time.time() + 60 * 24 * 60 * 60, int(row["id"]),
-                ),
-            )
-            personal += 1
-        self.conn.commit()
-        return {
-            "personal": personal,
-            "kept_group": kept_group,
-            "expired_duplicates": expired_duplicates,
-            "expired_literal": expired_literal,
-        }
+
+        return self._style_repository.migrate_focused_style_rules(group_id, focused_user_id)
 
     def member_profiles_for_context(
         self,
@@ -2893,28 +2434,15 @@ class MemoryStore:
         metadata: dict[str, object] | None = None,
         created_at: float | None = None,
     ) -> None:
-        clean_event_type = event_type.strip() or "unknown"
-        clean_stage = stage.strip()
-        clean_action = action.strip()
-        payload = metadata or {}
-        self.conn.execute(
-            """
-            insert into bot_metric_events(
-              event_type, group_id, user_id, stage, action, metadata_json, created_at
-            )
-            values (?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                clean_event_type[:60],
-                group_id,
-                user_id,
-                clean_stage[:80],
-                clean_action[:80],
-                json.dumps(payload, ensure_ascii=False, sort_keys=True),
-                created_at or time.time(),
-            ),
+        return self._metrics_repository.add_metric_event(
+            event_type=event_type,
+            group_id=group_id,
+            user_id=user_id,
+            stage=stage,
+            action=action,
+            metadata=metadata,
+            created_at=created_at,
         )
-        self.conn.commit()
 
     def metric_summary(
         self,
@@ -2924,34 +2452,10 @@ class MemoryStore:
         group_id: int | None = None,
         limit: int = 80,
     ) -> list[BotMetricSummary]:
-        where, params = _metric_where(start_at=start_at, end_at=end_at, group_id=group_id)
-        rows = self.conn.execute(
-            f"""
-            select event_type, stage, action, count(*) as count
-            from bot_metric_events
-            {where}
-            group by event_type, stage, action
-            order by count desc, event_type asc
-            limit ?
-            """,
-            (*params, limit),
-        ).fetchall()
-        return [
-            BotMetricSummary(
-                event_type=str(row["event_type"]),
-                stage=str(row["stage"]),
-                action=str(row["action"]),
-                count=int(row["count"]),
-            )
-            for row in rows
-        ]
+        return self._metrics_repository.metric_summary(start_at=start_at, end_at=end_at, group_id=group_id, limit=limit)
 
     def metric_event_count(self, event_type: str) -> int:
-        row = self.conn.execute(
-            "select count(*) as count from bot_metric_events where event_type = ?",
-            (event_type.strip(),),
-        ).fetchone()
-        return int(row["count"] or 0) if row else 0
+        return self._metrics_repository.metric_event_count(event_type)
 
     def recent_metric_events(
         self,
@@ -2961,18 +2465,12 @@ class MemoryStore:
         group_id: int | None = None,
         limit: int = 12,
     ) -> list[BotMetricEvent]:
-        where, params = _metric_where(start_at=start_at, end_at=end_at, group_id=group_id)
-        rows = self.conn.execute(
-            f"""
-            select event_type, group_id, user_id, stage, action, metadata_json, created_at
-            from bot_metric_events
-            {where}
-            order by created_at desc, id desc
-            limit ?
-            """,
-            (*params, limit),
-        ).fetchall()
-        return [_metric_event_from_row(row) for row in rows]
+        return self._metrics_repository.recent_metric_events(
+            start_at=start_at,
+            end_at=end_at,
+            group_id=group_id,
+            limit=limit,
+        )
 
     def prune_metric_events(
         self,
@@ -2980,46 +2478,7 @@ class MemoryStore:
         max_age_seconds: int | None = None,
         max_rows: int | None = None,
     ) -> dict[str, int]:
-        deleted_by_age = 0
-        deleted_by_rows = 0
-        if max_age_seconds is not None and max_age_seconds > 0:
-            cutoff = time.time() - int(max_age_seconds)
-            cursor = self.conn.execute(
-                "delete from bot_metric_events where created_at < ?",
-                (cutoff,),
-            )
-            deleted_by_age = int(cursor.rowcount or 0)
-        if max_rows is not None and max_rows > 0:
-            cutoff_row = self.conn.execute(
-                """
-                select created_at, id
-                from bot_metric_events
-                order by created_at desc, id desc
-                limit 1 offset ?
-                """,
-                (int(max_rows) - 1,),
-            ).fetchone()
-            if cutoff_row is not None:
-                cursor = self.conn.execute(
-                    """
-                    delete from bot_metric_events
-                    where created_at < ?
-                       or (created_at = ? and id < ?)
-                    """,
-                    (
-                        float(cutoff_row["created_at"]),
-                        float(cutoff_row["created_at"]),
-                        int(cutoff_row["id"]),
-                    ),
-                )
-                deleted_by_rows = int(cursor.rowcount or 0)
-        self.conn.commit()
-        row = self.conn.execute("select count(*) as count from bot_metric_events").fetchone()
-        return {
-            "deleted_by_age": deleted_by_age,
-            "deleted_by_rows": deleted_by_rows,
-            "remaining": int(row["count"] or 0) if row else 0,
-        }
+        return self._metrics_repository.prune_metric_events(max_age_seconds=max_age_seconds, max_rows=max_rows)
 
     def upsert_memory_atom(
         self,
@@ -3041,134 +2500,22 @@ class MemoryStore:
         status: str = "active",
         supersedes_id: int | None = None,
     ) -> int:
-        clean_content = re.sub(r"\s+", " ", content).strip()
-        if not clean_content:
-            return 0
-        clean_type = atom_type.strip()[:32] or "note"
-        clean_source = source.strip()[:80] or "manual"
-        source_key = _source_message_key(source_message_id)
-        clean_evidence_type = _normalize_memory_evidence_type(
-            evidence_type or _infer_memory_evidence_type(clean_source, source_key)
-        )
-        clean_status = _normalize_memory_atom_status(status)
-        effective_valid_to = valid_to if valid_to is not None else expires_at
-        now = time.time()
-        existing = None
-        if supersedes_id is None:
-            existing = self.conn.execute(
-                """
-                select id, source, confidence, importance, expires_at,
-                       evidence_type, source_message_id, observed_at,
-                       valid_from, valid_to, status, supersedes_id
-                from memory_atoms
-                where group_id = ?
-                  and atom_type = ?
-                  and coalesce(subject_user_id, -1) = coalesce(?, -1)
-                  and coalesce(object_user_id, -1) = coalesce(?, -1)
-                  and content = ?
-                  and status = 'active'
-                order by updated_at desc
-                limit 1
-                """,
-                (group_id, clean_type, subject_user_id, object_user_id, clean_content[:420]),
-            ).fetchone()
-        if existing:
-            atom_id = int(existing["id"])
-            before = {
-                "source": str(existing["source"]),
-                "confidence": float(existing["confidence"]),
-                "importance": float(existing["importance"]),
-                "expires_at": existing["expires_at"],
-                "evidence_type": str(existing["evidence_type"]),
-                "source_message_id": existing["source_message_id"],
-                "observed_at": existing["observed_at"],
-                "valid_from": existing["valid_from"],
-                "valid_to": existing["valid_to"],
-                "status": str(existing["status"]),
-                "supersedes_id": existing["supersedes_id"],
-            }
-            after = {
-                "source": clean_source,
-                "confidence": _clamp_float(confidence, 0.0, 1.0),
-                "importance": _clamp_float(importance, 0.0, 1.0),
-                "expires_at": effective_valid_to,
-                "evidence_type": clean_evidence_type,
-                "source_message_id": source_key,
-                "observed_at": observed_at if observed_at is not None else existing["observed_at"],
-                "valid_from": valid_from if valid_from is not None else existing["valid_from"],
-                "valid_to": effective_valid_to,
-                "status": clean_status,
-                "supersedes_id": supersedes_id if supersedes_id is not None else existing["supersedes_id"],
-            }
-            resulting_valid_from = after["valid_from"]
-            resulting_valid_to = after["valid_to"]
-            if (
-                resulting_valid_from is not None
-                and resulting_valid_to is not None
-                and float(resulting_valid_to) < float(resulting_valid_from)
-            ):
-                raise ValueError("memory atom valid_to cannot be earlier than valid_from")
-            if before == after:
-                return atom_id
-            try:
-                self.conn.execute(
-                    """
-                    update memory_atoms
-                    set source = ?, confidence = ?, importance = ?,
-                        expires_at = ?, evidence_type = ?, source_message_id = ?,
-                        observed_at = coalesce(?, observed_at),
-                        valid_from = coalesce(?, valid_from), valid_to = ?,
-                        status = ?, supersedes_id = coalesce(?, supersedes_id),
-                        updated_at = ?
-                    where id = ?
-                    """,
-                    (
-                        clean_source,
-                        _clamp_float(confidence, 0.0, 1.0),
-                        _clamp_float(importance, 0.0, 1.0),
-                        effective_valid_to,
-                        clean_evidence_type,
-                        source_key,
-                        observed_at,
-                        valid_from,
-                        effective_valid_to,
-                        clean_status,
-                        supersedes_id,
-                        now,
-                        atom_id,
-                    ),
-                )
-                self._insert_memory_atom_audit_event(
-                    atom_id=atom_id,
-                    action="refreshed",
-                    evidence_type=clean_evidence_type,
-                    source=clean_source,
-                    source_message_id=source_key,
-                    actor_user_id=None,
-                    detail="legacy upsert refreshed existing atom",
-                    observed_at=observed_at if observed_at is not None else now,
-                    metadata={"before": before, "after": after},
-                )
-                self.conn.commit()
-                return atom_id
-            except Exception:
-                self.conn.rollback()
-                raise
-        return self.add_memory_atom(
-            atom_type=clean_type,
+        return self._atom_repository.upsert_memory_atom(
+            atom_type=atom_type,
             group_id=group_id,
-            content=clean_content,
-            source=clean_source,
+            content=content,
+            source=source,
             subject_user_id=subject_user_id,
             object_user_id=object_user_id,
-            evidence_type=clean_evidence_type,
-            source_message_id=source_key,
-            observed_at=observed_at,
-            valid_from=valid_from,
-            valid_to=effective_valid_to,
             confidence=confidence,
             importance=importance,
-            status=clean_status,
+            expires_at=expires_at,
+            evidence_type=evidence_type,
+            source_message_id=source_message_id,
+            observed_at=observed_at,
+            valid_from=valid_from,
+            valid_to=valid_to,
+            status=status,
             supersedes_id=supersedes_id,
         )
 
@@ -3193,85 +2540,25 @@ class MemoryStore:
         actor_user_id: int | None = None,
         audit_detail: str = "",
     ) -> int:
-        clean_content = re.sub(r"\s+", " ", content).strip()
-        if not clean_content:
-            return 0
-        source_key = _source_message_key(source_message_id)
-        clean_evidence_type = _normalize_memory_evidence_type(
-            evidence_type or _infer_memory_evidence_type(source, source_key)
+        return self._atom_repository.add_memory_atom(
+            atom_type=atom_type,
+            group_id=group_id,
+            content=content,
+            source=source,
+            evidence_type=evidence_type,
+            source_message_id=source_message_id,
+            observed_at=observed_at,
+            valid_from=valid_from,
+            valid_to=valid_to,
+            subject_user_id=subject_user_id,
+            object_user_id=object_user_id,
+            confidence=confidence,
+            importance=importance,
+            status=status,
+            supersedes_id=supersedes_id,
+            actor_user_id=actor_user_id,
+            audit_detail=audit_detail,
         )
-        clean_status = _normalize_memory_atom_status(status)
-        now = time.time()
-        observed = float(observed_at) if observed_at is not None else now
-        starts = float(valid_from) if valid_from is not None else observed
-        ends = float(valid_to) if valid_to is not None else None
-        if clean_status == "expired" and ends is None:
-            ends = observed
-        if ends is not None and ends < starts:
-            raise ValueError("memory atom valid_to cannot be earlier than valid_from")
-        try:
-            superseded_event_id = 0
-            if supersedes_id is not None:
-                target = self.memory_atom(supersedes_id)
-                if target is None:
-                    raise ValueError(f"superseded memory atom does not exist: {supersedes_id}")
-                if target.group_id != group_id:
-                    raise ValueError("superseded memory atom must belong to the same group")
-                if target.status not in {"active", "disputed"}:
-                    raise ValueError(f"memory atom {supersedes_id} is already {target.status}")
-                if clean_status != "active":
-                    raise ValueError("a replacement memory atom must start as active")
-                if target.valid_from is not None and observed < target.valid_from:
-                    raise ValueError("replacement cannot predate the superseded atom's valid_from")
-                self.conn.execute(
-                    """
-                    update memory_atoms
-                    set status = 'superseded', valid_to = ?, expires_at = ?, updated_at = ?
-                    where id = ?
-                    """,
-                    (observed, observed, now, supersedes_id),
-                )
-                superseded_event_id = self._insert_memory_atom_audit_event(
-                    atom_id=supersedes_id,
-                    action="superseded",
-                    evidence_type=clean_evidence_type,
-                    source=source,
-                    source_message_id=source_key,
-                    actor_user_id=actor_user_id,
-                    detail=audit_detail or "superseded by replacement atom",
-                    observed_at=observed,
-                )
-            atom_id = self._insert_memory_atom_record(
-                atom_type=atom_type,
-                group_id=group_id,
-                content=clean_content,
-                source=source,
-                evidence_type=clean_evidence_type,
-                source_message_id=source_key,
-                observed_at=observed,
-                valid_from=starts,
-                valid_to=ends,
-                subject_user_id=subject_user_id,
-                object_user_id=object_user_id,
-                confidence=confidence,
-                importance=importance,
-                status=clean_status,
-                supersedes_id=supersedes_id,
-                actor_user_id=actor_user_id,
-                audit_action="created",
-                audit_detail=audit_detail or "memory atom created",
-                now=now,
-            )
-            if superseded_event_id:
-                self.conn.execute(
-                    "update memory_atom_audit_events set metadata_json = ? where id = ?",
-                    (json.dumps({"replacement_atom_id": atom_id}), superseded_event_id),
-                )
-            self.conn.commit()
-            return atom_id
-        except Exception:
-            self.conn.rollback()
-            raise
 
     def _insert_memory_atom_record(
         self,
@@ -3296,51 +2583,27 @@ class MemoryStore:
         audit_detail: str,
         now: float,
     ) -> int:
-        clean_type = atom_type.strip()[:32] or "note"
-        clean_source = source.strip()[:80] or evidence_type
-        cursor = self.conn.execute(
-            """
-            insert into memory_atoms(
-              atom_type, group_id, subject_user_id, object_user_id, content,
-              source, evidence_type, source_message_id, observed_at,
-              valid_from, valid_to, confidence, importance, status,
-              supersedes_id, expires_at, created_at, updated_at
-            )
-            values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                clean_type,
-                group_id,
-                subject_user_id,
-                object_user_id,
-                content[:420],
-                clean_source,
-                evidence_type,
-                source_message_id,
-                observed_at,
-                valid_from,
-                valid_to,
-                _clamp_float(confidence, 0.0, 1.0),
-                _clamp_float(importance, 0.0, 1.0),
-                status,
-                supersedes_id,
-                valid_to,
-                now,
-                now,
-            ),
-        )
-        atom_id = int(cursor.lastrowid or 0)
-        self._insert_memory_atom_audit_event(
-            atom_id=atom_id,
-            action=audit_action,
+        return self._atom_repository._insert_memory_atom_record(
+            atom_type=atom_type,
+            group_id=group_id,
+            content=content,
+            source=source,
             evidence_type=evidence_type,
-            source=clean_source,
             source_message_id=source_message_id,
-            actor_user_id=actor_user_id,
-            detail=audit_detail,
             observed_at=observed_at,
+            valid_from=valid_from,
+            valid_to=valid_to,
+            subject_user_id=subject_user_id,
+            object_user_id=object_user_id,
+            confidence=confidence,
+            importance=importance,
+            status=status,
+            supersedes_id=supersedes_id,
+            actor_user_id=actor_user_id,
+            audit_action=audit_action,
+            audit_detail=audit_detail,
+            now=now,
         )
-        return atom_id
 
     def add_memory_counter_evidence(
         self,
@@ -3355,34 +2618,17 @@ class MemoryStore:
         confidence: float = 0.8,
         mark_disputed: bool = True,
     ) -> int:
-        atom = self.memory_atom(atom_id)
-        clean_content = re.sub(r"\s+", " ", content).strip()
-        if atom is None or not clean_content:
-            return 0
-        clean_evidence_type = _normalize_memory_evidence_type(evidence_type)
-        observed = float(observed_at) if observed_at is not None else time.time()
-        try:
-            if mark_disputed and atom.status == "active":
-                self.conn.execute(
-                    "update memory_atoms set status = 'disputed', updated_at = ? where id = ?",
-                    (time.time(), atom_id),
-                )
-            event_id = self._insert_memory_atom_audit_event(
-                atom_id=atom_id,
-                action="counter_evidence",
-                evidence_type=clean_evidence_type,
-                source=source,
-                source_message_id=_source_message_key(source_message_id),
-                actor_user_id=actor_user_id,
-                detail=clean_content[:420],
-                observed_at=observed,
-                metadata={"confidence": _clamp_float(confidence, 0.0, 1.0)},
-            )
-            self.conn.commit()
-            return event_id
-        except Exception:
-            self.conn.rollback()
-            raise
+        return self._atom_repository.add_memory_counter_evidence(
+            atom_id,
+            content=content,
+            source=source,
+            evidence_type=evidence_type,
+            source_message_id=source_message_id,
+            observed_at=observed_at,
+            actor_user_id=actor_user_id,
+            confidence=confidence,
+            mark_disputed=mark_disputed,
+        )
 
     def dispute_memory_atom(
         self,
@@ -3396,18 +2642,15 @@ class MemoryStore:
         actor_user_id: int | None = None,
         confidence: float = 0.8,
     ) -> bool:
-        return bool(
-            self.add_memory_counter_evidence(
-                atom_id,
-                content=content,
-                source=source,
-                evidence_type=evidence_type,
-                source_message_id=source_message_id,
-                observed_at=observed_at,
-                actor_user_id=actor_user_id,
-                confidence=confidence,
-                mark_disputed=True,
-            )
+        return self._atom_repository.dispute_memory_atom(
+            atom_id,
+            content=content,
+            source=source,
+            evidence_type=evidence_type,
+            source_message_id=source_message_id,
+            observed_at=observed_at,
+            actor_user_id=actor_user_id,
+            confidence=confidence,
         )
 
     def expire_memory_atom(
@@ -3419,36 +2662,13 @@ class MemoryStore:
         observed_at: float | None = None,
         actor_user_id: int | None = None,
     ) -> bool:
-        atom = self.memory_atom(atom_id)
-        if atom is None or atom.status not in {"active", "disputed"}:
-            return False
-        observed = float(observed_at) if observed_at is not None else time.time()
-        if atom.valid_from is not None and observed < atom.valid_from:
-            raise ValueError("expiry cannot predate the memory atom's valid_from")
-        try:
-            self.conn.execute(
-                """
-                update memory_atoms
-                set status = 'expired', valid_to = ?, expires_at = ?, updated_at = ?
-                where id = ?
-                """,
-                (observed, observed, time.time(), atom_id),
-            )
-            self._insert_memory_atom_audit_event(
-                atom_id=atom_id,
-                action="expired",
-                evidence_type="manual",
-                source=source,
-                source_message_id=None,
-                actor_user_id=actor_user_id,
-                detail=(reason.strip() or "memory atom expired")[:420],
-                observed_at=observed,
-            )
-            self.conn.commit()
-            return True
-        except Exception:
-            self.conn.rollback()
-            raise
+        return self._atom_repository.expire_memory_atom(
+            atom_id,
+            reason=reason,
+            source=source,
+            observed_at=observed_at,
+            actor_user_id=actor_user_id,
+        )
 
     def correct_memory_atom(
         self,
@@ -3467,92 +2687,30 @@ class MemoryStore:
         subject_user_id: int | None = None,
         object_user_id: int | None = None,
     ) -> int:
-        old = self.memory_atom(atom_id)
-        clean_content = re.sub(r"\s+", " ", content).strip()
-        if old is None or old.status not in {"active", "disputed"} or not clean_content:
-            return 0
-        observed = float(observed_at) if observed_at is not None else time.time()
-        if old.valid_from is not None and observed < old.valid_from:
-            raise ValueError("correction cannot predate the memory atom's valid_from")
-        if valid_to is not None and float(valid_to) < observed:
-            raise ValueError("corrected memory valid_to cannot be earlier than observed_at")
-        now = time.time()
-        try:
-            self.conn.execute(
-                """
-                update memory_atoms
-                set status = 'superseded', valid_to = ?, expires_at = ?, updated_at = ?
-                where id = ?
-                """,
-                (observed, observed, now, atom_id),
-            )
-            superseded_event_id = self._insert_memory_atom_audit_event(
-                atom_id=atom_id,
-                action="superseded",
-                evidence_type="manual",
-                source=source,
-                source_message_id=_source_message_key(source_message_id),
-                actor_user_id=actor_user_id,
-                detail=(reason.strip() or "replaced by manual correction")[:420],
-                observed_at=observed,
-            )
-            new_atom_id = self._insert_memory_atom_record(
-                atom_type=atom_type or old.atom_type,
-                group_id=old.group_id,
-                content=clean_content,
-                source=source,
-                evidence_type="manual",
-                source_message_id=_source_message_key(source_message_id),
-                observed_at=observed,
-                valid_from=observed,
-                valid_to=valid_to,
-                subject_user_id=old.subject_user_id if subject_user_id is None else subject_user_id,
-                object_user_id=old.object_user_id if object_user_id is None else object_user_id,
-                confidence=old.confidence if confidence is None else confidence,
-                importance=old.importance if importance is None else importance,
-                status="active",
-                supersedes_id=old.id,
-                actor_user_id=actor_user_id,
-                audit_action="manual_correction",
-                audit_detail=(reason.strip() or f"manual correction of atom {old.id}")[:420],
-                now=now,
-            )
-            self.conn.execute(
-                "update memory_atom_audit_events set metadata_json = ? where id = ?",
-                (json.dumps({"replacement_atom_id": new_atom_id}), superseded_event_id),
-            )
-            self.conn.commit()
-            return new_atom_id
-        except Exception:
-            self.conn.rollback()
-            raise
+        return self._atom_repository.correct_memory_atom(
+            atom_id,
+            content=content,
+            source=source,
+            source_message_id=source_message_id,
+            observed_at=observed_at,
+            actor_user_id=actor_user_id,
+            reason=reason,
+            confidence=confidence,
+            importance=importance,
+            valid_to=valid_to,
+            atom_type=atom_type,
+            subject_user_id=subject_user_id,
+            object_user_id=object_user_id,
+        )
 
     def memory_atom(self, atom_id: int) -> MemoryAtom | None:
-        row = self.conn.execute(
-            f"select {_MEMORY_ATOM_SELECT_COLUMNS} from memory_atoms where id = ?",
-            (atom_id,),
-        ).fetchone()
-        return _memory_atom_from_row(row) if row is not None else None
+        return self._atom_repository.memory_atom(atom_id)
 
     def memory_atom_audit_trail(self, atom_id: int, *, limit: int = 100) -> list[MemoryAtomAuditEvent]:
-        rows = self.conn.execute(
-            """
-            select * from (
-              select id, atom_id, action, evidence_type, source, source_message_id,
-                     actor_user_id, detail, observed_at, created_at, metadata_json
-              from memory_atom_audit_events
-              where atom_id = ?
-              order by created_at desc, id desc
-              limit ?
-            )
-            order by created_at asc, id asc
-            """,
-            (atom_id, max(1, int(limit))),
-        ).fetchall()
-        return [_memory_atom_audit_event_from_row(row) for row in rows]
+        return self._atom_repository.memory_atom_audit_trail(atom_id, limit=limit)
 
     def memory_atom_events(self, atom_id: int, *, limit: int = 100) -> list[MemoryAtomAuditEvent]:
-        return self.memory_atom_audit_trail(atom_id, limit=limit)
+        return self._atom_repository.memory_atom_events(atom_id, limit=limit)
 
     def _insert_memory_atom_audit_event(
         self,
@@ -3567,49 +2725,23 @@ class MemoryStore:
         observed_at: float,
         metadata: dict[str, object] | None = None,
     ) -> int:
-        cursor = self.conn.execute(
-            """
-            insert into memory_atom_audit_events(
-              atom_id, action, evidence_type, source, source_message_id,
-              actor_user_id, detail, observed_at, created_at, metadata_json
-            )
-            values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                atom_id,
-                action.strip()[:32] or "updated",
-                _normalize_memory_evidence_type(evidence_type),
-                source.strip()[:80] or evidence_type,
-                source_message_id,
-                actor_user_id,
-                detail.strip()[:420],
-                observed_at,
-                time.time(),
-                json.dumps(metadata or {}, ensure_ascii=False),
-            ),
+        return self._atom_repository._insert_memory_atom_audit_event(
+            atom_id=atom_id,
+            action=action,
+            evidence_type=evidence_type,
+            source=source,
+            source_message_id=source_message_id,
+            actor_user_id=actor_user_id,
+            detail=detail,
+            observed_at=observed_at,
+            metadata=metadata,
         )
-        return int(cursor.lastrowid or 0)
 
     def delete_memory_atom(self, atom_id: int) -> bool:
-        return self.expire_memory_atom(atom_id, reason="legacy delete_memory_atom")
+        return self._atom_repository.delete_memory_atom(atom_id)
 
     def recent_memory_atoms(self, group_id: int, limit: int) -> list[MemoryAtom]:
-        now = time.time()
-        rows = self.conn.execute(
-            f"""
-            select {_MEMORY_ATOM_SELECT_COLUMNS}
-            from memory_atoms
-            where group_id = ?
-              and status = 'active'
-              and (valid_from is null or valid_from <= ?)
-              and (valid_to is null or valid_to > ?)
-              and (expires_at is null or expires_at > ?)
-            order by importance desc, updated_at desc, id desc
-            limit ?
-            """,
-            (group_id, now, now, now, limit),
-        ).fetchall()
-        return [_memory_atom_from_row(row) for row in rows]
+        return self._atom_repository.recent_memory_atoms(group_id, limit)
 
     def active_memory_atoms_for_subject(
         self,
@@ -3619,30 +2751,12 @@ class MemoryStore:
         atom_types: tuple[str, ...] | None = None,
         limit: int = 20,
     ) -> list[MemoryAtom]:
-        if subject_user_id is None:
-            return []
-        subject_ids = sorted(linked_account_ids(subject_user_id))
-        if not subject_ids:
-            return []
-        placeholders = ",".join("?" for _ in subject_ids)
-        clauses = ["group_id = ?", "status = 'active'", f"subject_user_id in ({placeholders})"]
-        params: list[object] = [int(group_id), *subject_ids]
-        if atom_types:
-            placeholders = ",".join("?" for _ in atom_types)
-            clauses.append(f"atom_type in ({placeholders})")
-            params.extend(atom_types)
-        params.append(max(1, min(100, int(limit))))
-        rows = self.conn.execute(
-            f"""
-            select {_MEMORY_ATOM_SELECT_COLUMNS}
-            from memory_atoms
-            where {" and ".join(clauses)}
-            order by importance desc, updated_at desc, id desc
-            limit ?
-            """,
-            tuple(params),
-        ).fetchall()
-        return [_memory_atom_from_row(row) for row in rows]
+        return self._atom_repository.active_memory_atoms_for_subject(
+            group_id,
+            subject_user_id,
+            atom_types=atom_types,
+            limit=limit,
+        )
 
     def relevant_memory_atoms(
         self,
@@ -3656,85 +2770,16 @@ class MemoryStore:
         candidate_limit: int = 120,
         now: float | None = None,
     ) -> list[MemoryAtom]:
-        current = time.time() if now is None else float(now)
-        subject_set = expand_linked_account_ids(
-            (
-                *(subject_user_ids or ()),
-                *(relationship_user_ids or ()),
-                speaker_user_id,
-            )
+        return self._atom_repository.relevant_memory_atoms(
+            group_id,
+            query,
+            subject_user_ids=subject_user_ids,
+            speaker_user_id=speaker_user_id,
+            relationship_user_ids=relationship_user_ids,
+            limit=limit,
+            candidate_limit=candidate_limit,
+            now=now,
         )
-        speaker_set = linked_account_ids(speaker_user_id)
-        has_query_terms = bool(_relevance_terms(query))
-        clauses = [
-            "group_id = ?",
-            "status = 'active'",
-            "atom_type != 'jargon_candidate'",
-            "(valid_from is null or valid_from <= ?)",
-            "(valid_to is null or valid_to > ?)",
-            "(expires_at is null or expires_at > ?)",
-        ]
-        params: list[object] = [group_id, current, current, current]
-        if subject_set and not has_query_terms:
-            placeholders = ",".join("?" for _ in subject_set)
-            clauses.append(
-                f"(subject_user_id in ({placeholders}) or object_user_id in ({placeholders}) or subject_user_id is null)"
-            )
-            params.extend(subject_set)
-            params.extend(subject_set)
-        rows = self.conn.execute(
-            f"""
-            select {_MEMORY_ATOM_SELECT_COLUMNS}
-            from memory_atoms
-            where {" and ".join(clauses)}
-            """,
-            tuple(params),
-        ).fetchall()
-        is_private_chat = group_id >= PRIVATE_CHAT_ID_OFFSET
-        scored: list[tuple[float, float, sqlite3.Row]] = []
-        for row in rows:
-            content = str(row["content"])
-            lexical_score = float(_text_relevance_score(query, content))
-            score = lexical_score
-            subject = row["subject_user_id"]
-            obj = row["object_user_id"]
-            person_match = bool(subject_set and (subject in subject_set or obj in subject_set))
-            atom_type = str(row["atom_type"]).casefold()
-            # A private conversation has one speaker, so person-match alone is
-            # almost always true.  Do not let unrelated snack/anime preferences
-            # crowd out the active subject just because they belong to this user.
-            if (
-                is_private_chat
-                and lexical_score <= 0
-                and person_match
-                and atom_type not in {"identity", "relation", "fact"}
-                and float(row["importance"] or 0.0) < 0.85
-            ):
-                continue
-            if has_query_terms and lexical_score <= 0 and not person_match:
-                continue
-            if subject_set and subject in subject_set:
-                score += 3.0
-            if subject_set and obj in subject_set:
-                score += 2.25
-            if speaker_set and subject in speaker_set:
-                score += 1.5
-            elif speaker_set and obj in speaker_set:
-                score += 0.75
-            if atom_type == "relation" and subject_set:
-                if subject in subject_set or obj in subject_set:
-                    score += 0.75
-            score += float(row["importance"] or 0.0) * 2.0
-            score += float(row["confidence"] or 0.0) * 0.75
-            score += _memory_atom_recency_score(row, now=current)
-            score += _memory_atom_feedback_score(row)
-            if score <= 0:
-                continue
-            scored.append((score, float(row["updated_at"]), row))
-        scored.sort(key=lambda item: (item[0], item[1]), reverse=True)
-        if candidate_limit > 0:
-            scored = scored[:candidate_limit]
-        return [_memory_atom_from_row(row) for _, _, row in scored[:limit]]
 
     def expire_due_memory_atoms(
         self,
@@ -3742,53 +2787,10 @@ class MemoryStore:
         now: float | None = None,
         group_id: int | None = None,
     ) -> int:
-        current = time.time() if now is None else float(now)
-        return self._expire_due_memory_atoms(current, group_id=group_id)
+        return self._atom_repository.expire_due_memory_atoms(now=now, group_id=group_id)
 
     def _expire_due_memory_atoms(self, now: float, *, group_id: int | None = None) -> int:
-        group_clause = " and group_id = ?" if group_id is not None else ""
-        params: tuple[object, ...] = (now, group_id) if group_id is not None else (now,)
-        rows = self.conn.execute(
-            f"""
-            select id, evidence_type, source, source_message_id
-            from memory_atoms
-            where status = 'active'
-              and coalesce(valid_to, expires_at) is not null
-              and coalesce(valid_to, expires_at) <= ?
-              {group_clause}
-            """,
-            params,
-        ).fetchall()
-        try:
-            for row in rows:
-                atom_id = int(row["id"])
-                self.conn.execute(
-                    """
-                    update memory_atoms
-                    set status = 'expired',
-                        valid_to = coalesce(valid_to, expires_at, ?),
-                        expires_at = coalesce(expires_at, valid_to, ?),
-                        updated_at = ?
-                    where id = ?
-                    """,
-                    (now, now, now, atom_id),
-                )
-                self._insert_memory_atom_audit_event(
-                    atom_id=atom_id,
-                    action="expired",
-                    evidence_type=str(row["evidence_type"] or "event"),
-                    source="validity_window",
-                    source_message_id=_source_message_key(row["source_message_id"]),
-                    actor_user_id=None,
-                    detail="validity window elapsed",
-                    observed_at=now,
-                )
-            if rows:
-                self.conn.commit()
-            return len(rows)
-        except Exception:
-            self.conn.rollback()
-            raise
+        return self._atom_repository._expire_due_memory_atoms(now, group_id=group_id)
 
     def upsert_custom_jargon(
         self,
@@ -3853,27 +2855,15 @@ class MemoryStore:
         created_at: float | None = None,
         source_key: str | None = None,
     ) -> bool:
-        if prompt_tokens is None and completion_tokens is None and total_tokens is None:
-            return False
-        cursor = self.conn.execute(
-            """
-            insert or ignore into llm_usage_events(
-              task, model, prompt_tokens, completion_tokens, total_tokens, created_at, source_key
-            )
-            values (?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                task.strip() or "unknown",
-                model.strip() or "unknown",
-                prompt_tokens,
-                completion_tokens,
-                total_tokens,
-                created_at or time.time(),
-                source_key.strip()[:240] if source_key else None,
-            ),
+        return self._metrics_repository.add_llm_usage(
+            task=task,
+            model=model,
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            total_tokens=total_tokens,
+            created_at=created_at,
+            source_key=source_key,
         )
-        self.conn.commit()
-        return cursor.rowcount > 0
 
     def llm_usage_summary(
         self,
@@ -3882,30 +2872,7 @@ class MemoryStore:
         start_at: float | None = None,
         end_at: float | None = None,
     ) -> list[LLMUsageSummary]:
-        where, params = _usage_time_where(
-            since_seconds=since_seconds,
-            start_at=start_at,
-            end_at=end_at,
-        )
-        rows = self.conn.execute(
-            f"""
-            select
-              task,
-              model,
-              count(*) as call_count,
-              sum(coalesce(prompt_tokens, 0)) as prompt_tokens,
-              sum(coalesce(completion_tokens, 0)) as completion_tokens,
-              sum(coalesce(total_tokens, coalesce(prompt_tokens, 0) + coalesce(completion_tokens, 0))) as total_tokens,
-              min(created_at) as first_at,
-              max(created_at) as last_at
-            from llm_usage_events
-            {where}
-            group by task, model
-            order by total_tokens desc, call_count desc
-            """,
-            params,
-        ).fetchall()
-        return [_llm_usage_summary_from_row(row) for row in rows]
+        return self._metrics_repository.llm_usage_summary(since_seconds=since_seconds, start_at=start_at, end_at=end_at)
 
     def recent_llm_usage_events(
         self,
@@ -3915,23 +2882,12 @@ class MemoryStore:
         end_at: float | None = None,
         limit: int = 8,
     ) -> list[LLMUsageEvent]:
-        where, time_params = _usage_time_where(
+        return self._metrics_repository.recent_llm_usage_events(
             since_seconds=since_seconds,
             start_at=start_at,
             end_at=end_at,
+            limit=limit,
         )
-        params: tuple[object, ...] = (*time_params, limit)
-        rows = self.conn.execute(
-            f"""
-            select task, model, prompt_tokens, completion_tokens, total_tokens, created_at
-            from llm_usage_events
-            {where}
-            order by created_at desc, id desc
-            limit ?
-            """,
-            params,
-        ).fetchall()
-        return [_llm_usage_event_from_row(row) for row in rows]
 
     def set_group_enabled(self, group_id: int, enabled: bool) -> None:
         self.conn.execute(
@@ -3987,18 +2943,10 @@ class MemoryStore:
         }
 
     def private_conversation_state(self, chat_id: int) -> PrivateConversationState | None:
-        row = self.conn.execute(
-            "select * from private_conversation_states where chat_id = ?",
-            (chat_id,),
-        ).fetchone()
-        return _private_conversation_state_from_row(row) if row is not None else None
+        return self._private_state_repository.private_conversation_state(chat_id)
 
     def recent_private_conversation_states(self, limit: int = 80) -> list[PrivateConversationState]:
-        rows = self.conn.execute(
-            "select * from private_conversation_states order by updated_at desc, chat_id desc limit ?",
-            (max(1, int(limit)),),
-        ).fetchall()
-        return [_private_conversation_state_from_row(row) for row in rows]
+        return self._private_state_repository.recent_private_conversation_states(limit)
 
     def update_private_conversation_state(
         self,
@@ -4019,53 +2967,16 @@ class MemoryStore:
         in ``memory_atoms`` instead of becoming mutable prompt text.
         """
 
-        old = self.private_conversation_state(chat_id)
-        now = time.time()
-        clean_name = _clean_private_state_text(
-            display_name if display_name is not None else (old.display_name if old else ""), 80
+        return self._private_state_repository.update_private_conversation_state(
+            chat_id=chat_id,
+            user_id=user_id,
+            display_name=display_name,
+            relationship_note=relationship_note,
+            interaction_tone=interaction_tone,
+            current_topic=current_topic,
+            open_threads=open_threads,
+            frozen_fields=frozen_fields,
         )
-        clean_relation = _clean_private_state_text(
-            relationship_note if relationship_note is not None else (old.relationship_note if old else ""), 420
-        )
-        clean_tone = _clean_private_state_text(
-            interaction_tone if interaction_tone is not None else (old.interaction_tone if old else ""), 240
-        )
-        clean_topic = _clean_private_state_text(
-            current_topic if current_topic is not None else (old.current_topic if old else ""), 280
-        )
-        clean_threads = _clean_private_threads(
-            open_threads if open_threads is not None else (old.open_threads if old else ())
-        )
-        clean_frozen = _clean_private_state_fields(
-            frozen_fields if frozen_fields is not None else (old.frozen_fields if old else ())
-        )
-        self.conn.execute(
-            """
-            insert into private_conversation_states(
-              chat_id, user_id, display_name, relationship_note, interaction_tone,
-              current_topic, open_threads_json, frozen_fields_json, updated_at
-            ) values (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            on conflict(chat_id) do update set
-              user_id = excluded.user_id,
-              display_name = excluded.display_name,
-              relationship_note = excluded.relationship_note,
-              interaction_tone = excluded.interaction_tone,
-              current_topic = excluded.current_topic,
-              open_threads_json = excluded.open_threads_json,
-              frozen_fields_json = excluded.frozen_fields_json,
-              updated_at = excluded.updated_at
-            """,
-            (
-                int(chat_id), int(user_id), clean_name, clean_relation, clean_tone,
-                clean_topic, json.dumps(clean_threads, ensure_ascii=False),
-                json.dumps(clean_frozen, ensure_ascii=False), now,
-            ),
-        )
-        self.conn.commit()
-        state = self.private_conversation_state(chat_id)
-        if state is None:
-            raise RuntimeError("private conversation state was not saved")
-        return state
 
     def refresh_private_conversation_learning(
         self,
@@ -4077,15 +2988,11 @@ class MemoryStore:
     ) -> PrivateConversationState:
         """Refresh short-term private state while honouring manual field locks."""
 
-        old = self.private_conversation_state(chat_id)
-        frozen = set(old.frozen_fields if old else ())
-        learned_threads = _clean_private_threads(open_threads)
-        return self.update_private_conversation_state(
+        return self._private_state_repository.refresh_private_conversation_learning(
             chat_id=chat_id,
             user_id=user_id,
-            display_name=None if "display_name" in frozen else display_name,
-            current_topic=None if "current_topic" in frozen else (learned_threads[0] if learned_threads else ""),
-            open_threads=None if "open_threads" in frozen else learned_threads,
+            display_name=display_name,
+            open_threads=open_threads,
         )
 
     def app_kv_get(self, key: str) -> str | None:
@@ -4121,36 +3028,18 @@ class MemoryStore:
         tags: tuple[str, ...] = (),
         enabled: bool = False,
     ) -> MemeAsset:
-        now = time.time()
-        cleaned_tags = tuple(dict.fromkeys(str(tag).strip() for tag in tags if str(tag).strip()))
-        tags_json = json.dumps(cleaned_tags, ensure_ascii=False)
-        self.conn.execute(
-            """
-            insert into meme_assets(
-              sha256, source_group_id, source_user_id, source_message_id,
-              file_path, mime_type, byte_size, description, tags_json, enabled,
-              created_at, updated_at
-            ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            on conflict(sha256) do update set
-              source_message_id = excluded.source_message_id,
-              file_path = excluded.file_path,
-              mime_type = excluded.mime_type,
-              byte_size = excluded.byte_size,
-              description = case when excluded.description != '' then excluded.description else meme_assets.description end,
-              tags_json = case when excluded.tags_json != '[]' then excluded.tags_json else meme_assets.tags_json end,
-              enabled = max(meme_assets.enabled, excluded.enabled),
-              updated_at = excluded.updated_at
-            """,
-            (
-                sha256, int(source_group_id), int(source_user_id), str(source_message_id),
-                file_path, mime_type, max(0, int(byte_size)), description.strip()[:900], tags_json,
-                int(bool(enabled)), now, now,
-            ),
+        return self._meme_repository.upsert_meme_asset(
+            sha256=sha256,
+            source_group_id=source_group_id,
+            source_user_id=source_user_id,
+            source_message_id=source_message_id,
+            file_path=file_path,
+            mime_type=mime_type,
+            byte_size=byte_size,
+            description=description,
+            tags=tags,
+            enabled=enabled,
         )
-        self.conn.commit()
-        row = self.conn.execute("select * from meme_assets where sha256 = ?", (sha256,)).fetchone()
-        assert row is not None
-        return _meme_asset_from_row(row)
 
     def meme_assets_for_private(
         self,
@@ -4159,95 +3048,17 @@ class MemoryStore:
         limit: int = 6,
         same_meme_cooldown_seconds: float = 6 * 60 * 60,
     ) -> list[MemeAsset]:
-        now = time.time()
-        cooldown = max(0.0, float(same_meme_cooldown_seconds))
-        if cooldown:
-            rows = self.conn.execute(
-                """
-                select * from meme_assets
-                where enabled = 1
-                  and (last_used_at is null or last_used_at <= ?)
-                order by coalesce(last_used_at, 0) asc, use_count asc, id asc
-                limit 80
-                """,
-                (now - cooldown,),
-            ).fetchall()
-        else:
-            rows = self.conn.execute(
-                """
-                select * from meme_assets
-                where enabled = 1
-                order by coalesce(last_used_at, 0) asc, use_count asc, id asc
-                limit 80
-                """
-            ).fetchall()
-        assets = [_meme_asset_from_row(row) for row in rows]
-        if not assets:
-            return []
-        terms = _meme_query_terms(query)
-        ranked = sorted(
-            assets,
-            key=lambda asset: (
-                -_meme_relevance_score(asset, terms),
-                asset.use_count,
-                asset.last_used_at or 0.0,
-                asset.id,
-            ),
+        return self._meme_repository.meme_assets_for_private(
+            query=query,
+            limit=limit,
+            same_meme_cooldown_seconds=same_meme_cooldown_seconds,
         )
-        return ranked[: max(1, min(12, int(limit)))]
 
     def mark_meme_asset_used(self, meme_id: int) -> bool:
-        now = time.time()
-        cursor = self.conn.execute(
-            """
-            update meme_assets
-            set last_used_at = ?, use_count = use_count + 1, updated_at = ?
-            where id = ? and enabled = 1
-            """,
-            (now, now, int(meme_id)),
-        )
-        self.conn.commit()
-        return cursor.rowcount > 0
+        return self._meme_repository.mark_meme_asset_used(meme_id)
 
     def meme_asset(self, meme_id: int) -> MemeAsset | None:
-        row = self.conn.execute("select * from meme_assets where id = ?", (int(meme_id),)).fetchone()
-        return _meme_asset_from_row(row) if row is not None else None
-
-
-def _meme_asset_from_row(row: sqlite3.Row) -> MemeAsset:
-    try:
-        parsed_tags = json.loads(str(row["tags_json"] or "[]"))
-    except (TypeError, ValueError, json.JSONDecodeError):
-        parsed_tags = []
-    tags = tuple(str(tag).strip() for tag in parsed_tags if str(tag).strip()) if isinstance(parsed_tags, list) else ()
-    raw_last_used = row["last_used_at"]
-    return MemeAsset(
-        id=int(row["id"]),
-        sha256=str(row["sha256"]),
-        source_message_id=str(row["source_message_id"]),
-        file_path=str(row["file_path"]),
-        mime_type=str(row["mime_type"]),
-        byte_size=int(row["byte_size"]),
-        description=str(row["description"] or ""),
-        tags=tags,
-        enabled=bool(row["enabled"]),
-        created_at=float(row["created_at"]),
-        last_used_at=float(raw_last_used) if raw_last_used is not None else None,
-        use_count=int(row["use_count"] or 0),
-    )
-
-
-def _meme_query_terms(query: str) -> tuple[str, ...]:
-    clean = _compact_text(query).casefold()
-    terms = [item for item in re.findall(r"[\u4e00-\u9fff]{2,}|[a-z0-9]{3,}", clean) if item]
-    return tuple(dict.fromkeys(terms))
-
-
-def _meme_relevance_score(asset: MemeAsset, terms: tuple[str, ...]) -> float:
-    if not terms:
-        return 0.0
-    haystack = f"{asset.description} {' '.join(asset.tags)}".casefold()
-    return float(sum(1 for term in terms if term in haystack))
+        return self._meme_repository.meme_asset(meme_id)
 
 
 def _dedupe_recent_message_rows(rows: list[sqlite3.Row], limit: int) -> list[sqlite3.Row]:
@@ -4269,24 +3080,6 @@ def _dedupe_recent_message_rows(rows: list[sqlite3.Row], limit: int) -> list[sql
         if len(selected) >= limit:
             break
     return selected
-
-
-def _message_from_row(row: sqlite3.Row) -> ChatMessage:
-    keys = set(row.keys())
-    return ChatMessage(
-        group_id=int(row["group_id"]),
-        user_id=int(row["user_id"]),
-        nickname=str(row["nickname"]),
-        text=str(row["text"]),
-        is_bot=bool(row["is_bot"]),
-        created_at=float(row["created_at"]),
-        id=int(row["id"]),
-        source_message_id=str(row["source_message_id"] or "") if "source_message_id" in keys else "",
-        session_id=str(row["session_id"] or "") if "session_id" in keys else "",
-        message_segments_json=str(row["message_segments_json"] or "") if "message_segments_json" in keys else "",
-        raw_message_json=str(row["raw_message_json"] or "") if "raw_message_json" in keys else "",
-        sender_json=str(row["sender_json"] or "") if "sender_json" in keys else "",
-    )
 
 
 def _group_info_from_row(row: sqlite3.Row) -> GroupInfo:
@@ -4337,436 +3130,6 @@ def _summary_from_row(row: sqlite3.Row) -> MemorySummary:
         locked=bool(locked),
         updated_at=float(updated_at or row["created_at"]),
     )
-
-
-def _metric_event_from_row(row: sqlite3.Row) -> BotMetricEvent:
-    try:
-        raw_metadata = json.loads(str(row["metadata_json"]))
-    except json.JSONDecodeError:
-        raw_metadata = {}
-    metadata = raw_metadata if isinstance(raw_metadata, dict) else {}
-    group_id = row["group_id"]
-    user_id = row["user_id"]
-    return BotMetricEvent(
-        event_type=str(row["event_type"]),
-        group_id=int(group_id) if group_id is not None else None,
-        user_id=int(user_id) if user_id is not None else None,
-        stage=str(row["stage"]),
-        action=str(row["action"]),
-        metadata=metadata,
-        created_at=float(row["created_at"]),
-    )
-
-
-def _memory_atom_from_row(row: sqlite3.Row) -> MemoryAtom:
-    columns = set(row.keys())
-    subject = row["subject_user_id"]
-    obj = row["object_user_id"]
-    expires_at = row["expires_at"]
-    source_message_id = row["source_message_id"] if "source_message_id" in columns else None
-    observed_at = row["observed_at"] if "observed_at" in columns else row["created_at"]
-    valid_from = row["valid_from"] if "valid_from" in columns else row["created_at"]
-    valid_to = row["valid_to"] if "valid_to" in columns else expires_at
-    supersedes_id = row["supersedes_id"] if "supersedes_id" in columns else None
-    return MemoryAtom(
-        id=int(row["id"]),
-        atom_type=str(row["atom_type"]),
-        group_id=int(row["group_id"]),
-        subject_user_id=int(subject) if subject is not None else None,
-        object_user_id=int(obj) if obj is not None else None,
-        content=str(row["content"]),
-        source=str(row["source"]),
-        confidence=float(row["confidence"]),
-        importance=float(row["importance"]),
-        expires_at=float(expires_at) if expires_at is not None else None,
-        created_at=float(row["created_at"]),
-        updated_at=float(row["updated_at"]),
-        evidence_type=str(row["evidence_type"] or "manual") if "evidence_type" in columns else "manual",
-        source_message_id=str(source_message_id) if source_message_id is not None else None,
-        observed_at=float(observed_at) if observed_at is not None else float(row["created_at"]),
-        valid_from=float(valid_from) if valid_from is not None else None,
-        valid_to=float(valid_to) if valid_to is not None else None,
-        status=str(row["status"] or "active") if "status" in columns else "active",
-        supersedes_id=int(supersedes_id) if supersedes_id is not None else None,
-    )
-
-
-def _memory_atom_audit_event_from_row(row: sqlite3.Row) -> MemoryAtomAuditEvent:
-    try:
-        raw_metadata = json.loads(str(row["metadata_json"] or "{}"))
-    except (TypeError, json.JSONDecodeError):
-        raw_metadata = {}
-    metadata = raw_metadata if isinstance(raw_metadata, dict) else {}
-    source_message_id = row["source_message_id"]
-    actor_user_id = row["actor_user_id"]
-    return MemoryAtomAuditEvent(
-        id=int(row["id"]),
-        atom_id=int(row["atom_id"]),
-        action=str(row["action"]),
-        evidence_type=str(row["evidence_type"]),
-        source=str(row["source"]),
-        source_message_id=str(source_message_id) if source_message_id is not None else None,
-        actor_user_id=int(actor_user_id) if actor_user_id is not None else None,
-        detail=str(row["detail"]),
-        observed_at=float(row["observed_at"]),
-        created_at=float(row["created_at"]),
-        metadata=metadata,
-    )
-
-
-def _metric_where(
-    *,
-    start_at: float | None,
-    end_at: float | None,
-    group_id: int | None,
-) -> tuple[str, tuple[object, ...]]:
-    clauses: list[str] = []
-    params: list[object] = []
-    if start_at is not None:
-        clauses.append("created_at >= ?")
-        params.append(start_at)
-    if end_at is not None:
-        clauses.append("created_at < ?")
-        params.append(end_at)
-    if group_id is not None:
-        clauses.append("group_id = ?")
-        params.append(group_id)
-    if not clauses:
-        return "", ()
-    return "where " + " and ".join(clauses), tuple(params)
-
-
-def _clamp_float(value: float, low: float, high: float) -> float:
-    try:
-        number = float(value)
-    except (TypeError, ValueError):
-        number = low
-    return max(low, min(high, number))
-
-
-_STYLE_RULE_CANONICAL_REPLACEMENTS = (
-    ("面对", "群友"),
-    ("遇到", "群友"),
-    ("当群友", "群友"),
-    ("可以", ""),
-    ("适合", ""),
-    ("建议", ""),
-    ("表达方式", ""),
-    ("表达", ""),
-    ("回应", "回复"),
-    ("接话", "回复"),
-    ("夸张比喻", "夸张"),
-    ("夸张词", "夸张"),
-    ("夸张方式", "夸张"),
-    ("离谱内容", "荒诞"),
-    ("荒谬观点", "荒诞"),
-    ("荒诞疑问", "荒诞"),
-    ("荒诞话题", "荒诞"),
-    ("明显玩梗内容", "玩梗"),
-    ("网络梗", "玩梗"),
-    ("接梗", "玩梗"),
-    ("用简短", "用短"),
-    ("一句", "短句"),
-    ("短促", "短"),
-    ("调侃", "吐槽"),
-    ("吐槽强化", "吐槽"),
-    ("放大槽点", "放大荒诞"),
-    ("突出反差", "放大荒诞"),
-    ("强化喜剧效果", "放大荒诞"),
-    ("放大荒诞感", "放大荒诞"),
-    ("反讽短句", "反讽"),
-    ("简短反讽句", "反讽"),
-    ("黑色幽默", "反讽"),
-    ("谐音梗", "谐音"),
-    ("双关语", "双关"),
-    ("制造幽默", "制造笑点"),
-    ("制造双关效果", "制造笑点"),
-    ("可爱语气词", "可爱语气"),
-    ("拟声词", "可爱语气"),
-    ("简短感叹句", "简短感叹"),
-    ("简短感叹", "短句感叹"),
-)
-
-
-def _style_rule_fingerprint(situation: str, style: str) -> str:
-    left = _normalize_style_rule_text(situation)
-    right = _normalize_style_rule_text(style)
-    if not left or not right:
-        return ""
-    return f"{left}=>{right}"[:160]
-
-
-def _normalize_style_rule_text(text: str) -> str:
-    normalized = _compact_text(text).casefold()
-    for old, new in _STYLE_RULE_CANONICAL_REPLACEMENTS:
-        normalized = normalized.replace(old.casefold(), new.casefold())
-    normalized = re.sub(r"(的时候|时可以|时用|时要)", "时", normalized)
-    normalized = re.sub(r"[，。、；：:,.!?！？\s]+", "", normalized)
-    low_info = ("方式", "语气", "内容", "观点", "话题")
-    for token in low_info:
-        if len(normalized) > 12:
-            normalized = normalized.replace(token, "")
-    return normalized[:80]
-
-
-_STYLE_RULE_SEMANTIC_MARKERS = (
-    "夸张",
-    "荒诞",
-    "玩梗",
-    "吐槽",
-    "反讽",
-    "短句",
-    "短",
-    "谐音",
-    "双关",
-    "互损",
-    "自嘲",
-    "安慰",
-    "难受",
-    "情绪",
-    "认真",
-    "技术",
-    "代码",
-    "搜索",
-    "政治",
-    "创造者",
-    "小鸟",
-    "可爱",
-)
-
-
-def _style_rule_semantic_markers(text: str) -> set[str]:
-    normalized = _normalize_style_rule_text(text)
-    return {marker for marker in _STYLE_RULE_SEMANTIC_MARKERS if marker in normalized}
-
-
-def _style_rules_are_semantically_mergeable(
-    existing_situation: str,
-    existing_style: str,
-    *,
-    incoming_situation: str,
-    incoming_style: str,
-) -> bool:
-    """Merge only clearly equivalent group-wide rules without an LLM call.
-
-    A shared generic setting alone is not enough: both the triggering scene and
-    the proposed expression must overlap on a known semantic marker. Personal
-    style keeps using exact fingerprints so one member's habits never bleed into
-    another member's profile.
-    """
-    existing_scene = _style_rule_semantic_markers(existing_situation)
-    incoming_scene = _style_rule_semantic_markers(incoming_situation)
-    existing_expression = _style_rule_semantic_markers(existing_style)
-    incoming_expression = _style_rule_semantic_markers(incoming_style)
-    return bool(existing_scene & incoming_scene) and bool(existing_expression & incoming_expression)
-
-
-def _unique_recent_ints(values: tuple[int, ...] | list[int], *, limit: int | None = None) -> list[int]:
-    result: list[int] = []
-    for value in values:
-        try:
-            parsed = int(value)
-        except (TypeError, ValueError):
-            continue
-        if parsed <= 0:
-            continue
-        if parsed in result:
-            result.remove(parsed)
-        result.append(parsed)
-    if limit is not None and limit > 0:
-        result = result[-limit:]
-    return result
-
-
-def _style_rule_confidence(
-    *,
-    support_user_count: int,
-    evidence_count: int,
-    merged_count: int,
-    has_user_ids: bool,
-) -> float:
-    if not has_user_ids:
-        base = 0.65
-    elif support_user_count >= 2:
-        base = 0.78
-    else:
-        base = 0.56
-    base += min(0.14, max(0, evidence_count - 1) * 0.015)
-    base += min(0.08, max(0, merged_count) * 0.01)
-    base += min(0.08, max(0, support_user_count - 1) * 0.02)
-    return round(max(0.1, min(0.94, base)), 3)
-
-
-def _prefer_specific_style_text(old: str, new: str, *, limit: int) -> str:
-    old = str(old or "").strip()
-    new = str(new or "").strip()
-    if not old:
-        return new[:limit]
-    if not new:
-        return old[:limit]
-    return (new if _style_text_specificity(new) > _style_text_specificity(old) else old)[:limit]
-
-
-def _style_text_specificity(text: str) -> float:
-    compact = _compact_text(text)
-    score = min(4.0, len(compact) / 12)
-    specific_markers = ("技术", "代码", "难受", "情绪", "创造者", "小鸟", "学术", "搜索", "认真", "安慰", "自嘲", "互损")
-    score += sum(0.35 for marker in specific_markers if marker in compact)
-    generic_markers = ("群友", "内容", "话题", "事情", "表达", "回应", "接话")
-    score -= sum(0.18 for marker in generic_markers if marker in compact)
-    return score
-
-
-def _style_rule_value(row: sqlite3.Row, *, now: float) -> float:
-    situation = str(row["situation"] or "")
-    style = str(row["style"] or "")
-    evidence = max(1, int(row["evidence_count"] or 1))
-    support = max(1, int(row["support_user_count"] or 1))
-    confidence = max(0.1, min(1.0, float(row["confidence"] or 0.6)))
-    merged = max(0, int(row["merged_count"] or 0))
-    last_seen = float(row["last_seen_at"] or row["created_at"] or 0.0)
-    age_days = max(0.0, (now - last_seen) / (24 * 60 * 60))
-    recency = 1.5 / (1.0 + age_days / 14.0)
-    value = confidence * 3.0
-    value += min(evidence, 20) * 0.18
-    value += min(support, 8) * 0.42
-    value += min(merged, 20) * 0.08
-    value += recency
-    value += _style_text_specificity(f"{situation}{style}") * 0.35
-    if str(row["scope"] or "") == "personal":
-        value -= 0.35
-    generic_patterns = (
-        "群友回复",
-        "群友表达",
-        "群友讨论",
-        "群友提到",
-        "用短句",
-        "简短评价",
-        "用调侃",
-        "用玩梗",
-    )
-    compact = _compact_text(f"{situation}{style}")
-    value -= sum(0.22 for marker in generic_patterns if marker in compact)
-    if support <= 1:
-        value -= 0.35
-    if evidence <= 1:
-        value -= 0.25
-    return value
-
-
-def _normalize_memory_evidence_type(value: str) -> str:
-    normalized = str(value or "").strip().casefold()
-    if normalized not in MEMORY_ATOM_EVIDENCE_TYPES:
-        raise ValueError(
-            f"unsupported memory evidence type: {value!r}; "
-            f"expected one of {sorted(MEMORY_ATOM_EVIDENCE_TYPES)}"
-        )
-    return normalized
-
-
-def _infer_memory_evidence_type(source: str, source_message_id: str | None) -> str:
-    if source_message_id:
-        return "message"
-    normalized = str(source or "").strip().casefold()
-    if normalized.startswith("message:"):
-        return "message"
-    if normalized == "manual" or normalized.startswith(("manual:", "manual_", "builtin")):
-        return "manual"
-    return "event"
-
-
-def _normalize_memory_atom_status(value: str) -> str:
-    normalized = str(value or "").strip().casefold()
-    if normalized not in MEMORY_ATOM_STATUSES:
-        raise ValueError(
-            f"unsupported memory atom status: {value!r}; "
-            f"expected one of {sorted(MEMORY_ATOM_STATUSES)}"
-        )
-    return normalized
-
-
-def _memory_atom_recency_score(row: sqlite3.Row, *, now: float) -> float:
-    observed_at = row["observed_at"]
-    timestamp = float(observed_at) if observed_at is not None else float(row["updated_at"] or 0.0)
-    age_seconds = max(0.0, now - timestamp)
-    return 1.5 / (1.0 + age_seconds / (7 * 24 * 60 * 60))
-
-
-def _memory_atom_feedback_score(row: sqlite3.Row) -> float:
-    atom_type = str(row["atom_type"] or "").casefold()
-    source = str(row["source"] or "").casefold()
-    content = str(row["content"] or "")
-    score = 0.0
-    if atom_type == "feedback":
-        score += 1.5
-    if source.startswith(("approval_", "recall_", "owner_feedback")):
-        score += 0.75
-    if "不准奏反馈" in content or "优质反馈" in content:
-        score += 0.5
-    return score
-
-
-def _text_relevance_score(query: str, haystack: str) -> int:
-    query_terms = _relevance_terms(query)
-    if not query_terms:
-        return 0
-    haystack_lower = haystack.casefold()
-    score = 0
-    for term in query_terms:
-        term_lower = term.casefold()
-        if term_lower not in haystack_lower:
-            continue
-        score += 3 if len(term_lower) >= 4 else 1
-    return score
-
-
-def _relevance_terms(text: str) -> set[str]:
-    lowered = text.casefold()
-    terms = {
-        match.group(0)
-        for match in re.finditer(r"[a-z0-9_]{2,}", lowered)
-    }
-    for chunk in re.findall(r"[\u4e00-\u9fff]{2,}", text):
-        if len(chunk) <= 8:
-            terms.add(chunk)
-        for size in (2, 3, 4):
-            if len(chunk) < size:
-                continue
-            for index in range(0, len(chunk) - size + 1):
-                terms.add(chunk[index : index + size])
-    stop_terms = {
-        "这个",
-        "那个",
-        "什么",
-        "怎么",
-        "就是",
-        "然后",
-        "可以",
-        "不是",
-        "没有",
-        "一下",
-        "感觉",
-        "时候",
-    }
-    return {term for term in terms if term not in stop_terms}
-
-
-def _loads_int_list(value: object) -> list[int]:
-    try:
-        raw = json.loads(str(value or "[]"))
-    except (json.JSONDecodeError, TypeError):
-        return []
-    if not isinstance(raw, list):
-        return []
-    result: list[int] = []
-    for item in raw:
-        try:
-            parsed = int(item)
-        except (TypeError, ValueError):
-            continue
-        if parsed > 0 and parsed not in result:
-            result.append(parsed)
-    return result
 
 
 def _raw_corpus_tags(text: str) -> tuple[str, ...]:
@@ -4847,10 +3210,6 @@ def _is_low_value_raw_corpus_text(text: str) -> bool:
     }
 
 
-def _compact_text(text: str) -> str:
-    return re.sub(r"\s+", "", text).casefold()
-
-
 def _counter_from_json(value: object) -> Counter[str]:
     try:
         raw = json.loads(str(value))
@@ -4904,75 +3263,6 @@ def _cap_counter(counter: Counter[str], limit: int) -> Counter[str]:
 
 def _top_counter_items(counter: Counter[str], limit: int) -> tuple[tuple[str, int], ...]:
     return tuple((key, int(count)) for key, count in counter.most_common(limit) if count > 0)
-
-
-def _json_text_list(value: object, *, limit: int) -> list[str]:
-    try:
-        raw = json.loads(str(value))
-    except json.JSONDecodeError:
-        raw = []
-    if not isinstance(raw, list):
-        return []
-    return _clean_text_list([str(item) for item in raw], limit=limit, item_limit=140)
-
-
-def _clean_text_list(items: list[str], *, limit: int, item_limit: int) -> list[str]:
-    cleaned: list[str] = []
-    seen: set[str] = set()
-    for item in items:
-        text = re.sub(r"\s+", " ", str(item)).strip()
-        if not text:
-            continue
-        key = text.casefold()
-        if key in seen:
-            continue
-        seen.add(key)
-        cleaned.append(text[:item_limit])
-        if len(cleaned) >= limit:
-            break
-    return cleaned
-
-
-def _clean_private_state_text(value: object, limit: int) -> str:
-    return re.sub(r"\s+", " ", str(value or "")).strip()[:limit]
-
-
-def _clean_private_threads(values: object) -> list[str]:
-    if not isinstance(values, (list, tuple)):
-        return []
-    cleaned: list[str] = []
-    seen: set[str] = set()
-    for value in values:
-        text = _clean_private_state_text(value, 280)
-        key = text.casefold()
-        if not text or key in seen:
-            continue
-        seen.add(key)
-        cleaned.append(text)
-        if len(cleaned) >= 5:
-            break
-    return cleaned
-
-
-def _clean_private_state_fields(values: object) -> list[str]:
-    allowed = {"display_name", "relationship_note", "interaction_tone", "current_topic", "open_threads"}
-    if not isinstance(values, (list, tuple)):
-        return []
-    return [field for field in values if isinstance(field, str) and field in allowed]
-
-
-def _private_conversation_state_from_row(row: sqlite3.Row) -> PrivateConversationState:
-    return PrivateConversationState(
-        chat_id=int(row["chat_id"]),
-        user_id=int(row["user_id"]),
-        display_name=str(row["display_name"] or ""),
-        relationship_note=str(row["relationship_note"] or ""),
-        interaction_tone=str(row["interaction_tone"] or ""),
-        current_topic=str(row["current_topic"] or ""),
-        open_threads=tuple(_clean_private_threads(_json_text_list(row["open_threads_json"], limit=5))),
-        frozen_fields=tuple(_clean_private_state_fields(_json_text_list(row["frozen_fields_json"], limit=5))),
-        updated_at=float(row["updated_at"] or 0.0),
-    )
 
 
 def _profile_from_row(row: sqlite3.Row) -> MemberProfile:
@@ -5107,56 +3397,6 @@ def _custom_jargon_from_row(row: sqlite3.Row) -> CustomJargonEntry:
     )
 
 
-def _usage_time_where(
-    *,
-    since_seconds: int | None,
-    start_at: float | None,
-    end_at: float | None,
-) -> tuple[str, tuple[float, ...]]:
-    clauses: list[str] = []
-    params: list[float] = []
-    if start_at is None and since_seconds is not None:
-        start_at = time.time() - since_seconds
-    if start_at is not None:
-        clauses.append("created_at >= ?")
-        params.append(start_at)
-    if end_at is not None:
-        clauses.append("created_at < ?")
-        params.append(end_at)
-    if not clauses:
-        return "", ()
-    return "where " + " and ".join(clauses), tuple(params)
-
-
-def _llm_usage_summary_from_row(row: sqlite3.Row) -> LLMUsageSummary:
-    return LLMUsageSummary(
-        task=str(row["task"]),
-        model=str(row["model"]),
-        call_count=int(row["call_count"] or 0),
-        prompt_tokens=int(row["prompt_tokens"] or 0),
-        completion_tokens=int(row["completion_tokens"] or 0),
-        total_tokens=int(row["total_tokens"] or 0),
-        first_at=float(row["first_at"] or 0.0),
-        last_at=float(row["last_at"] or 0.0),
-    )
-
-
-def _llm_usage_event_from_row(row: sqlite3.Row) -> LLMUsageEvent:
-    prompt_tokens = int(row["prompt_tokens"] or 0)
-    completion_tokens = int(row["completion_tokens"] or 0)
-    total_tokens = row["total_tokens"]
-    if total_tokens is None:
-        total_tokens = prompt_tokens + completion_tokens
-    return LLMUsageEvent(
-        task=str(row["task"]),
-        model=str(row["model"]),
-        prompt_tokens=prompt_tokens,
-        completion_tokens=completion_tokens,
-        total_tokens=int(total_tokens or 0),
-        created_at=float(row["created_at"]),
-    )
-
-
 def _dedupe_names(names: object) -> list[str]:
     result: list[str] = []
     seen: set[str] = set()
@@ -5179,10 +3419,3 @@ def _dedupe_ints(values: list[int]) -> list[int]:
         seen.add(value)
         result.append(value)
     return result
-
-
-def _source_message_key(source_message_id: int | str | None) -> str | None:
-    if source_message_id is None:
-        return None
-    key = str(source_message_id).strip()
-    return key or None
